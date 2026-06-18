@@ -61,3 +61,66 @@ fn library_compares_in_memory_bytes() {
     assert_eq!(report.critical_count, from_files.critical_count);
     assert_eq!(report.total_findings, from_files.total_findings);
 }
+
+#[test]
+fn library_detects_parameter_reordering() {
+    use soroban_upgrade_safeguard::diff::{compare, Severity};
+    use soroban_upgrade_safeguard::spec::ContractSpec;
+    use stellar_xdr::curr::{ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef, StringM, VecM};
+
+    let mut old_spec = ContractSpec::default();
+    let old_inputs = vec![
+        ScSpecFunctionInputV0 {
+            doc: StringM::default(),
+            name: "a".try_into().unwrap(),
+            type_: ScSpecTypeDef::U32,
+        },
+        ScSpecFunctionInputV0 {
+            doc: StringM::default(),
+            name: "b".try_into().unwrap(),
+            type_: ScSpecTypeDef::U32,
+        },
+    ];
+    old_spec.functions.insert(
+        "test_fn".to_string(),
+        ScSpecFunctionV0 {
+            doc: StringM::default(),
+            name: "test_fn".try_into().unwrap(),
+            inputs: VecM::try_from(old_inputs).unwrap(),
+            outputs: VecM::default(),
+        },
+    );
+
+    let mut new_spec = ContractSpec::default();
+    let new_inputs = vec![
+        ScSpecFunctionInputV0 {
+            doc: StringM::default(),
+            name: "b".try_into().unwrap(),
+            type_: ScSpecTypeDef::U32,
+        },
+        ScSpecFunctionInputV0 {
+            doc: StringM::default(),
+            name: "a".try_into().unwrap(),
+            type_: ScSpecTypeDef::U32,
+        },
+    ];
+    new_spec.functions.insert(
+        "test_fn".to_string(),
+        ScSpecFunctionV0 {
+            doc: StringM::default(),
+            name: "test_fn".try_into().unwrap(),
+            inputs: VecM::try_from(new_inputs).unwrap(),
+            outputs: VecM::default(),
+        },
+    );
+
+    let diff_report = compare(&old_spec, &new_spec);
+    let reorder_finding = diff_report
+        .findings
+        .iter()
+        .find(|f| f.category == "Parameter Reordered");
+
+    assert!(reorder_finding.is_some(), "Integration: Expected a Parameter Reordered finding");
+    let f = reorder_finding.unwrap();
+    assert_eq!(f.severity, Severity::Critical);
+}
