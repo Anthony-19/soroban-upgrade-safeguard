@@ -15,4 +15,9 @@ cd ../v2
 cargo build --target wasm32-unknown-unknown --release
 cp target/wasm32-unknown-unknown/release/mock_contract_v2.wasm ../../wasm/v2.wasm
 
+echo "Building v3..."
+cd ../v3
+cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/mock_contract_v3.wasm ../../wasm/v3.wasm
+
 echo "Successfully built mock contracts into tests/wasm/!"
