@@ -61,3 +61,46 @@ fn library_compares_in_memory_bytes() {
     assert_eq!(report.critical_count, from_files.critical_count);
     assert_eq!(report.total_findings, from_files.total_findings);
 }
+
+#[test]
+fn test_duplicate_warning_stderr() {
+    use stellar_xdr::curr::{ScSpecEntry, ScSpecFunctionV0, VecM};
+    use soroban_upgrade_safeguard::spec::ContractSpec;
+
+    // If a special env var is set, run the duplicate spec generation and panic.
+    if std::env::var("RUN_DUPLICATE_SPEC_TEST").is_ok() {
+        let f1 = ScSpecFunctionV0 {
+            doc: "doc1".try_into().unwrap(),
+            name: "my_func".try_into().unwrap(),
+            inputs: VecM::default(),
+            outputs: VecM::default(),
+        };
+        let f2 = ScSpecFunctionV0 {
+            doc: "doc2".try_into().unwrap(),
+            name: "my_func".try_into().unwrap(),
+            inputs: VecM::default(),
+            outputs: VecM::default(),
+        };
+        let entries = vec![
+            ScSpecEntry::FunctionV0(f1),
+            ScSpecEntry::FunctionV0(f2),
+        ];
+        let _spec = ContractSpec::from_entries(&entries);
+        panic!("duplicate spec test completed");
+    }
+
+    // Otherwise, spawn ourselves as a subprocess with the env var set, and capture stdout/stderr!
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("test_duplicate_warning_stderr")
+        .env("RUN_DUPLICATE_SPEC_TEST", "1")
+        .output()
+        .expect("failed to spawn test subprocess");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let combined = format!("--- STDOUT ---\n{}\n--- STDERR ---\n{}", stdout, stderr);
+    assert!(
+        combined.contains("WARNING: Duplicate function 'my_func' detected. Keeping the first entry."),
+        "Did not find duplicate warning in output:\n{}", combined
+    );
+}
