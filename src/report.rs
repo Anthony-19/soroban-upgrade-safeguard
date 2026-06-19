@@ -246,4 +246,72 @@ impl SafetyReport {
 
         output
     }
+
+    /// Generate a structured Markdown output.
+    pub fn generate_summary_markdown(&self) -> String {
+        let mut output = String::new();
+        output.push_str("# Soroban Upgrade Safety Report\n\n");
+
+        let status = if self.is_safe {
+            "✅ PASSED (No breaking changes detected)"
+        } else {
+            "❌ FAILED (Critical breaking changes detected)"
+        };
+        output.push_str(&format!("## Status: {}\n\n", status));
+
+        output.push_str("### Summary Table\n\n");
+        output.push_str("| Finding Severity | Count |\n");
+        output.push_str("| :--- | :--- |\n");
+        output.push_str(&format!("| **Critical** | {} |\n", self.critical_count));
+        output.push_str(&format!("| **Warning** | {} |\n", self.warning_count));
+        output.push_str(&format!("| **Info** | {} |\n", self.info_count));
+        if self.suppressed_count > 0 {
+            output.push_str(&format!("| **Suppressed** | {} |\n", self.suppressed_count));
+        }
+        output.push_str("\n---\n\n");
+
+        if self.total_findings == 0 {
+            output.push_str("No relevant changes detected. The upgrade is identical in its exports and types.\n");
+            return output;
+        }
+
+        // Sort categories to have consistent output; surface Environment first.
+        let mut categories: Vec<&String> = self.findings_by_category.keys().collect();
+        categories.sort_by(|a, b| {
+            let rank = |name: &str| if name == "Environment" { 0 } else { 1 };
+            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+        });
+
+        for category in categories {
+            output.push_str(&format!("### {}\n\n", category));
+            let group = self.findings_by_category.get(category).unwrap();
+            for reported in group {
+                let finding = &reported.finding;
+
+                if reported.suppressed {
+                    output.push_str(&format!("- 🔕 **[SUPPRESSED]** {}\n", finding.message));
+                    if let Some(reason) = &reported.suppression_reason {
+                        output.push_str(&format!("  - ↳ reason: {}\n", reason));
+                    }
+                    continue;
+                }
+
+                let emoji = match finding.severity {
+                    Severity::Critical => "🔴",
+                    Severity::Warning => "🟡",
+                    Severity::Info => "🔵",
+                };
+                output.push_str(&format!("- {} {}\n", emoji, finding.message));
+            }
+            output.push('\n');
+        }
+
+        if !self.is_safe {
+            output.push_str("### ⚠️ Action Required\n\n");
+            output.push_str("- The new contract version modifies existing storage layouts or function interfaces.\n");
+            output.push_str("- Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n");
+        }
+
+        output
+    }
 }
