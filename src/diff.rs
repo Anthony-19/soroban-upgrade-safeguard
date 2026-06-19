@@ -203,6 +203,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                         category: "Function Documentation Changed".to_string(),
                         message,
                         type_name: None,
+                        target: Some(name.to_string()),
                     });
                 }
             }
@@ -371,6 +372,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                         category: "Struct Documentation Changed".to_string(),
                         message,
                         type_name: Some(name.clone()),
+                        target: Some(name.clone()),
                     });
                 }
             }
@@ -529,6 +531,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                         category: "Enum Documentation Changed".to_string(),
                         message,
                         type_name: Some(name.clone()),
+                        target: Some(name.clone()),
                     });
                 }
             }

@@ -52,6 +52,10 @@ struct Args {
     /// used if present; otherwise no suppressions are applied.
     #[arg(long, value_name = "CONFIG")]
     config: Option<PathBuf>,
+
+    /// Print a concise remediation explanation for each finding.
+    #[arg(long)]
+    explain: bool,
 }
 
 fn main() -> Result<()> {
@@ -160,7 +164,7 @@ fn main() -> Result<()> {
     }
 
     // Generate Safety Report
-    let safety_report = report::SafetyReport::with_suppressions(&diff_report, &suppressions);
+    let safety_report = report::SafetyReport::with_suppressions(&diff_report, &suppressions, args.explain);
 
     if json {
         // Single JSON document to stdout; no decorative text, no ANSI codes.
@@ -169,7 +173,7 @@ fn main() -> Result<()> {
             serde_json::to_string_pretty(&safety_report.to_json())?
         );
     } else {
-        println!("{}", safety_report.generate_summary_text());
+        println!("{}", safety_report.generate_summary_text(args.explain));
     }
 
     if !safety_report.is_safe {
