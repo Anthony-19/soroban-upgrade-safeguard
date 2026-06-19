@@ -26,6 +26,19 @@ pub struct Finding {
     /// relates to a specific type.  Used by cascade-detection so it never
     /// needs to re-parse `message`.
     pub type_name: Option<String>,
+    /// A stable, structured identifier for the exact entity this finding is
+    /// about, independent of the human-readable `message`. It is the key used
+    /// by the suppression config to match a finding precisely:
+    ///
+    /// - functions: the function name (e.g. `transfer`)
+    /// - function parameters: `function.param` (e.g. `transfer.to`)
+    /// - types (struct/enum removed/added, cascades): the type name (e.g. `Data`)
+    /// - struct fields: `Type.field` (e.g. `Data.amount`)
+    /// - enum cases: `Enum.case` (e.g. `Status.Active`)
+    ///
+    /// `None` for findings that are not tied to a single named entity (for
+    /// example environment-metadata changes).
+    pub target: Option<String>,
 }
 
 /// Holds all findings from a comparison of two contract specs.
@@ -90,6 +103,7 @@ pub fn compare_env_metadata(
                 category: ENVIRONMENT_CATEGORY.to_string(),
                 message: format_env_metadata_change(old_meta, new_meta),
                 type_name: None,
+                target: None,
             });
         }
     }
@@ -167,10 +181,30 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                         name
                     ),
                     type_name: None,
+                    target: Some(name.clone()),
                 });
             }
             Some(new_fn) => {
                 check_function_signature(name, old_fn, new_fn, report);
+                // Compare function doc-strings and emit informational findings
+                if old_fn.doc != new_fn.doc {
+                    let old_doc_empty = old_fn.doc.to_string().is_empty();
+                    let new_doc_empty = new_fn.doc.to_string().is_empty();
+                    let message = if old_doc_empty && !new_doc_empty {
+                        format!("Function '{}' documentation was added.", name)
+                    } else if !old_doc_empty && new_doc_empty {
+                        format!("Function '{}' documentation was removed.", name)
+                    } else {
+                        format!("Function '{}' documentation changed.", name)
+                    };
+
+                    report.findings.push(Finding {
+                        severity: Severity::Info,
+                        category: "Function Documentation Changed".to_string(),
+                        message,
+                        type_name: None,
+                    });
+                }
             }
         }
     }
@@ -183,6 +217,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                 category: "Function Added".to_string(),
                 message: format!("New function '{}' added.", name),
                 type_name: None,
+                target: Some(name.clone()),
             });
         }
     }
@@ -210,6 +245,7 @@ fn check_function_signature(
                 new_inputs.len()
             ),
             type_name: None,
+            target: Some(name.to_string()),
         });
         return; // No point comparing individual params if count differs
     }
@@ -232,6 +268,7 @@ fn check_function_signature(
                 name
             ),
             type_name: None,
+            target: Some(name.to_string()),
         });
 
         // Check for genuine type changes by matching parameter name.
@@ -256,6 +293,7 @@ fn check_function_signature(
                             crate::mapper::type_to_string(new_type)
                         ),
                         type_name: None,
+                        target: Some(format!("{}.{}", name, p_name)),
                     });
                 }
             }
@@ -275,6 +313,7 @@ fn check_function_signature(
                         name, i, old_name, new_name
                     ),
                     type_name: None,
+                    target: Some(format!("{}.{}", name, old_name)),
                 });
             }
 
@@ -291,6 +330,7 @@ fn check_function_signature(
                         crate::mapper::type_to_string(&new_input.type_)
                     ),
                     type_name: None,
+                    target: Some(format!("{}.{}", name, old_name)),
                 });
             }
         }
@@ -311,6 +351,7 @@ fn check_function_signature(
                 new_outputs.len()
             ),
             type_name: None,
+            target: Some(name.to_string()),
         });
     } else {
         for (i, (old_out, new_out)) in old_outputs.iter().zip(new_outputs.iter()).enumerate() {
@@ -326,6 +367,7 @@ fn check_function_signature(
                         crate::mapper::type_to_string(new_out)
                     ),
                     type_name: None,
+                    target: Some(name.to_string()),
                 });
             }
         }
@@ -357,10 +399,30 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                         name
                     ),
                     type_name: Some(name.clone()),
+                    target: Some(name.clone()),
                 });
             }
             Some(new_struct) => {
                 check_struct_fields(name, old_struct, new_struct, report);
+                // Compare struct doc-strings (informational only)
+                if old_struct.doc != new_struct.doc {
+                    let old_doc_empty = old_struct.doc.to_string().is_empty();
+                    let new_doc_empty = new_struct.doc.to_string().is_empty();
+                    let message = if old_doc_empty && !new_doc_empty {
+                        format!("Struct '{}' documentation was added.", name)
+                    } else if !old_doc_empty && new_doc_empty {
+                        format!("Struct '{}' documentation was removed.", name)
+                    } else {
+                        format!("Struct '{}' documentation changed.", name)
+                    };
+
+                    report.findings.push(Finding {
+                        severity: Severity::Info,
+                        category: "Struct Documentation Changed".to_string(),
+                        message,
+                        type_name: Some(name.clone()),
+                    });
+                }
             }
         }
     }
@@ -373,6 +435,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                 category: "Struct Added".to_string(),
                 message: format!("New struct '{}' added.", name),
                 type_name: Some(name.clone()),
+                target: Some(name.clone()),
             });
         }
     }
@@ -411,6 +474,7 @@ fn check_struct_fields(
                     msg_prefix, name, old_name
                 ),
                 type_name: Some(name.to_string()),
+                target: Some(format!("{}.{}", name, old_name)),
             });
         }
     }
@@ -431,6 +495,7 @@ fn check_struct_fields(
                     msg_prefix, name, i, old_name, new_name
                 ),
                 type_name: Some(name.to_string()),
+                target: Some(format!("{}.{}", name, old_name)),
             });
         }
 
@@ -449,6 +514,7 @@ fn check_struct_fields(
                     crate::mapper::type_to_string(&new_field.type_)
                 ),
                 type_name: Some(name.to_string()),
+                target: Some(format!("{}.{}", name, old_name)),
             });
         }
     }
@@ -466,6 +532,7 @@ fn check_struct_fields(
                     new_field.name
                 ),
                 type_name: Some(name.to_string()),
+                target: Some(format!("{}.{}", name, new_field.name)),
             });
         }
     }
@@ -490,10 +557,30 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                         name
                     ),
                     type_name: Some(name.clone()),
+                    target: Some(name.clone()),
                 });
             }
             Some(new_enum) => {
                 check_enum_cases(name, old_enum, new_enum, report);
+                // Compare enum doc-strings (informational only)
+                if old_enum.doc != new_enum.doc {
+                    let old_doc_empty = old_enum.doc.to_string().is_empty();
+                    let new_doc_empty = new_enum.doc.to_string().is_empty();
+                    let message = if old_doc_empty && !new_doc_empty {
+                        format!("Enum '{}' documentation was added.", name)
+                    } else if !old_doc_empty && new_doc_empty {
+                        format!("Enum '{}' documentation was removed.", name)
+                    } else {
+                        format!("Enum '{}' documentation changed.", name)
+                    };
+
+                    report.findings.push(Finding {
+                        severity: Severity::Info,
+                        category: "Enum Documentation Changed".to_string(),
+                        message,
+                        type_name: Some(name.clone()),
+                    });
+                }
             }
         }
     }
@@ -506,6 +593,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                 category: "Enum Added".to_string(),
                 message: format!("New enum '{}' added.", name),
                 type_name: Some(name.clone()),
+                target: Some(name.clone()),
             });
         }
     }
@@ -543,6 +631,7 @@ fn check_enum_cases(
                         msg_prefix, name, old_name, old_case.value
                     ),
                     type_name: Some(name.to_string()),
+                    target: Some(format!("{}.{}", name, old_name)),
                 });
             }
             Some(new_case) => {
@@ -557,6 +646,7 @@ fn check_enum_cases(
                             msg_prefix, name, old_name, old_case.value, new_case.value
                         ),
                         type_name: Some(name.to_string()),
+                        target: Some(format!("{}.{}", name, old_name)),
                     });
                 }
             }
@@ -576,6 +666,7 @@ fn check_enum_cases(
                         msg_prefix, name, new_name, new_case.value
                     ),
                     type_name: Some(name.to_string()),
+                    target: Some(format!("{}.{}", name, new_name)),
                 });
             }
         }
@@ -623,6 +714,7 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
                             dep, current_broken_type, dep
                         ),
                         type_name: Some(dep.clone()),
+                        target: Some(dep.clone()),
                     });
                 }
             }
@@ -739,6 +831,7 @@ mod tests {
             message: "This message has no quotes and mentions no type prefix whatsoever."
                 .to_string(),
             type_name: Some("Child".to_string()),
+            target: Some("Child".to_string()),
         });
 
         // Run cascade detection against the old spec
@@ -771,6 +864,7 @@ mod tests {
             category: "Function Removed".to_string(),
             message: "Function 'do_stuff' was removed.".to_string(),
             type_name: None,
+            target: Some("do_stuff".to_string()),
         });
 
         detect_cascading_layout_breaks(&old, &mut report);
@@ -839,6 +933,41 @@ mod tests {
         let f = field_change.unwrap();
         assert_eq!(f.severity, Severity::Critical);
         assert_eq!(f.type_name.as_deref(), Some("Data"));
+        // The `target` pinpoints the exact field (`Type.field`) so a
+        // suppression keyed on it cannot over-apply to sibling fields.
+        assert_eq!(f.target.as_deref(), Some("Data.amount"));
+    }
+
+    // ---------------------------------------------------------------
+    // Test 6: findings carry a precise, structured `target` for every
+    //         granularity (function, field, enum case, type).
+    // ---------------------------------------------------------------
+    #[test]
+    fn findings_expose_precise_targets() {
+        // Struct removed entirely -> target is the bare type name.
+        let old = spec_with_structs(vec![("Gone", vec![("x", ScSpecTypeDef::U32)])]);
+        let new = ContractSpec::default();
+        let report = compare(&old, &new);
+        let removed = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Removed")
+            .expect("expected a struct-removed finding");
+        assert_eq!(removed.target.as_deref(), Some("Gone"));
+
+        // Struct field removed -> target is `Type.field`.
+        let old = spec_with_structs(vec![(
+            "Data",
+            vec![("keep", ScSpecTypeDef::U32), ("drop", ScSpecTypeDef::U32)],
+        )]);
+        let new = spec_with_structs(vec![("Data", vec![("keep", ScSpecTypeDef::U32)])]);
+        let report = compare(&old, &new);
+        let field_removed = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Removed")
+            .expect("expected a field-removed finding");
+        assert_eq!(field_removed.target.as_deref(), Some("Data.drop"));
     }
 
     fn env_meta(protocol: u32, pre_release: u32) -> ContractEnvMeta {
@@ -846,6 +975,44 @@ mod tests {
         ContractEnvMeta {
             entries: vec![ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(version)],
         }
+    }
+
+    #[test]
+    fn struct_doc_change_produces_info() {
+        let mut old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let mut new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+
+        // Set differing docs
+        old.structs.get_mut("Data").unwrap().doc = "old doc".try_into().unwrap();
+        new.structs.get_mut("Data").unwrap().doc = "new doc".try_into().unwrap();
+
+        let report = compare(&old, &new);
+
+        let found = report.findings.iter().any(|f| {
+            f.severity == Severity::Info
+                && f.category == "Struct Documentation Changed"
+                && f.type_name.as_deref() == Some("Data")
+        });
+        assert!(found, "Expected an info finding for struct doc change");
+
+        // Ensure info findings do not influence safety
+        let safety = crate::report::SafetyReport::new(&report);
+        assert!(safety.is_safe);
+        assert_eq!(safety.critical_count, 0);
+    }
+
+    #[test]
+    fn identical_struct_docs_produce_no_finding() {
+        let mut old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let mut new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+
+        // Same doc text
+        old.structs.get_mut("Data").unwrap().doc = "doc".try_into().unwrap();
+        new.structs.get_mut("Data").unwrap().doc = "doc".try_into().unwrap();
+
+        let report = compare(&old, &new);
+        // No findings expected
+        assert!(report.findings.is_empty(), "Expected no findings when docs identical");
     }
 
     #[test]

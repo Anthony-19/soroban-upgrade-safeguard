@@ -1,9 +1,12 @@
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use colored::Colorize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use soroban_upgrade_safeguard::{diff, loader, parser, report, spec};
+use soroban_upgrade_safeguard::{
+    diff, loader, parser, report, spec,
+    suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
+};
 
 /// Output format for the safety report.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -43,6 +46,12 @@ struct Args {
     /// Stellar RPC URL (e.g. https://soroban-testnet.stellar.org)
     #[arg(long, value_name = "RPC_URL", requires = "contract_id")]
     rpc_url: Option<String>,
+
+    /// Path to a suppression config acknowledging known, intentional breaking
+    /// changes. When omitted, `.safeguard.toml` in the current directory is
+    /// used if present; otherwise no suppressions are applied.
+    #[arg(long, value_name = "CONFIG")]
+    config: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -133,8 +142,25 @@ fn main() -> Result<()> {
         &mut diff_report,
     );
 
+    // Load suppression config: an explicit --config must exist; otherwise fall
+    // back to `.safeguard.toml` in the working directory if it happens to be
+    // present. With neither, an empty config preserves today's behavior.
+    let suppressions = match &args.config {
+        Some(path) => SuppressionConfig::load_from_path(path)?,
+        None => {
+            SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?.unwrap_or_default()
+        }
+    };
+    if !suppressions.rules.is_empty() {
+        progress(format!(
+            "\n{} {} suppression rule(s) loaded",
+            "🔕".to_string(),
+            suppressions.rules.len()
+        ));
+    }
+
     // Generate Safety Report
-    let safety_report = report::SafetyReport::new(&diff_report);
+    let safety_report = report::SafetyReport::with_suppressions(&diff_report, &suppressions);
 
     if json {
         // Single JSON document to stdout; no decorative text, no ANSI codes.
