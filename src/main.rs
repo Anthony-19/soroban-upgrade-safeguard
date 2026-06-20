@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use colored::Colorize;
 use std::path::{Path, PathBuf};
@@ -26,15 +26,19 @@ enum OutputFormat {
     version,
     about,
     long_about = None,
-    // Two usage modes:
-    //   1. Local:  soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>
-    //   2. RPC:    soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>
+    // Four usage modes:
+    //   1. Local:      soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM> [OPTIONS]
+    //   2. RPC:        soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM> [OPTIONS]
+    //   3. Manifest:   soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]
+    //   4. Dir Scan:   soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]
     override_usage = "soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM> [OPTIONS]\n       \
-                      soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM> [OPTIONS]"
+                      soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM> [OPTIONS]\n       \
+                      soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]\n       \
+                      soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]"
 )]
 struct Args {
     /// WASM paths: <OLD_WASM> <NEW_WASM> in local mode, or just <NEW_WASM> in RPC mode
-    #[arg(value_name = "WASM", num_args = 1..=2)]
+    #[arg(value_name = "WASM", num_args = 0..=2)]
     wasm_paths: Vec<PathBuf>,
 
     /// Output format
@@ -58,6 +62,22 @@ struct Args {
     /// Print a concise remediation explanation for each finding.
     #[arg(long)]
     explain: bool,
+
+    /// Exit with a non-zero code if any Warnings or Critical findings are found
+    #[arg(long)]
+    strict: bool,
+
+    /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
+    #[arg(long, value_name = "MANIFEST_PATH")]
+    manifest: Option<PathBuf>,
+
+    /// Directory containing the old versions of the contracts for directory comparison
+    #[arg(long, value_name = "OLD_DIR", requires = "new_dir")]
+    old_dir: Option<PathBuf>,
+
+    /// Directory containing the new versions of the contracts for directory comparison
+    #[arg(long, value_name = "NEW_DIR", requires = "old_dir")]
+    new_dir: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -114,39 +134,9 @@ fn main() -> Result<()> {
     } else {
         loader::load_wasm(&args.wasm_paths[0])?
     };
-    let old_meta = parser::extract_metadata(&old.bytes)?;
-    let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
-    progress(format!(
-        "  {} {} ({} bytes)",
-        "✅ Old:".green().bold(),
-        old.path,
-        old.bytes.len()
-    ));
-    progress(format!("     └─ {}", old_spec.summary().dimmed()));
 
     // New WASM
     let new = loader::load_wasm(new_wasm_path)?;
-    let new_meta = parser::extract_metadata(&new.bytes)?;
-    let new_spec = spec::ContractSpec::from_entries(&new_meta.spec);
-    progress(format!(
-        "  {} {} ({} bytes)",
-        "✅ New:".green().bold(),
-        new.path,
-        new.bytes.len()
-    ));
-    progress(format!("     └─ {}", new_spec.summary().dimmed()));
-
-    // Run comparison
-    progress(format!(
-        "\n{}",
-        "🔬 Analyzing structural compatibility...".cyan().bold()
-    ));
-    let mut diff_report = diff::compare(&old_spec, &new_spec);
-    diff::compare_env_metadata(
-        old_meta.env_meta.as_ref(),
-        new_meta.env_meta.as_ref(),
-        &mut diff_report,
-    );
 
     // Load suppression config: an explicit --config must exist; otherwise fall
     // back to `.safeguard.toml` in the working directory if it happens to be
@@ -165,8 +155,17 @@ fn main() -> Result<()> {
         ));
     }
 
-    // Generate Safety Report
-    let safety_report = report::SafetyReport::with_suppressions(&diff_report, &suppressions, args.explain);
+    // Generate Safety Report using the factored helper
+    let safety_report = compare_contracts(
+        &old.bytes,
+        &old.path,
+        &new.bytes,
+        &new.path,
+        &suppressions,
+        args.explain,
+        args.strict,
+        &progress,
+    )?;
 
     match args.format {
         OutputFormat::Json => {
@@ -189,4 +188,127 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+struct ContractPair {
+    old: PathBuf,
+    new: PathBuf,
+    name: Option<String>,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+struct Manifest {
+    pairs: Vec<ContractPair>,
+}
+
+/// Helper function to run comparison for a single pair.
+fn compare_contracts(
+    old_bytes: &[u8],
+    old_path: &str,
+    new_bytes: &[u8],
+    new_path: &str,
+    suppressions: &SuppressionConfig,
+    explain: bool,
+    strict: bool,
+    progress: &impl Fn(String),
+) -> Result<report::SafetyReport> {
+    let old_meta = parser::extract_metadata(old_bytes)?;
+    let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
+    progress(format!(
+        "  {} {} ({} bytes)",
+        "✅ Old:".green().bold(),
+        old_path,
+        old_bytes.len()
+    ));
+    progress(format!("     └─ {}", old_spec.summary().dimmed()));
+
+    let new_meta = parser::extract_metadata(new_bytes)?;
+    let new_spec = spec::ContractSpec::from_entries(&new_meta.spec);
+    progress(format!(
+        "  {} {} ({} bytes)",
+        "✅ New:".green().bold(),
+        new_path,
+        new_bytes.len()
+    ));
+    progress(format!("     └─ {}", new_spec.summary().dimmed()));
+
+    progress(format!(
+        "\n{}",
+        "🔬 Analyzing structural compatibility...".cyan().bold()
+    ));
+    let mut diff_report = diff::compare(&old_spec, &new_spec);
+    diff::compare_env_metadata(
+        old_meta.env_meta.as_ref(),
+        new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+
+    Ok(report::SafetyReport::with_suppressions(
+        &diff_report,
+        suppressions,
+        explain,
+        strict,
+    ))
+}
+
+fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read manifest file: {}", path.display()))?;
+
+    // Try TOML, then JSON
+    if let Ok(manifest) = toml::from_str::<Manifest>(&content) {
+        return Ok(manifest.pairs);
+    }
+    if let Ok(manifest) = serde_json::from_str::<Manifest>(&content) {
+        return Ok(manifest.pairs);
+    }
+
+    anyhow::bail!(
+        "Failed to parse manifest '{}' as either TOML or JSON.",
+        path.display()
+    )
+}
+
+fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>> {
+    if !old_dir.is_dir() {
+        anyhow::bail!("Old directory '{}' is not a directory", old_dir.display());
+    }
+    if !new_dir.is_dir() {
+        anyhow::bail!("New directory '{}' is not a directory", new_dir.display());
+    }
+
+    let mut pairs = Vec::new();
+    for entry in std::fs::read_dir(old_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("wasm") {
+            let filename = path.file_name().unwrap();
+            let new_path = new_dir.join(filename);
+            if new_path.exists() {
+                let name = path.file_stem().and_then(|s| s.to_str()).map(String::from);
+                pairs.push(ContractPair {
+                    old: path,
+                    new: new_path,
+                    name,
+                });
+            } else {
+                eprintln!(
+                    "⚠️  Warning: Match not found for '{}' in new directory '{}'",
+                    filename.to_string_lossy(),
+                    new_dir.display()
+                );
+            }
+        }
+    }
+
+    if pairs.is_empty() {
+        anyhow::bail!(
+            "No matching .wasm contract pairs found between '{}' and '{}'",
+            old_dir.display(),
+            new_dir.display()
+        );
+    }
+
+    Ok(pairs)
 }
