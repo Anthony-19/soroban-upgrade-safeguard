@@ -16,6 +16,8 @@ enum OutputFormat {
     Text,
     /// A single machine-readable JSON document for CI and dashboards.
     Json,
+    /// Markdown document suitable for PR descriptions and comments.
+    Markdown,
 }
 
 #[derive(Parser, Debug)]
@@ -60,7 +62,6 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let json = args.format == OutputFormat::Json;
 
     // Resolve the two usage modes:
     //   - 2 positional args => local-vs-local comparison
@@ -86,11 +87,12 @@ fn main() -> Result<()> {
         }
     };
 
-    // In JSON mode, decorative progress goes to stderr so stdout stays a
-    // single, pristine JSON document. In text mode it stays on stdout
+    // In JSON or Markdown mode, decorative progress goes to stderr so stdout
+    // stays a single, pristine document. In text mode it stays on stdout
     // exactly as before.
+    let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
     let progress = |line: String| {
-        if json {
+        if clean_stdout {
             eprintln!("{line}");
         } else {
             println!("{line}");
@@ -166,14 +168,20 @@ fn main() -> Result<()> {
     // Generate Safety Report
     let safety_report = report::SafetyReport::with_suppressions(&diff_report, &suppressions, args.explain);
 
-    if json {
-        // Single JSON document to stdout; no decorative text, no ANSI codes.
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&safety_report.to_json())?
-        );
-    } else {
-        println!("{}", safety_report.generate_summary_text(args.explain));
+    match args.format {
+        OutputFormat::Json => {
+            // Single JSON document to stdout; no decorative text, no ANSI codes.
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&safety_report.to_json())?
+            );
+        }
+        OutputFormat::Markdown => {
+            println!("{}", safety_report.generate_summary_markdown());
+        }
+        OutputFormat::Text => {
+            println!("{}", safety_report.generate_summary_text());
+        }
     }
 
     if !safety_report.is_safe {

@@ -53,6 +53,7 @@ pub struct SeverityCounts {
 #[derive(Serialize)]
 pub struct SafetyReportJson<'a> {
     pub is_safe: bool,
+    pub strict: bool,
     pub counts: SeverityCounts,
     /// Findings (of any severity) acknowledged by the suppression config.
     pub suppressed_count: usize,
@@ -119,6 +120,12 @@ impl SafetyReport {
                 });
         }
 
+        let is_safe = if strict {
+            critical_count == 0 && warning_count == 0
+        } else {
+            critical_count == 0
+        };
+
         Self {
             critical_count,
             warning_count,
@@ -127,6 +134,7 @@ impl SafetyReport {
             total_findings: diff.findings.len(),
             is_safe: failing_critical_count == 0,
             findings_by_category,
+            strict,
         }
     }
 
@@ -134,6 +142,7 @@ impl SafetyReport {
     pub fn to_json(&self) -> SafetyReportJson<'_> {
         SafetyReportJson {
             is_safe: self.is_safe,
+            strict: self.strict,
             counts: SeverityCounts {
                 critical: self.critical_count,
                 warning: self.warning_count,
@@ -163,6 +172,14 @@ impl SafetyReport {
                 .cyan()
                 .to_string(),
         );
+        if self.strict {
+            output.push_str(
+                &"    [STRICT MODE ACTIVE]\n"
+                    .bold()
+                    .yellow()
+                    .to_string(),
+            );
+        }
         output.push_str(
             &"========================================\n"
                 .bold()
@@ -171,6 +188,10 @@ impl SafetyReport {
 
         let status = if self.is_safe {
             "✅ PASSED (No breaking changes detected)".green().bold()
+        } else if self.strict && self.critical_count == 0 {
+            "❌ FAILED (Warnings detected in strict mode)"
+                .red()
+                .bold()
         } else {
             "❌ FAILED (Critical breaking changes detected)"
                 .red()
@@ -268,8 +289,81 @@ impl SafetyReport {
         }
 
         if !self.is_safe {
-            output.push_str(&"⚠️  ACTION REQUIRED: The new contract version modifies existing storage layouts or function interfaces.\n".red().bold().to_string());
-            output.push_str(&"Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n".red().to_string());
+            if self.strict && self.critical_count == 0 {
+                output.push_str(&"⚠️  ACTION REQUIRED: Strict mode is active and warnings were detected.\n".yellow().bold().to_string());
+                output.push_str(&"These warnings must be resolved or strict mode disabled to proceed.\n".yellow().to_string());
+            } else {
+                output.push_str(&"⚠️  ACTION REQUIRED: The new contract version modifies existing storage layouts or function interfaces.\n".red().bold().to_string());
+                output.push_str(&"Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n".red().to_string());
+            }
+        }
+
+        output
+    }
+
+    /// Generate a structured Markdown output.
+    pub fn generate_summary_markdown(&self) -> String {
+        let mut output = String::new();
+        output.push_str("# Soroban Upgrade Safety Report\n\n");
+
+        let status = if self.is_safe {
+            "✅ PASSED (No breaking changes detected)"
+        } else {
+            "❌ FAILED (Critical breaking changes detected)"
+        };
+        output.push_str(&format!("## Status: {}\n\n", status));
+
+        output.push_str("### Summary Table\n\n");
+        output.push_str("| Finding Severity | Count |\n");
+        output.push_str("| :--- | :--- |\n");
+        output.push_str(&format!("| **Critical** | {} |\n", self.critical_count));
+        output.push_str(&format!("| **Warning** | {} |\n", self.warning_count));
+        output.push_str(&format!("| **Info** | {} |\n", self.info_count));
+        if self.suppressed_count > 0 {
+            output.push_str(&format!("| **Suppressed** | {} |\n", self.suppressed_count));
+        }
+        output.push_str("\n---\n\n");
+
+        if self.total_findings == 0 {
+            output.push_str("No relevant changes detected. The upgrade is identical in its exports and types.\n");
+            return output;
+        }
+
+        // Sort categories to have consistent output; surface Environment first.
+        let mut categories: Vec<&String> = self.findings_by_category.keys().collect();
+        categories.sort_by(|a, b| {
+            let rank = |name: &str| if name == "Environment" { 0 } else { 1 };
+            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+        });
+
+        for category in categories {
+            output.push_str(&format!("### {}\n\n", category));
+            let group = self.findings_by_category.get(category).unwrap();
+            for reported in group {
+                let finding = &reported.finding;
+
+                if reported.suppressed {
+                    output.push_str(&format!("- 🔕 **[SUPPRESSED]** {}\n", finding.message));
+                    if let Some(reason) = &reported.suppression_reason {
+                        output.push_str(&format!("  - ↳ reason: {}\n", reason));
+                    }
+                    continue;
+                }
+
+                let emoji = match finding.severity {
+                    Severity::Critical => "🔴",
+                    Severity::Warning => "🟡",
+                    Severity::Info => "🔵",
+                };
+                output.push_str(&format!("- {} {}\n", emoji, finding.message));
+            }
+            output.push('\n');
+        }
+
+        if !self.is_safe {
+            output.push_str("### ⚠️ Action Required\n\n");
+            output.push_str("- The new contract version modifies existing storage layouts or function interfaces.\n");
+            output.push_str("- Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n");
         }
 
         output
