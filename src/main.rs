@@ -54,6 +54,10 @@ struct Args {
     /// used if present; otherwise no suppressions are applied.
     #[arg(long, value_name = "CONFIG")]
     config: Option<PathBuf>,
+
+    /// Print a concise remediation explanation for each finding.
+    #[arg(long)]
+    explain: bool,
 }
 
 fn main() -> Result<()> {
@@ -162,7 +166,7 @@ fn main() -> Result<()> {
     }
 
     // Generate Safety Report
-    let safety_report = report::SafetyReport::with_suppressions(&diff_report, &suppressions);
+    let safety_report = report::SafetyReport::with_suppressions(&diff_report, &suppressions, args.explain);
 
     match args.format {
         OutputFormat::Json => {

@@ -21,6 +21,9 @@ pub struct ReportedFinding {
     /// The justification copied from the matching rule, if it provided one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suppression_reason: Option<String>,
+    /// Optional remediation/explanation advice for the user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
 }
 
 /// A structured container for aggregated comparison findings.
@@ -64,7 +67,7 @@ impl SafetyReport {
     /// Equivalent to [`SafetyReport::with_suppressions`] using an empty config,
     /// so behavior is identical to before suppression support existed.
     pub fn new(diff: &DiffReport) -> Self {
-        Self::with_suppressions(diff, &SuppressionConfig::default())
+        Self::with_suppressions(diff, &SuppressionConfig::default(), false)
     }
 
     /// Compute a safety report, applying a suppression config.
@@ -73,7 +76,11 @@ impl SafetyReport {
     /// suppressed and excluded from the failing set. `is_safe` is therefore
     /// true when no *unsuppressed* Critical finding remains — a deliberately
     /// acknowledged breaking change no longer fails the run.
-    pub fn with_suppressions(diff: &DiffReport, suppressions: &SuppressionConfig) -> Self {
+    pub fn with_suppressions(
+        diff: &DiffReport,
+        suppressions: &SuppressionConfig,
+        explain: bool,
+    ) -> Self {
         let mut critical_count = 0;
         let mut warning_count = 0;
         let mut info_count = 0;
@@ -96,6 +103,12 @@ impl SafetyReport {
                 failing_critical_count += 1;
             }
 
+            let remediation = if explain {
+                get_remediation_guidance(&finding.category).map(String::from)
+            } else {
+                None
+            };
+
             findings_by_category
                 .entry(finding.category.clone())
                 .or_default()
@@ -103,6 +116,7 @@ impl SafetyReport {
                     finding: finding.clone(),
                     suppressed,
                     suppression_reason: rule.and_then(|r| r.reason.clone()),
+                    remediation,
                 });
         }
 
@@ -145,7 +159,7 @@ impl SafetyReport {
     }
 
     /// Generate a structured, human-readable text output for the CLI.
-    pub fn generate_summary_text(&self) -> String {
+    pub fn generate_summary_text(&self, explain: bool) -> String {
         let mut output = String::new();
         output.push_str(
             &"\n========================================\n"
@@ -247,6 +261,13 @@ impl SafetyReport {
                             &format!("    ↳ reason: {}\n", reason).dimmed().to_string(),
                         );
                     }
+                    if explain {
+                        if let Some(remediation) = &reported.remediation {
+                            output.push_str(
+                                &format!("    ↳ guidance: {}\n", remediation).dimmed().to_string(),
+                            );
+                        }
+                    }
                     continue;
                 }
 
@@ -256,6 +277,13 @@ impl SafetyReport {
                     Severity::Info => format!("🔵 {}", finding.message).cyan(),
                 };
                 output.push_str(&format!("{}\n", formatted));
+                if explain {
+                    if let Some(remediation) = &reported.remediation {
+                        output.push_str(
+                            &format!("    ↳ guidance: {}\n", remediation).green().to_string(),
+                        );
+                    }
+                }
             }
             output.push('\n');
         }
@@ -339,5 +367,117 @@ impl SafetyReport {
         }
 
         output
+    }
+}
+
+/// Returns remediation/explanation guidance for a given finding category.
+pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
+    match category {
+        "Environment" => Some("Verify that the target network supports the new protocol version and adjust any SDK/tooling dependencies accordingly."),
+        "Function Removed" => Some("This is a breaking change. If the function is no longer needed, deprecate it in client integrations. Otherwise, restore the function signature."),
+        "Function Documentation Changed" => Some("No code changes required. Ensure client/consumer integrations are aware of the updated documentation/behavior."),
+        "Function Added" => Some("No action required. Inform client integrations about the availability of the new function."),
+        "Function Signature Changed" => Some("This is a breaking change. Update call sites, SDKs, and tests to match the new parameter structure."),
+        "Parameter Renamed" => Some("This is a breaking change for named-argument RPC systems. Update all client integrations to use the new parameter name."),
+        "Parameter Type Changed" => Some("This is a breaking change. Update caller arguments and client SDKs to match the new parameter type."),
+        "Return Type Changed" => Some("This is a breaking change. Update caller expectations and client SDKs to match the new return type."),
+        "Event Definition Removed" => Some("This is a breaking change. Update or remove downstream event indexing or monitoring systems that consume this event."),
+        "Struct Removed" => Some("This is a breaking change. Ensure no stored data or active interfaces reference this struct. If they do, restore the struct."),
+        "Struct Documentation Changed" => Some("No code changes required. Ensure documentation changes are aligned with the struct's intended usage."),
+        "Struct Added" => Some("No action required. New structs can be safely integrated into storage layouts or interface parameters."),
+        "Struct Field Removed" => Some("This is a breaking change. Removing fields breaks serialized storage layouts. Restore the field or perform a state migration."),
+        "Event Field Removed" => Some("This is a breaking change. Update event indexers and consumers that expect this field to be present."),
+        "Struct Field Reordered" => Some("This is a breaking change. Reordering fields breaks positional serialization layouts. Restore the original field order."),
+        "Event Field Reordered" => Some("This is a breaking change. Update event indexers and consumers to handle the new positional field order."),
+        "Struct Field Type Changed" => Some("This is a breaking change. Changing field types breaks layout serialization. Revert the type change or migrate existing data."),
+        "Event Field Type Changed" => Some("This is a breaking change. Update event indexers and consumers to handle the new field type."),
+        "Struct Field Added" => Some("Warning: Ensure existing storage entries are migrated or initialized with correct default values for the new field."),
+        "Event Enum Removed" => Some("This is a breaking change. Downstream event consumers or indexers relying on this enum will fail. Restore the enum."),
+        "Enum Removed" => Some("This is a breaking change. Stored data or parameters using this enum will be invalid. Restore the enum."),
+        "Enum Documentation Changed" => Some("No code changes required. Ensure the updated docs are clear for consumers."),
+        "Enum Added" => Some("No action required. Ensure consumers are aware of the new enum type if needed."),
+        "Enum Case Removed" => Some("This is a breaking change. On-chain data or parameters using this case will be invalid. Restore the case."),
+        "Event Enum Case Removed" => Some("This is a breaking change. Downstream event indexers or consumers relying on this case will fail. Restore the case."),
+        "Enum Case Value Changed" => Some("This is a breaking change. Modifying case values breaks serialization/deserialization. Revert the value change."),
+        "Event Enum Case Value Changed" => Some("This is a breaking change. Downstream event indexers or consumers relying on these values will fail. Revert the value change."),
+        "Enum Case Added" => Some("No action required. Ensure consumers can handle the new case gracefully."),
+        "Event Enum Case Added" => Some("No action required. Update event indexers and consumers to handle the new event enum case if necessary."),
+        "Cascading Layout Break" => Some("This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type."),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_every_emitted_category_has_guidance() {
+        let diff_rs_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("diff.rs");
+        let content = std::fs::read_to_string(diff_rs_path).expect("Failed to read src/diff.rs");
+
+        let mut checked_categories = std::collections::HashSet::new();
+
+        for line in content.lines() {
+            if line.contains("category:") {
+                // If it is ENVIRONMENT_CATEGORY
+                if line.contains("ENVIRONMENT_CATEGORY") {
+                    checked_categories.insert("Environment".to_string());
+                    continue;
+                }
+
+                // Find all string literals in the line
+                let mut chars = line.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '"' {
+                        let mut literal = String::new();
+                        while let Some(&nc) = chars.peek() {
+                            if nc == '"' {
+                                chars.next();
+                                break;
+                            }
+                            literal.push(chars.next().unwrap());
+                        }
+                        if !literal.is_empty() {
+                            // If it's a format string like "{} Removed"
+                            if literal.contains("{}") {
+                                let suffixes = vec!["Removed", "Reordered", "Type Changed", "Value Changed", "Added"];
+                                for suffix in suffixes {
+                                    if literal == format!("{{}} {}", suffix) {
+                                        let prefixes = match suffix {
+                                            "Reordered" | "Type Changed" => vec!["Struct Field", "Event Field"],
+                                            "Value Changed" | "Added" => vec!["Enum Case", "Event Enum Case"],
+                                            "Removed" => vec!["Struct Field", "Event Field", "Enum Case", "Event Enum Case"],
+                                            _ => unreachable!(),
+                                        };
+                                        for prefix in prefixes {
+                                            checked_categories.insert(format!("{} {}", prefix, suffix));
+                                        }
+                                    }
+                                }
+                            } else {
+                                checked_categories.insert(literal);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Remove test custom categories
+        checked_categories.remove("TOTALLY CUSTOM CATEGORY");
+
+        assert!(!checked_categories.is_empty(), "Sanity check: should have found categories");
+
+        for cat in &checked_categories {
+            let guidance = get_remediation_guidance(cat);
+            assert!(
+                guidance.is_some(),
+                "Category '{}' does not have remediation guidance!",
+                cat
+            );
+        }
     }
 }
