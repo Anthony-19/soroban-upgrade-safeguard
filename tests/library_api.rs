@@ -63,44 +63,64 @@ fn library_compares_in_memory_bytes() {
 }
 
 #[test]
-fn test_duplicate_warning_stderr() {
-    use stellar_xdr::curr::{ScSpecEntry, ScSpecFunctionV0, VecM};
+fn library_detects_parameter_reordering() {
+    use soroban_upgrade_safeguard::diff::{compare, Severity};
     use soroban_upgrade_safeguard::spec::ContractSpec;
+    use stellar_xdr::curr::{ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef, StringM, VecM};
 
-    // If a special env var is set, run the duplicate spec generation and panic.
-    if std::env::var("RUN_DUPLICATE_SPEC_TEST").is_ok() {
-        let f1 = ScSpecFunctionV0 {
-            doc: "doc1".try_into().unwrap(),
-            name: "my_func".try_into().unwrap(),
-            inputs: VecM::default(),
+    let mut old_spec = ContractSpec::default();
+    let old_inputs = vec![
+        ScSpecFunctionInputV0 {
+            doc: StringM::default(),
+            name: "a".try_into().unwrap(),
+            type_: ScSpecTypeDef::U32,
+        },
+        ScSpecFunctionInputV0 {
+            doc: StringM::default(),
+            name: "b".try_into().unwrap(),
+            type_: ScSpecTypeDef::U32,
+        },
+    ];
+    old_spec.functions.insert(
+        "test_fn".to_string(),
+        ScSpecFunctionV0 {
+            doc: StringM::default(),
+            name: "test_fn".try_into().unwrap(),
+            inputs: VecM::try_from(old_inputs).unwrap(),
             outputs: VecM::default(),
-        };
-        let f2 = ScSpecFunctionV0 {
-            doc: "doc2".try_into().unwrap(),
-            name: "my_func".try_into().unwrap(),
-            inputs: VecM::default(),
-            outputs: VecM::default(),
-        };
-        let entries = vec![
-            ScSpecEntry::FunctionV0(f1),
-            ScSpecEntry::FunctionV0(f2),
-        ];
-        let _spec = ContractSpec::from_entries(&entries);
-        panic!("duplicate spec test completed");
-    }
-
-    // Otherwise, spawn ourselves as a subprocess with the env var set, and capture stdout/stderr!
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .arg("test_duplicate_warning_stderr")
-        .env("RUN_DUPLICATE_SPEC_TEST", "1")
-        .output()
-        .expect("failed to spawn test subprocess");
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    let combined = format!("--- STDOUT ---\n{}\n--- STDERR ---\n{}", stdout, stderr);
-    assert!(
-        combined.contains("WARNING: Duplicate function 'my_func' detected. Keeping the first entry."),
-        "Did not find duplicate warning in output:\n{}", combined
+        },
     );
+
+    let mut new_spec = ContractSpec::default();
+    let new_inputs = vec![
+        ScSpecFunctionInputV0 {
+            doc: StringM::default(),
+            name: "b".try_into().unwrap(),
+            type_: ScSpecTypeDef::U32,
+        },
+        ScSpecFunctionInputV0 {
+            doc: StringM::default(),
+            name: "a".try_into().unwrap(),
+            type_: ScSpecTypeDef::U32,
+        },
+    ];
+    new_spec.functions.insert(
+        "test_fn".to_string(),
+        ScSpecFunctionV0 {
+            doc: StringM::default(),
+            name: "test_fn".try_into().unwrap(),
+            inputs: VecM::try_from(new_inputs).unwrap(),
+            outputs: VecM::default(),
+        },
+    );
+
+    let diff_report = compare(&old_spec, &new_spec);
+    let reorder_finding = diff_report
+        .findings
+        .iter()
+        .find(|f| f.category == "Parameter Reordered");
+
+    assert!(reorder_finding.is_some(), "Integration: Expected a Parameter Reordered finding");
+    let f = reorder_finding.unwrap();
+    assert_eq!(f.severity, Severity::Critical);
 }

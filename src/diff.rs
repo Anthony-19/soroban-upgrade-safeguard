@@ -252,38 +252,88 @@ fn check_function_signature(
     }
 
     // Check each input parameter
-    for (i, (old_input, new_input)) in old_inputs.iter().zip(new_inputs.iter()).enumerate() {
-        let old_name = old_input.name.to_string();
-        let new_name = new_input.name.to_string();
+    let old_names: Vec<String> = old_inputs.iter().map(|input| input.name.to_string()).collect();
+    let new_names: Vec<String> = new_inputs.iter().map(|input| input.name.to_string()).collect();
 
-        if old_name != new_name {
-            report.findings.push(Finding {
-                severity: Severity::Warning,
-                category: "Parameter Renamed".to_string(),
-                message: format!(
-                    "Function '{}': parameter {} renamed from '{}' to '{}'.",
-                    name, i, old_name, new_name
-                ),
-                type_name: None,
-                target: Some(format!("{}.{}", name, old_name)),
-            });
+    let old_names_set: std::collections::HashSet<String> = old_names.iter().cloned().collect();
+    let new_names_set: std::collections::HashSet<String> = new_names.iter().cloned().collect();
+
+    let is_reordered = old_names_set == new_names_set && old_names != new_names;
+
+    if is_reordered {
+        report.findings.push(Finding {
+            severity: Severity::Critical,
+            category: "Parameter Reordered".to_string(),
+            message: format!(
+                "Function '{}': parameters reordered. The set of parameter names is unchanged but their order differs.",
+                name
+            ),
+            type_name: None,
+            target: Some(name.to_string()),
+        });
+
+        // Check for genuine type changes by matching parameter name.
+        let new_by_name: std::collections::HashMap<String, &ScSpecTypeDef> = new_inputs
+            .iter()
+            .map(|input| (input.name.to_string(), &input.type_))
+            .collect();
+
+        for (i, old_input) in old_inputs.iter().enumerate() {
+            let p_name = old_input.name.to_string();
+            if let Some(new_type) = new_by_name.get(&p_name) {
+                if !types_equal(&old_input.type_, new_type) {
+                    report.findings.push(Finding {
+                        severity: Severity::Critical,
+                        category: "Parameter Type Changed".to_string(),
+                        message: format!(
+                            "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
+                            name,
+                            i,
+                            p_name,
+                            crate::mapper::type_to_string(&old_input.type_),
+                            crate::mapper::type_to_string(new_type)
+                        ),
+                        type_name: None,
+                        target: Some(format!("{}.{}", name, p_name)),
+                    });
+                }
+            }
         }
+    } else {
+        // Fall back to original positional check
+        for (i, (old_input, new_input)) in old_inputs.iter().zip(new_inputs.iter()).enumerate() {
+            let old_name = old_input.name.to_string();
+            let new_name = new_input.name.to_string();
 
-        if !types_equal(&old_input.type_, &new_input.type_) {
-            report.findings.push(Finding {
-                severity: Severity::Critical,
-                category: "Parameter Type Changed".to_string(),
-                message: format!(
-                    "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
-                    name,
-                    i,
-                    old_name,
-                    crate::mapper::type_to_string(&old_input.type_),
-                    crate::mapper::type_to_string(&new_input.type_)
-                ),
-                type_name: None,
-                target: Some(format!("{}.{}", name, old_name)),
-            });
+            if old_name != new_name {
+                report.findings.push(Finding {
+                    severity: Severity::Warning,
+                    category: "Parameter Renamed".to_string(),
+                    message: format!(
+                        "Function '{}': parameter {} renamed from '{}' to '{}'.",
+                        name, i, old_name, new_name
+                    ),
+                    type_name: None,
+                    target: Some(format!("{}.{}", name, old_name)),
+                });
+            }
+
+            if !types_equal(&old_input.type_, &new_input.type_) {
+                report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category: "Parameter Type Changed".to_string(),
+                    message: format!(
+                        "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
+                        name,
+                        i,
+                        old_name,
+                        crate::mapper::type_to_string(&old_input.type_),
+                        crate::mapper::type_to_string(&new_input.type_)
+                    ),
+                    type_name: None,
+                    target: Some(format!("{}.{}", name, old_name)),
+                });
+            }
         }
     }
 
@@ -1013,5 +1063,100 @@ mod tests {
         let safety = crate::report::SafetyReport::new(&report);
         assert!(safety.is_safe);
         assert_eq!(safety.critical_count, 0);
+    }
+
+    /// Helper: build a minimal ContractSpec with the given functions.
+    fn spec_with_functions(functions: Vec<(&str, Vec<(&str, ScSpecTypeDef)>)>) -> ContractSpec {
+        let mut spec = ContractSpec::default();
+        for (name, inputs) in functions {
+            let xdr_inputs: Vec<stellar_xdr::curr::ScSpecFunctionInputV0> = inputs
+                .into_iter()
+                .map(|(iname, itype)| stellar_xdr::curr::ScSpecFunctionInputV0 {
+                    doc: StringM::default(),
+                    name: iname.try_into().unwrap(),
+                    type_: itype,
+                })
+                .collect();
+            spec.functions.insert(
+                name.to_string(),
+                stellar_xdr::curr::ScSpecFunctionV0 {
+                    doc: StringM::default(),
+                    name: name.try_into().unwrap(),
+                    inputs: VecM::try_from(xdr_inputs).unwrap(),
+                    outputs: VecM::default(),
+                },
+            );
+        }
+        spec
+    }
+
+    #[test]
+    fn param_reorder_same_type_produces_critical_finding() {
+        let old = spec_with_functions(vec![("test_fn", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)])]);
+        let new = spec_with_functions(vec![("test_fn", vec![("b", ScSpecTypeDef::U32), ("a", ScSpecTypeDef::U32)])]);
+
+        let report = compare(&old, &new);
+        let reorder_finding = report.findings.iter().find(|f| f.category == "Parameter Reordered");
+        
+        assert!(reorder_finding.is_some(), "Expected a Parameter Reordered finding");
+        let f = reorder_finding.unwrap();
+        assert_eq!(f.severity, Severity::Critical);
+        assert!(f.message.contains("parameters reordered"));
+        
+        // Ensure no Parameter Renamed warnings are generated
+        let rename_findings = report.findings.iter().filter(|f| f.category == "Parameter Renamed").count();
+        assert_eq!(rename_findings, 0, "Should not double-count reorders as renames");
+    }
+
+    #[test]
+    fn param_pure_rename_produces_warning() {
+        let old = spec_with_functions(vec![("test_fn", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)])]);
+        let new = spec_with_functions(vec![("test_fn", vec![("x", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)])]);
+
+        let report = compare(&old, &new);
+        let rename_finding = report.findings.iter().find(|f| f.category == "Parameter Renamed");
+        
+        assert!(rename_finding.is_some(), "Expected a Parameter Renamed finding");
+        let f = rename_finding.unwrap();
+        assert_eq!(f.severity, Severity::Warning);
+        
+        // Ensure no Parameter Reordered findings are generated
+        let reorder_findings = report.findings.iter().filter(|f| f.category == "Parameter Reordered").count();
+        assert_eq!(reorder_findings, 0);
+    }
+
+    #[test]
+    fn param_type_change_produces_critical_finding() {
+        let old = spec_with_functions(vec![("test_fn", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)])]);
+        let new = spec_with_functions(vec![("test_fn", vec![("a", ScSpecTypeDef::Bool), ("b", ScSpecTypeDef::U32)])]);
+
+        let report = compare(&old, &new);
+        let type_finding = report.findings.iter().find(|f| f.category == "Parameter Type Changed");
+        
+        assert!(type_finding.is_some(), "Expected a Parameter Type Changed finding");
+        let f = type_finding.unwrap();
+        assert_eq!(f.severity, Severity::Critical);
+        
+        // Ensure no Parameter Reordered findings are generated
+        let reorder_findings = report.findings.iter().filter(|f| f.category == "Parameter Reordered").count();
+        assert_eq!(reorder_findings, 0);
+    }
+
+    #[test]
+    fn param_reorder_and_type_change_produces_both() {
+        let old = spec_with_functions(vec![("test_fn", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)])]);
+        let new = spec_with_functions(vec![("test_fn", vec![("b", ScSpecTypeDef::U32), ("a", ScSpecTypeDef::Bool)])]);
+
+        let report = compare(&old, &new);
+        
+        let reorder_finding = report.findings.iter().find(|f| f.category == "Parameter Reordered");
+        assert!(reorder_finding.is_some(), "Expected a Parameter Reordered finding");
+        assert_eq!(reorder_finding.unwrap().severity, Severity::Critical);
+
+        let type_finding = report.findings.iter().find(|f| f.category == "Parameter Type Changed");
+        assert!(type_finding.is_some(), "Expected a Parameter Type Changed finding");
+        let tf = type_finding.unwrap();
+        assert_eq!(tf.severity, Severity::Critical);
+        assert!(tf.message.contains("parameter 0 ('a') type changed")); // Index in old is 0
     }
 }
