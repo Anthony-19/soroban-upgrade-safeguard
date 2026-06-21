@@ -7,16 +7,17 @@ This document explains what Soroban Upgrade Safeguard does, how it works interna
 1. [Overview](#overview)
 2. [Why Upgrade Safety Matters](#why-upgrade-safety-matters)
 3. [Installation](#installation)
-4. [Command Line Usage](#command-line-usage)
-5. [How the Analysis Works](#how-the-analysis-works)
-6. [Detection Categories](#detection-categories)
-7. [Severity Levels](#severity-levels)
-8. [Cascading Layout Breaks](#cascading-layout-breaks)
-9. [Reading the Report](#reading-the-report)
-10. [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes)
-11. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
-12. [Limitations](#limitations)
-13. [Frequently Asked Questions](#frequently-asked-questions)
+4. [Docker](#docker)
+5. [Command Line Usage](#command-line-usage)
+6. [How the Analysis Works](#how-the-analysis-works)
+7. [Detection Categories](#detection-categories)
+8. [Severity Levels](#severity-levels)
+9. [Cascading Layout Breaks](#cascading-layout-breaks)
+10. [Reading the Report](#reading-the-report)
+11. [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes)
+12. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
+13. [Limitations](#limitations)
+14. [Frequently Asked Questions](#frequently-asked-questions)
 
 ## Overview
 
@@ -48,6 +49,71 @@ This places a `soroban-upgrade-safeguard` binary on your Cargo bin path. You can
 
 ```bash
 cargo run -- <OLD_WASM> <NEW_WASM>
+```
+
+## Docker
+
+Build the image from the repository root:
+
+```bash
+docker build -t soroban-upgrade-safeguard .
+```
+
+The build uses two stages: the first compiles a release binary using `rust:slim-bookworm`; the second copies only that binary into `debian:bookworm-slim`. The final image does not contain `cargo`, `rustc`, or `rustup`.
+
+### Local mode
+
+Mount a directory that contains your WASM files and pass the in-container paths as arguments:
+
+```bash
+docker run --rm \
+  -v $(pwd)/tests/wasm:/wasms \
+  soroban-upgrade-safeguard \
+  /wasms/v1.wasm /wasms/v2.wasm
+```
+
+All paths you pass must be paths inside the container. Use `--format` to choose a different output format:
+
+```bash
+docker run --rm \
+  -v $(pwd)/tests/wasm:/wasms \
+  soroban-upgrade-safeguard \
+  /wasms/v1.wasm /wasms/v2.wasm --format json
+```
+
+### RPC mode
+
+```bash
+docker run --rm \
+  -v $(pwd)/path/to/new:/wasms \
+  soroban-upgrade-safeguard \
+  --contract-id C... \
+  --rpc-url https://soroban-testnet.stellar.org \
+  /wasms/new.wasm
+```
+
+### Suppression config
+
+Mount the directory that contains `.safeguard.toml` and point to it with `--config`:
+
+```bash
+docker run --rm \
+  -v $(pwd)/tests/wasm:/wasms \
+  -v $(pwd):/config \
+  soroban-upgrade-safeguard \
+  /wasms/v1.wasm /wasms/v2.wasm --config /config/.safeguard.toml
+```
+
+### CI example
+
+The image preserves exit code semantics (0 = safe, 1 = critical findings). Use it directly as a pipeline step:
+
+```yaml
+- name: Check upgrade safety
+  run: |
+    docker run --rm \
+      -v ${{ github.workspace }}/wasm:/wasms \
+      soroban-upgrade-safeguard /wasms/on-chain.wasm /wasms/candidate.wasm
 ```
 
 ## Command Line Usage
