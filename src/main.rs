@@ -83,7 +83,199 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Resolve the two usage modes:
+    // 1. Identify which mode we are running:
+    //    - Batch Manifest Mode
+    //    - Batch Directory Mode
+    //    - Single Contract Pair Mode
+    let is_batch = args.manifest.is_some() || (args.old_dir.is_some() && args.new_dir.is_some());
+
+    if args.manifest.is_some() && (args.old_dir.is_some() || args.new_dir.is_some()) {
+        anyhow::bail!("Cannot specify both --manifest and --old-dir/--new-dir at the same time");
+    }
+
+    if is_batch && !args.wasm_paths.is_empty() {
+        anyhow::bail!("Cannot specify positional WASM paths when using batch mode (--manifest or --old-dir/--new-dir)");
+    }
+
+    // In JSON or Markdown mode, decorative progress goes to stderr so stdout
+    // stays a single, pristine document. In text mode it stays on stdout
+    // exactly as before.
+    let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
+    let progress = |line: String| {
+        if clean_stdout {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    };
+
+    // Load suppression config: an explicit --config must exist; otherwise fall
+    // back to `.safeguard.toml` in the working directory if it happens to be
+    // present. With neither, an empty config preserves today's behavior.
+    let suppressions = match &args.config {
+        Some(path) => SuppressionConfig::load_from_path(path)?,
+        None => {
+            SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?.unwrap_or_default()
+        }
+    };
+
+    if is_batch {
+        let pairs = if let Some(manifest_path) = &args.manifest {
+            parse_manifest(manifest_path)?
+        } else {
+            scan_directories(args.old_dir.as_ref().unwrap(), args.new_dir.as_ref().unwrap())?
+        };
+
+        progress("🔍 Soroban Upgrade Safeguard (Batch Mode)".to_string());
+        progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
+        progress(format!(
+            "Loaded {} pair(s) for comparison.\n",
+            pairs.len()
+        ));
+
+        let mut results = std::collections::BTreeMap::new();
+        let mut overall_safe = true;
+
+        for (i, pair) in pairs.iter().enumerate() {
+            let default_name = format!("pair_{}", i + 1);
+            let contract_name = pair.name.clone().unwrap_or_else(|| {
+                pair.new.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.to_string())
+                    .unwrap_or(default_name)
+            });
+
+            progress(format!(
+                "📦 [{}/{}] Comparing contract pair: {}",
+                i + 1,
+                pairs.len(),
+                contract_name.bold()
+            ));
+
+            let old_wasm = loader::load_wasm(&pair.old)?;
+            let new_wasm = loader::load_wasm(&pair.new)?;
+
+            let report = compare_contracts(
+                &old_wasm.bytes,
+                &old_wasm.path,
+                &new_wasm.bytes,
+                &new_wasm.path,
+                &suppressions,
+                args.explain,
+                args.strict,
+                &progress,
+            )?;
+
+            if !report.is_safe {
+                overall_safe = false;
+            }
+
+            results.insert(contract_name, report);
+            progress("\n----------------------------------------\n".to_string());
+        }
+
+        match args.format {
+            OutputFormat::Json => {
+                let mut results_json = serde_json::Map::new();
+                for (name, report) in &results {
+                    results_json.insert(name.clone(), serde_json::to_value(report.to_json())?);
+                }
+
+                let batch_json = serde_json::json!({
+                    "is_safe": overall_safe,
+                    "strict": args.strict,
+                    "total_pairs": pairs.len(),
+                    "results": results_json,
+                });
+
+                println!("{}", serde_json::to_string_pretty(&batch_json)?);
+            }
+            OutputFormat::Markdown => {
+                let mut markdown = String::new();
+                markdown.push_str("# Soroban Upgrade Safety Report (Batch Mode)\n\n");
+                
+                let status = if overall_safe {
+                    "✅ PASSED (All contracts safe)"
+                } else {
+                    "❌ FAILED (Some contracts have breaking changes)"
+                };
+                markdown.push_str(&format!("## Status: {}\n\n", status));
+                markdown.push_str("### Summary\n\n");
+                markdown.push_str("| Contract | Status | Critical | Warning | Info | Suppressed |\n");
+                markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
+
+                for (name, report) in &results {
+                    let status_str = if report.is_safe { "✅ PASSED" } else { "❌ FAILED" };
+                    markdown.push_str(&format!(
+                        "| {} | {} | {} | {} | {} | {} |\n",
+                        name,
+                        status_str,
+                        report.critical_count,
+                        report.warning_count,
+                        report.info_count,
+                        report.suppressed_count
+                    ));
+                }
+
+                markdown.push_str("\n---\n\n");
+
+                for (name, report) in &results {
+                    markdown.push_str(&format!("## Details: {}\n\n", name));
+                    let report_md = report.generate_summary_markdown();
+                    let stripped_md = report_md.replace("# Soroban Upgrade Safety Report\n\n", "");
+                    markdown.push_str(&stripped_md);
+                    markdown.push_str("\n---\n\n");
+                }
+
+                println!("{}", markdown);
+            }
+            OutputFormat::Text => {
+                println!("========================================");
+                println!("    SOROBAN BATCH SAFETY REPORT");
+                println!("========================================");
+
+                let status = if overall_safe {
+                    "✅ PASSED (All contracts safe)".green().bold()
+                } else {
+                    "❌ FAILED (Some contracts have breaking changes)".red().bold()
+                };
+                println!("Overall Status: {}\n", status);
+
+                println!("Summary of Contracts:");
+                for (name, report) in &results {
+                    let status_str = if report.is_safe {
+                        "✅ PASSED".green()
+                    } else {
+                        "❌ FAILED".red().bold()
+                    };
+                    println!(
+                        "  - {}: {} ({} critical, {} warnings, {} info, {} suppressed)",
+                        name.bold(),
+                        status_str,
+                        report.critical_count,
+                        report.warning_count,
+                        report.info_count,
+                        report.suppressed_count
+                    );
+                }
+
+                println!("\n========================================\n");
+
+                for (name, report) in &results {
+                    println!("=== Contract: {} ===", name.bold().magenta());
+                    println!("{}", report.generate_summary_text(args.explain));
+                    println!("========================================\n");
+                }
+            }
+        }
+
+        if !overall_safe {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // Resolve the two usage modes for single pair:
     //   - 2 positional args => local-vs-local comparison
     //   - 1 positional arg  + --contract-id/--rpc-url => RPC-vs-local comparison
     let (old_source, new_wasm_path) = match (args.wasm_paths.len(), &args.contract_id) {
@@ -99,23 +291,21 @@ fn main() -> Result<()> {
                 "Missing OLD_WASM path. Provide two WASM files, or use --contract-id and --rpc-url \
                  to fetch the old contract from chain.\n\n\
                  Usage: soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>\n       \
-                 soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>"
+                 soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>\n\n\
+                 Or use batch mode:\n       \
+                 soroban-upgrade-safeguard --manifest <MANIFEST_PATH>\n       \
+                 soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>"
             );
         }
         _ => {
-            anyhow::bail!("Expected 1 or 2 WASM path arguments");
-        }
-    };
-
-    // In JSON or Markdown mode, decorative progress goes to stderr so stdout
-    // stays a single, pristine document. In text mode it stays on stdout
-    // exactly as before.
-    let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
-    let progress = |line: String| {
-        if clean_stdout {
-            eprintln!("{line}");
-        } else {
-            println!("{line}");
+            anyhow::bail!(
+                "Expected 1 or 2 WASM path arguments.\n\n\
+                 Usage: soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>\n       \
+                 soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>\n\n\
+                 Or use batch mode:\n       \
+                 soroban-upgrade-safeguard --manifest <MANIFEST_PATH>\n       \
+                 soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>"
+            );
         }
     };
 
@@ -138,15 +328,6 @@ fn main() -> Result<()> {
     // New WASM
     let new = loader::load_wasm(new_wasm_path)?;
 
-    // Load suppression config: an explicit --config must exist; otherwise fall
-    // back to `.safeguard.toml` in the working directory if it happens to be
-    // present. With neither, an empty config preserves today's behavior.
-    let suppressions = match &args.config {
-        Some(path) => SuppressionConfig::load_from_path(path)?,
-        None => {
-            SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?.unwrap_or_default()
-        }
-    };
     if !suppressions.rules.is_empty() {
         progress(format!(
             "\n{} {} suppression rule(s) loaded",
@@ -179,7 +360,7 @@ fn main() -> Result<()> {
             println!("{}", safety_report.generate_summary_markdown());
         }
         OutputFormat::Text => {
-            println!("{}", safety_report.generate_summary_text());
+            println!("{}", safety_report.generate_summary_text(args.explain));
         }
     }
 
