@@ -36,6 +36,7 @@ pub struct SafetyReport {
     pub total_findings: usize,
     pub is_safe: bool,
     pub findings_by_category: HashMap<String, Vec<ReportedFinding>>,
+    pub strict: bool,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -67,7 +68,7 @@ impl SafetyReport {
     /// Equivalent to [`SafetyReport::with_suppressions`] using an empty config,
     /// so behavior is identical to before suppression support existed.
     pub fn new(diff: &DiffReport) -> Self {
-        Self::with_suppressions(diff, &SuppressionConfig::default(), false)
+        Self::with_suppressions(diff, &SuppressionConfig::default(), false, false)
     }
 
     /// Compute a safety report, applying a suppression config.
@@ -80,12 +81,14 @@ impl SafetyReport {
         diff: &DiffReport,
         suppressions: &SuppressionConfig,
         explain: bool,
+        strict: bool,
     ) -> Self {
         let mut critical_count = 0;
         let mut warning_count = 0;
         let mut info_count = 0;
         let mut suppressed_count = 0;
         let mut failing_critical_count = 0;
+        let mut failing_warning_count = 0;
         let mut findings_by_category: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
 
         for finding in &diff.findings {
@@ -99,8 +102,12 @@ impl SafetyReport {
             let suppressed = rule.is_some();
             if suppressed {
                 suppressed_count += 1;
-            } else if finding.severity == Severity::Critical {
-                failing_critical_count += 1;
+            } else {
+                match finding.severity {
+                    Severity::Critical => failing_critical_count += 1,
+                    Severity::Warning => failing_warning_count += 1,
+                    _ => {}
+                }
             }
 
             let remediation = if explain {
@@ -121,9 +128,9 @@ impl SafetyReport {
         }
 
         let is_safe = if strict {
-            critical_count == 0 && warning_count == 0
+            failing_critical_count == 0 && failing_warning_count == 0
         } else {
-            critical_count == 0
+            failing_critical_count == 0
         };
 
         Self {
@@ -132,7 +139,7 @@ impl SafetyReport {
             info_count,
             suppressed_count,
             total_findings: diff.findings.len(),
-            is_safe: failing_critical_count == 0,
+            is_safe,
             findings_by_category,
             strict,
         }
