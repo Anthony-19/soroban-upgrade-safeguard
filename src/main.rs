@@ -157,13 +157,15 @@ fn main() -> Result<()> {
             let new_wasm = loader::load_wasm(&pair.new)?;
 
             let report = compare_contracts(
-                &old_wasm.bytes,
-                &old_wasm.path,
-                &new_wasm.bytes,
-                &new_wasm.path,
-                &suppressions,
-                args.explain,
-                args.strict,
+                &ContractComparison {
+                    old_bytes: &old_wasm.bytes,
+                    old_path: &old_wasm.path,
+                    new_bytes: &new_wasm.bytes,
+                    new_path: &new_wasm.path,
+                    suppressions: &suppressions,
+                    explain: args.explain,
+                    strict: args.strict,
+                },
                 &progress,
             )?;
 
@@ -338,21 +340,22 @@ fn main() -> Result<()> {
 
     if !suppressions.rules.is_empty() {
         progress(format!(
-            "\n{} {} suppression rule(s) loaded",
-            "🔕".to_string(),
+            "\n🔕 {} suppression rule(s) loaded",
             suppressions.rules.len()
         ));
     }
 
     // Generate Safety Report using the factored helper
     let safety_report = compare_contracts(
-        &old.bytes,
-        &old.path,
-        &new.bytes,
-        &new.path,
-        &suppressions,
-        args.explain,
-        args.strict,
+        &ContractComparison {
+            old_bytes: &old.bytes,
+            old_path: &old.path,
+            new_bytes: &new.bytes,
+            new_path: &new.path,
+            suppressions: &suppressions,
+            explain: args.explain,
+            strict: args.strict,
+        },
         &progress,
     )?;
 
@@ -391,17 +394,30 @@ struct Manifest {
     pairs: Vec<ContractPair>,
 }
 
-/// Helper function to run comparison for a single pair.
-fn compare_contracts(
-    old_bytes: &[u8],
-    old_path: &str,
-    new_bytes: &[u8],
-    new_path: &str,
-    suppressions: &SuppressionConfig,
+struct ContractComparison<'a> {
+    old_bytes: &'a [u8],
+    old_path: &'a str,
+    new_bytes: &'a [u8],
+    new_path: &'a str,
+    suppressions: &'a SuppressionConfig,
     explain: bool,
     strict: bool,
+}
+
+/// Helper function to run comparison for a single pair.
+fn compare_contracts(
+    comparison: &ContractComparison<'_>,
     progress: &impl Fn(String),
 ) -> Result<report::SafetyReport> {
+    let ContractComparison {
+        old_bytes,
+        old_path,
+        new_bytes,
+        new_path,
+        suppressions,
+        explain,
+        strict,
+    } = comparison;
     let old_meta = parser::extract_metadata(old_bytes)?;
     let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
     progress(format!(
@@ -436,8 +452,8 @@ fn compare_contracts(
     Ok(report::SafetyReport::with_suppressions(
         &diff_report,
         suppressions,
-        explain,
-        strict,
+        *explain,
+        *strict,
     ))
 }
 

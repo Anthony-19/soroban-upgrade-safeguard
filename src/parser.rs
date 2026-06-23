@@ -12,9 +12,12 @@ pub struct ContractEnvMeta {
 impl ContractEnvMeta {
     /// The packed Soroban interface version, when present.
     pub fn interface_version(&self) -> Option<u64> {
-        self.entries.iter().find_map(|entry| match entry {
-            ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(version) => Some(*version),
-        })
+        self.entries
+            .iter()
+            .map(|entry| match entry {
+                ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(version) => *version,
+            })
+            .next()
     }
 
     /// Ledger / protocol version (high 32 bits of the interface version).
