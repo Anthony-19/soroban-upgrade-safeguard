@@ -49,6 +49,7 @@ fn json_breaking_upgrade_reports_critical_and_exits_one() {
 
     // Stable top-level structure.
     assert_eq!(json["is_safe"], Value::Bool(false));
+    assert_eq!(json["recommended_bump"], "major");
     assert!(json["counts"]["critical"].as_u64().unwrap() >= 1);
     assert_eq!(
         json["total_findings"].as_u64().unwrap(),
@@ -104,6 +105,7 @@ fn json_identical_upgrade_is_safe_and_exits_zero() {
 
     assert_eq!(code, 0, "non-breaking upgrade must exit 0");
     assert_eq!(json["is_safe"], Value::Bool(true));
+    assert_eq!(json["recommended_bump"], "patch");
     assert_eq!(json["counts"]["critical"].as_u64().unwrap(), 0);
     assert!(
         !stdout.contains('\u{1b}'),
@@ -118,6 +120,7 @@ fn json_strict_warning_only_exits_one() {
     assert_eq!(code, 1, "warning-only upgrade under strict mode must exit 1");
     assert_eq!(json["is_safe"], Value::Bool(false));
     assert_eq!(json["strict"], Value::Bool(true));
+    assert_eq!(json["recommended_bump"], "minor");
     assert_eq!(json["counts"]["critical"].as_u64().unwrap(), 0);
     assert!(json["counts"]["warning"].as_u64().unwrap() > 0);
     assert!(
@@ -133,6 +136,7 @@ fn json_non_strict_warning_only_exits_zero() {
     assert_eq!(code, 0, "warning-only upgrade under non-strict mode must exit 0");
     assert_eq!(json["is_safe"], Value::Bool(true));
     assert_eq!(json["strict"], Value::Bool(false));
+    assert_eq!(json["recommended_bump"], "minor");
     assert_eq!(json["counts"]["critical"].as_u64().unwrap(), 0);
     assert!(json["counts"]["warning"].as_u64().unwrap() > 0);
     assert!(

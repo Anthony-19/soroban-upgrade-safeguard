@@ -39,6 +39,7 @@ fn markdown_breaking_upgrade_reports_critical_and_exits_one() {
     assert!(stdout.contains("### Summary Table"), "Missing summary table heading");
     assert!(stdout.contains("| Finding Severity | Count |"), "Missing table columns");
     assert!(stdout.contains("| **Critical** |"), "Missing critical row");
+    assert!(stdout.contains("**Recommended SemVer Bump**: `major`"), "Missing recommended bump");
 
     // Grouping and finding listing checks
     assert!(stdout.contains("### Function Signature Changed"), "Should group functions under signature changed");
@@ -63,6 +64,7 @@ fn markdown_identical_upgrade_is_safe_and_exits_zero() {
     assert!(stdout.contains("# Soroban Upgrade Safety Report"), "Missing title");
     assert!(stdout.contains("## Status: ✅ PASSED (No breaking changes detected)"), "Missing status");
     assert!(stdout.contains("No relevant changes detected."), "Missing no changes message");
+    assert!(stdout.contains("**Recommended SemVer Bump**: `patch`"), "Missing recommended bump");
 
     assert!(
         !stdout.contains('\u{1b}'),
