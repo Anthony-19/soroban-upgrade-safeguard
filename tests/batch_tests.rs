@@ -47,7 +47,7 @@ fn batch_manifest_toml_mode_fails_and_exits_one() {
         .expect("failed to run binary");
 
     let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
-    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let _stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
     let code = output.status.code().expect("process terminated by signal");
 
     assert_eq!(code, 1, "batch run with breaking contract must exit 1");
@@ -58,10 +58,10 @@ fn batch_manifest_toml_mode_fails_and_exits_one() {
     assert!(stdout.contains("clean_contract: ✅ PASSED"), "Missing passed contract summary");
     assert!(stdout.contains("breaking_contract: ❌ FAILED"), "Missing failed contract summary");
     
-    // Stderr should contain loading messages
-    assert!(stderr.contains("Loaded 2 pair(s) for comparison."), "Missing loading message");
-    assert!(stderr.contains("Comparing contract pair: clean_contract"), "Missing clean contract progress");
-    assert!(stderr.contains("Comparing contract pair: breaking_contract"), "Missing breaking contract progress");
+    // stdout should contain loading messages
+    assert!(stdout.contains("Loaded 2 pair(s) for comparison."), "Missing loading message");
+    assert!(stdout.contains("Comparing contract pair: clean_contract"), "Missing clean contract progress");
+    assert!(stdout.contains("Comparing contract pair: breaking_contract"), "Missing breaking contract progress");
 }
 
 #[test]

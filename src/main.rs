@@ -67,6 +67,10 @@ struct Args {
     #[arg(long)]
     strict: bool,
 
+    /// Do not color output
+    #[arg(long)]
+    no_color: bool,
+
     /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
     #[arg(long, value_name = "MANIFEST_PATH")]
     manifest: Option<PathBuf>,
@@ -82,6 +86,13 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.no_color
+        || std::env::var_os("NO_COLOR").is_some()
+        || !std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        colored::control::set_override(false);
+    }
 
     // 1. Identify which mode we are running:
     //    - Batch Manifest Mode
