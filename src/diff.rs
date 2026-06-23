@@ -27,6 +27,19 @@ pub struct Finding {
     /// relates to a specific type.  Used by cascade-detection so it never
     /// needs to re-parse `message`.
     pub type_name: Option<String>,
+    /// A stable, structured identifier for the exact entity this finding is
+    /// about, independent of the human-readable `message`. It is the key used
+    /// by the suppression config to match a finding precisely:
+    ///
+    /// - functions: the function name (e.g. `transfer`)
+    /// - function parameters: `function.param` (e.g. `transfer.to`)
+    /// - types (struct/enum removed/added, cascades): the type name (e.g. `Data`)
+    /// - struct fields: `Type.field` (e.g. `Data.amount`)
+    /// - enum cases: `Enum.case` (e.g. `Status.Active`)
+    ///
+    /// `None` for findings that are not tied to a single named entity (for
+    /// example environment-metadata changes).
+    pub target: Option<String>,
 }
 
 /// Holds all findings from a comparison of two contract specs.
@@ -93,6 +106,7 @@ pub fn compare_env_metadata(
                 category: ENVIRONMENT_CATEGORY.to_string(),
                 message: format_env_metadata_change(old_meta, new_meta),
                 type_name: None,
+                target: None,
             });
         }
     }
@@ -170,10 +184,31 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                         name
                     ),
                     type_name: None,
+                    target: Some(name.clone()),
                 });
             }
             Some(new_fn) => {
                 check_function_signature(name, old_fn, new_fn, report);
+                // Compare function doc-strings and emit informational findings
+                if old_fn.doc != new_fn.doc {
+                    let old_doc_empty = old_fn.doc.to_string().is_empty();
+                    let new_doc_empty = new_fn.doc.to_string().is_empty();
+                    let message = if old_doc_empty && !new_doc_empty {
+                        format!("Function '{}' documentation was added.", name)
+                    } else if !old_doc_empty && new_doc_empty {
+                        format!("Function '{}' documentation was removed.", name)
+                    } else {
+                        format!("Function '{}' documentation changed.", name)
+                    };
+
+                    report.findings.push(Finding {
+                        severity: Severity::Info,
+                        category: "Function Documentation Changed".to_string(),
+                        message,
+                        type_name: None,
+                        target: Some(name.clone()),
+                    });
+                }
             }
         }
     }
@@ -186,6 +221,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                 category: "Function Added".to_string(),
                 message: format!("New function '{}' added.", name),
                 type_name: None,
+                target: Some(name.clone()),
             });
         }
     }
@@ -213,41 +249,94 @@ fn check_function_signature(
                 new_inputs.len()
             ),
             type_name: None,
+            target: Some(name.to_string()),
         });
         return; // No point comparing individual params if count differs
     }
 
     // Check each input parameter
-    for (i, (old_input, new_input)) in old_inputs.iter().zip(new_inputs.iter()).enumerate() {
-        let old_name = old_input.name.to_string();
-        let new_name = new_input.name.to_string();
+    let old_names: Vec<String> = old_inputs.iter().map(|input| input.name.to_string()).collect();
+    let new_names: Vec<String> = new_inputs.iter().map(|input| input.name.to_string()).collect();
 
-        if old_name != new_name {
-            report.findings.push(Finding {
-                severity: Severity::Warning,
-                category: "Parameter Renamed".to_string(),
-                message: format!(
-                    "Function '{}': parameter {} renamed from '{}' to '{}'.",
-                    name, i, old_name, new_name
-                ),
-                type_name: None,
-            });
+    let old_names_set: std::collections::HashSet<String> = old_names.iter().cloned().collect();
+    let new_names_set: std::collections::HashSet<String> = new_names.iter().cloned().collect();
+
+    let is_reordered = old_names_set == new_names_set && old_names != new_names;
+
+    if is_reordered {
+        report.findings.push(Finding {
+            severity: Severity::Critical,
+            category: "Parameter Reordered".to_string(),
+            message: format!(
+                "Function '{}': parameters reordered. The set of parameter names is unchanged but their order differs.",
+                name
+            ),
+            type_name: None,
+            target: Some(name.to_string()),
+        });
+
+        // Check for genuine type changes by matching parameter name.
+        let new_by_name: std::collections::HashMap<String, &ScSpecTypeDef> = new_inputs
+            .iter()
+            .map(|input| (input.name.to_string(), &input.type_))
+            .collect();
+
+        for (i, old_input) in old_inputs.iter().enumerate() {
+            let p_name = old_input.name.to_string();
+            if let Some(new_type) = new_by_name.get(&p_name) {
+                if !types_equal(&old_input.type_, new_type) {
+                    report.findings.push(Finding {
+                        severity: Severity::Critical,
+                        category: "Parameter Type Changed".to_string(),
+                        message: format!(
+                            "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
+                            name,
+                            i,
+                            p_name,
+                            crate::mapper::type_to_string(&old_input.type_),
+                            crate::mapper::type_to_string(new_type)
+                        ),
+                        type_name: None,
+                        target: Some(format!("{}.{}", name, p_name)),
+                    });
+                }
+            }
         }
+    } else {
+        // Fall back to original positional check
+        for (i, (old_input, new_input)) in old_inputs.iter().zip(new_inputs.iter()).enumerate() {
+            let old_name = old_input.name.to_string();
+            let new_name = new_input.name.to_string();
 
-        if !types_equal(&old_input.type_, &new_input.type_) {
-            report.findings.push(Finding {
-                severity: Severity::Critical,
-                category: "Parameter Type Changed".to_string(),
-                message: format!(
-                    "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
-                    name,
-                    i,
-                    old_name,
-                    crate::mapper::type_to_string(&old_input.type_),
-                    crate::mapper::type_to_string(&new_input.type_)
-                ),
-                type_name: None,
-            });
+            if old_name != new_name {
+                report.findings.push(Finding {
+                    severity: Severity::Warning,
+                    category: "Parameter Renamed".to_string(),
+                    message: format!(
+                        "Function '{}': parameter {} renamed from '{}' to '{}'.",
+                        name, i, old_name, new_name
+                    ),
+                    type_name: None,
+                    target: Some(format!("{}.{}", name, old_name)),
+                });
+            }
+
+            if !types_equal(&old_input.type_, &new_input.type_) {
+                report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category: "Parameter Type Changed".to_string(),
+                    message: format!(
+                        "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
+                        name,
+                        i,
+                        old_name,
+                        crate::mapper::type_to_string(&old_input.type_),
+                        crate::mapper::type_to_string(&new_input.type_)
+                    ),
+                    type_name: None,
+                    target: Some(format!("{}.{}", name, old_name)),
+                });
+            }
         }
     }
 
@@ -266,6 +355,7 @@ fn check_function_signature(
                 new_outputs.len()
             ),
             type_name: None,
+            target: Some(name.to_string()),
         });
     } else {
         for (i, (old_out, new_out)) in old_outputs.iter().zip(new_outputs.iter()).enumerate() {
@@ -281,6 +371,7 @@ fn check_function_signature(
                         crate::mapper::type_to_string(new_out)
                     ),
                     type_name: None,
+                    target: Some(name.to_string()),
                 });
             }
         }
@@ -312,10 +403,31 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                         name
                     ),
                     type_name: Some(name.clone()),
+                    target: Some(name.clone()),
                 });
             }
             Some(new_struct) => {
                 check_struct_fields(name, old_struct, new_struct, report);
+                // Compare struct doc-strings (informational only)
+                if old_struct.doc != new_struct.doc {
+                    let old_doc_empty = old_struct.doc.to_string().is_empty();
+                    let new_doc_empty = new_struct.doc.to_string().is_empty();
+                    let message = if old_doc_empty && !new_doc_empty {
+                        format!("Struct '{}' documentation was added.", name)
+                    } else if !old_doc_empty && new_doc_empty {
+                        format!("Struct '{}' documentation was removed.", name)
+                    } else {
+                        format!("Struct '{}' documentation changed.", name)
+                    };
+
+                    report.findings.push(Finding {
+                        severity: Severity::Info,
+                        category: "Struct Documentation Changed".to_string(),
+                        message,
+                        type_name: Some(name.clone()),
+                        target: Some(name.clone()),
+                    });
+                }
             }
         }
     }
@@ -328,6 +440,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                 category: "Struct Added".to_string(),
                 message: format!("New struct '{}' added.", name),
                 type_name: Some(name.clone()),
+                target: Some(name.clone()),
             });
         }
     }
@@ -366,6 +479,7 @@ fn check_struct_fields(
                     msg_prefix, name, old_name
                 ),
                 type_name: Some(name.to_string()),
+                target: Some(format!("{}.{}", name, old_name)),
             });
         }
     }
@@ -386,6 +500,7 @@ fn check_struct_fields(
                     msg_prefix, name, i, old_name, new_name
                 ),
                 type_name: Some(name.to_string()),
+                target: Some(format!("{}.{}", name, old_name)),
             });
         }
 
@@ -404,6 +519,7 @@ fn check_struct_fields(
                     crate::mapper::type_to_string(&new_field.type_)
                 ),
                 type_name: Some(name.to_string()),
+                target: Some(format!("{}.{}", name, old_name)),
             });
         }
     }
@@ -421,6 +537,7 @@ fn check_struct_fields(
                     new_field.name
                 ),
                 type_name: Some(name.to_string()),
+                target: Some(format!("{}.{}", name, new_field.name)),
             });
         }
     }
@@ -445,10 +562,31 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                         name
                     ),
                     type_name: Some(name.clone()),
+                    target: Some(name.clone()),
                 });
             }
             Some(new_enum) => {
                 check_enum_cases(name, old_enum, new_enum, report);
+                // Compare enum doc-strings (informational only)
+                if old_enum.doc != new_enum.doc {
+                    let old_doc_empty = old_enum.doc.to_string().is_empty();
+                    let new_doc_empty = new_enum.doc.to_string().is_empty();
+                    let message = if old_doc_empty && !new_doc_empty {
+                        format!("Enum '{}' documentation was added.", name)
+                    } else if !old_doc_empty && new_doc_empty {
+                        format!("Enum '{}' documentation was removed.", name)
+                    } else {
+                        format!("Enum '{}' documentation changed.", name)
+                    };
+
+                    report.findings.push(Finding {
+                        severity: Severity::Info,
+                        category: "Enum Documentation Changed".to_string(),
+                        message,
+                        type_name: Some(name.clone()),
+                        target: Some(name.clone()),
+                    });
+                }
             }
         }
     }
@@ -461,6 +599,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                 category: "Enum Added".to_string(),
                 message: format!("New enum '{}' added.", name),
                 type_name: Some(name.clone()),
+                target: Some(name.clone()),
             });
         }
     }
@@ -498,6 +637,7 @@ fn check_enum_cases(
                         msg_prefix, name, old_name, old_case.value
                     ),
                     type_name: Some(name.to_string()),
+                    target: Some(format!("{}.{}", name, old_name)),
                 });
             }
             Some(new_case) => {
@@ -512,6 +652,7 @@ fn check_enum_cases(
                             msg_prefix, name, old_name, old_case.value, new_case.value
                         ),
                         type_name: Some(name.to_string()),
+                        target: Some(format!("{}.{}", name, old_name)),
                     });
                 }
             }
@@ -531,6 +672,7 @@ fn check_enum_cases(
                         msg_prefix, name, new_name, new_case.value
                     ),
                     type_name: Some(name.to_string()),
+                    target: Some(format!("{}.{}", name, new_name)),
                 });
             }
         }
@@ -814,6 +956,7 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
                             dep, current_broken_type, dep
                         ),
                         type_name: Some(dep.clone()),
+                        target: Some(dep.clone()),
                     });
                 }
             }
@@ -933,6 +1076,7 @@ mod tests {
             message: "This message has no quotes and mentions no type prefix whatsoever."
                 .to_string(),
             type_name: Some("Child".to_string()),
+            target: Some("Child".to_string()),
         });
 
         // Run cascade detection against the old spec
@@ -965,6 +1109,7 @@ mod tests {
             category: "Function Removed".to_string(),
             message: "Function 'do_stuff' was removed.".to_string(),
             type_name: None,
+            target: Some("do_stuff".to_string()),
         });
 
         detect_cascading_layout_breaks(&old, &mut report);
@@ -1033,6 +1178,41 @@ mod tests {
         let f = field_change.unwrap();
         assert_eq!(f.severity, Severity::Critical);
         assert_eq!(f.type_name.as_deref(), Some("Data"));
+        // The `target` pinpoints the exact field (`Type.field`) so a
+        // suppression keyed on it cannot over-apply to sibling fields.
+        assert_eq!(f.target.as_deref(), Some("Data.amount"));
+    }
+
+    // ---------------------------------------------------------------
+    // Test 6: findings carry a precise, structured `target` for every
+    //         granularity (function, field, enum case, type).
+    // ---------------------------------------------------------------
+    #[test]
+    fn findings_expose_precise_targets() {
+        // Struct removed entirely -> target is the bare type name.
+        let old = spec_with_structs(vec![("Gone", vec![("x", ScSpecTypeDef::U32)])]);
+        let new = ContractSpec::default();
+        let report = compare(&old, &new);
+        let removed = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Removed")
+            .expect("expected a struct-removed finding");
+        assert_eq!(removed.target.as_deref(), Some("Gone"));
+
+        // Struct field removed -> target is `Type.field`.
+        let old = spec_with_structs(vec![(
+            "Data",
+            vec![("keep", ScSpecTypeDef::U32), ("drop", ScSpecTypeDef::U32)],
+        )]);
+        let new = spec_with_structs(vec![("Data", vec![("keep", ScSpecTypeDef::U32)])]);
+        let report = compare(&old, &new);
+        let field_removed = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Removed")
+            .expect("expected a field-removed finding");
+        assert_eq!(field_removed.target.as_deref(), Some("Data.drop"));
     }
 
     fn env_meta(protocol: u32, pre_release: u32) -> ContractEnvMeta {
@@ -1040,6 +1220,44 @@ mod tests {
         ContractEnvMeta {
             entries: vec![ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(version)],
         }
+    }
+
+    #[test]
+    fn struct_doc_change_produces_info() {
+        let mut old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let mut new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+
+        // Set differing docs
+        old.structs.get_mut("Data").unwrap().doc = "old doc".try_into().unwrap();
+        new.structs.get_mut("Data").unwrap().doc = "new doc".try_into().unwrap();
+
+        let report = compare(&old, &new);
+
+        let found = report.findings.iter().any(|f| {
+            f.severity == Severity::Info
+                && f.category == "Struct Documentation Changed"
+                && f.type_name.as_deref() == Some("Data")
+        });
+        assert!(found, "Expected an info finding for struct doc change");
+
+        // Ensure info findings do not influence safety
+        let safety = crate::report::SafetyReport::new(&report);
+        assert!(safety.is_safe);
+        assert_eq!(safety.critical_count, 0);
+    }
+
+    #[test]
+    fn identical_struct_docs_produce_no_finding() {
+        let mut old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let mut new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+
+        // Same doc text
+        old.structs.get_mut("Data").unwrap().doc = "doc".try_into().unwrap();
+        new.structs.get_mut("Data").unwrap().doc = "doc".try_into().unwrap();
+
+        let report = compare(&old, &new);
+        // No findings expected
+        assert!(report.findings.is_empty(), "Expected no findings when docs identical");
     }
 
     #[test]
@@ -1089,63 +1307,25 @@ mod tests {
         assert_eq!(safety.critical_count, 0);
     }
 
-    enum UnionCaseSpec {
-        Void(&'static str),
-        Tuple(&'static str, Vec<ScSpecTypeDef>),
-    }
-
-    fn spec_with_unions(unions: Vec<(&str, Vec<UnionCaseSpec>)>) -> ContractSpec {
+    /// Helper: build a minimal ContractSpec with the given functions.
+    fn spec_with_functions(functions: Vec<(&str, Vec<(&str, ScSpecTypeDef)>)>) -> ContractSpec {
         let mut spec = ContractSpec::default();
-        for (name, cases) in unions {
-            let xdr_cases: Vec<ScSpecUdtUnionCaseV0> = cases
+        for (name, inputs) in functions {
+            let xdr_inputs: Vec<stellar_xdr::curr::ScSpecFunctionInputV0> = inputs
                 .into_iter()
-                .map(|case| match case {
-                    UnionCaseSpec::Void(case_name) => {
-                        ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
-                            doc: StringM::default(),
-                            name: case_name.try_into().unwrap(),
-                        })
-                    }
-                    UnionCaseSpec::Tuple(case_name, types) => {
-                        ScSpecUdtUnionCaseV0::TupleV0(ScSpecUdtUnionCaseTupleV0 {
-                            doc: StringM::default(),
-                            name: case_name.try_into().unwrap(),
-                            type_: VecM::try_from(types).unwrap(),
-                        })
-                    }
+                .map(|(iname, itype)| stellar_xdr::curr::ScSpecFunctionInputV0 {
+                    doc: StringM::default(),
+                    name: iname.try_into().unwrap(),
+                    type_: itype,
                 })
                 .collect();
-            spec.unions.insert(
+            spec.functions.insert(
                 name.to_string(),
-                ScSpecUdtUnionV0 {
+                stellar_xdr::curr::ScSpecFunctionV0 {
                     doc: StringM::default(),
-                    lib: StringM::default(),
                     name: name.try_into().unwrap(),
-                    cases: VecM::try_from(xdr_cases).unwrap(),
-                },
-            );
-        }
-        spec
-    }
-
-    fn spec_with_error_enums(enums: Vec<(&str, Vec<(&str, u32)>)>) -> ContractSpec {
-        let mut spec = ContractSpec::default();
-        for (name, cases) in enums {
-            let xdr_cases: Vec<ScSpecUdtErrorEnumCaseV0> = cases
-                .into_iter()
-                .map(|(case_name, value)| ScSpecUdtErrorEnumCaseV0 {
-                    doc: StringM::default(),
-                    name: case_name.try_into().unwrap(),
-                    value,
-                })
-                .collect();
-            spec.error_enums.insert(
-                name.to_string(),
-                ScSpecUdtErrorEnumV0 {
-                    doc: StringM::default(),
-                    lib: StringM::default(),
-                    name: name.try_into().unwrap(),
-                    cases: VecM::try_from(xdr_cases).unwrap(),
+                    inputs: VecM::try_from(xdr_inputs).unwrap(),
+                    outputs: VecM::default(),
                 },
             );
         }
@@ -1153,133 +1333,72 @@ mod tests {
     }
 
     #[test]
-    fn union_case_type_change_is_critical() {
-        let old = spec_with_unions(vec![(
-            "Action",
-            vec![UnionCaseSpec::Tuple("Deposit", vec![ScSpecTypeDef::U32])],
-        )]);
-        let new = spec_with_unions(vec![(
-            "Action",
-            vec![UnionCaseSpec::Tuple("Deposit", vec![ScSpecTypeDef::U64])],
-        )]);
+    fn param_reorder_same_type_produces_critical_finding() {
+        let old = spec_with_functions(vec![("test_fn", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)])]);
+        let new = spec_with_functions(vec![("test_fn", vec![("b", ScSpecTypeDef::U32), ("a", ScSpecTypeDef::U32)])]);
 
         let report = compare(&old, &new);
-        assert!(report.findings.iter().any(|f| {
-            f.severity == Severity::Critical && f.category == "Union Case Type Changed"
-        }));
-        assert!(!crate::report::SafetyReport::new(&report).is_safe);
+        let reorder_finding = report.findings.iter().find(|f| f.category == "Parameter Reordered");
+        
+        assert!(reorder_finding.is_some(), "Expected a Parameter Reordered finding");
+        let f = reorder_finding.unwrap();
+        assert_eq!(f.severity, Severity::Critical);
+        assert!(f.message.contains("parameters reordered"));
+        
+        // Ensure no Parameter Renamed warnings are generated
+        let rename_findings = report.findings.iter().filter(|f| f.category == "Parameter Renamed").count();
+        assert_eq!(rename_findings, 0, "Should not double-count reorders as renames");
     }
 
     #[test]
-    fn union_case_removed_is_critical() {
-        let old = spec_with_unions(vec![(
-            "Action",
-            vec![
-                UnionCaseSpec::Void("Cancel"),
-                UnionCaseSpec::Tuple("Deposit", vec![ScSpecTypeDef::U32]),
-            ],
-        )]);
-        let new = spec_with_unions(vec![(
-            "Action",
-            vec![UnionCaseSpec::Tuple("Deposit", vec![ScSpecTypeDef::U32])],
-        )]);
+    fn param_pure_rename_produces_warning() {
+        let old = spec_with_functions(vec![("test_fn", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)])]);
+        let new = spec_with_functions(vec![("test_fn", vec![("x", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)])]);
 
         let report = compare(&old, &new);
-        assert!(report.findings.iter().any(|f| {
-            f.severity == Severity::Critical && f.category == "Union Case Removed"
-        }));
+        let rename_finding = report.findings.iter().find(|f| f.category == "Parameter Renamed");
+        
+        assert!(rename_finding.is_some(), "Expected a Parameter Renamed finding");
+        let f = rename_finding.unwrap();
+        assert_eq!(f.severity, Severity::Warning);
+        
+        // Ensure no Parameter Reordered findings are generated
+        let reorder_findings = report.findings.iter().filter(|f| f.category == "Parameter Reordered").count();
+        assert_eq!(reorder_findings, 0);
     }
 
     #[test]
-    fn union_case_added_is_info_only() {
-        let old = spec_with_unions(vec![(
-            "Action",
-            vec![UnionCaseSpec::Void("Cancel")],
-        )]);
-        let new = spec_with_unions(vec![(
-            "Action",
-            vec![
-                UnionCaseSpec::Void("Cancel"),
-                UnionCaseSpec::Tuple("Deposit", vec![ScSpecTypeDef::U32]),
-            ],
-        )]);
+    fn param_type_change_produces_critical_finding() {
+        let old = spec_with_functions(vec![("test_fn", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)])]);
+        let new = spec_with_functions(vec![("test_fn", vec![("a", ScSpecTypeDef::Bool), ("b", ScSpecTypeDef::U32)])]);
 
         let report = compare(&old, &new);
-        let added = report
-            .findings
-            .iter()
-            .find(|f| f.category == "Union Case Added")
-            .expect("expected union case added finding");
-        assert_eq!(added.severity, Severity::Info);
-        assert!(crate::report::SafetyReport::new(&report).is_safe);
+        let type_finding = report.findings.iter().find(|f| f.category == "Parameter Type Changed");
+        
+        assert!(type_finding.is_some(), "Expected a Parameter Type Changed finding");
+        let f = type_finding.unwrap();
+        assert_eq!(f.severity, Severity::Critical);
+        
+        // Ensure no Parameter Reordered findings are generated
+        let reorder_findings = report.findings.iter().filter(|f| f.category == "Parameter Reordered").count();
+        assert_eq!(reorder_findings, 0);
     }
 
     #[test]
-    fn union_case_reordered_is_critical() {
-        let old = spec_with_unions(vec![(
-            "Action",
-            vec![
-                UnionCaseSpec::Void("Cancel"),
-                UnionCaseSpec::Tuple("Deposit", vec![ScSpecTypeDef::U32]),
-            ],
-        )]);
-        let new = spec_with_unions(vec![(
-            "Action",
-            vec![
-                UnionCaseSpec::Tuple("Deposit", vec![ScSpecTypeDef::U32]),
-                UnionCaseSpec::Void("Cancel"),
-            ],
-        )]);
+    fn param_reorder_and_type_change_produces_both() {
+        let old = spec_with_functions(vec![("test_fn", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)])]);
+        let new = spec_with_functions(vec![("test_fn", vec![("b", ScSpecTypeDef::U32), ("a", ScSpecTypeDef::Bool)])]);
 
         let report = compare(&old, &new);
-        assert!(report.findings.iter().any(|f| {
-            f.severity == Severity::Critical && f.category == "Union Case Reordered"
-        }));
-    }
+        
+        let reorder_finding = report.findings.iter().find(|f| f.category == "Parameter Reordered");
+        assert!(reorder_finding.is_some(), "Expected a Parameter Reordered finding");
+        assert_eq!(reorder_finding.unwrap().severity, Severity::Critical);
 
-    #[test]
-    fn error_enum_case_value_change_is_critical() {
-        let old = spec_with_error_enums(vec![("ContractError", vec![("NotFound", 1)])]);
-        let new = spec_with_error_enums(vec![("ContractError", vec![("NotFound", 2)])]);
-
-        let report = compare(&old, &new);
-        assert!(report.findings.iter().any(|f| {
-            f.severity == Severity::Critical && f.category == "Error Enum Case Value Changed"
-        }));
-        assert!(!crate::report::SafetyReport::new(&report).is_safe);
-    }
-
-    #[test]
-    fn union_break_cascades_to_embedder() {
-        let old = spec_with_structs(vec![
-            (
-                "Envelope",
-                vec![("action", udt("Action"))],
-            ),
-        ]);
-        let mut old = old;
-        old.unions = spec_with_unions(vec![(
-            "Action",
-            vec![UnionCaseSpec::Tuple("Deposit", vec![ScSpecTypeDef::U32])],
-        )])
-        .unions;
-
-        let new = spec_with_structs(vec![(
-            "Envelope",
-            vec![("action", udt("Action"))],
-        )]);
-        let mut new = new;
-        new.unions = spec_with_unions(vec![(
-            "Action",
-            vec![UnionCaseSpec::Tuple("Deposit", vec![ScSpecTypeDef::U64])],
-        )])
-        .unions;
-
-        let report = compare(&old, &new);
-        assert!(report.findings.iter().any(|f| {
-            f.severity == Severity::Critical
-                && f.type_name.as_deref() == Some("Envelope")
-                && f.category == "Cascading Layout Break"
-        }));
+        let type_finding = report.findings.iter().find(|f| f.category == "Parameter Type Changed");
+        assert!(type_finding.is_some(), "Expected a Parameter Type Changed finding");
+        let tf = type_finding.unwrap();
+        assert_eq!(tf.severity, Severity::Critical);
+        assert!(tf.message.contains("parameter 0 ('a') type changed")); // Index in old is 0
     }
 }

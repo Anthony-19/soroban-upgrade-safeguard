@@ -1,0 +1,30 @@
+# Example suppression config for Soroban Upgrade Safeguard.
+#
+# Copy this to `.safeguard.toml` in your repo root (or pass it explicitly with
+# `--config`) to acknowledge known, intentional breaking changes so they no
+# longer fail the run. Suppressed findings are still shown in the report,
+# clearly marked, so the acknowledgement stays auditable.
+#
+# Matching is EXACT: a rule applies only when both `category` and `target`
+# equal the finding's own values. This keeps a suppression from over-applying
+# to a sibling field, case, or parameter. Run with `--format json` to discover
+# the precise `category` and `target` of any finding you want to suppress.
+#
+# `target` convention:
+#   - functions ............ the function name        e.g. "transfer"
+#   - function parameters .. "function.param"         e.g. "transfer.to"
+#   - types ................ the type name            e.g. "ConfigData"
+#   - struct fields ........ "Type.field"             e.g. "ConfigData.threshold"
+#   - enum cases ........... "Enum.case"              e.g. "StatusEvent.Paused"
+#
+# Omit `target` to match only findings that have no target (e.g. "Environment").
+
+[[suppress]]
+category = "Struct Field Removed"
+target   = "ConfigData.threshold"
+reason   = "Planned storage migration in v2 drops the unused threshold field."
+
+[[suppress]]
+category = "Function Signature Changed"
+target   = "initialize"
+reason   = "Re-init is intentional and gated behind the migration admin call."

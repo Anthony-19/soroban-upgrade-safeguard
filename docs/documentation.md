@@ -7,15 +7,17 @@ This document explains what Soroban Upgrade Safeguard does, how it works interna
 1. [Overview](#overview)
 2. [Why Upgrade Safety Matters](#why-upgrade-safety-matters)
 3. [Installation](#installation)
-4. [Command Line Usage](#command-line-usage)
-5. [How the Analysis Works](#how-the-analysis-works)
-6. [Detection Categories](#detection-categories)
-7. [Severity Levels](#severity-levels)
-8. [Cascading Layout Breaks](#cascading-layout-breaks)
-9. [Reading the Report](#reading-the-report)
-10. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
-11. [Limitations](#limitations)
-12. [Frequently Asked Questions](#frequently-asked-questions)
+4. [Docker](#docker)
+5. [Command Line Usage](#command-line-usage)
+6. [How the Analysis Works](#how-the-analysis-works)
+7. [Detection Categories](#detection-categories)
+8. [Severity Levels](#severity-levels)
+9. [Cascading Layout Breaks](#cascading-layout-breaks)
+10. [Reading the Report](#reading-the-report)
+11. [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes)
+12. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
+13. [Limitations](#limitations)
+14. [Frequently Asked Questions](#frequently-asked-questions)
 
 ## Overview
 
@@ -47,6 +49,71 @@ This places a `soroban-upgrade-safeguard` binary on your Cargo bin path. You can
 
 ```bash
 cargo run -- <OLD_WASM> <NEW_WASM>
+```
+
+## Docker
+
+Build the image from the repository root:
+
+```bash
+docker build -t soroban-upgrade-safeguard .
+```
+
+The build uses two stages: the first compiles a release binary using `rust:slim-bookworm`; the second copies only that binary into `debian:bookworm-slim`. The final image does not contain `cargo`, `rustc`, or `rustup`.
+
+### Local mode
+
+Mount a directory that contains your WASM files and pass the in-container paths as arguments:
+
+```bash
+docker run --rm \
+  -v $(pwd)/tests/wasm:/wasms \
+  soroban-upgrade-safeguard \
+  /wasms/v1.wasm /wasms/v2.wasm
+```
+
+All paths you pass must be paths inside the container. Use `--format` to choose a different output format:
+
+```bash
+docker run --rm \
+  -v $(pwd)/tests/wasm:/wasms \
+  soroban-upgrade-safeguard \
+  /wasms/v1.wasm /wasms/v2.wasm --format json
+```
+
+### RPC mode
+
+```bash
+docker run --rm \
+  -v $(pwd)/path/to/new:/wasms \
+  soroban-upgrade-safeguard \
+  --contract-id C... \
+  --rpc-url https://soroban-testnet.stellar.org \
+  /wasms/new.wasm
+```
+
+### Suppression config
+
+Mount the directory that contains `.safeguard.toml` and point to it with `--config`:
+
+```bash
+docker run --rm \
+  -v $(pwd)/tests/wasm:/wasms \
+  -v $(pwd):/config \
+  soroban-upgrade-safeguard \
+  /wasms/v1.wasm /wasms/v2.wasm --config /config/.safeguard.toml
+```
+
+### CI example
+
+The image preserves exit code semantics (0 = safe, 1 = critical findings). Use it directly as a pipeline step:
+
+```yaml
+- name: Check upgrade safety
+  run: |
+    docker run --rm \
+      -v ${{ github.workspace }}/wasm:/wasms \
+      soroban-upgrade-safeguard /wasms/on-chain.wasm /wasms/candidate.wasm
 ```
 
 ## Command Line Usage
@@ -135,6 +202,75 @@ A run prints a header for each loaded contract with a one line summary of how ma
 The report begins with an overall status line that is either passed or failed, followed by counts of critical, warning, and info findings. Below that, findings are grouped by category, sorted for stable output, and each line is prefixed with a colored marker that maps to its severity. When the run fails, a closing action-required notice explains the practical consequences of deploying anyway.
 
 If the two contracts have identical exports and types, the report states that no relevant changes were detected and the run passes.
+
+## Suppressing Known Breaking Changes
+
+Sometimes a breaking change is deliberate and already accounted for — a planned
+storage migration, a re-initialization gated behind an admin call, or a
+deprecated function dropped on purpose. A suppression config lets a team
+whitelist specific, reviewed findings so they no longer fail the run, while
+keeping them visible in the report as explicitly acknowledged.
+
+### Config file
+
+By default the tool looks for `.safeguard.toml` in the current directory. You
+can point at a different file with `--config <PATH>`:
+
+```bash
+soroban-upgrade-safeguard ./on-chain.wasm ./candidate.wasm --config .safeguard.toml
+```
+
+If no `--config` is given and `.safeguard.toml` is absent, nothing is
+suppressed and the tool behaves exactly as it always has. If you pass
+`--config` explicitly and the file is missing or malformed, that is a hard
+error rather than a silent no-op, so a typo never quietly disables suppression.
+
+Each `[[suppress]]` entry acknowledges exactly one finding:
+
+```toml
+[[suppress]]
+category = "Struct Field Removed"
+target   = "ConfigData.threshold"
+reason   = "Planned storage migration in v2 drops the unused threshold field."
+
+[[suppress]]
+category = "Function Signature Changed"
+target   = "initialize"
+reason   = "Re-init is intentional and gated behind the migration admin call."
+```
+
+A ready-to-copy template lives at [`.safeguard.example.toml`](../.safeguard.example.toml).
+
+### How matching works
+
+Matching is **exact**: a rule applies only when both its `category` and its
+`target` equal the finding's own values. This strictness keeps a suppression
+from over-applying to a sibling field, enum case, or parameter. A rule that
+omits `target` matches only findings that themselves have no target (for
+example `Environment` changes).
+
+The `target` is a stable, structured identifier for the exact entity a finding
+is about, independent of the human-readable message:
+
+| Finding is about     | `target` form     | Example                  |
+| -------------------- | ----------------- | ------------------------ |
+| a function           | `function`        | `transfer`               |
+| a function parameter | `function.param`  | `transfer.to`            |
+| a type               | `Type`            | `ConfigData`             |
+| a struct field       | `Type.field`      | `ConfigData.threshold`   |
+| an enum case         | `Enum.case`       | `StatusEvent.Paused`     |
+
+The easiest way to find the right `category` and `target` for a finding is to
+run with `--format json`; every finding carries both fields verbatim.
+
+### What suppression does and does not change
+
+A suppressed finding is **not hidden**. It is still listed in the report, marked
+`[SUPPRESSED]` along with its reason, and still counted in the severity totals.
+What changes is the failing set: a suppressed Critical no longer contributes to
+the exit code. The run passes only when no *unsuppressed* Critical remains. The
+JSON output adds a top-level `suppressed_count`, and each suppressed finding
+gains `"suppressed": true` (and a `"suppression_reason"` when one was given).
 
 ## Exit Codes and CI Integration
 

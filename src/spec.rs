@@ -23,6 +23,11 @@ pub struct ContractSpec {
 
 impl ContractSpec {
     /// Build a `ContractSpec` from a list of decoded `ScSpecEntry` objects.
+    ///
+    /// If multiple entries with the same name for a given kind (e.g., two functions
+    /// with the same name) are encountered, a warning is printed to stderr. Under the
+    /// first-wins tie-break strategy, the first entry encountered in the `entries`
+    /// slice is retained, and subsequent duplicates are ignored.
     pub fn from_entries(entries: &[ScSpecEntry]) -> Self {
         let mut spec = ContractSpec::default();
 
@@ -30,23 +35,58 @@ impl ContractSpec {
             match entry {
                 ScSpecEntry::FunctionV0(f) => {
                     let name = f.name.to_string();
-                    spec.functions.insert(name, f.clone());
+                    if spec.functions.contains_key(&name) {
+                        eprintln!(
+                            "WARNING: Duplicate function '{}' detected. Keeping the first entry.",
+                            name
+                        );
+                    } else {
+                        spec.functions.insert(name, f.clone());
+                    }
                 }
                 ScSpecEntry::UdtStructV0(s) => {
                     let name = s.name.to_string();
-                    spec.structs.insert(name, s.clone());
+                    if spec.structs.contains_key(&name) {
+                        eprintln!(
+                            "WARNING: Duplicate struct '{}' detected. Keeping the first entry.",
+                            name
+                        );
+                    } else {
+                        spec.structs.insert(name, s.clone());
+                    }
                 }
                 ScSpecEntry::UdtEnumV0(e) => {
                     let name = e.name.to_string();
-                    spec.enums.insert(name, e.clone());
+                    if spec.enums.contains_key(&name) {
+                        eprintln!(
+                            "WARNING: Duplicate enum '{}' detected. Keeping the first entry.",
+                            name
+                        );
+                    } else {
+                        spec.enums.insert(name, e.clone());
+                    }
                 }
                 ScSpecEntry::UdtUnionV0(u) => {
                     let name = u.name.to_string();
-                    spec.unions.insert(name, u.clone());
+                    if spec.unions.contains_key(&name) {
+                        eprintln!(
+                            "WARNING: Duplicate union '{}' detected. Keeping the first entry.",
+                            name
+                        );
+                    } else {
+                        spec.unions.insert(name, u.clone());
+                    }
                 }
                 ScSpecEntry::UdtErrorEnumV0(e) => {
                     let name = e.name.to_string();
-                    spec.error_enums.insert(name, e.clone());
+                    if spec.error_enums.contains_key(&name) {
+                        eprintln!(
+                            "WARNING: Duplicate error enum '{}' detected. Keeping the first entry.",
+                            name
+                        );
+                    } else {
+                        spec.error_enums.insert(name, e.clone());
+                    }
                 }
             }
         }
@@ -64,5 +104,170 @@ impl ContractSpec {
             self.unions.len(),
             self.error_enums.len(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::{StringM, VecM};
+
+    #[test]
+    fn test_from_entries_duplicate_function_first_wins() {
+        let f1 = ScSpecFunctionV0 {
+            doc: "doc1".try_into().unwrap(),
+            name: "my_func".try_into().unwrap(),
+            inputs: VecM::default(),
+            outputs: VecM::default(),
+        };
+        let f2 = ScSpecFunctionV0 {
+            doc: "doc2".try_into().unwrap(),
+            name: "my_func".try_into().unwrap(),
+            inputs: VecM::default(),
+            outputs: VecM::default(),
+        };
+
+        let entries = vec![
+            ScSpecEntry::FunctionV0(f1),
+            ScSpecEntry::FunctionV0(f2),
+        ];
+
+        let spec = ContractSpec::from_entries(&entries);
+
+        assert_eq!(spec.functions.len(), 1);
+        let resolved = spec.functions.get("my_func").unwrap();
+        assert_eq!(resolved.doc.to_string(), "doc1");
+    }
+
+    #[test]
+    fn test_from_entries_duplicate_struct_first_wins() {
+        let s1 = ScSpecUdtStructV0 {
+            doc: "doc1".try_into().unwrap(),
+            lib: StringM::default(),
+            name: "my_struct".try_into().unwrap(),
+            fields: VecM::default(),
+        };
+        let s2 = ScSpecUdtStructV0 {
+            doc: "doc2".try_into().unwrap(),
+            lib: StringM::default(),
+            name: "my_struct".try_into().unwrap(),
+            fields: VecM::default(),
+        };
+
+        let entries = vec![
+            ScSpecEntry::UdtStructV0(s1),
+            ScSpecEntry::UdtStructV0(s2),
+        ];
+
+        let spec = ContractSpec::from_entries(&entries);
+
+        assert_eq!(spec.structs.len(), 1);
+        let resolved = spec.structs.get("my_struct").unwrap();
+        assert_eq!(resolved.doc.to_string(), "doc1");
+    }
+
+    #[test]
+    fn test_from_entries_duplicate_enum_first_wins() {
+        let e1 = ScSpecUdtEnumV0 {
+            doc: "doc1".try_into().unwrap(),
+            lib: StringM::default(),
+            name: "my_enum".try_into().unwrap(),
+            cases: VecM::default(),
+        };
+        let e2 = ScSpecUdtEnumV0 {
+            doc: "doc2".try_into().unwrap(),
+            lib: StringM::default(),
+            name: "my_enum".try_into().unwrap(),
+            cases: VecM::default(),
+        };
+
+        let entries = vec![
+            ScSpecEntry::UdtEnumV0(e1),
+            ScSpecEntry::UdtEnumV0(e2),
+        ];
+
+        let spec = ContractSpec::from_entries(&entries);
+
+        assert_eq!(spec.enums.len(), 1);
+        let resolved = spec.enums.get("my_enum").unwrap();
+        assert_eq!(resolved.doc.to_string(), "doc1");
+    }
+
+    #[test]
+    fn test_from_entries_duplicate_union_first_wins() {
+        let u1 = ScSpecUdtUnionV0 {
+            doc: "doc1".try_into().unwrap(),
+            lib: StringM::default(),
+            name: "my_union".try_into().unwrap(),
+            cases: VecM::default(),
+        };
+        let u2 = ScSpecUdtUnionV0 {
+            doc: "doc2".try_into().unwrap(),
+            lib: StringM::default(),
+            name: "my_union".try_into().unwrap(),
+            cases: VecM::default(),
+        };
+
+        let entries = vec![
+            ScSpecEntry::UdtUnionV0(u1),
+            ScSpecEntry::UdtUnionV0(u2),
+        ];
+
+        let spec = ContractSpec::from_entries(&entries);
+
+        assert_eq!(spec.unions.len(), 1);
+        let resolved = spec.unions.get("my_union").unwrap();
+        assert_eq!(resolved.doc.to_string(), "doc1");
+    }
+
+    #[test]
+    fn test_from_entries_duplicate_error_enum_first_wins() {
+        let e1 = ScSpecUdtErrorEnumV0 {
+            doc: "doc1".try_into().unwrap(),
+            lib: StringM::default(),
+            name: "my_err".try_into().unwrap(),
+            cases: VecM::default(),
+        };
+        let e2 = ScSpecUdtErrorEnumV0 {
+            doc: "doc2".try_into().unwrap(),
+            lib: StringM::default(),
+            name: "my_err".try_into().unwrap(),
+            cases: VecM::default(),
+        };
+
+        let entries = vec![
+            ScSpecEntry::UdtErrorEnumV0(e1),
+            ScSpecEntry::UdtErrorEnumV0(e2),
+        ];
+
+        let spec = ContractSpec::from_entries(&entries);
+
+        assert_eq!(spec.error_enums.len(), 1);
+        let resolved = spec.error_enums.get("my_err").unwrap();
+        assert_eq!(resolved.doc.to_string(), "doc1");
+    }
+
+    #[test]
+    fn test_from_entries_unique_names_no_warning() {
+        let f1 = ScSpecFunctionV0 {
+            doc: "doc1".try_into().unwrap(),
+            name: "my_func1".try_into().unwrap(),
+            inputs: VecM::default(),
+            outputs: VecM::default(),
+        };
+        let f2 = ScSpecFunctionV0 {
+            doc: "doc2".try_into().unwrap(),
+            name: "my_func2".try_into().unwrap(),
+            inputs: VecM::default(),
+            outputs: VecM::default(),
+        };
+
+        let entries = vec![
+            ScSpecEntry::FunctionV0(f1),
+            ScSpecEntry::FunctionV0(f2),
+        ];
+
+        let spec = ContractSpec::from_entries(&entries);
+        assert_eq!(spec.functions.len(), 2);
     }
 }

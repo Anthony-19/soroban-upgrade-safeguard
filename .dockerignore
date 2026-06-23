@@ -1,0 +1,30 @@
+# Build artifacts (can be gigabytes; must be excluded to preserve layer caching)
+target/
+
+# Version control
+.git/
+.gitignore
+
+# Tests — fixture sub-crates each have their own Cargo.toml/Cargo.lock and
+# are not needed to build the binary. Pre-compiled WASM files are test inputs,
+# not build inputs.
+tests/
+
+# Documentation and assets
+docs/
+assets/
+*.md
+
+# Suppression config examples
+*.toml.example
+.safeguard.example.toml
+
+# CI configuration
+.github/
+
+# Editor and OS artifacts
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
