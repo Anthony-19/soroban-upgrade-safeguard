@@ -698,6 +698,7 @@ fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepor
                         name
                     ),
                     type_name: Some(name.clone()),
+                    target: Some(name.clone()),
                 });
             }
             Some(new_union) => {
@@ -713,6 +714,7 @@ fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepor
                 category: "Union Added".to_string(),
                 message: format!("New union '{}' added.", name),
                 type_name: Some(name.clone()),
+                target: Some(name.clone()),
             });
         }
     }
@@ -743,6 +745,7 @@ fn check_union_cases(
                     name, old_name
                 ),
                 type_name: Some(name.to_string()),
+                target: Some(format!("{}.{}", name, old_name)),
             });
         }
     }
@@ -761,6 +764,7 @@ fn check_union_cases(
                     name, i, old_name, new_name
                 ),
                 type_name: Some(name.to_string()),
+                target: Some(format!("{}.{}", name, old_name)),
             });
         }
 
@@ -777,6 +781,7 @@ fn check_union_cases(
                     union_case_type_signature(new_case)
                 ),
                 type_name: Some(name.to_string()),
+                target: Some(format!("{}.{}", name, old_name)),
             });
         }
     }
@@ -793,6 +798,7 @@ fn check_union_cases(
                     union_case_type_signature(new_case)
                 ),
                 type_name: Some(name.to_string()),
+                target: Some(format!("{}.{}", name, union_case_name(new_case))),
             });
         }
     }
@@ -844,6 +850,7 @@ fn compare_error_enums(old: &ContractSpec, new: &ContractSpec, report: &mut Diff
                         name
                     ),
                     type_name: Some(name.clone()),
+                    target: Some(name.clone()),
                 });
             }
             Some(new_error_enum) => {
@@ -859,6 +866,7 @@ fn compare_error_enums(old: &ContractSpec, new: &ContractSpec, report: &mut Diff
                 category: "Error Enum Added".to_string(),
                 message: format!("New error enum '{}' added.", name),
                 type_name: Some(name.clone()),
+                target: Some(name.clone()),
             });
         }
     }
@@ -887,6 +895,7 @@ fn check_error_enum_cases(
                         name, old_name, old_case.value
                     ),
                     type_name: Some(name.to_string()),
+                    target: Some(format!("{}.{}", name, old_name)),
                 });
             }
             Some(new_case) if old_case.value != new_case.value => {
@@ -899,6 +908,7 @@ fn check_error_enum_cases(
                         name, old_name, old_case.value, new_case.value
                     ),
                     type_name: Some(name.to_string()),
+                    target: Some(format!("{}.{}", name, old_name)),
                 });
             }
             _ => {}
@@ -916,6 +926,7 @@ fn check_error_enum_cases(
                     name, new_name, new_case.value
                 ),
                 type_name: Some(name.to_string()),
+                target: Some(format!("{}.{}", name, new_name)),
             });
         }
     }
