@@ -1,14 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use colored::Colorize;
+use soroban_upgrade_safeguard::{diff, loader, parser, report, spec};
 use std::path::PathBuf;
-
-mod diff;
-mod loader;
-mod mapper;
-mod parser;
-mod report;
-mod spec;
 
 /// Output format for the safety report.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
