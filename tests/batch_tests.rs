@@ -51,17 +51,38 @@ fn batch_manifest_toml_mode_fails_and_exits_one() {
     let code = output.status.code().expect("process terminated by signal");
 
     assert_eq!(code, 1, "batch run with breaking contract must exit 1");
-    
+
     // Assert stdout/stderr output details
-    assert!(stdout.contains("SOROBAN BATCH SAFETY REPORT"), "Missing batch report header");
-    assert!(stdout.contains("Overall Status: ❌ FAILED"), "Missing failed status");
-    assert!(stdout.contains("clean_contract: ✅ PASSED"), "Missing passed contract summary");
-    assert!(stdout.contains("breaking_contract: ❌ FAILED"), "Missing failed contract summary");
-    
+    assert!(
+        stdout.contains("SOROBAN BATCH SAFETY REPORT"),
+        "Missing batch report header"
+    );
+    assert!(
+        stdout.contains("Overall Status: ❌ FAILED"),
+        "Missing failed status"
+    );
+    assert!(
+        stdout.contains("clean_contract: ✅ PASSED"),
+        "Missing passed contract summary"
+    );
+    assert!(
+        stdout.contains("breaking_contract: ❌ FAILED"),
+        "Missing failed contract summary"
+    );
+
     // Stderr should contain loading messages
-    assert!(stderr.contains("Loaded 2 pair(s) for comparison."), "Missing loading message");
-    assert!(stderr.contains("Comparing contract pair: clean_contract"), "Missing clean contract progress");
-    assert!(stderr.contains("Comparing contract pair: breaking_contract"), "Missing breaking contract progress");
+    assert!(
+        stderr.contains("Loaded 2 pair(s) for comparison."),
+        "Missing loading message"
+    );
+    assert!(
+        stderr.contains("Comparing contract pair: clean_contract"),
+        "Missing clean contract progress"
+    );
+    assert!(
+        stderr.contains("Comparing contract pair: breaking_contract"),
+        "Missing breaking contract progress"
+    );
 }
 
 #[test]
@@ -97,7 +118,10 @@ fn batch_manifest_all_clean_exits_zero() {
     let code = output.status.code().expect("process terminated by signal");
 
     assert_eq!(code, 0, "batch run with all clean contracts must exit 0");
-    assert!(stdout.contains("Overall Status: ✅ PASSED"), "Missing passed status");
+    assert!(
+        stdout.contains("Overall Status: ✅ PASSED"),
+        "Missing passed status"
+    );
 }
 
 #[test]
@@ -141,12 +165,14 @@ fn batch_manifest_json_mode_json_output() {
     let json: Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
     assert_eq!(json["is_safe"], Value::Bool(false));
     assert_eq!(json["total_pairs"].as_u64().unwrap(), 2);
-    
+
     // Check results object
-    let results = json["results"].as_object().expect("results must be an object");
+    let results = json["results"]
+        .as_object()
+        .expect("results must be an object");
     assert!(results.contains_key("clean_json"));
     assert!(results.contains_key("breaking_json"));
-    
+
     assert_eq!(results["clean_json"]["is_safe"], Value::Bool(true));
     assert_eq!(results["breaking_json"]["is_safe"], Value::Bool(false));
 }
@@ -190,11 +216,21 @@ fn batch_directory_scanning_fails_on_breaking_contract() {
 fn batch_conflicting_options_exit_with_error() {
     // 1. Both manifest and old-dir/new-dir
     let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
-        .args(["--manifest", "dummy.toml", "--old-dir", "dummy_old", "--new-dir", "dummy_new"])
+        .args([
+            "--manifest",
+            "dummy.toml",
+            "--old-dir",
+            "dummy_old",
+            "--new-dir",
+            "dummy_new",
+        ])
         .output()
         .expect("failed to run binary");
 
-    assert!(!output.status.success(), "conflicting batch options must fail");
+    assert!(
+        !output.status.success(),
+        "conflicting batch options must fail"
+    );
 
     // 2. Positional args + manifest
     let output2 = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
@@ -204,5 +240,8 @@ fn batch_conflicting_options_exit_with_error() {
         .output()
         .expect("failed to run binary");
 
-    assert!(!output2.status.success(), "positional args + manifest must fail");
+    assert!(
+        !output2.status.success(),
+        "positional args + manifest must fail"
+    );
 }

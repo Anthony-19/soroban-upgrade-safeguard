@@ -180,12 +180,7 @@ impl SafetyReport {
                 .to_string(),
         );
         if self.strict {
-            output.push_str(
-                &"    [STRICT MODE ACTIVE]\n"
-                    .bold()
-                    .yellow()
-                    .to_string(),
-            );
+            output.push_str(&"    [STRICT MODE ACTIVE]\n".bold().yellow().to_string());
         }
         output.push_str(
             &"========================================\n"
@@ -196,9 +191,7 @@ impl SafetyReport {
         let status = if self.is_safe {
             "✅ PASSED (No breaking changes detected)".green().bold()
         } else if self.strict && self.critical_count == 0 {
-            "❌ FAILED (Warnings detected in strict mode)"
-                .red()
-                .bold()
+            "❌ FAILED (Warnings detected in strict mode)".red().bold()
         } else {
             "❌ FAILED (Critical breaking changes detected)"
                 .red()
@@ -264,14 +257,15 @@ impl SafetyReport {
                         .to_string();
                     output.push_str(&format!("{}\n", label));
                     if let Some(reason) = &reported.suppression_reason {
-                        output.push_str(
-                            &format!("    ↳ reason: {}\n", reason).dimmed().to_string(),
-                        );
+                        output
+                            .push_str(&format!("    ↳ reason: {}\n", reason).dimmed().to_string());
                     }
                     if explain {
                         if let Some(remediation) = &reported.remediation {
                             output.push_str(
-                                &format!("    ↳ guidance: {}\n", remediation).dimmed().to_string(),
+                                &format!("    ↳ guidance: {}\n", remediation)
+                                    .dimmed()
+                                    .to_string(),
                             );
                         }
                     }
@@ -287,7 +281,9 @@ impl SafetyReport {
                 if explain {
                     if let Some(remediation) = &reported.remediation {
                         output.push_str(
-                            &format!("    ↳ guidance: {}\n", remediation).green().to_string(),
+                            &format!("    ↳ guidance: {}\n", remediation)
+                                .green()
+                                .to_string(),
                         );
                     }
                 }
@@ -297,8 +293,17 @@ impl SafetyReport {
 
         if !self.is_safe {
             if self.strict && self.critical_count == 0 {
-                output.push_str(&"⚠️  ACTION REQUIRED: Strict mode is active and warnings were detected.\n".yellow().bold().to_string());
-                output.push_str(&"These warnings must be resolved or strict mode disabled to proceed.\n".yellow().to_string());
+                output.push_str(
+                    &"⚠️  ACTION REQUIRED: Strict mode is active and warnings were detected.\n"
+                        .yellow()
+                        .bold()
+                        .to_string(),
+                );
+                output.push_str(
+                    &"These warnings must be resolved or strict mode disabled to proceed.\n"
+                        .yellow()
+                        .to_string(),
+                );
             } else {
                 output.push_str(&"⚠️  ACTION REQUIRED: The new contract version modifies existing storage layouts or function interfaces.\n".red().bold().to_string());
                 output.push_str(&"Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n".red().to_string());
@@ -450,17 +455,33 @@ mod tests {
                         if !literal.is_empty() {
                             // If it's a format string like "{} Removed"
                             if literal.contains("{}") {
-                                let suffixes = vec!["Removed", "Reordered", "Type Changed", "Value Changed", "Added"];
+                                let suffixes = vec![
+                                    "Removed",
+                                    "Reordered",
+                                    "Type Changed",
+                                    "Value Changed",
+                                    "Added",
+                                ];
                                 for suffix in suffixes {
                                     if literal == format!("{{}} {}", suffix) {
                                         let prefixes = match suffix {
-                                            "Reordered" | "Type Changed" => vec!["Struct Field", "Event Field"],
-                                            "Value Changed" | "Added" => vec!["Enum Case", "Event Enum Case"],
-                                            "Removed" => vec!["Struct Field", "Event Field", "Enum Case", "Event Enum Case"],
+                                            "Reordered" | "Type Changed" => {
+                                                vec!["Struct Field", "Event Field"]
+                                            }
+                                            "Value Changed" | "Added" => {
+                                                vec!["Enum Case", "Event Enum Case"]
+                                            }
+                                            "Removed" => vec![
+                                                "Struct Field",
+                                                "Event Field",
+                                                "Enum Case",
+                                                "Event Enum Case",
+                                            ],
                                             _ => unreachable!(),
                                         };
                                         for prefix in prefixes {
-                                            checked_categories.insert(format!("{} {}", prefix, suffix));
+                                            checked_categories
+                                                .insert(format!("{} {}", prefix, suffix));
                                         }
                                     }
                                 }
@@ -476,7 +497,10 @@ mod tests {
         // Remove test custom categories
         checked_categories.remove("TOTALLY CUSTOM CATEGORY");
 
-        assert!(!checked_categories.is_empty(), "Sanity check: should have found categories");
+        assert!(
+            !checked_categories.is_empty(),
+            "Sanity check: should have found categories"
+        );
 
         for cat in &checked_categories {
             let guidance = get_remediation_guidance(cat);

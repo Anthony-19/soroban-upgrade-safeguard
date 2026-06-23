@@ -30,11 +30,7 @@ impl ContractEnvMeta {
     /// Short human-readable summary for report messages.
     pub fn summary(&self) -> String {
         if let Some(version) = self.interface_version() {
-            format!(
-                "protocol {}, pre-release {}",
-                version >> 32,
-                version as u32
-            )
+            format!("protocol {}, pre-release {}", version >> 32, version as u32)
         } else if self.entries.is_empty() {
             "empty".to_string()
         } else {
@@ -82,8 +78,8 @@ fn decode_env_meta_entries(data: &[u8]) -> Result<Vec<ScEnvMetaEntry>> {
     let mut entries = Vec::new();
 
     while (limited.inner.position() as usize) < data.len() {
-        let entry =
-            ScEnvMetaEntry::read_xdr(&mut limited).context("Failed to decode ScEnvMetaEntry XDR")?;
+        let entry = ScEnvMetaEntry::read_xdr(&mut limited)
+            .context("Failed to decode ScEnvMetaEntry XDR")?;
         entries.push(entry);
     }
 
@@ -164,7 +160,10 @@ mod tests {
 
     fn wasm_with_custom_section(name: &str, data: &[u8]) -> Vec<u8> {
         let section_size = 1 + name.len() + data.len();
-        assert!(section_size < 128, "test helper only encodes small sections");
+        assert!(
+            section_size < 128,
+            "test helper only encodes small sections"
+        );
 
         let mut wasm = Vec::from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
         wasm.push(0);
@@ -218,15 +217,11 @@ mod tests {
     fn extract_metadata_reports_contractspec_section_offset_for_decode_errors() {
         let wasm = wasm_with_custom_section("contractspecv0", &[0x00]);
         let error = extract_metadata(&wasm).expect_err("invalid spec section must fail");
-        let messages = error
-            .chain()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
+        let messages = error.chain().map(ToString::to_string).collect::<Vec<_>>();
 
         assert!(
             messages.iter().any(|message| {
-                message.contains("contractspecv0 section 0")
-                    && message.contains("byte offset")
+                message.contains("contractspecv0 section 0") && message.contains("byte offset")
             }),
             "error chain should name the contractspecv0 section offset, got: {messages:?}"
         );
@@ -241,8 +236,7 @@ mod tests {
     #[test]
     fn extract_metadata_skips_invalid_env_meta_without_error() {
         let wasm = std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/wasm/v1.wasm"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/wasm/v1.wasm"),
         )
         .expect("v1.wasm fixture must exist");
 

@@ -1,6 +1,6 @@
+use serde_json::Value;
 use std::path::PathBuf;
 use std::process::Command;
-use serde_json::Value;
 
 /// Absolute path to a fixture WASM under `tests/wasm/`.
 fn wasm(name: &str) -> PathBuf {
@@ -20,7 +20,10 @@ fn text_explain_mode_attaches_remediation_guidance() {
         .expect("failed to run binary");
 
     let stdout_no_explain = String::from_utf8(output_no_explain.stdout).unwrap();
-    assert!(!stdout_no_explain.contains("↳ guidance:"), "Without --explain, output should not contain guidance");
+    assert!(
+        !stdout_no_explain.contains("↳ guidance:"),
+        "Without --explain, output should not contain guidance"
+    );
 
     // 2. With --explain
     let output_explain = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
@@ -31,14 +34,20 @@ fn text_explain_mode_attaches_remediation_guidance() {
         .expect("failed to run binary");
 
     let stdout_explain = String::from_utf8(output_explain.stdout).unwrap();
-    assert!(stdout_explain.contains("↳ guidance:"), "With --explain, output should contain guidance");
+    assert!(
+        stdout_explain.contains("↳ guidance:"),
+        "With --explain, output should contain guidance"
+    );
     assert!(
         stdout_explain.contains("Removing fields breaks serialized storage layouts. Restore the field or perform a state migration."),
         "Should show remediation message"
     );
 
     // 3. Exit codes must be identical
-    assert_eq!(output_no_explain.status.code(), output_explain.status.code());
+    assert_eq!(
+        output_no_explain.status.code(),
+        output_explain.status.code()
+    );
 }
 
 #[test]
@@ -71,7 +80,10 @@ fn json_explain_mode_includes_remediation_field() {
         .expect("findings_by_category must be an object");
     for (_cat, findings) in categories_no_explain {
         for finding in findings.as_array().unwrap() {
-            assert!(finding.get("remediation").is_none(), "Should not have remediation key without --explain");
+            assert!(
+                finding.get("remediation").is_none(),
+                "Should not have remediation key without --explain"
+            );
         }
     }
 
@@ -89,5 +101,8 @@ fn json_explain_mode_includes_remediation_field() {
             }
         }
     }
-    assert!(saw_remediation, "At least one finding must have remediation populated with --explain");
+    assert!(
+        saw_remediation,
+        "At least one finding must have remediation populated with --explain"
+    );
 }

@@ -66,7 +66,9 @@ fn library_compares_in_memory_bytes() {
 fn library_detects_parameter_reordering() {
     use soroban_upgrade_safeguard::diff::{compare, Severity};
     use soroban_upgrade_safeguard::spec::ContractSpec;
-    use stellar_xdr::curr::{ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef, StringM, VecM};
+    use stellar_xdr::curr::{
+        ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef, StringM, VecM,
+    };
 
     let mut old_spec = ContractSpec::default();
     let old_inputs = vec![
@@ -120,7 +122,10 @@ fn library_detects_parameter_reordering() {
         .iter()
         .find(|f| f.category == "Parameter Reordered");
 
-    assert!(reorder_finding.is_some(), "Integration: Expected a Parameter Reordered finding");
+    assert!(
+        reorder_finding.is_some(),
+        "Integration: Expected a Parameter Reordered finding"
+    );
     let f = reorder_finding.unwrap();
     assert_eq!(f.severity, Severity::Critical);
 }

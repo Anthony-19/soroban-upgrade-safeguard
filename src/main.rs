@@ -123,15 +123,15 @@ fn main() -> Result<()> {
         let pairs = if let Some(manifest_path) = &args.manifest {
             parse_manifest(manifest_path)?
         } else {
-            scan_directories(args.old_dir.as_ref().unwrap(), args.new_dir.as_ref().unwrap())?
+            scan_directories(
+                args.old_dir.as_ref().unwrap(),
+                args.new_dir.as_ref().unwrap(),
+            )?
         };
 
         progress("🔍 Soroban Upgrade Safeguard (Batch Mode)".to_string());
         progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
-        progress(format!(
-            "Loaded {} pair(s) for comparison.\n",
-            pairs.len()
-        ));
+        progress(format!("Loaded {} pair(s) for comparison.\n", pairs.len()));
 
         let mut results = std::collections::BTreeMap::new();
         let mut overall_safe = true;
@@ -139,7 +139,8 @@ fn main() -> Result<()> {
         for (i, pair) in pairs.iter().enumerate() {
             let default_name = format!("pair_{}", i + 1);
             let contract_name = pair.name.clone().unwrap_or_else(|| {
-                pair.new.file_name()
+                pair.new
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .map(|n| n.to_string())
                     .unwrap_or(default_name)
@@ -193,7 +194,7 @@ fn main() -> Result<()> {
             OutputFormat::Markdown => {
                 let mut markdown = String::new();
                 markdown.push_str("# Soroban Upgrade Safety Report (Batch Mode)\n\n");
-                
+
                 let status = if overall_safe {
                     "✅ PASSED (All contracts safe)"
                 } else {
@@ -201,11 +202,16 @@ fn main() -> Result<()> {
                 };
                 markdown.push_str(&format!("## Status: {}\n\n", status));
                 markdown.push_str("### Summary\n\n");
-                markdown.push_str("| Contract | Status | Critical | Warning | Info | Suppressed |\n");
+                markdown
+                    .push_str("| Contract | Status | Critical | Warning | Info | Suppressed |\n");
                 markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
 
                 for (name, report) in &results {
-                    let status_str = if report.is_safe { "✅ PASSED" } else { "❌ FAILED" };
+                    let status_str = if report.is_safe {
+                        "✅ PASSED"
+                    } else {
+                        "❌ FAILED"
+                    };
                     markdown.push_str(&format!(
                         "| {} | {} | {} | {} | {} | {} |\n",
                         name,
@@ -237,7 +243,9 @@ fn main() -> Result<()> {
                 let status = if overall_safe {
                     "✅ PASSED (All contracts safe)".green().bold()
                 } else {
-                    "❌ FAILED (Some contracts have breaking changes)".red().bold()
+                    "❌ FAILED (Some contracts have breaking changes)"
+                        .red()
+                        .bold()
                 };
                 println!("Overall Status: {}\n", status);
 
@@ -279,7 +287,7 @@ fn main() -> Result<()> {
     //   - 2 positional args => local-vs-local comparison
     //   - 1 positional arg  + --contract-id/--rpc-url => RPC-vs-local comparison
     let (old_source, new_wasm_path) = match (args.wasm_paths.len(), &args.contract_id) {
-        (2, None) => (None, &args.wasm_paths[1]),          // local mode
+        (2, None) => (None, &args.wasm_paths[1]), // local mode
         (1, Some(_)) => (args.contract_id.as_deref(), &args.wasm_paths[0]), // RPC mode
         (2, Some(_)) => {
             anyhow::bail!(

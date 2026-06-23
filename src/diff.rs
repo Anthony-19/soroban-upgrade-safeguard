@@ -255,8 +255,14 @@ fn check_function_signature(
     }
 
     // Check each input parameter
-    let old_names: Vec<String> = old_inputs.iter().map(|input| input.name.to_string()).collect();
-    let new_names: Vec<String> = new_inputs.iter().map(|input| input.name.to_string()).collect();
+    let old_names: Vec<String> = old_inputs
+        .iter()
+        .map(|input| input.name.to_string())
+        .collect();
+    let new_names: Vec<String> = new_inputs
+        .iter()
+        .map(|input| input.name.to_string())
+        .collect();
 
     let old_names_set: std::collections::HashSet<String> = old_names.iter().cloned().collect();
     let new_names_set: std::collections::HashSet<String> = new_names.iter().cloned().collect();
@@ -1039,14 +1045,18 @@ mod tests {
                 && f.type_name.as_deref() == Some("Outer")
                 && f.category == "Cascading Layout Break"
         });
-        assert!(outer_cascade.is_some(), "Expected a cascading break for Outer");
+        assert!(
+            outer_cascade.is_some(),
+            "Expected a cascading break for Outer"
+        );
         let message = &outer_cascade.unwrap().message;
         assert!(
             !message.contains("broken safely"),
             "Cascade message must not use contradictory 'broken safely' phrasing"
         );
         assert!(
-            message.contains("Type 'Outer' layout is broken because it embeds modified type 'Inner'"),
+            message
+                .contains("Type 'Outer' layout is broken because it embeds modified type 'Inner'"),
             "Unexpected cascade message: {message}"
         );
         assert!(
@@ -1257,7 +1267,10 @@ mod tests {
 
         let report = compare(&old, &new);
         // No findings expected
-        assert!(report.findings.is_empty(), "Expected no findings when docs identical");
+        assert!(
+            report.findings.is_empty(),
+            "Expected no findings when docs identical"
+        );
     }
 
     #[test]
@@ -1279,7 +1292,9 @@ mod tests {
         let finding = &report.findings[0];
         assert_eq!(finding.severity, Severity::Warning);
         assert_eq!(finding.category, ENVIRONMENT_CATEGORY);
-        assert!(finding.message.contains("protocol interface version changed"));
+        assert!(finding
+            .message
+            .contains("protocol interface version changed"));
     }
 
     #[test]
@@ -1334,69 +1349,138 @@ mod tests {
 
     #[test]
     fn param_reorder_same_type_produces_critical_finding() {
-        let old = spec_with_functions(vec![("test_fn", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)])]);
-        let new = spec_with_functions(vec![("test_fn", vec![("b", ScSpecTypeDef::U32), ("a", ScSpecTypeDef::U32)])]);
+        let old = spec_with_functions(vec![(
+            "test_fn",
+            vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)],
+        )]);
+        let new = spec_with_functions(vec![(
+            "test_fn",
+            vec![("b", ScSpecTypeDef::U32), ("a", ScSpecTypeDef::U32)],
+        )]);
 
         let report = compare(&old, &new);
-        let reorder_finding = report.findings.iter().find(|f| f.category == "Parameter Reordered");
-        
-        assert!(reorder_finding.is_some(), "Expected a Parameter Reordered finding");
+        let reorder_finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Parameter Reordered");
+
+        assert!(
+            reorder_finding.is_some(),
+            "Expected a Parameter Reordered finding"
+        );
         let f = reorder_finding.unwrap();
         assert_eq!(f.severity, Severity::Critical);
         assert!(f.message.contains("parameters reordered"));
-        
+
         // Ensure no Parameter Renamed warnings are generated
-        let rename_findings = report.findings.iter().filter(|f| f.category == "Parameter Renamed").count();
-        assert_eq!(rename_findings, 0, "Should not double-count reorders as renames");
+        let rename_findings = report
+            .findings
+            .iter()
+            .filter(|f| f.category == "Parameter Renamed")
+            .count();
+        assert_eq!(
+            rename_findings, 0,
+            "Should not double-count reorders as renames"
+        );
     }
 
     #[test]
     fn param_pure_rename_produces_warning() {
-        let old = spec_with_functions(vec![("test_fn", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)])]);
-        let new = spec_with_functions(vec![("test_fn", vec![("x", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)])]);
+        let old = spec_with_functions(vec![(
+            "test_fn",
+            vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)],
+        )]);
+        let new = spec_with_functions(vec![(
+            "test_fn",
+            vec![("x", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)],
+        )]);
 
         let report = compare(&old, &new);
-        let rename_finding = report.findings.iter().find(|f| f.category == "Parameter Renamed");
-        
-        assert!(rename_finding.is_some(), "Expected a Parameter Renamed finding");
+        let rename_finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Parameter Renamed");
+
+        assert!(
+            rename_finding.is_some(),
+            "Expected a Parameter Renamed finding"
+        );
         let f = rename_finding.unwrap();
         assert_eq!(f.severity, Severity::Warning);
-        
+
         // Ensure no Parameter Reordered findings are generated
-        let reorder_findings = report.findings.iter().filter(|f| f.category == "Parameter Reordered").count();
+        let reorder_findings = report
+            .findings
+            .iter()
+            .filter(|f| f.category == "Parameter Reordered")
+            .count();
         assert_eq!(reorder_findings, 0);
     }
 
     #[test]
     fn param_type_change_produces_critical_finding() {
-        let old = spec_with_functions(vec![("test_fn", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)])]);
-        let new = spec_with_functions(vec![("test_fn", vec![("a", ScSpecTypeDef::Bool), ("b", ScSpecTypeDef::U32)])]);
+        let old = spec_with_functions(vec![(
+            "test_fn",
+            vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)],
+        )]);
+        let new = spec_with_functions(vec![(
+            "test_fn",
+            vec![("a", ScSpecTypeDef::Bool), ("b", ScSpecTypeDef::U32)],
+        )]);
 
         let report = compare(&old, &new);
-        let type_finding = report.findings.iter().find(|f| f.category == "Parameter Type Changed");
-        
-        assert!(type_finding.is_some(), "Expected a Parameter Type Changed finding");
+        let type_finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Parameter Type Changed");
+
+        assert!(
+            type_finding.is_some(),
+            "Expected a Parameter Type Changed finding"
+        );
         let f = type_finding.unwrap();
         assert_eq!(f.severity, Severity::Critical);
-        
+
         // Ensure no Parameter Reordered findings are generated
-        let reorder_findings = report.findings.iter().filter(|f| f.category == "Parameter Reordered").count();
+        let reorder_findings = report
+            .findings
+            .iter()
+            .filter(|f| f.category == "Parameter Reordered")
+            .count();
         assert_eq!(reorder_findings, 0);
     }
 
     #[test]
     fn param_reorder_and_type_change_produces_both() {
-        let old = spec_with_functions(vec![("test_fn", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)])]);
-        let new = spec_with_functions(vec![("test_fn", vec![("b", ScSpecTypeDef::U32), ("a", ScSpecTypeDef::Bool)])]);
+        let old = spec_with_functions(vec![(
+            "test_fn",
+            vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U32)],
+        )]);
+        let new = spec_with_functions(vec![(
+            "test_fn",
+            vec![("b", ScSpecTypeDef::U32), ("a", ScSpecTypeDef::Bool)],
+        )]);
 
         let report = compare(&old, &new);
-        
-        let reorder_finding = report.findings.iter().find(|f| f.category == "Parameter Reordered");
-        assert!(reorder_finding.is_some(), "Expected a Parameter Reordered finding");
+
+        let reorder_finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Parameter Reordered");
+        assert!(
+            reorder_finding.is_some(),
+            "Expected a Parameter Reordered finding"
+        );
         assert_eq!(reorder_finding.unwrap().severity, Severity::Critical);
 
-        let type_finding = report.findings.iter().find(|f| f.category == "Parameter Type Changed");
-        assert!(type_finding.is_some(), "Expected a Parameter Type Changed finding");
+        let type_finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Parameter Type Changed");
+        assert!(
+            type_finding.is_some(),
+            "Expected a Parameter Type Changed finding"
+        );
         let tf = type_finding.unwrap();
         assert_eq!(tf.severity, Severity::Critical);
         assert!(tf.message.contains("parameter 0 ('a') type changed")); // Index in old is 0

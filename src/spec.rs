@@ -127,10 +127,7 @@ mod tests {
             outputs: VecM::default(),
         };
 
-        let entries = vec![
-            ScSpecEntry::FunctionV0(f1),
-            ScSpecEntry::FunctionV0(f2),
-        ];
+        let entries = vec![ScSpecEntry::FunctionV0(f1), ScSpecEntry::FunctionV0(f2)];
 
         let spec = ContractSpec::from_entries(&entries);
 
@@ -154,10 +151,7 @@ mod tests {
             fields: VecM::default(),
         };
 
-        let entries = vec![
-            ScSpecEntry::UdtStructV0(s1),
-            ScSpecEntry::UdtStructV0(s2),
-        ];
+        let entries = vec![ScSpecEntry::UdtStructV0(s1), ScSpecEntry::UdtStructV0(s2)];
 
         let spec = ContractSpec::from_entries(&entries);
 
@@ -181,10 +175,7 @@ mod tests {
             cases: VecM::default(),
         };
 
-        let entries = vec![
-            ScSpecEntry::UdtEnumV0(e1),
-            ScSpecEntry::UdtEnumV0(e2),
-        ];
+        let entries = vec![ScSpecEntry::UdtEnumV0(e1), ScSpecEntry::UdtEnumV0(e2)];
 
         let spec = ContractSpec::from_entries(&entries);
 
@@ -208,10 +199,7 @@ mod tests {
             cases: VecM::default(),
         };
 
-        let entries = vec![
-            ScSpecEntry::UdtUnionV0(u1),
-            ScSpecEntry::UdtUnionV0(u2),
-        ];
+        let entries = vec![ScSpecEntry::UdtUnionV0(u1), ScSpecEntry::UdtUnionV0(u2)];
 
         let spec = ContractSpec::from_entries(&entries);
 
@@ -262,10 +250,7 @@ mod tests {
             outputs: VecM::default(),
         };
 
-        let entries = vec![
-            ScSpecEntry::FunctionV0(f1),
-            ScSpecEntry::FunctionV0(f2),
-        ];
+        let entries = vec![ScSpecEntry::FunctionV0(f1), ScSpecEntry::FunctionV0(f2)];
 
         let spec = ContractSpec::from_entries(&entries);
         assert_eq!(spec.functions.len(), 2);

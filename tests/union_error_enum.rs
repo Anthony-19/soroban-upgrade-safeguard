@@ -67,9 +67,10 @@ fn fixture_pair_union_variant_type_change_is_unsafe() {
     let safety = SafetyReport::new(&report);
 
     assert!(!safety.is_safe);
-    assert!(report.findings.iter().any(|f| {
-        f.severity == Severity::Critical && f.category == "Union Case Type Changed"
-    }));
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| { f.severity == Severity::Critical && f.category == "Union Case Type Changed" }));
 }
 
 #[test]
@@ -101,9 +102,10 @@ fn fixture_pair_new_union_variant_is_info_only() {
 
     assert!(safety.is_safe);
     assert_eq!(safety.critical_count, 0);
-    assert!(report.findings.iter().any(|f| {
-        f.severity == Severity::Info && f.category == "Union Case Added"
-    }));
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| { f.severity == Severity::Info && f.category == "Union Case Added" }));
 }
 
 #[test]
