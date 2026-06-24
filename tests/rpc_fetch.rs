@@ -112,7 +112,9 @@ fn start_mock_rpc(instance_xdr: String, code_xdr: String) -> (String, Arc<TcpLis
                 body_str.len(),
                 body_str
             );
-            stream.write_all(response.as_bytes()).expect("failed to write response");
+            stream
+                .write_all(response.as_bytes())
+                .expect("failed to write response");
             stream.flush().expect("failed to flush");
         }
     });
@@ -146,7 +148,9 @@ fn start_mock_rpc_not_found() -> (String, Arc<TcpListener>) {
             body_str.len(),
             body_str
         );
-        stream.write_all(response.as_bytes()).expect("failed to write response");
+        stream
+            .write_all(response.as_bytes())
+            .expect("failed to write response");
         stream.flush().expect("failed to flush");
     });
 

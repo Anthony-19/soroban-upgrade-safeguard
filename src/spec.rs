@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use stellar_xdr::curr::{
@@ -35,57 +36,72 @@ impl ContractSpec {
             match entry {
                 ScSpecEntry::FunctionV0(f) => {
                     let name = f.name.to_string();
-                    if spec.functions.contains_key(&name) {
-                        eprintln!(
-                            "WARNING: Duplicate function '{}' detected. Keeping the first entry.",
-                            name
-                        );
-                    } else {
-                        spec.functions.insert(name, f.clone());
+                    match spec.functions.entry(name) {
+                        Entry::Occupied(entry) => {
+                            eprintln!(
+                                "WARNING: Duplicate function '{}' detected. Keeping the first entry.",
+                                entry.key()
+                            );
+                        }
+                        Entry::Vacant(slot) => {
+                            slot.insert(f.clone());
+                        }
                     }
                 }
                 ScSpecEntry::UdtStructV0(s) => {
                     let name = s.name.to_string();
-                    if spec.structs.contains_key(&name) {
-                        eprintln!(
-                            "WARNING: Duplicate struct '{}' detected. Keeping the first entry.",
-                            name
-                        );
-                    } else {
-                        spec.structs.insert(name, s.clone());
+                    match spec.structs.entry(name) {
+                        Entry::Occupied(entry) => {
+                            eprintln!(
+                                "WARNING: Duplicate struct '{}' detected. Keeping the first entry.",
+                                entry.key()
+                            );
+                        }
+                        Entry::Vacant(slot) => {
+                            slot.insert(s.clone());
+                        }
                     }
                 }
                 ScSpecEntry::UdtEnumV0(e) => {
                     let name = e.name.to_string();
-                    if spec.enums.contains_key(&name) {
-                        eprintln!(
-                            "WARNING: Duplicate enum '{}' detected. Keeping the first entry.",
-                            name
-                        );
-                    } else {
-                        spec.enums.insert(name, e.clone());
+                    match spec.enums.entry(name) {
+                        Entry::Occupied(entry) => {
+                            eprintln!(
+                                "WARNING: Duplicate enum '{}' detected. Keeping the first entry.",
+                                entry.key()
+                            );
+                        }
+                        Entry::Vacant(slot) => {
+                            slot.insert(e.clone());
+                        }
                     }
                 }
                 ScSpecEntry::UdtUnionV0(u) => {
                     let name = u.name.to_string();
-                    if spec.unions.contains_key(&name) {
-                        eprintln!(
-                            "WARNING: Duplicate union '{}' detected. Keeping the first entry.",
-                            name
-                        );
-                    } else {
-                        spec.unions.insert(name, u.clone());
+                    match spec.unions.entry(name) {
+                        Entry::Occupied(entry) => {
+                            eprintln!(
+                                "WARNING: Duplicate union '{}' detected. Keeping the first entry.",
+                                entry.key()
+                            );
+                        }
+                        Entry::Vacant(slot) => {
+                            slot.insert(u.clone());
+                        }
                     }
                 }
                 ScSpecEntry::UdtErrorEnumV0(e) => {
                     let name = e.name.to_string();
-                    if spec.error_enums.contains_key(&name) {
-                        eprintln!(
-                            "WARNING: Duplicate error enum '{}' detected. Keeping the first entry.",
-                            name
-                        );
-                    } else {
-                        spec.error_enums.insert(name, e.clone());
+                    match spec.error_enums.entry(name) {
+                        Entry::Occupied(entry) => {
+                            eprintln!(
+                                "WARNING: Duplicate error enum '{}' detected. Keeping the first entry.",
+                                entry.key()
+                            );
+                        }
+                        Entry::Vacant(slot) => {
+                            slot.insert(e.clone());
+                        }
                     }
                 }
             }
@@ -127,10 +143,7 @@ mod tests {
             outputs: VecM::default(),
         };
 
-        let entries = vec![
-            ScSpecEntry::FunctionV0(f1),
-            ScSpecEntry::FunctionV0(f2),
-        ];
+        let entries = vec![ScSpecEntry::FunctionV0(f1), ScSpecEntry::FunctionV0(f2)];
 
         let spec = ContractSpec::from_entries(&entries);
 
@@ -154,10 +167,7 @@ mod tests {
             fields: VecM::default(),
         };
 
-        let entries = vec![
-            ScSpecEntry::UdtStructV0(s1),
-            ScSpecEntry::UdtStructV0(s2),
-        ];
+        let entries = vec![ScSpecEntry::UdtStructV0(s1), ScSpecEntry::UdtStructV0(s2)];
 
         let spec = ContractSpec::from_entries(&entries);
 
@@ -181,10 +191,7 @@ mod tests {
             cases: VecM::default(),
         };
 
-        let entries = vec![
-            ScSpecEntry::UdtEnumV0(e1),
-            ScSpecEntry::UdtEnumV0(e2),
-        ];
+        let entries = vec![ScSpecEntry::UdtEnumV0(e1), ScSpecEntry::UdtEnumV0(e2)];
 
         let spec = ContractSpec::from_entries(&entries);
 
@@ -208,10 +215,7 @@ mod tests {
             cases: VecM::default(),
         };
 
-        let entries = vec![
-            ScSpecEntry::UdtUnionV0(u1),
-            ScSpecEntry::UdtUnionV0(u2),
-        ];
+        let entries = vec![ScSpecEntry::UdtUnionV0(u1), ScSpecEntry::UdtUnionV0(u2)];
 
         let spec = ContractSpec::from_entries(&entries);
 
@@ -262,10 +266,7 @@ mod tests {
             outputs: VecM::default(),
         };
 
-        let entries = vec![
-            ScSpecEntry::FunctionV0(f1),
-            ScSpecEntry::FunctionV0(f2),
-        ];
+        let entries = vec![ScSpecEntry::FunctionV0(f1), ScSpecEntry::FunctionV0(f2)];
 
         let spec = ContractSpec::from_entries(&entries);
         assert_eq!(spec.functions.len(), 2);

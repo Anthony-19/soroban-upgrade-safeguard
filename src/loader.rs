@@ -1,8 +1,8 @@
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 use stellar_xdr::curr::{
-    ContractExecutable, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyContractCode,
-    LedgerKeyContractData, ScAddress, ScVal, Hash, Limits, ReadXdr, WriteXdr,
+    ContractExecutable, Hash, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyContractCode,
+    LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
 };
 use wasmparser::{Parser, Payload};
 
@@ -145,9 +145,12 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
         hash: wasm_hash.clone(),
     });
 
-    let code_key_b64 = code_ledger_key
-        .to_xdr_base64(Limits::none())
-        .map_err(|e| anyhow::anyhow!("Failed to serialize ContractCode LedgerKey to base64: {}", e))?;
+    let code_key_b64 = code_ledger_key.to_xdr_base64(Limits::none()).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to serialize ContractCode LedgerKey to base64: {}",
+            e
+        )
+    })?;
 
     let code_response = query_rpc(
         rpc_url,
@@ -172,8 +175,10 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
         .as_str()
         .context("RPC response code entry missing 'xdr' field")?;
 
-    let code_entry = LedgerEntry::from_xdr_base64(code_entry_xdr_b64, Limits::none())
-        .map_err(|e| anyhow::anyhow!("Failed to deserialize ContractCode LedgerEntry XDR: {}", e))?;
+    let code_entry =
+        LedgerEntry::from_xdr_base64(code_entry_xdr_b64, Limits::none()).map_err(|e| {
+            anyhow::anyhow!("Failed to deserialize ContractCode LedgerEntry XDR: {}", e)
+        })?;
 
     let contract_code = match code_entry.data {
         LedgerEntryData::ContractCode(code) => code,
@@ -190,8 +195,12 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
         );
     }
 
-    validate_wasm_structure(&wasm_bytes)
-        .with_context(|| format!("WASM validation failed for fetched contract '{}'", contract_id))?;
+    validate_wasm_structure(&wasm_bytes).with_context(|| {
+        format!(
+            "WASM validation failed for fetched contract '{}'",
+            contract_id
+        )
+    })?;
 
     Ok(WasmModule {
         path: format!("stellar://{}", contract_id),
@@ -222,4 +231,3 @@ fn query_rpc(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<s
 
     Ok(response)
 }
-

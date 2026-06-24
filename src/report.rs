@@ -180,12 +180,7 @@ impl SafetyReport {
                 .to_string(),
         );
         if self.strict {
-            output.push_str(
-                &"    [STRICT MODE ACTIVE]\n"
-                    .bold()
-                    .yellow()
-                    .to_string(),
-            );
+            output.push_str(&"    [STRICT MODE ACTIVE]\n".bold().yellow().to_string());
         }
         output.push_str(
             &"========================================\n"
@@ -196,9 +191,7 @@ impl SafetyReport {
         let status = if self.is_safe {
             "✅ PASSED (No breaking changes detected)".green().bold()
         } else if self.strict && self.critical_count == 0 {
-            "❌ FAILED (Warnings detected in strict mode)"
-                .red()
-                .bold()
+            "❌ FAILED (Warnings detected in strict mode)".red().bold()
         } else {
             "❌ FAILED (Critical breaking changes detected)"
                 .red()
@@ -264,14 +257,15 @@ impl SafetyReport {
                         .to_string();
                     output.push_str(&format!("{}\n", label));
                     if let Some(reason) = &reported.suppression_reason {
-                        output.push_str(
-                            &format!("    ↳ reason: {}\n", reason).dimmed().to_string(),
-                        );
+                        output
+                            .push_str(&format!("    ↳ reason: {}\n", reason).dimmed().to_string());
                     }
                     if explain {
                         if let Some(remediation) = &reported.remediation {
                             output.push_str(
-                                &format!("    ↳ guidance: {}\n", remediation).dimmed().to_string(),
+                                &format!("    ↳ guidance: {}\n", remediation)
+                                    .dimmed()
+                                    .to_string(),
                             );
                         }
                     }
@@ -287,7 +281,9 @@ impl SafetyReport {
                 if explain {
                     if let Some(remediation) = &reported.remediation {
                         output.push_str(
-                            &format!("    ↳ guidance: {}\n", remediation).green().to_string(),
+                            &format!("    ↳ guidance: {}\n", remediation)
+                                .green()
+                                .to_string(),
                         );
                     }
                 }
@@ -297,8 +293,17 @@ impl SafetyReport {
 
         if !self.is_safe {
             if self.strict && self.critical_count == 0 {
-                output.push_str(&"⚠️  ACTION REQUIRED: Strict mode is active and warnings were detected.\n".yellow().bold().to_string());
-                output.push_str(&"These warnings must be resolved or strict mode disabled to proceed.\n".yellow().to_string());
+                output.push_str(
+                    &"⚠️  ACTION REQUIRED: Strict mode is active and warnings were detected.\n"
+                        .yellow()
+                        .bold()
+                        .to_string(),
+                );
+                output.push_str(
+                    &"These warnings must be resolved or strict mode disabled to proceed.\n"
+                        .yellow()
+                        .to_string(),
+                );
             } else {
                 output.push_str(&"⚠️  ACTION REQUIRED: The new contract version modifies existing storage layouts or function interfaces.\n".red().bold().to_string());
                 output.push_str(&"Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n".red().to_string());
@@ -386,6 +391,7 @@ pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
         "Function Added" => Some("No action required. Inform client integrations about the availability of the new function."),
         "Function Signature Changed" => Some("This is a breaking change. Update call sites, SDKs, and tests to match the new parameter structure."),
         "Parameter Renamed" => Some("This is a breaking change for named-argument RPC systems. Update all client integrations to use the new parameter name."),
+        "Parameter Reordered" => Some("This is a breaking change. Reordering parameters breaks positional RPC invocation. Restore the original parameter order."),
         "Parameter Type Changed" => Some("This is a breaking change. Update caller arguments and client SDKs to match the new parameter type."),
         "Return Type Changed" => Some("This is a breaking change. Update caller expectations and client SDKs to match the new return type."),
         "Event Definition Removed" => Some("This is a breaking change. Update or remove downstream event indexing or monitoring systems that consume this event."),
@@ -409,6 +415,17 @@ pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
         "Event Enum Case Value Changed" => Some("This is a breaking change. Downstream event indexers or consumers relying on these values will fail. Revert the value change."),
         "Enum Case Added" => Some("No action required. Ensure consumers can handle the new case gracefully."),
         "Event Enum Case Added" => Some("No action required. Update event indexers and consumers to handle the new event enum case if necessary."),
+        "Union Removed" => Some("This is a breaking change. Stored data or parameters using this union will be invalid. Restore the union."),
+        "Union Added" => Some("No action required. Ensure consumers are aware of the new union type if needed."),
+        "Union Case Removed" => Some("This is a breaking change. On-chain data using this union case will be invalid. Restore the case."),
+        "Union Case Reordered" => Some("This is a breaking change. Reordering union cases breaks positional discriminant serialization. Restore the original case order."),
+        "Union Case Type Changed" => Some("This is a breaking change. Changing union case payload types breaks layout serialization. Revert the type change or migrate existing data."),
+        "Union Case Added" => Some("No action required. Ensure consumers can handle the new union case gracefully."),
+        "Error Enum Removed" => Some("This is a breaking change. Clients matching on these error codes will break. Restore the error enum."),
+        "Error Enum Added" => Some("No action required. Inform client integrations about the new error enum if needed."),
+        "Error Enum Case Removed" => Some("This is a breaking change. Clients matching on this error code will break. Restore the case."),
+        "Error Enum Case Value Changed" => Some("This is a breaking change. Modifying error case values breaks error-code compatibility. Revert the value change."),
+        "Error Enum Case Added" => Some("No action required. Ensure clients can handle the new error case gracefully."),
         "Cascading Layout Break" => Some("This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type."),
         _ => None,
     }
@@ -450,17 +467,33 @@ mod tests {
                         if !literal.is_empty() {
                             // If it's a format string like "{} Removed"
                             if literal.contains("{}") {
-                                let suffixes = vec!["Removed", "Reordered", "Type Changed", "Value Changed", "Added"];
+                                let suffixes = vec![
+                                    "Removed",
+                                    "Reordered",
+                                    "Type Changed",
+                                    "Value Changed",
+                                    "Added",
+                                ];
                                 for suffix in suffixes {
                                     if literal == format!("{{}} {}", suffix) {
                                         let prefixes = match suffix {
-                                            "Reordered" | "Type Changed" => vec!["Struct Field", "Event Field"],
-                                            "Value Changed" | "Added" => vec!["Enum Case", "Event Enum Case"],
-                                            "Removed" => vec!["Struct Field", "Event Field", "Enum Case", "Event Enum Case"],
+                                            "Reordered" | "Type Changed" => {
+                                                vec!["Struct Field", "Event Field"]
+                                            }
+                                            "Value Changed" | "Added" => {
+                                                vec!["Enum Case", "Event Enum Case"]
+                                            }
+                                            "Removed" => vec![
+                                                "Struct Field",
+                                                "Event Field",
+                                                "Enum Case",
+                                                "Event Enum Case",
+                                            ],
                                             _ => unreachable!(),
                                         };
                                         for prefix in prefixes {
-                                            checked_categories.insert(format!("{} {}", prefix, suffix));
+                                            checked_categories
+                                                .insert(format!("{} {}", prefix, suffix));
                                         }
                                     }
                                 }
@@ -476,7 +509,10 @@ mod tests {
         // Remove test custom categories
         checked_categories.remove("TOTALLY CUSTOM CATEGORY");
 
-        assert!(!checked_categories.is_empty(), "Sanity check: should have found categories");
+        assert!(
+            !checked_categories.is_empty(),
+            "Sanity check: should have found categories"
+        );
 
         for cat in &checked_categories {
             let guidance = get_remediation_guidance(cat);
