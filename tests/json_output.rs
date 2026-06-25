@@ -24,9 +24,7 @@ fn run_json(old: &str, new: &str) -> (Value, i32, String) {
 
 fn run_json_ext(old: &str, new: &str, strict: bool) -> (Value, i32, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"));
-    cmd.arg(wasm(old))
-        .arg(wasm(new))
-        .args(["--format", "json"]);
+    cmd.arg(wasm(old)).arg(wasm(new)).args(["--format", "json"]);
     if strict {
         cmd.arg("--strict");
     }
@@ -117,7 +115,10 @@ fn json_identical_upgrade_is_safe_and_exits_zero() {
 fn json_strict_warning_only_exits_one() {
     let (json, code, stdout) = run_json_ext("v1.wasm", "v3.wasm", true);
 
-    assert_eq!(code, 1, "warning-only upgrade under strict mode must exit 1");
+    assert_eq!(
+        code, 1,
+        "warning-only upgrade under strict mode must exit 1"
+    );
     assert_eq!(json["is_safe"], Value::Bool(false));
     assert_eq!(json["strict"], Value::Bool(true));
     assert_eq!(json["recommended_bump"], "minor");
@@ -133,7 +134,10 @@ fn json_strict_warning_only_exits_one() {
 fn json_non_strict_warning_only_exits_zero() {
     let (json, code, stdout) = run_json_ext("v1.wasm", "v3.wasm", false);
 
-    assert_eq!(code, 0, "warning-only upgrade under non-strict mode must exit 0");
+    assert_eq!(
+        code, 0,
+        "warning-only upgrade under non-strict mode must exit 0"
+    );
     assert_eq!(json["is_safe"], Value::Bool(true));
     assert_eq!(json["strict"], Value::Bool(false));
     assert_eq!(json["recommended_bump"], "minor");

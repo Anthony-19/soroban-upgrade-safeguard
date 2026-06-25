@@ -34,17 +34,41 @@ fn markdown_breaking_upgrade_reports_critical_and_exits_one() {
     assert_eq!(code, 1, "breaking upgrade must exit 1");
 
     // Verify Markdown format and sections
-    assert!(stdout.contains("# Soroban Upgrade Safety Report"), "Missing title");
-    assert!(stdout.contains("## Status: ❌ FAILED (Critical breaking changes detected)"), "Missing status");
-    assert!(stdout.contains("### Summary Table"), "Missing summary table heading");
-    assert!(stdout.contains("| Finding Severity | Count |"), "Missing table columns");
+    assert!(
+        stdout.contains("# Soroban Upgrade Safety Report"),
+        "Missing title"
+    );
+    assert!(
+        stdout.contains("## Status: ❌ FAILED (Critical breaking changes detected)"),
+        "Missing status"
+    );
+    assert!(
+        stdout.contains("### Summary Table"),
+        "Missing summary table heading"
+    );
+    assert!(
+        stdout.contains("| Finding Severity | Count |"),
+        "Missing table columns"
+    );
     assert!(stdout.contains("| **Critical** |"), "Missing critical row");
-    assert!(stdout.contains("**Recommended SemVer Bump**: `major`"), "Missing recommended bump");
+    assert!(
+        stdout.contains("**Recommended SemVer Bump**: `major`"),
+        "Missing recommended bump"
+    );
 
     // Grouping and finding listing checks
-    assert!(stdout.contains("### Function Signature Changed"), "Should group functions under signature changed");
-    assert!(stdout.contains("### Struct Field Removed"), "Should group structs under struct field removed");
-    assert!(stdout.contains("🔴"), "Should use red circle emoji for critical findings");
+    assert!(
+        stdout.contains("### Function Signature Changed"),
+        "Should group functions under signature changed"
+    );
+    assert!(
+        stdout.contains("### Struct Field Removed"),
+        "Should group structs under struct field removed"
+    );
+    assert!(
+        stdout.contains("🔴"),
+        "Should use red circle emoji for critical findings"
+    );
 
     // Output must be free of ANSI color codes.
     assert!(
@@ -53,7 +77,10 @@ fn markdown_breaking_upgrade_reports_critical_and_exits_one() {
     );
 
     // Decorative progress should go to stderr
-    assert!(stderr.contains("🔍 Soroban Upgrade Safeguard"), "Decorative progress should be in stderr");
+    assert!(
+        stderr.contains("🔍 Soroban Upgrade Safeguard"),
+        "Decorative progress should be in stderr"
+    );
 }
 
 #[test]
@@ -61,15 +88,30 @@ fn markdown_identical_upgrade_is_safe_and_exits_zero() {
     let (code, stdout, stderr) = run_markdown("v1.wasm", "v1.wasm");
 
     assert_eq!(code, 0, "non-breaking upgrade must exit 0");
-    assert!(stdout.contains("# Soroban Upgrade Safety Report"), "Missing title");
-    assert!(stdout.contains("## Status: ✅ PASSED (No breaking changes detected)"), "Missing status");
-    assert!(stdout.contains("No relevant changes detected."), "Missing no changes message");
-    assert!(stdout.contains("**Recommended SemVer Bump**: `patch`"), "Missing recommended bump");
+    assert!(
+        stdout.contains("# Soroban Upgrade Safety Report"),
+        "Missing title"
+    );
+    assert!(
+        stdout.contains("## Status: ✅ PASSED (No breaking changes detected)"),
+        "Missing status"
+    );
+    assert!(
+        stdout.contains("No relevant changes detected."),
+        "Missing no changes message"
+    );
+    assert!(
+        stdout.contains("**Recommended SemVer Bump**: `patch`"),
+        "Missing recommended bump"
+    );
 
     assert!(
         !stdout.contains('\u{1b}'),
         "Markdown output must not contain ANSI codes"
     );
 
-    assert!(stderr.contains("🔍 Soroban Upgrade Safeguard"), "Decorative progress should be in stderr");
+    assert!(
+        stderr.contains("🔍 Soroban Upgrade Safeguard"),
+        "Decorative progress should be in stderr"
+    );
 }

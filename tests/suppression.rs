@@ -97,10 +97,15 @@ fn suppressing_all_criticals_passes_but_still_lists_them() {
     assert_eq!(json["counts"]["critical"].as_u64().unwrap(), 3);
     let all = findings(&json);
     let suppressed: Vec<_> = all.iter().filter(|(_, _, s)| *s).collect();
-    assert_eq!(suppressed.len(), 3, "all three criticals must be listed as suppressed");
+    assert_eq!(
+        suppressed.len(),
+        3,
+        "all three criticals must be listed as suppressed"
+    );
     assert!(
-        all.iter()
-            .any(|(c, t, s)| c == "Struct Field Removed" && t.as_deref() == Some("ConfigData.threshold") && *s),
+        all.iter().any(|(c, t, s)| c == "Struct Field Removed"
+            && t.as_deref() == Some("ConfigData.threshold")
+            && *s),
         "the removed field must appear, flagged suppressed"
     );
 }
@@ -172,7 +177,10 @@ fn missing_explicit_config_is_an_error() {
         .output()
         .expect("failed to run binary");
 
-    assert!(!output.status.success(), "missing explicit config must fail");
+    assert!(
+        !output.status.success(),
+        "missing explicit config must fail"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("suppression config"),
