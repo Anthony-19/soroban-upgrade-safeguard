@@ -51,6 +51,10 @@ fn markdown_breaking_upgrade_reports_critical_and_exits_one() {
         "Missing table columns"
     );
     assert!(stdout.contains("| **Critical** |"), "Missing critical row");
+    assert!(
+        stdout.contains("**Recommended SemVer Bump**: `major`"),
+        "Missing recommended bump"
+    );
 
     // Grouping and finding listing checks
     assert!(
@@ -95,6 +99,10 @@ fn markdown_identical_upgrade_is_safe_and_exits_zero() {
     assert!(
         stdout.contains("No relevant changes detected."),
         "Missing no changes message"
+    );
+    assert!(
+        stdout.contains("**Recommended SemVer Bump**: `patch`"),
+        "Missing recommended bump"
     );
 
     assert!(

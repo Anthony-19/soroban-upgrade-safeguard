@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use colored::Colorize;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use soroban_upgrade_safeguard::{
+    color::should_disable_color,
     diff, loader, parser, report, spec,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
@@ -67,6 +69,10 @@ struct Args {
     #[arg(long)]
     strict: bool,
 
+    /// Do not color output
+    #[arg(long)]
+    no_color: bool,
+
     /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
     #[arg(long, value_name = "MANIFEST_PATH")]
     manifest: Option<PathBuf>,
@@ -82,6 +88,14 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if should_disable_color(
+        args.no_color,
+        std::env::var_os("NO_COLOR").is_some(),
+        std::io::stdout().is_terminal(),
+    ) {
+        colored::control::set_override(false);
+    }
 
     // 1. Identify which mode we are running:
     //    - Batch Manifest Mode

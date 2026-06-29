@@ -59,6 +59,7 @@ pub struct SafetyReportJson<'a> {
     /// Findings (of any severity) acknowledged by the suppression config.
     pub suppressed_count: usize,
     pub total_findings: usize,
+    pub recommended_bump: &'static str,
     pub findings_by_category: BTreeMap<&'a str, &'a Vec<ReportedFinding>>,
 }
 
@@ -145,6 +146,24 @@ impl SafetyReport {
         }
     }
 
+    /// Derive the recommended SemVer bump from safety report findings:
+    /// - `Critical` findings present -> `major` (breaking interface or storage changes).
+    /// - `Warning` findings present -> `minor` (we map warnings like `Parameter Renamed`
+    ///   or `Struct Field Added` explicitly to `minor` because they represent changes
+    ///   that are not strictly breaking for all contexts, but require caller adjustments
+    ///   or data migrations).
+    /// - `Info` findings present -> `minor` (additive, non-breaking changes).
+    /// - No findings -> `patch` (identical interface).
+    pub fn recommended_bump(&self) -> &'static str {
+        if self.critical_count > 0 {
+            "major"
+        } else if self.warning_count > 0 || self.info_count > 0 {
+            "minor"
+        } else {
+            "patch"
+        }
+    }
+
     /// Build a serializable, machine-readable view of this report.
     pub fn to_json(&self) -> SafetyReportJson<'_> {
         SafetyReportJson {
@@ -157,6 +176,7 @@ impl SafetyReport {
             },
             suppressed_count: self.suppressed_count,
             total_findings: self.total_findings,
+            recommended_bump: self.recommended_bump(),
             findings_by_category: self
                 .findings_by_category
                 .iter()
@@ -220,6 +240,14 @@ impl SafetyReport {
                 self.suppressed_count.to_string().magenta().bold()
             ));
         }
+        let bump = self.recommended_bump();
+        let bump_str = match bump {
+            "major" => "major".red().bold(),
+            "minor" => "minor".yellow().bold(),
+            "patch" => "patch".green().bold(),
+            _ => bump.normal(),
+        };
+        output.push_str(&format!("Recommended Bump: {}\n", bump_str));
         output.push_str(
             &"----------------------------------------\n\n"
                 .dimmed()
@@ -334,7 +362,11 @@ impl SafetyReport {
         if self.suppressed_count > 0 {
             output.push_str(&format!("| **Suppressed** | {} |\n", self.suppressed_count));
         }
-        output.push_str("\n---\n\n");
+        output.push_str(&format!(
+            "\n**Recommended SemVer Bump**: `{}`\n\n",
+            self.recommended_bump()
+        ));
+        output.push_str("---\n\n");
 
         if self.total_findings == 0 {
             output.push_str("No relevant changes detected. The upgrade is identical in its exports and types.\n");
@@ -522,5 +554,35 @@ mod tests {
                 cat
             );
         }
+    }
+
+    #[test]
+    fn test_recommended_semver_bump() {
+        let mut report = SafetyReport {
+            critical_count: 0,
+            warning_count: 0,
+            info_count: 0,
+            suppressed_count: 0,
+            total_findings: 0,
+            is_safe: true,
+            findings_by_category: std::collections::HashMap::new(),
+            strict: false,
+        };
+
+        // Identical upgrade -> patch
+        assert_eq!(report.recommended_bump(), "patch");
+
+        // Info findings -> minor
+        report.info_count = 1;
+        assert_eq!(report.recommended_bump(), "minor");
+
+        // Warning findings -> minor
+        report.info_count = 0;
+        report.warning_count = 1;
+        assert_eq!(report.recommended_bump(), "minor");
+
+        // Critical findings -> major (even if other findings are present)
+        report.critical_count = 1;
+        assert_eq!(report.recommended_bump(), "major");
     }
 }
