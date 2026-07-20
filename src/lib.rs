@@ -71,15 +71,36 @@ pub use crate::limits::{LimitError, ResourcePolicy};
 /// Returns an error if either input is not a parseable WASM module or if the
 /// embedded `contractspecv0` section cannot be decoded.
 pub fn compare_wasm_bytes(old_wasm: &[u8], new_wasm: &[u8]) -> Result<SafetyReport> {
-    let old_meta = parser::extract_metadata(old_wasm)
+    compare_wasm_bytes_with_policy(old_wasm, new_wasm, &ResourcePolicy::default())
+}
+
+/// Like [`compare_wasm_bytes`], but bounds decoding and every recursive type walk
+/// by an explicit [`ResourcePolicy`].
+///
+/// Untrusted WASM (a file, or bytes fetched over RPC) can declare oversized XDR
+/// lengths or arbitrarily nested types. Threading `policy` through metadata
+/// extraction and the diff makes those inputs fail with a controlled
+/// [`LimitError`] instead of exhausting memory or overflowing the stack.
+///
+/// # Errors
+///
+/// Returns a [`LimitError`] (recoverable via [`anyhow::Error::downcast_ref`]) when
+/// the input exceeds a configured limit, or an ordinary error if either input is
+/// not a parseable WASM module or its `contractspecv0` section cannot be decoded.
+pub fn compare_wasm_bytes_with_policy(
+    old_wasm: &[u8],
+    new_wasm: &[u8],
+    policy: &ResourcePolicy,
+) -> Result<SafetyReport> {
+    let old_meta = parser::extract_metadata_with_policy(old_wasm, policy)
         .context("Failed to extract metadata from the old WASM")?;
-    let new_meta = parser::extract_metadata(new_wasm)
+    let new_meta = parser::extract_metadata_with_policy(new_wasm, policy)
         .context("Failed to extract metadata from the new WASM")?;
 
     let old_spec = ContractSpec::from_entries(&old_meta.spec);
     let new_spec = ContractSpec::from_entries(&new_meta.spec);
 
-    let diff_report = diff::compare(&old_spec, &new_spec);
+    let diff_report = diff::compare_with_policy(&old_spec, &new_spec, policy)?;
     Ok(SafetyReport::new(&diff_report))
 }
 
@@ -97,7 +118,17 @@ pub fn compare_wasm_bytes(old_wasm: &[u8], new_wasm: &[u8]) -> Result<SafetyRepo
 /// Returns an error if either file is missing, is not a valid WASM binary, or
 /// if its embedded contract spec cannot be decoded.
 pub fn compare_wasm_files(old_path: &Path, new_path: &Path) -> Result<SafetyReport> {
+    compare_wasm_files_with_policy(old_path, new_path, &ResourcePolicy::default())
+}
+
+/// Like [`compare_wasm_files`], but bounds decoding and every recursive type walk
+/// by an explicit [`ResourcePolicy`]. See [`compare_wasm_bytes_with_policy`].
+pub fn compare_wasm_files_with_policy(
+    old_path: &Path,
+    new_path: &Path,
+    policy: &ResourcePolicy,
+) -> Result<SafetyReport> {
     let old = loader::load_wasm(old_path)?;
     let new = loader::load_wasm(new_path)?;
-    compare_wasm_bytes(&old.bytes, &new.bytes)
+    compare_wasm_bytes_with_policy(&old.bytes, &new.bytes, policy)
 }
