@@ -42,6 +42,7 @@ pub mod loader;
 pub mod mapper;
 pub mod parser;
 pub mod report;
+pub mod rules;
 pub mod spec;
 pub mod suppression;
 
