@@ -4,6 +4,23 @@ use colored::Colorize;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 
+/// One-line summary of exactly what a verdict from this tool certifies.
+///
+/// Displayed under the status in every human-readable format and mirrored into
+/// the JSON `certifies` field. It exists to stop a green result from being read
+/// as "storage-compatible": the analysis only sees the exported `contractspecv0`
+/// interface and environment metadata, never the internal storage layout that
+/// actually governs on-chain upgrade compatibility.
+pub const SCOPE_SUMMARY_LINE: &str = "Exported interface + environment metadata only — \
+     storage layout is NOT verified by this result.";
+
+/// Longer bounded-claim paragraph appended to reports so an operator cannot
+/// mistake "no exported-interface breaks" for "storage-compatible".
+pub const STORAGE_NOT_VERIFIED_NOTE: &str = "Note: this result does NOT certify storage-layout \
+     compatibility. Internal value types serialized into storage and storage-key discriminants \
+     need not appear in the exported spec, so a green verdict here says nothing about whether \
+     stored data will still deserialize after the upgrade.";
+
 /// A finding as it appears in the report, augmented with suppression state.
 ///
 /// The raw [`Finding`] from the diff layer is left untouched; suppression is a
@@ -55,6 +72,9 @@ pub struct SeverityCounts {
 pub struct SafetyReportJson<'a> {
     pub is_safe: bool,
     pub strict: bool,
+    /// One-sentence bounded claim describing what this verdict certifies.
+    /// Machine consumers should not equate `is_safe` with storage compatibility.
+    pub certifies: &'static str,
     pub counts: SeverityCounts,
     /// Findings (of any severity) acknowledged by the suppression config.
     pub suppressed_count: usize,
@@ -169,6 +189,7 @@ impl SafetyReport {
         SafetyReportJson {
             is_safe: self.is_safe,
             strict: self.strict,
+            certifies: SCOPE_SUMMARY_LINE,
             counts: SeverityCounts {
                 critical: self.critical_count,
                 warning: self.warning_count,
@@ -209,15 +230,16 @@ impl SafetyReport {
         );
 
         let status = if self.is_safe {
-            "✅ PASSED (No breaking changes detected)".green().bold()
+            "✅ PASSED (No exported-interface breaking changes)".green().bold()
         } else if self.strict && self.critical_count == 0 {
             "❌ FAILED (Warnings detected in strict mode)".red().bold()
         } else {
-            "❌ FAILED (Critical breaking changes detected)"
+            "❌ FAILED (Exported-interface breaking changes detected)"
                 .red()
                 .bold()
         };
         output.push_str(&format!("Status: {}\n", status));
+        output.push_str(&format!("Scope:  {}\n", SCOPE_SUMMARY_LINE.dimmed()));
 
         let crit_str = if self.critical_count > 0 {
             self.critical_count.to_string().red().bold()
@@ -255,7 +277,8 @@ impl SafetyReport {
         );
 
         if self.total_findings == 0 {
-            output.push_str(&"No relevant changes detected. The upgrade is identical in its exports and types.\n".green().to_string());
+            output.push_str(&"No relevant changes detected. The exported interface is identical in its exports and types.\n".green().to_string());
+            output.push_str(&format!("\n{}\n", STORAGE_NOT_VERIFIED_NOTE.dimmed()));
             return output;
         }
 
@@ -347,11 +370,12 @@ impl SafetyReport {
         output.push_str("# Soroban Upgrade Safety Report\n\n");
 
         let status = if self.is_safe {
-            "✅ PASSED (No breaking changes detected)"
+            "✅ PASSED (No exported-interface breaking changes)"
         } else {
-            "❌ FAILED (Critical breaking changes detected)"
+            "❌ FAILED (Exported-interface breaking changes detected)"
         };
         output.push_str(&format!("## Status: {}\n\n", status));
+        output.push_str(&format!("_{}_\n\n", SCOPE_SUMMARY_LINE));
 
         output.push_str("### Summary Table\n\n");
         output.push_str("| Finding Severity | Count |\n");
@@ -369,7 +393,8 @@ impl SafetyReport {
         output.push_str("---\n\n");
 
         if self.total_findings == 0 {
-            output.push_str("No relevant changes detected. The upgrade is identical in its exports and types.\n");
+            output.push_str("No relevant changes detected. The exported interface is identical in its exports and types.\n\n");
+            output.push_str(&format!("> {}\n", STORAGE_NOT_VERIFIED_NOTE));
             return output;
         }
 
