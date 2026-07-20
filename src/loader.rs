@@ -2,9 +2,11 @@ use anyhow::{bail, Context, Result};
 use std::path::Path;
 use stellar_xdr::curr::{
     ContractExecutable, Hash, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyContractCode,
-    LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
+    LedgerKeyContractData, ReadXdr, ScAddress, ScVal, WriteXdr,
 };
 use wasmparser::{Parser, Payload};
+
+use crate::limits::{LimitError, ResourcePolicy};
 
 /// Holds raw WASM bytes alongside the validated file path.
 #[derive(Debug)]
@@ -69,8 +71,25 @@ fn validate_wasm_structure(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Fetches a deployed Soroban contract's WASM bytes from Stellar RPC by contract ID.
+/// Fetches a deployed Soroban contract's WASM bytes from Stellar RPC by contract
+/// ID, using the default [`ResourcePolicy`].
 pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModule> {
+    fetch_wasm_from_rpc_with_policy(contract_id, rpc_url, &ResourcePolicy::default())
+}
+
+/// Fetches a deployed Soroban contract's WASM bytes from Stellar RPC by contract
+/// ID, bounding XDR (de)serialization by `policy`.
+///
+/// RPC responses are attacker-influenced (the contract ID is arbitrary), so the
+/// `LedgerEntry` payloads are decoded under `policy.xdr_limits()`: an oversized or
+/// deeply nested entry fails with a [`LimitError`] instead of exhausting memory or
+/// the stack. The returned WASM is validated structurally; its embedded spec is
+/// subject to the same policy when later decoded by the caller.
+pub fn fetch_wasm_from_rpc_with_policy(
+    contract_id: &str,
+    rpc_url: &str,
+    policy: &ResourcePolicy,
+) -> Result<WasmModule> {
     // 1. Parse contract_id using stellar_strkey
     let strkey = stellar_strkey::Strkey::from_string(contract_id)
         .map_err(|e| anyhow::anyhow!("Invalid contract ID '{}': {}", contract_id, e))?;
@@ -89,7 +108,7 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
 
     // 3. Serialize LedgerKey to Base64
     let key_b64 = ledger_key
-        .to_xdr_base64(Limits::none())
+        .to_xdr_base64(policy.xdr_limits())
         .map_err(|e| anyhow::anyhow!("Failed to serialize LedgerKey to base64: {}", e))?;
 
     // 4. Query getLedgerEntries RPC
@@ -115,8 +134,11 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
         .context("RPC response entry missing 'xdr' field")?;
 
     // 6. Deserialize LedgerEntry
-    let entry = LedgerEntry::from_xdr_base64(entry_xdr_b64, Limits::none())
-        .map_err(|e| anyhow::anyhow!("Failed to deserialize LedgerEntry XDR: {}", e))?;
+    let entry = LedgerEntry::from_xdr_base64(entry_xdr_b64, policy.xdr_limits()).map_err(|e| {
+        LimitError::from_xdr_error(&e, policy)
+            .map(anyhow::Error::from)
+            .unwrap_or_else(|| anyhow::anyhow!("Failed to deserialize LedgerEntry XDR: {}", e))
+    })?;
 
     // 7. Get ContractInstance val
     let contract_data = match entry.data {
@@ -145,7 +167,7 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
         hash: wasm_hash.clone(),
     });
 
-    let code_key_b64 = code_ledger_key.to_xdr_base64(Limits::none()).map_err(|e| {
+    let code_key_b64 = code_ledger_key.to_xdr_base64(policy.xdr_limits()).map_err(|e| {
         anyhow::anyhow!(
             "Failed to serialize ContractCode LedgerKey to base64: {}",
             e
@@ -175,9 +197,13 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
         .as_str()
         .context("RPC response code entry missing 'xdr' field")?;
 
-    let code_entry =
-        LedgerEntry::from_xdr_base64(code_entry_xdr_b64, Limits::none()).map_err(|e| {
-            anyhow::anyhow!("Failed to deserialize ContractCode LedgerEntry XDR: {}", e)
+    let code_entry = LedgerEntry::from_xdr_base64(code_entry_xdr_b64, policy.xdr_limits())
+        .map_err(|e| {
+            LimitError::from_xdr_error(&e, policy)
+                .map(anyhow::Error::from)
+                .unwrap_or_else(|| {
+                    anyhow::anyhow!("Failed to deserialize ContractCode LedgerEntry XDR: {}", e)
+                })
         })?;
 
     let contract_code = match code_entry.data {

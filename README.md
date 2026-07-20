@@ -13,6 +13,7 @@ A powerful CLI tool to analyze and validate Soroban smart contract upgrades on t
 - **Rich CLI Output**: Beautiful, color-coded reports with actionable severity levels (Critical, Warning, Info).
 - **CI/CD Friendly**: Exits with a non-zero code if critical breaking changes are detected.
 - **Suppression Config**: Acknowledge known, intentional breaking changes (e.g. a planned migration) in a `.safeguard.toml` so they no longer fail the run — while still listing them in the report.
+- **Hardened Against Malicious Input**: The WASM and its embedded XDR are treated as untrusted. Configurable resource limits bound decode depth, decoded byte length, entry count, and type-walk depth, so a crafted contract cannot crash the gate with an out-of-memory allocation or a stack overflow.
 
 ## Installation
 
@@ -53,6 +54,49 @@ The tool auto-loads `.safeguard.toml` from the current directory, or use
 [`.safeguard.example.toml`](.safeguard.example.toml) for a documented template
 and the [documentation](docs/documentation.md#suppressing-known-breaking-changes)
 for the full `target` convention.
+
+### Resource limits (untrusted input)
+
+The tool runs as a CI gate and, in RPC mode, decodes WASM fetched for an arbitrary
+contract ID — so the input and its embedded XDR are treated as **adversarial**. A
+central resource policy bounds every decode and every recursive type walk. When an
+input exceeds a limit, the run stops with a **controlled error and exit code 2**
+(distinct from `1` = breaking changes), never a crash.
+
+| Limit | Default | What it caps |
+| :--- | :--- | :--- |
+| `max_xdr_depth` | 64 | XDR nesting depth per entry (stack-overflow guard) |
+| `max_xdr_len` | 33554432 (32 MiB) | Bytes decoded per custom section (allocation guard) |
+| `max_entries` | 100000 | Decoded spec entries, summed across all sections |
+| `max_walk_depth` | 128 | Recursive type-walk depth (equality, rendering, cascade detection) |
+
+Defaults comfortably accept every real spec while blocking pathological input. To
+raise a limit, set it in a `[limits]` table in `.safeguard.toml`:
+
+```toml
+[limits]
+max_xdr_depth  = 128
+max_xdr_len    = 67108864   # 64 MiB
+max_entries    = 200000
+max_walk_depth = 256
+```
+
+…or override any of them for a single run with a flag (flags win over the file):
+
+```bash
+soroban-upgrade-safeguard old.wasm new.wasm --max-xdr-depth 128 --max-walk-depth 256
+```
+
+In batch mode a pair that trips a limit fails **only that pair** — the rest of the
+run continues — and the overall run exits `2` if any pair hit a limit.
+
+### Exit codes
+
+| Code | Meaning |
+| :--- | :--- |
+| `0` | Safe — no critical findings (or all suppressed). |
+| `1` | Breaking changes detected, or a generic error (missing/malformed file). |
+| `2` | A resource limit was exceeded on untrusted input (raise the relevant limit to proceed). |
 
 ## How it Works
 
