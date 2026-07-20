@@ -38,6 +38,7 @@
 
 pub mod color;
 pub mod diff;
+pub mod limits;
 pub mod loader;
 pub mod mapper;
 pub mod parser;
@@ -51,6 +52,8 @@ use anyhow::{Context, Result};
 
 use crate::report::SafetyReport;
 use crate::spec::ContractSpec;
+
+pub use crate::limits::{LimitError, ResourcePolicy};
 
 /// Compare two Soroban contract builds supplied as raw WASM byte slices.
 ///
