@@ -15,9 +15,10 @@ This document explains what Soroban Upgrade Safeguard does, how it works interna
 9. [Cascading Layout Breaks](#cascading-layout-breaks)
 10. [Reading the Report](#reading-the-report)
 11. [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes)
-12. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
-13. [Limitations](#limitations)
-14. [Frequently Asked Questions](#frequently-asked-questions)
+12. [Resource Limits and Hardening Against Malicious Input](#resource-limits-and-hardening-against-malicious-input)
+13. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
+14. [Limitations](#limitations)
+15. [Frequently Asked Questions](#frequently-asked-questions)
 
 ## Overview
 
@@ -131,6 +132,8 @@ soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
 ```
 
 The first argument should be the build that is currently deployed on chain. The second argument should be the build you intend to deploy. Order matters: the comparison is directional, because removing a field from the old version is treated differently from adding a field in the new version.
+
+Common flags: `--format <text|json|markdown>`, `--explain`, `--strict`, `--config <PATH>`, and the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)).
 
 ## How the Analysis Works
 
@@ -272,12 +275,72 @@ the exit code. The run passes only when no *unsuppressed* Critical remains. The
 JSON output adds a top-level `suppressed_count`, and each suppressed finding
 gains `"suppressed": true` (and a `"suppression_reason"` when one was given).
 
+## Resource Limits and Hardening Against Malicious Input
+
+The tool runs as a CI gate and, in RPC mode, decodes WASM fetched for an arbitrary
+contract ID. The input WASM and its embedded `contractspecv0` / `contractenvmetav0`
+sections are therefore treated as **adversarial**. Without bounds, a crafted section
+could declare an enormous vector length (a multi-gigabyte allocation) or nest a type
+to arbitrary depth (a native stack overflow that aborts the process). A gate that can
+be crashed on demand is a gate that can be bypassed.
+
+A single resource policy is threaded through every decode and every recursive type
+walk. Four limits, each independently configurable:
+
+| Limit | Default | Bounds |
+| :--- | :--- | :--- |
+| `max_xdr_depth` | 64 | XDR recursion depth per entry. Guards against stack overflow at decode time. |
+| `max_xdr_len` | 33554432 (32 MiB) | Bytes decoded per custom section — shared across every entry in the section, so it also caps the total decoded bytes. Guards against oversized-length allocations. |
+| `max_entries` | 100000 | Decoded spec entries, **summed across all `contractspecv0` sections** (a module may carry more than one). Env-metadata entries are budgeted separately. |
+| `max_walk_depth` | 128 | Recursion depth for the type walkers — structural equality, finding-message rendering, and cascade detection — which operate on already-decoded types. |
+
+The distinction between `max_xdr_len` (a **per-section byte cap**) and `max_entries`
+(a **cross-section count cap**) matters: many individually valid sections cannot be
+summed to exhaust memory, and a single section cannot over-allocate before the entry
+cap trips.
+
+### Configuring limits
+
+Set a `[limits]` table in `.safeguard.toml` (the same file used for suppressions).
+Every field is optional; an omitted field keeps the default:
+
+```toml
+[limits]
+max_xdr_depth  = 128
+max_xdr_len    = 67108864   # 64 MiB
+max_entries    = 200000
+max_walk_depth = 256
+```
+
+Or override any single limit for one run with a flag. Precedence is **flags > file >
+defaults**:
+
+```bash
+soroban-upgrade-safeguard old.wasm new.wasm --max-xdr-depth 128 --max-walk-depth 256
+```
+
+The defaults accept every fixture and a representative corpus of real mainnet specs.
+Raise a limit only if a legitimate, unusually large contract is rejected.
+
+### Behavior when a limit is exceeded
+
+An input that exceeds a limit is rejected with a controlled, typed error and the CLI
+exits with **code 2** — distinct from `1` (breaking changes) so a pipeline can tell
+"the input was rejected as adversarial" apart from "the upgrade is unsafe". The
+process never aborts with a stack overflow or an out-of-memory kill.
+
+In **batch mode**, the policy is enforced **per pair**: a pair that trips a limit (or
+otherwise errors) fails only that pair and is reported as errored — the rest of the
+run continues rather than aborting. The overall run then exits `2` if any pair hit a
+limit, else `1` if any pair had breaking changes, else `0`.
+
 ## Exit Codes and CI Integration
 
 The tool is designed to drop into a continuous integration pipeline.
 
 - Exit code `0`: no critical findings. The upgrade is considered safe to deploy.
 - Exit code `1`: at least one critical finding, or a fatal error such as a missing or malformed WASM file.
+- Exit code `2`: a resource limit was exceeded on untrusted input (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)). Raise the relevant limit to proceed.
 
 Because the process exits non-zero on critical findings, you can gate a deployment job on it directly:
 
