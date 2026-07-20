@@ -1,4 +1,6 @@
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
+use std::fmt;
 use std::path::Path;
 use stellar_xdr::curr::{
     ContractExecutable, Hash, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyContractCode,
@@ -11,21 +13,48 @@ use wasmparser::{Parser, Payload};
 pub struct WasmModule {
     pub path: String,
     pub bytes: Vec<u8>,
+    /// SHA-256 hash of the WASM bytecode, verified against on-chain data
+    /// (only populated when fetched from RPC).
+    pub verified_hash: Option<[u8; 32]>,
 }
+
+/// A dedicated error type for cryptographic or payload integrity failures.
+///
+/// Returned instead of a generic `anyhow::Error` so callers can inspect the
+/// kind of integrity failure without parsing error messages.
+#[derive(Debug)]
+pub struct IntegrityError {
+    pub kind: IntegrityErrorKind,
+    pub details: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrityErrorKind {
+    /// The computed SHA-256 hash of fetched WASM bytecode does not match the
+    /// hash stored in the contract instance entry.
+    HashMismatch,
+    /// The ledger key returned by the RPC does not match the requested key.
+    KeyMismatch,
+}
+
+impl fmt::Display for IntegrityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "IntegrityError[{:?}]: {}", self.kind, self.details)
+    }
+}
+
+impl std::error::Error for IntegrityError {}
 
 /// Reads a WASM file from disk, validates it is a valid WASM binary,
 /// and returns a `WasmModule` ready for further analysis.
 pub fn load_wasm(path: &Path) -> Result<WasmModule> {
-    // 1. Check the file exists
     if !path.exists() {
         bail!("File not found: {}", path.display());
     }
 
-    // 2. Read all bytes into memory
     let bytes =
         std::fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
 
-    // 3. Validate the WASM magic header (0x00 0x61 0x73 0x6d)
     if bytes.len() < 4 || &bytes[0..4] != b"\0asm" {
         bail!(
             "'{}' does not appear to be a valid WASM binary (bad magic bytes)",
@@ -33,22 +62,20 @@ pub fn load_wasm(path: &Path) -> Result<WasmModule> {
         );
     }
 
-    // 4. Do a full structural parse to detect any deeper format errors
     validate_wasm_structure(&bytes)
         .with_context(|| format!("WASM validation failed for '{}'", path.display()))?;
 
     Ok(WasmModule {
         path: path.to_string_lossy().into_owned(),
         bytes,
+        verified_hash: None,
     })
 }
 
-/// Iterates through all WASM payloads and fails fast on any parse error.
 fn validate_wasm_structure(bytes: &[u8]) -> Result<()> {
     let parser = Parser::new(0);
     for payload in parser.parse_all(bytes) {
         match payload.context("Malformed WASM payload encountered")? {
-            // We just want to iterate; real analysis happens in later modules
             Payload::Version { .. } => {}
             Payload::TypeSection(_) => {}
             Payload::FunctionSection(_) => {}
@@ -69,9 +96,74 @@ fn validate_wasm_structure(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Scans a JSON-RPC `entries` array and returns the entry whose `key` field
+/// matches the XDR-base64 encoding of `expected_key`.
+fn find_entry_by_key<'a>(
+    entries: &'a [serde_json::Value],
+    expected_key: &LedgerKey,
+    context: &str,
+) -> Result<&'a serde_json::Value> {
+    if entries.is_empty() {
+        bail!("{}: RPC response returned zero entries", context);
+    }
+
+    let expected_b64 = expected_key
+        .to_xdr_base64(Limits::none())
+        .map_err(|e| anyhow::anyhow!("{}: failed to serialize expected key: {}", context, e))?;
+
+    let mut matched: Vec<&serde_json::Value> = Vec::new();
+
+    for entry in entries {
+        let key_b64 = entry["key"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("{}: RPC entry missing 'key' field", context))?;
+
+        let _xdr_b64 = entry["xdr"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("{}: RPC entry missing 'xdr' field", context))?;
+
+        if key_b64 == expected_b64 {
+            matched.push(entry);
+        }
+    }
+
+    if matched.is_empty() {
+        return Err(IntegrityError {
+            kind: IntegrityErrorKind::KeyMismatch,
+            details: format!(
+                "{}: no entry matches the expected ledger key (possible RPC manipulation)",
+                context
+            ),
+        }
+        .into());
+    }
+
+    if matched.len() > 1 {
+        bail!(
+            "{}: {} entries share the same ledger key (possible RPC manipulation)",
+            context,
+            matched.len()
+        );
+    }
+
+    Ok(matched[0])
+}
+
 /// Fetches a deployed Soroban contract's WASM bytes from Stellar RPC by contract ID.
+///
+/// # Zero-Trust Pipeline
+///
+/// 1. Parses and validates the contract ID via `stellar_strkey`.
+/// 2. Builds the expected `LedgerKey` for the contract instance.
+/// 3. Queries `getLedgerEntries` and defensively validates that exactly one
+///    entry matches the requested key — rejects empty, duplicate, or mismatched
+///    payloads.
+/// 4. Extracts the `ContractExecutable::Wasm` hash from the instance.
+/// 5. Queries the contract-code sub-entry using the advertised hash.
+/// 6. Reconcilies the returned key against the expected code `LedgerKey`.
+/// 7. Computes the SHA-256 of the fetched bytecode and compares it against the
+///    hash from step 4 — aborts on mismatch with an `IntegrityError`.
 pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModule> {
-    // 1. Parse contract_id using stellar_strkey
     let strkey = stellar_strkey::Strkey::from_string(contract_id)
         .map_err(|e| anyhow::anyhow!("Invalid contract ID '{}': {}", contract_id, e))?;
 
@@ -80,45 +172,35 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
         _ => bail!("Provided ID '{}' is not a valid contract ID", contract_id),
     };
 
-    // 2. Build LedgerKey for contract instance
     let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
         contract: ScAddress::Contract(Hash(contract_bytes)),
         key: ScVal::LedgerKeyContractInstance,
         durability: stellar_xdr::curr::ContractDataDurability::Persistent,
     });
 
-    // 3. Serialize LedgerKey to Base64
-    let key_b64 = ledger_key
-        .to_xdr_base64(Limits::none())
-        .map_err(|e| anyhow::anyhow!("Failed to serialize LedgerKey to base64: {}", e))?;
-
-    // 4. Query getLedgerEntries RPC
     let response = query_rpc(
         rpc_url,
         "getLedgerEntries",
         serde_json::json!({
-            "keys": [key_b64]
+            "keys": [ledger_key
+                .to_xdr_base64(Limits::none())
+                .map_err(|e| anyhow::anyhow!("Failed to serialize LedgerKey: {}", e))?]
         }),
     )?;
 
-    // 5. Extract LedgerEntry XDR from response
     let entries = response["result"]["entries"]
         .as_array()
         .context("RPC response did not contain 'entries' array")?;
 
-    if entries.is_empty() {
-        bail!("Contract '{}' not found on-chain", contract_id);
-    }
+    let matched_entry = find_entry_by_key(entries, &ledger_key, "contract-instance lookup")?;
 
-    let entry_xdr_b64 = entries[0]["xdr"]
+    let entry_xdr_b64 = matched_entry["xdr"]
         .as_str()
         .context("RPC response entry missing 'xdr' field")?;
 
-    // 6. Deserialize LedgerEntry
     let entry = LedgerEntry::from_xdr_base64(entry_xdr_b64, Limits::none())
         .map_err(|e| anyhow::anyhow!("Failed to deserialize LedgerEntry XDR: {}", e))?;
 
-    // 7. Get ContractInstance val
     let contract_data = match entry.data {
         LedgerEntryData::ContractData(cd) => cd,
         _ => bail!("Unexpected ledger entry type returned for contract instance"),
@@ -129,7 +211,6 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
         _ => bail!("Expected ScVal::ContractInstance in contract data"),
     };
 
-    // 8. Extract WASM hash from instance executable
     let wasm_hash = match instance.executable {
         ContractExecutable::Wasm(hash) => hash,
         ContractExecutable::StellarAsset => {
@@ -140,23 +221,17 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
         }
     };
 
-    // 9. Fetch WASM code using WASM hash
     let code_ledger_key = LedgerKey::ContractCode(LedgerKeyContractCode {
         hash: wasm_hash.clone(),
     });
-
-    let code_key_b64 = code_ledger_key.to_xdr_base64(Limits::none()).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to serialize ContractCode LedgerKey to base64: {}",
-            e
-        )
-    })?;
 
     let code_response = query_rpc(
         rpc_url,
         "getLedgerEntries",
         serde_json::json!({
-            "keys": [code_key_b64]
+            "keys": [code_ledger_key
+                .to_xdr_base64(Limits::none())
+                .map_err(|e| anyhow::anyhow!("Failed to serialize code key: {}", e))?]
         }),
     )?;
 
@@ -164,14 +239,10 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
         .as_array()
         .context("RPC response for contract code did not contain 'entries' array")?;
 
-    if code_entries.is_empty() {
-        bail!(
-            "WASM code not found on-chain for hash {}",
-            hex::encode(wasm_hash.0)
-        );
-    }
+    let matched_code_entry =
+        find_entry_by_key(code_entries, &code_ledger_key, "contract-code lookup")?;
 
-    let code_entry_xdr_b64 = code_entries[0]["xdr"]
+    let code_entry_xdr_b64 = matched_code_entry["xdr"]
         .as_str()
         .context("RPC response code entry missing 'xdr' field")?;
 
@@ -187,7 +258,20 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
 
     let wasm_bytes = contract_code.code.to_vec();
 
-    // Validate WASM bytes
+    let computed_hash = Sha256::digest(&wasm_bytes);
+    if computed_hash[..] != wasm_hash.0[..] {
+        return Err(IntegrityError {
+            kind: IntegrityErrorKind::HashMismatch,
+            details: format!(
+                "WASM hash mismatch for contract '{}': expected {}, computed {}",
+                contract_id,
+                hex::encode(wasm_hash.0),
+                hex::encode(computed_hash),
+            ),
+        }
+        .into());
+    }
+
     if wasm_bytes.len() < 4 || &wasm_bytes[0..4] != b"\0asm" {
         bail!(
             "Fetched WASM for contract '{}' has invalid magic bytes",
@@ -205,10 +289,10 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
     Ok(WasmModule {
         path: format!("stellar://{}", contract_id),
         bytes: wasm_bytes,
+        verified_hash: Some(wasm_hash.0),
     })
 }
 
-/// Helper to execute JSON-RPC request to Stellar RPC.
 fn query_rpc(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
     let payload = serde_json::json!({
         "jsonrpc": "2.0",
