@@ -21,6 +21,125 @@ pub const STORAGE_NOT_VERIFIED_NOTE: &str = "Note: this result does NOT certify 
      need not appear in the exported spec, so a green verdict here says nothing about whether \
      stored data will still deserialize after the upgrade.";
 
+/// Whether — and how much — storage layout was analyzed for this run.
+///
+/// A verdict is only as trustworthy as its scope. When no storage schema is
+/// supplied the tool has no view of internal storage layout at all, and this
+/// state records that plainly so neither a human nor a machine consumer mistakes
+/// "no exported-interface breaks" for "storage-compatible".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageScopeState {
+    /// No storage schema was supplied — storage layout was not analyzed.
+    NotAnalyzed,
+    /// A storage schema was supplied and diffed; coverage is bounded to the
+    /// declared key and value types.
+    Analyzed {
+        key_types: usize,
+        value_types: usize,
+    },
+}
+
+/// A structured description of what a given run actually inspected.
+///
+/// Every field answers "was this dimension analyzed?" so the scope can be
+/// reported faithfully in all formats and consumed as machine-readable coverage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalysisScope {
+    /// The exported `contractspecv0` interface is always compared.
+    pub exported_interface: bool,
+    /// Whether environment metadata (`contractenvmetav0`) was compared.
+    pub env_metadata: bool,
+    /// The storage-layout analysis state for this run.
+    pub storage_schema: StorageScopeState,
+}
+
+impl Default for AnalysisScope {
+    /// The conservative default: exported interface analyzed, environment
+    /// metadata not compared, storage layout not analyzed. Callers that do more
+    /// (the CLI compares env metadata; a schema-backed run analyzes storage)
+    /// widen the scope explicitly, so the report never overstates coverage.
+    fn default() -> Self {
+        Self {
+            exported_interface: true,
+            env_metadata: false,
+            storage_schema: StorageScopeState::NotAnalyzed,
+        }
+    }
+}
+
+impl AnalysisScope {
+    /// Whether a storage schema was analyzed for this run.
+    pub fn storage_analyzed(&self) -> bool {
+        matches!(self.storage_schema, StorageScopeState::Analyzed { .. })
+    }
+
+    /// One-sentence bounded claim describing what this verdict certifies. When
+    /// no schema was supplied it reduces to [`SCOPE_SUMMARY_LINE`].
+    pub fn summary_line(&self) -> String {
+        match &self.storage_schema {
+            StorageScopeState::NotAnalyzed => SCOPE_SUMMARY_LINE.to_string(),
+            StorageScopeState::Analyzed {
+                key_types,
+                value_types,
+            } => format!(
+                "Exported interface + environment metadata, plus a declared storage schema \
+                 ({key_types} key type(s), {value_types} value type(s)). Storage coverage is \
+                 limited to the declared types."
+            ),
+        }
+    }
+
+    /// A single line stating the storage-layout coverage explicitly.
+    pub fn storage_status_line(&self) -> String {
+        match &self.storage_schema {
+            StorageScopeState::NotAnalyzed => {
+                "Storage layout: NOT analyzed — no storage schema supplied.".to_string()
+            }
+            StorageScopeState::Analyzed {
+                key_types,
+                value_types,
+            } => format!(
+                "Storage layout: analyzed against the declared schema \
+                 ({key_types} key type(s), {value_types} value type(s))."
+            ),
+        }
+    }
+}
+
+/// A machine-readable view of an [`AnalysisScope`] for `--format json`.
+#[derive(Serialize)]
+pub struct ScopeJson {
+    pub exported_interface_analyzed: bool,
+    pub env_metadata_analyzed: bool,
+    pub storage_layout_analyzed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_key_types: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_value_types: Option<usize>,
+    pub summary: String,
+}
+
+impl AnalysisScope {
+    /// Build the serializable coverage view of this scope.
+    pub fn to_json(&self) -> ScopeJson {
+        let (storage_key_types, storage_value_types) = match &self.storage_schema {
+            StorageScopeState::NotAnalyzed => (None, None),
+            StorageScopeState::Analyzed {
+                key_types,
+                value_types,
+            } => (Some(*key_types), Some(*value_types)),
+        };
+        ScopeJson {
+            exported_interface_analyzed: self.exported_interface,
+            env_metadata_analyzed: self.env_metadata,
+            storage_layout_analyzed: self.storage_analyzed(),
+            storage_key_types,
+            storage_value_types,
+            summary: self.summary_line(),
+        }
+    }
+}
+
 /// A finding as it appears in the report, augmented with suppression state.
 ///
 /// The raw [`Finding`] from the diff layer is left untouched; suppression is a
@@ -54,6 +173,9 @@ pub struct SafetyReport {
     pub is_safe: bool,
     pub findings_by_category: HashMap<String, Vec<ReportedFinding>>,
     pub strict: bool,
+    /// What this run actually inspected. Drives the scope reporting so a verdict
+    /// is never read as broader than the analysis that produced it.
+    pub scope: AnalysisScope,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -74,7 +196,9 @@ pub struct SafetyReportJson<'a> {
     pub strict: bool,
     /// One-sentence bounded claim describing what this verdict certifies.
     /// Machine consumers should not equate `is_safe` with storage compatibility.
-    pub certifies: &'static str,
+    pub certifies: String,
+    /// Structured coverage: which analysis dimensions actually ran.
+    pub scope: ScopeJson,
     pub counts: SeverityCounts,
     /// Findings (of any severity) acknowledged by the suppression config.
     pub suppressed_count: usize,
@@ -163,7 +287,18 @@ impl SafetyReport {
             is_safe,
             findings_by_category,
             strict,
+            scope: AnalysisScope::default(),
         }
+    }
+
+    /// Attach an [`AnalysisScope`] describing what this run inspected.
+    ///
+    /// Consuming builder so a caller can widen the reported scope (for example
+    /// the CLI, which compares environment metadata, or a schema-backed run that
+    /// analyzed declared storage types) without the report ever overstating it.
+    pub fn with_scope(mut self, scope: AnalysisScope) -> Self {
+        self.scope = scope;
+        self
     }
 
     /// Derive the recommended SemVer bump from safety report findings:
@@ -189,7 +324,8 @@ impl SafetyReport {
         SafetyReportJson {
             is_safe: self.is_safe,
             strict: self.strict,
-            certifies: SCOPE_SUMMARY_LINE,
+            certifies: self.scope.summary_line(),
+            scope: self.scope.to_json(),
             counts: SeverityCounts {
                 critical: self.critical_count,
                 warning: self.warning_count,
@@ -239,7 +375,15 @@ impl SafetyReport {
                 .bold()
         };
         output.push_str(&format!("Status: {}\n", status));
-        output.push_str(&format!("Scope:  {}\n", SCOPE_SUMMARY_LINE.dimmed()));
+        output.push_str(&format!("Scope:  {}\n", self.scope.summary_line().dimmed()));
+        let storage_status = self.scope.storage_status_line();
+        let storage_status = if self.scope.storage_analyzed() {
+            storage_status.dimmed()
+        } else {
+            // No schema: make the "not analyzed" gap visible rather than dim.
+            storage_status.yellow()
+        };
+        output.push_str(&format!("        {}\n", storage_status));
 
         let crit_str = if self.critical_count > 0 {
             self.critical_count.to_string().red().bold()
@@ -375,7 +519,8 @@ impl SafetyReport {
             "❌ FAILED (Exported-interface breaking changes detected)"
         };
         output.push_str(&format!("## Status: {}\n\n", status));
-        output.push_str(&format!("_{}_\n\n", SCOPE_SUMMARY_LINE));
+        output.push_str(&format!("_{}_\n\n", self.scope.summary_line()));
+        output.push_str(&format!("**Scope:** {}\n\n", self.scope.storage_status_line()));
 
         output.push_str("### Summary Table\n\n");
         output.push_str("| Finding Severity | Count |\n");
@@ -592,6 +737,7 @@ mod tests {
             is_safe: true,
             findings_by_category: std::collections::HashMap::new(),
             strict: false,
+            scope: AnalysisScope::default(),
         };
 
         // Identical upgrade -> patch

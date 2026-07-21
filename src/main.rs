@@ -463,12 +463,22 @@ fn compare_contracts(
         &mut diff_report,
     );
 
+    // The CLI always compares environment metadata (above); storage layout is
+    // not analyzed until a storage schema is wired in. Record that faithfully so
+    // the report states its own coverage rather than implying more.
+    let scope = report::AnalysisScope {
+        exported_interface: true,
+        env_metadata: true,
+        storage_schema: report::StorageScopeState::NotAnalyzed,
+    };
+
     Ok(report::SafetyReport::with_suppressions(
         &diff_report,
         suppressions,
         *explain,
         *strict,
-    ))
+    )
+    .with_scope(scope))
 }
 
 fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {
