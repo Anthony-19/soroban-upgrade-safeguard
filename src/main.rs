@@ -78,6 +78,12 @@ struct Args {
     #[arg(long)]
     allow_http_local: bool,
 
+    /// Expected SHA-256 hash (hex) of the on-chain WASM baseline.
+    /// When provided the tool verifies the hash of the fetched bytecode
+    /// matches this value and fails immediately on mismatch.
+    #[arg(long, value_name = "HEX_HASH")]
+    expected_wasm_hash: Option<String>,
+
     /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
     #[arg(long, value_name = "MANIFEST_PATH")]
     manifest: Option<PathBuf>,
@@ -184,6 +190,8 @@ fn main() -> Result<()> {
                     suppressions: &suppressions,
                     explain: args.explain,
                     strict: args.strict,
+                    baseline_source: Some("Local File"),
+                    verified_code_hash: None,
                 },
                 &progress,
             )?;
@@ -349,7 +357,47 @@ fn main() -> Result<()> {
     // Old WASM — from file or from RPC
     let old = if let Some(contract_id) = old_source {
         let rpc_url = args.rpc_url.as_ref().unwrap();
-        loader::fetch_wasm_from_rpc(contract_id, rpc_url, args.allow_http_local)?
+        let wasm = loader::fetch_wasm_from_rpc(contract_id, rpc_url, args.allow_http_local)?;
+
+        // ── Expected hash pinning ─────────────────────────────────────────
+        if let Some(ref expected_hex) = args.expected_wasm_hash {
+            let expected_hash = hex::decode(expected_hex).with_context(|| {
+                format!(
+                    "Invalid --expected-wasm-hash: '{}' (must be 64 hex chars)",
+                    expected_hex
+                )
+            })?;
+
+            if expected_hash.len() != 32 {
+                anyhow::bail!(
+                    "Invalid --expected-wasm-hash length: got {} bytes, expected 32",
+                    expected_hash.len()
+                );
+            }
+
+            let mut expected_arr = [0u8; 32];
+            expected_arr.copy_from_slice(&expected_hash);
+
+            match wasm.verified_hash {
+                Some(actual) if actual == expected_arr => {
+                    progress("  ✅ On-chain WASM hash matches --expected-wasm-hash".to_string());
+                }
+                Some(actual) => {
+                    anyhow::bail!(
+                        "Hash mismatch: --expected-wasm-hash {}, but verified on-chain hash is {}",
+                        hex::encode(expected_arr),
+                        hex::encode(actual),
+                    );
+                }
+                None => {
+                    anyhow::bail!(
+                        "--expected-wasm-hash provided but baseline has no verified hash"
+                    );
+                }
+            }
+        }
+
+        wasm
     } else {
         loader::load_wasm(&args.wasm_paths[0])?
     };
@@ -365,6 +413,12 @@ fn main() -> Result<()> {
     }
 
     // Generate Safety Report using the factored helper
+    let baseline_source: Option<&str> = if old_source.is_some() {
+        Some("RPC")
+    } else {
+        Some("Local File")
+    };
+    let verified_hash_hex = old.verified_hash.as_ref().map(hex::encode);
     let safety_report = compare_contracts(
         &ContractComparison {
             old_bytes: &old.bytes,
@@ -374,6 +428,8 @@ fn main() -> Result<()> {
             suppressions: &suppressions,
             explain: args.explain,
             strict: args.strict,
+            baseline_source,
+            verified_code_hash: verified_hash_hex.as_deref(),
         },
         &progress,
     )?;
@@ -421,6 +477,10 @@ struct ContractComparison<'a> {
     suppressions: &'a SuppressionConfig,
     explain: bool,
     strict: bool,
+    /// Indicates if the baseline was fetched from RPC.
+    baseline_source: Option<&'a str>,
+    /// Verified SHA-256 hash of the baseline WASM (hex), if available.
+    verified_code_hash: Option<&'a str>,
 }
 
 /// Helper function to run comparison for a single pair.
@@ -436,6 +496,8 @@ fn compare_contracts(
         suppressions,
         explain,
         strict,
+        baseline_source,
+        verified_code_hash,
     } = comparison;
     let old_meta = parser::extract_metadata(old_bytes)?;
     let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
@@ -468,12 +530,11 @@ fn compare_contracts(
         &mut diff_report,
     );
 
-    Ok(report::SafetyReport::with_suppressions(
-        &diff_report,
-        suppressions,
-        *explain,
-        *strict,
-    ))
+    let mut safety_report =
+        report::SafetyReport::with_suppressions(&diff_report, suppressions, *explain, *strict);
+    safety_report.baseline_source = baseline_source.map(|s| s.to_string());
+    safety_report.verified_code_hash = verified_code_hash.map(|s| s.to_string());
+    Ok(safety_report)
 }
 
 fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {
