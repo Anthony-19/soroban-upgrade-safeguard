@@ -4,9 +4,11 @@ use std::fmt;
 use std::path::Path;
 use stellar_xdr::curr::{
     ContractExecutable, Hash, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyContractCode,
-    LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
+    LedgerKeyContractData, ReadXdr, ScAddress, ScVal, WriteXdr,
 };
 use wasmparser::{Parser, Payload};
+
+use crate::limits::{LimitError, ResourcePolicy};
 
 /// Holds raw WASM bytes alongside the validated file path.
 #[derive(Debug)]
@@ -96,80 +98,26 @@ fn validate_wasm_structure(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Scans a JSON-RPC `entries` array and returns the entry whose `key` field
-/// matches the XDR-base64 encoding of `expected_key`.
-fn find_entry_by_key<'a>(
-    entries: &'a [serde_json::Value],
-    expected_key: &LedgerKey,
-    context: &str,
-) -> Result<&'a serde_json::Value> {
-    if entries.is_empty() {
-        bail!("{}: RPC response returned zero entries", context);
-    }
-
-    let expected_b64 = expected_key
-        .to_xdr_base64(Limits::none())
-        .map_err(|e| anyhow::anyhow!("{}: failed to serialize expected key: {}", context, e))?;
-
-    let mut matched: Vec<&serde_json::Value> = Vec::new();
-
-    for entry in entries {
-        let key_b64 = entry["key"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("{}: RPC entry missing 'key' field", context))?;
-
-        let _xdr_b64 = entry["xdr"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("{}: RPC entry missing 'xdr' field", context))?;
-
-        if key_b64 == expected_b64 {
-            matched.push(entry);
-        }
-    }
-
-    if matched.is_empty() {
-        return Err(IntegrityError {
-            kind: IntegrityErrorKind::KeyMismatch,
-            details: format!(
-                "{}: no entry matches the expected ledger key (possible RPC manipulation)",
-                context
-            ),
-        }
-        .into());
-    }
-
-    if matched.len() > 1 {
-        bail!(
-            "{}: {} entries share the same ledger key (possible RPC manipulation)",
-            context,
-            matched.len()
-        );
-    }
-
-    Ok(matched[0])
+/// Fetches a deployed Soroban contract's WASM bytes from Stellar RPC by contract
+/// ID, using the default [`ResourcePolicy`].
+pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModule> {
+    fetch_wasm_from_rpc_with_policy(contract_id, rpc_url, &ResourcePolicy::default())
 }
 
-/// Fetches a deployed Soroban contract's WASM bytes from Stellar RPC by contract ID.
+/// Fetches a deployed Soroban contract's WASM bytes from Stellar RPC by contract
+/// ID, bounding XDR (de)serialization by `policy`.
 ///
-/// # Zero-Trust Pipeline
-///
-/// 1. Parses and validates the contract ID via `stellar_strkey`.
-/// 2. Builds the expected `LedgerKey` for the contract instance.
-/// 3. Queries `getLedgerEntries` and defensively validates that exactly one
-///    entry matches the requested key — rejects empty, duplicate, or mismatched
-///    payloads.
-/// 4. Extracts the `ContractExecutable::Wasm` hash from the instance.
-/// 5. Queries the contract-code sub-entry using the advertised hash.
-/// 6. Reconcilies the returned key against the expected code `LedgerKey`.
-/// 7. Computes the SHA-256 of the fetched bytecode and compares it against the
-///    hash from step 4 — aborts on mismatch with an `IntegrityError`.
-pub fn fetch_wasm_from_rpc(
+/// RPC responses are attacker-influenced (the contract ID is arbitrary), so the
+/// `LedgerEntry` payloads are decoded under `policy.xdr_limits()`: an oversized or
+/// deeply nested entry fails with a [`LimitError`] instead of exhausting memory or
+/// the stack. The returned WASM is validated structurally; its embedded spec is
+/// subject to the same policy when later decoded by the caller.
+pub fn fetch_wasm_from_rpc_with_policy(
     contract_id: &str,
     rpc_url: &str,
-    allow_http_local: bool,
+    policy: &ResourcePolicy,
 ) -> Result<WasmModule> {
-    validate_rpc_url(rpc_url, allow_http_local).context("RPC transport security check failed")?;
-
+    // 1. Parse contract_id using stellar_strkey
     let strkey = stellar_strkey::Strkey::from_string(contract_id)
         .map_err(|e| anyhow::anyhow!("Invalid contract ID '{}': {}", contract_id, e))?;
 
@@ -184,6 +132,12 @@ pub fn fetch_wasm_from_rpc(
         durability: stellar_xdr::curr::ContractDataDurability::Persistent,
     });
 
+    // 3. Serialize LedgerKey to Base64
+    let key_b64 = ledger_key
+        .to_xdr_base64(policy.xdr_limits())
+        .map_err(|e| anyhow::anyhow!("Failed to serialize LedgerKey to base64: {}", e))?;
+
+    // 4. Query getLedgerEntries RPC
     let response = query_rpc(
         rpc_url,
         "getLedgerEntries",
@@ -204,8 +158,12 @@ pub fn fetch_wasm_from_rpc(
         .as_str()
         .context("RPC response entry missing 'xdr' field")?;
 
-    let entry = LedgerEntry::from_xdr_base64(entry_xdr_b64, Limits::none())
-        .map_err(|e| anyhow::anyhow!("Failed to deserialize LedgerEntry XDR: {}", e))?;
+    // 6. Deserialize LedgerEntry
+    let entry = LedgerEntry::from_xdr_base64(entry_xdr_b64, policy.xdr_limits()).map_err(|e| {
+        LimitError::from_xdr_error(&e, policy)
+            .map(anyhow::Error::from)
+            .unwrap_or_else(|| anyhow::anyhow!("Failed to deserialize LedgerEntry XDR: {}", e))
+    })?;
 
     let contract_data = match entry.data {
         LedgerEntryData::ContractData(cd) => cd,
@@ -231,6 +189,13 @@ pub fn fetch_wasm_from_rpc(
         hash: wasm_hash.clone(),
     });
 
+    let code_key_b64 = code_ledger_key.to_xdr_base64(policy.xdr_limits()).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to serialize ContractCode LedgerKey to base64: {}",
+            e
+        )
+    })?;
+
     let code_response = query_rpc(
         rpc_url,
         "getLedgerEntries",
@@ -252,9 +217,13 @@ pub fn fetch_wasm_from_rpc(
         .as_str()
         .context("RPC response code entry missing 'xdr' field")?;
 
-    let code_entry =
-        LedgerEntry::from_xdr_base64(code_entry_xdr_b64, Limits::none()).map_err(|e| {
-            anyhow::anyhow!("Failed to deserialize ContractCode LedgerEntry XDR: {}", e)
+    let code_entry = LedgerEntry::from_xdr_base64(code_entry_xdr_b64, policy.xdr_limits())
+        .map_err(|e| {
+            LimitError::from_xdr_error(&e, policy)
+                .map(anyhow::Error::from)
+                .unwrap_or_else(|| {
+                    anyhow::anyhow!("Failed to deserialize ContractCode LedgerEntry XDR: {}", e)
+                })
         })?;
 
     let contract_code = match code_entry.data {

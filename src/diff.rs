@@ -1,4 +1,5 @@
-use crate::mapper::LayoutMapper;
+use crate::limits::{LimitError, ResourcePolicy};
+use crate::mapper::{try_type_to_string, LayoutMapper};
 use crate::parser::ContractEnvMeta;
 use crate::spec::ContractSpec;
 use serde::Serialize;
@@ -73,18 +74,38 @@ impl DiffReport {
 }
 
 /// Compare two contract specs and return a report of all findings.
+///
+/// Infallible convenience wrapper over [`compare_with_policy`] using the default
+/// [`ResourcePolicy`]. Retained for the shallow inputs used in unit tests and for
+/// callers that don't need to distinguish a resource-limit violation; on the
+/// (practically unreachable) event that a type nests past the default walk-depth
+/// limit it returns whatever findings were gathered before the limit tripped.
 pub fn compare(old: &ContractSpec, new: &ContractSpec) -> DiffReport {
+    compare_with_policy(old, new, &ResourcePolicy::default()).unwrap_or_default()
+}
+
+/// Compare two contract specs under `policy`, bounding every recursive type walk.
+///
+/// A type nested past `policy.max_walk_depth` — in an equality check, a UDT
+/// dependency walk, or a rendered finding message — aborts the comparison with
+/// [`LimitError::WalkDepthExceeded`] instead of overflowing the stack. This is
+/// the fallible core; [`compare`] is the infallible default-policy wrapper.
+pub fn compare_with_policy(
+    old: &ContractSpec,
+    new: &ContractSpec,
+    policy: &ResourcePolicy,
+) -> Result<DiffReport, LimitError> {
     let mut report = DiffReport::default();
 
-    compare_functions(old, new, &mut report);
-    compare_structs(old, new, &mut report);
+    compare_functions(old, new, &mut report, policy)?;
+    compare_structs(old, new, &mut report, policy)?;
     compare_enums(old, new, &mut report);
-    compare_unions(old, new, &mut report);
+    compare_unions(old, new, &mut report, policy)?;
     compare_error_enums(old, new, &mut report);
 
-    detect_cascading_layout_breaks(old, &mut report);
+    detect_cascading_layout_breaks_with_policy(old, &mut report, policy)?;
 
-    report
+    Ok(report)
 }
 
 /// Category label for contract environment metadata findings.
@@ -171,7 +192,12 @@ fn is_event(name: &str) -> bool {
 }
 
 /// Compare function signatures between old and new contract specs.
-fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport) {
+fn compare_functions(
+    old: &ContractSpec,
+    new: &ContractSpec,
+    report: &mut DiffReport,
+    policy: &ResourcePolicy,
+) -> Result<(), LimitError> {
     // Check for removed or changed functions
     for (name, old_fn) in &old.functions {
         match new.functions.get(name) {
@@ -188,7 +214,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                 });
             }
             Some(new_fn) => {
-                check_function_signature(name, old_fn, new_fn, report);
+                check_function_signature(name, old_fn, new_fn, report, policy)?;
                 // Compare function doc-strings and emit informational findings
                 if old_fn.doc != new_fn.doc {
                     let old_doc_empty = old_fn.doc.to_string().is_empty();
@@ -225,6 +251,8 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
             });
         }
     }
+
+    Ok(())
 }
 
 /// Compare signatures of two functions with the same name.
@@ -233,7 +261,8 @@ fn check_function_signature(
     old_fn: &ScSpecFunctionV0,
     new_fn: &ScSpecFunctionV0,
     report: &mut DiffReport,
-) {
+    policy: &ResourcePolicy,
+) -> Result<(), LimitError> {
     // Check input count
     let old_inputs: &[ScSpecFunctionInputV0] = old_fn.inputs.as_ref();
     let new_inputs: &[ScSpecFunctionInputV0] = new_fn.inputs.as_ref();
@@ -251,7 +280,7 @@ fn check_function_signature(
             type_name: None,
             target: Some(name.to_string()),
         });
-        return; // No point comparing individual params if count differs
+        return Ok(()); // No point comparing individual params if count differs
     }
 
     // Check each input parameter
@@ -290,7 +319,7 @@ fn check_function_signature(
         for (i, old_input) in old_inputs.iter().enumerate() {
             let p_name = old_input.name.to_string();
             if let Some(new_type) = new_by_name.get(&p_name) {
-                if !types_equal(&old_input.type_, new_type) {
+                if !types_equal(&old_input.type_, new_type, policy)? {
                     report.findings.push(Finding {
                         severity: Severity::Critical,
                         category: "Parameter Type Changed".to_string(),
@@ -299,8 +328,8 @@ fn check_function_signature(
                             name,
                             i,
                             p_name,
-                            crate::mapper::type_to_string(&old_input.type_),
-                            crate::mapper::type_to_string(new_type)
+                            try_type_to_string(&old_input.type_, 0, policy.max_walk_depth)?,
+                            try_type_to_string(new_type, 0, policy.max_walk_depth)?
                         ),
                         type_name: None,
                         target: Some(format!("{}.{}", name, p_name)),
@@ -327,7 +356,7 @@ fn check_function_signature(
                 });
             }
 
-            if !types_equal(&old_input.type_, &new_input.type_) {
+            if !types_equal(&old_input.type_, &new_input.type_, policy)? {
                 report.findings.push(Finding {
                     severity: Severity::Critical,
                     category: "Parameter Type Changed".to_string(),
@@ -336,8 +365,8 @@ fn check_function_signature(
                         name,
                         i,
                         old_name,
-                        crate::mapper::type_to_string(&old_input.type_),
-                        crate::mapper::type_to_string(&new_input.type_)
+                        try_type_to_string(&old_input.type_, 0, policy.max_walk_depth)?,
+                        try_type_to_string(&new_input.type_, 0, policy.max_walk_depth)?
                     ),
                     type_name: None,
                     target: Some(format!("{}.{}", name, old_name)),
@@ -365,7 +394,7 @@ fn check_function_signature(
         });
     } else {
         for (i, (old_out, new_out)) in old_outputs.iter().zip(new_outputs.iter()).enumerate() {
-            if !types_equal(old_out, new_out) {
+            if !types_equal(old_out, new_out, policy)? {
                 report.findings.push(Finding {
                     severity: Severity::Critical,
                     category: "Return Type Changed".to_string(),
@@ -373,8 +402,8 @@ fn check_function_signature(
                         "Function '{}': return type {} changed from `{}` to `{}`.",
                         name,
                         i,
-                        crate::mapper::type_to_string(old_out),
-                        crate::mapper::type_to_string(new_out)
+                        try_type_to_string(old_out, 0, policy.max_walk_depth)?,
+                        try_type_to_string(new_out, 0, policy.max_walk_depth)?
                     ),
                     type_name: None,
                     target: Some(name.to_string()),
@@ -382,16 +411,79 @@ fn check_function_signature(
             }
         }
     }
+
+    Ok(())
 }
 
-/// Compare two ScSpecTypeDef values for equality.
-/// We use the PartialEq derive on the XDR types.
-fn types_equal(a: &ScSpecTypeDef, b: &ScSpecTypeDef) -> bool {
-    a == b
+/// Compare two `ScSpecTypeDef` values for structural equality, bounding the
+/// recursion to `policy.max_walk_depth`.
+///
+/// Replaces the derived recursive `PartialEq` (which has no depth bound and would
+/// overflow the stack on a maliciously nested type). Same-discriminant container
+/// variants are compared explicitly with a depth counter; the `_` arm only ever
+/// sees leaf types or a discriminant mismatch, so its `a == b` is O(1) and safe.
+fn types_equal(
+    a: &ScSpecTypeDef,
+    b: &ScSpecTypeDef,
+    policy: &ResourcePolicy,
+) -> Result<bool, LimitError> {
+    types_equal_inner(a, b, 0, policy.max_walk_depth)
+}
+
+fn types_equal_inner(
+    a: &ScSpecTypeDef,
+    b: &ScSpecTypeDef,
+    depth: usize,
+    max: usize,
+) -> Result<bool, LimitError> {
+    if depth > max {
+        return Err(LimitError::WalkDepthExceeded { limit: max });
+    }
+    let equal = match (a, b) {
+        (ScSpecTypeDef::Option(x), ScSpecTypeDef::Option(y)) => {
+            types_equal_inner(&x.value_type, &y.value_type, depth + 1, max)?
+        }
+        (ScSpecTypeDef::Result(x), ScSpecTypeDef::Result(y)) => {
+            types_equal_inner(&x.ok_type, &y.ok_type, depth + 1, max)?
+                && types_equal_inner(&x.error_type, &y.error_type, depth + 1, max)?
+        }
+        (ScSpecTypeDef::Vec(x), ScSpecTypeDef::Vec(y)) => {
+            types_equal_inner(&x.element_type, &y.element_type, depth + 1, max)?
+        }
+        (ScSpecTypeDef::Map(x), ScSpecTypeDef::Map(y)) => {
+            types_equal_inner(&x.key_type, &y.key_type, depth + 1, max)?
+                && types_equal_inner(&x.value_type, &y.value_type, depth + 1, max)?
+        }
+        (ScSpecTypeDef::Tuple(x), ScSpecTypeDef::Tuple(y)) => {
+            let xs: &[ScSpecTypeDef] = x.value_types.as_ref();
+            let ys: &[ScSpecTypeDef] = y.value_types.as_ref();
+            if xs.len() != ys.len() {
+                false
+            } else {
+                let mut all_eq = true;
+                for (l, r) in xs.iter().zip(ys.iter()) {
+                    if !types_equal_inner(l, r, depth + 1, max)? {
+                        all_eq = false;
+                        break;
+                    }
+                }
+                all_eq
+            }
+        }
+        // Leaf types (primitives, BytesN, Udt) and any discriminant mismatch:
+        // the derived equality here is O(1) and never recurses into a container.
+        _ => a == b,
+    };
+    Ok(equal)
 }
 
 /// Compare struct definitions between old and new contract specs.
-fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport) {
+fn compare_structs(
+    old: &ContractSpec,
+    new: &ContractSpec,
+    report: &mut DiffReport,
+    policy: &ResourcePolicy,
+) -> Result<(), LimitError> {
     for (name, old_struct) in &old.structs {
         let is_evt = is_event(name);
         match new.structs.get(name) {
@@ -413,7 +505,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                 });
             }
             Some(new_struct) => {
-                check_struct_fields(name, old_struct, new_struct, report);
+                check_struct_fields(name, old_struct, new_struct, report, policy)?;
                 // Compare struct doc-strings (informational only)
                 if old_struct.doc != new_struct.doc {
                     let old_doc_empty = old_struct.doc.to_string().is_empty();
@@ -450,6 +542,8 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
             });
         }
     }
+
+    Ok(())
 }
 
 /// Compare fields of two structs with the same name.
@@ -461,7 +555,8 @@ fn check_struct_fields(
     old_struct: &ScSpecUdtStructV0,
     new_struct: &ScSpecUdtStructV0,
     report: &mut DiffReport,
-) {
+    policy: &ResourcePolicy,
+) -> Result<(), LimitError> {
     let old_fields: &[ScSpecUdtStructFieldV0] = old_struct.fields.as_ref();
     let new_fields: &[ScSpecUdtStructFieldV0] = new_struct.fields.as_ref();
     let is_evt = is_event(name);
@@ -511,7 +606,7 @@ fn check_struct_fields(
         }
 
         // Field type changed
-        if !types_equal(&old_field.type_, &new_field.type_) {
+        if !types_equal(&old_field.type_, &new_field.type_, policy)? {
             report.findings.push(Finding {
                 severity: Severity::Critical,
                 category: format!("{} Type Changed", category_prefix),
@@ -521,8 +616,8 @@ fn check_struct_fields(
                     name,
                     old_name,
                     i,
-                    crate::mapper::type_to_string(&old_field.type_),
-                    crate::mapper::type_to_string(&new_field.type_)
+                    try_type_to_string(&old_field.type_, 0, policy.max_walk_depth)?,
+                    try_type_to_string(&new_field.type_, 0, policy.max_walk_depth)?
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
@@ -547,6 +642,8 @@ fn check_struct_fields(
             });
         }
     }
+
+    Ok(())
 }
 
 /// Compare enum definitions between old and new contract specs.
@@ -686,7 +783,12 @@ fn check_enum_cases(
 }
 
 /// Compare union definitions between old and new contract specs.
-fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport) {
+fn compare_unions(
+    old: &ContractSpec,
+    new: &ContractSpec,
+    report: &mut DiffReport,
+    policy: &ResourcePolicy,
+) -> Result<(), LimitError> {
     for (name, old_union) in &old.unions {
         match new.unions.get(name) {
             None => {
@@ -702,7 +804,7 @@ fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepor
                 });
             }
             Some(new_union) => {
-                check_union_cases(name, old_union, new_union, report);
+                check_union_cases(name, old_union, new_union, report, policy)?;
             }
         }
     }
@@ -718,6 +820,8 @@ fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepor
             });
         }
     }
+
+    Ok(())
 }
 
 /// Compare cases of two unions with the same name.
@@ -729,7 +833,8 @@ fn check_union_cases(
     old_union: &ScSpecUdtUnionV0,
     new_union: &ScSpecUdtUnionV0,
     report: &mut DiffReport,
-) {
+    policy: &ResourcePolicy,
+) -> Result<(), LimitError> {
     let old_cases: &[ScSpecUdtUnionCaseV0] = old_union.cases.as_ref();
     let new_cases: &[ScSpecUdtUnionCaseV0] = new_union.cases.as_ref();
 
@@ -768,7 +873,7 @@ fn check_union_cases(
             });
         }
 
-        if !union_cases_equal(old_case, new_case) {
+        if !union_cases_equal(old_case, new_case, policy)? {
             report.findings.push(Finding {
                 severity: Severity::Critical,
                 category: "Union Case Type Changed".to_string(),
@@ -777,8 +882,8 @@ fn check_union_cases(
                     name,
                     old_name,
                     i,
-                    union_case_type_signature(old_case),
-                    union_case_type_signature(new_case)
+                    union_case_type_signature(old_case, policy)?,
+                    union_case_type_signature(new_case, policy)?
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
@@ -795,13 +900,15 @@ fn check_union_cases(
                     "Union '{}': new case '{}' ({}) added.",
                     name,
                     union_case_name(new_case),
-                    union_case_type_signature(new_case)
+                    union_case_type_signature(new_case, policy)?
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, union_case_name(new_case))),
             });
         }
     }
+
+    Ok(())
 }
 
 fn union_case_name(case: &ScSpecUdtUnionCaseV0) -> String {
@@ -811,30 +918,48 @@ fn union_case_name(case: &ScSpecUdtUnionCaseV0) -> String {
     }
 }
 
-fn union_case_type_signature(case: &ScSpecUdtUnionCaseV0) -> String {
-    match case {
+fn union_case_type_signature(
+    case: &ScSpecUdtUnionCaseV0,
+    policy: &ResourcePolicy,
+) -> Result<String, LimitError> {
+    Ok(match case {
         ScSpecUdtUnionCaseV0::VoidV0(_) => "void".to_string(),
         ScSpecUdtUnionCaseV0::TupleV0(t) => {
-            let types: Vec<String> = t.type_.iter().map(crate::mapper::type_to_string).collect();
+            let types: Vec<String> = t
+                .type_
+                .iter()
+                .map(|ty| try_type_to_string(ty, 0, policy.max_walk_depth))
+                .collect::<Result<_, _>>()?;
             format!("({})", types.join(", "))
         }
-    }
+    })
 }
 
-fn union_cases_equal(a: &ScSpecUdtUnionCaseV0, b: &ScSpecUdtUnionCaseV0) -> bool {
-    match (a, b) {
+fn union_cases_equal(
+    a: &ScSpecUdtUnionCaseV0,
+    b: &ScSpecUdtUnionCaseV0,
+    policy: &ResourcePolicy,
+) -> Result<bool, LimitError> {
+    Ok(match (a, b) {
         (ScSpecUdtUnionCaseV0::VoidV0(_), ScSpecUdtUnionCaseV0::VoidV0(_)) => true,
         (ScSpecUdtUnionCaseV0::TupleV0(a_tuple), ScSpecUdtUnionCaseV0::TupleV0(b_tuple)) => {
             let a_types: &[ScSpecTypeDef] = a_tuple.type_.as_ref();
             let b_types: &[ScSpecTypeDef] = b_tuple.type_.as_ref();
-            a_types.len() == b_types.len()
-                && a_types
-                    .iter()
-                    .zip(b_types.iter())
-                    .all(|(left, right)| types_equal(left, right))
+            if a_types.len() != b_types.len() {
+                false
+            } else {
+                let mut all_eq = true;
+                for (left, right) in a_types.iter().zip(b_types.iter()) {
+                    if !types_equal(left, right, policy)? {
+                        all_eq = false;
+                        break;
+                    }
+                }
+                all_eq
+            }
         }
         _ => false,
-    }
+    })
 }
 
 /// Compare contract error enum definitions between old and new specs.
@@ -932,10 +1057,24 @@ fn check_error_enum_cases(
     }
 }
 
-/// Uses dependency graphing to figure out if storage layout changes cascade to other types.
+/// Uses dependency graphing to figure out if storage layout changes cascade to
+/// other types. Infallible wrapper (default policy) retained for unit tests;
+/// production uses [`detect_cascading_layout_breaks_with_policy`].
+#[cfg(test)]
 fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
-    let old_mapper = LayoutMapper::new(old);
-    let reverse_deps = old_mapper.build_reverse_dependencies();
+    let _ = detect_cascading_layout_breaks_with_policy(old, report, &ResourcePolicy::default());
+}
+
+/// Depth-bounded variant of `detect_cascading_layout_breaks`: the reverse
+/// dependency walk is bounded by `policy.max_walk_depth`, so a maliciously nested
+/// type yields [`LimitError::WalkDepthExceeded`] rather than overflowing the stack.
+fn detect_cascading_layout_breaks_with_policy(
+    old: &ContractSpec,
+    report: &mut DiffReport,
+    policy: &ResourcePolicy,
+) -> Result<(), LimitError> {
+    let old_mapper = LayoutMapper::new_with_policy(old, policy);
+    let reverse_deps = old_mapper.try_build_reverse_dependencies()?;
 
     // Collect all UDTs that had a critical breaking change.
     // We read `type_name` directly — no message-text parsing needed.
@@ -979,15 +1118,14 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
             }
         }
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
-        ScEnvMetaEntry, ScSpecTypeUdt, ScSpecUdtErrorEnumCaseV0, ScSpecUdtUnionCaseTupleV0,
-        ScSpecUdtUnionCaseV0, ScSpecUdtUnionCaseVoidV0, StringM, VecM,
-    };
+    use stellar_xdr::curr::{ScEnvMetaEntry, ScSpecTypeUdt, StringM, VecM};
 
     /// Helper: build a minimal ContractSpec with the given structs.
     fn spec_with_structs(structs: Vec<(&str, Vec<(&str, ScSpecTypeDef)>)>) -> ContractSpec {

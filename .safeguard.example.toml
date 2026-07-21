@@ -28,3 +28,24 @@ reason   = "Planned storage migration in v2 drops the unused threshold field."
 category = "Function Signature Changed"
 target   = "initialize"
 reason   = "Re-init is intentional and gated behind the migration admin call."
+
+# ---------------------------------------------------------------------------
+# Resource limits (optional).
+#
+# The WASM and its embedded XDR are treated as untrusted input. These limits
+# bound how much work a single (possibly malicious) contract can cause; an input
+# that exceeds one stops the run with a controlled error and exit code 2 —
+# distinct from exit code 1 (breaking changes) — rather than crashing the gate
+# with an out-of-memory allocation or a stack overflow.
+#
+# Every field is optional; an omitted field keeps the built-in default shown
+# below. Each is independently configurable, and any of them can be overridden
+# for a single run with the matching --max-* CLI flag (flags win over this file).
+# The defaults accept every real mainnet spec — only raise a limit if a
+# legitimate, unusually large contract is rejected.
+
+[limits]
+max_xdr_depth  = 64         # Max XDR nesting depth per entry (stack-overflow guard).
+max_xdr_len    = 33554432   # Max bytes decoded per custom section, 32 MiB (allocation guard).
+max_entries    = 100000     # Max decoded spec entries, summed across all sections.
+max_walk_depth = 128        # Max recursive type-walk depth (equality, rendering, cascades).
