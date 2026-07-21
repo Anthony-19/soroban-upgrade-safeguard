@@ -14,6 +14,11 @@
 //! - [`diff`] compares two specs and produces a list of findings.
 //! - [`report`] aggregates findings into a [`report::SafetyReport`].
 //!
+//! The exported spec only describes a contract's *callable surface*. Storage
+//! compatibility is governed by internal storage-key and value types that need
+//! not appear in it at all, so [`storage_schema`] defines an opt-in manifest in
+//! which a team declares those types for analysis.
+//!
 //! Most callers only need the two top-level helpers, [`compare_wasm_files`] and
 //! [`compare_wasm_bytes`], which run the whole pipeline and return a structured
 //! [`report::SafetyReport`]. The individual modules are public so that more
@@ -43,6 +48,7 @@ pub mod mapper;
 pub mod parser;
 pub mod report;
 pub mod spec;
+pub mod storage_schema;
 pub mod suppression;
 
 use std::path::Path;
