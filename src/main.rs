@@ -73,6 +73,11 @@ struct Args {
     #[arg(long)]
     no_color: bool,
 
+    /// Allow HTTP connections for RPC when the host is localhost/127.0.0.1.
+    /// Without this flag only HTTPS URLs are accepted.
+    #[arg(long)]
+    allow_http_local: bool,
+
     /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
     #[arg(long, value_name = "MANIFEST_PATH")]
     manifest: Option<PathBuf>,
@@ -344,7 +349,7 @@ fn main() -> Result<()> {
     // Old WASM — from file or from RPC
     let old = if let Some(contract_id) = old_source {
         let rpc_url = args.rpc_url.as_ref().unwrap();
-        loader::fetch_wasm_from_rpc(contract_id, rpc_url)?
+        loader::fetch_wasm_from_rpc(contract_id, rpc_url, args.allow_http_local)?
     } else {
         loader::load_wasm(&args.wasm_paths[0])?
     };

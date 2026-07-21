@@ -163,7 +163,13 @@ fn find_entry_by_key<'a>(
 /// 6. Reconcilies the returned key against the expected code `LedgerKey`.
 /// 7. Computes the SHA-256 of the fetched bytecode and compares it against the
 ///    hash from step 4 — aborts on mismatch with an `IntegrityError`.
-pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModule> {
+pub fn fetch_wasm_from_rpc(
+    contract_id: &str,
+    rpc_url: &str,
+    allow_http_local: bool,
+) -> Result<WasmModule> {
+    validate_rpc_url(rpc_url, allow_http_local).context("RPC transport security check failed")?;
+
     let strkey = stellar_strkey::Strkey::from_string(contract_id)
         .map_err(|e| anyhow::anyhow!("Invalid contract ID '{}': {}", contract_id, e))?;
 
@@ -293,6 +299,48 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
     })
 }
 
+/// Validates an RPC URL for secure transport.
+///
+/// - Rejects non-`https` URLs unless `allow_http_local` is `true`.
+/// - When `allow_http_local` is `true`, only `localhost` and `127.0.0.1` are
+///   accepted for `http://` URLs.
+/// - Rejects unknown/unexpected schemes.
+pub fn validate_rpc_url(rpc_url: &str, allow_http_local: bool) -> Result<()> {
+    if rpc_url.starts_with("https://") {
+        return Ok(());
+    }
+
+    if let Some(rest) = rpc_url.strip_prefix("http://") {
+        if !allow_http_local {
+            bail!(
+                "Insecure RPC URL scheme 'http' for '{}'. \
+                 Use 'https://' for secure transport, or pass \
+                 --allow-http-local for local development only.",
+                rpc_url
+            );
+        }
+
+        let host = rest.split('/').next().unwrap_or(rest);
+        let host = host.split(':').next().unwrap_or(host);
+
+        if host != "localhost" && host != "127.0.0.1" {
+            bail!(
+                "HTTP RPC URL '{}' is not allowed. \
+                 --allow-http-local only permits localhost or 127.0.0.1.",
+                rpc_url
+            );
+        }
+        return Ok(());
+    }
+
+    bail!(
+        "Unsupported RPC URL scheme in '{}'. Use 'https://'.",
+        rpc_url
+    )
+}
+
+/// Helper to execute JSON-RPC request to Stellar RPC.
+/// Disables redirect following to prevent HTTPS-to-HTTP downgrade attacks.
 fn query_rpc(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
     let payload = serde_json::json!({
         "jsonrpc": "2.0",
@@ -301,7 +349,10 @@ fn query_rpc(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<s
         "params": params
     });
 
-    let response: serde_json::Value = ureq::post(rpc_url)
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+
+    let response: serde_json::Value = agent
+        .post(rpc_url)
         .send_json(payload)
         .map_err(|e| anyhow::anyhow!("RPC request failed: {}", e))?
         .into_json()
