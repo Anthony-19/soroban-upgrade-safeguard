@@ -13,11 +13,12 @@ This document explains what Soroban Upgrade Safeguard does, how it works interna
 7. [Detection Categories](#detection-categories)
 8. [Severity Levels](#severity-levels)
 9. [Cascading Layout Breaks](#cascading-layout-breaks)
-10. [Reading the Report](#reading-the-report)
-11. [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes)
-12. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
-13. [Limitations](#limitations)
-14. [Frequently Asked Questions](#frequently-asked-questions)
+10. [Zero-Trust RPC Baseline Retrieval](#zero-trust-rpc-baseline-retrieval)
+11. [Reading the Report](#reading-the-report)
+12. [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes)
+13. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
+14. [Limitations](#limitations)
+15. [Frequently Asked Questions](#frequently-asked-questions)
 
 ## Overview
 
@@ -92,6 +93,26 @@ docker run --rm \
   /wasms/new.wasm
 ```
 
+For local development against a local RPC node:
+
+```bash
+soroban-upgrade-safeguard \
+  --contract-id C... \
+  --rpc-url http://localhost:8000 \
+  --allow-http-local \
+  new.wasm
+```
+
+To pin the expected on-chain WASM hash (CI/CD safety):
+
+```bash
+soroban-upgrade-safeguard \
+  --contract-id C... \
+  --rpc-url https://soroban-testnet.stellar.org \
+  --expected-wasm-hash a1b2c3d4e5f6... \
+  new.wasm
+```
+
 ### Suppression config
 
 Mount the directory that contains `.safeguard.toml` and point to it with `--config`:
@@ -137,6 +158,8 @@ The first argument should be the build that is currently deployed on chain. The 
 The analysis runs as a short pipeline. Each stage lives in its own module under `src/`.
 
 1. **Load and validate (`loader.rs`).** Each file is read from disk and checked for the WASM magic header. The tool then walks every WASM payload to confirm the binary is structurally well formed before any deeper work happens. A corrupt or non-WASM file fails fast with a clear message.
+
+   When the baseline is fetched from an RPC endpoint (`--contract-id` / `--rpc-url`), the loader applies a **zero-trust pipeline**: the URL is validated for transport security (HTTPS required unless `--allow-http-local` is set), the RPC response entries are checked for matching ledger keys, and the SHA-256 hash of the fetched bytecode is verified against the on-chain contract instance hash. An optional `--expected-wasm-hash` flag provides additional hash pinning.
 
 2. **Extract metadata (`parser.rs`).** The Soroban SDK stores the contract interface in custom WASM sections. The parser scans for the `contractspecv0` section and decodes the concatenated XDR `ScSpecEntry` objects it contains. The `contractenvmetav0` section is captured as well for completeness.
 
@@ -194,6 +217,72 @@ Every finding carries one of three severity levels.
 The most subtle failures come from shared types. Suppose a small struct named `Money` is used as a field inside `Account`, and `Account` is used inside `Ledger`. If you change `Money`, the stored bytes for every `Account` and every `Ledger` are now wrong, even though you never touched those larger types directly.
 
 To catch this, `mapper.rs` builds a reverse dependency graph: for each user-defined type, it records which other types embed it. After the direct comparison finds the set of types with critical changes, `diff.rs` walks that graph outward and marks every dependent type as broken too, transitively. These appear in the report under the **Cascading Layout Break** category, naming both the affected parent type and the underlying modified type that caused the break. Cyclic type references are handled safely so the walk always terminates.
+
+## Zero-Trust RPC Baseline Retrieval
+
+When using `--contract-id` and `--rpc-url` to fetch the on-chain baseline, the tool implements a **zero-trust pipeline** that protects against malicious or compromised RPC endpoints:
+
+### Cryptographic Hash Verification
+
+After fetching the contract bytecode from the RPC, the tool computes its SHA-256 hash and compares it against the hash stored in the contract instance's `ContractExecutable::Wasm` entry. If the hashes do not match — indicating tampered bytecode — execution aborts immediately with an `IntegrityError[HashMismatch]`.
+
+### Defensive Key Matching
+
+Every entry returned by `getLedgerEntries` is validated against the expected ledger key:
+
+- The RPC response entry's `key` field must match the XDR-base64 encoding of the ledger key that was requested.
+- Empty entry arrays are rejected.
+- Duplicate entries (multiple responses sharing the same key) are rejected as possible RPC manipulation.
+- Missing `key` or `xdr` fields in any entry are rejected.
+
+This replaces the insecure `entries[0]` pattern that previously trusted the RPC to return the correct entry.
+
+### StellarAsset Handling
+
+Contracts that are built-in `StellarAsset` contracts (which have no WASM bytecode) are detected upfront with a clear error message rather than producing confusing downstream failures.
+
+### Transport Security
+
+- By default, only `https://` URLs are accepted for RPC connections.
+- The `--allow-http-local` flag permits `http://` connections exclusively to `localhost` or `127.0.0.1` for local development.
+- Remote HTTP URLs are rejected even when `--allow-http-local` is set.
+- Redirect following is disabled in the HTTP client to prevent HTTPS-to-HTTP downgrade attacks.
+
+### Expected Hash Pinning
+
+The optional `--expected-wasm-hash <HEX>` flag lets callers pin the expected on-chain WASM hash. After the RPC fetch completes and the hash is verified against the instance entry, the tool also compares it against this user-supplied value. A mismatch fails immediately, providing an additional integrity check for CI/CD pipelines that know the expected deployment hash ahead of time.
+
+### IntegrityError Types
+
+| Error | Cause |
+|-------|-------|
+| `IntegrityError[HashMismatch]` | The SHA-256 of the fetched bytecode does not match the hash in the contract instance entry |
+| `IntegrityError[KeyMismatch]` | The ledger key in the RPC response does not match the requested key |
+
+### Report Metadata
+
+When the baseline is fetched from RPC, the report includes:
+
+- `baseline_source`: Set to `"RPC"` (or `"Local File"` for disk-based comparisons).
+- `verified_code_hash`: The verified SHA-256 hash of the on-chain WASM, expressed as a hex string.
+
+These fields appear in the JSON output (`--format json`) and in the text/Markdown summaries:
+
+```bash
+soroban-upgrade-safeguard --contract-id C... \
+  --rpc-url https://soroban-testnet.stellar.org \
+  --format json \
+  new.wasm
+```
+
+Example JSON excerpt:
+
+```json
+{
+  "baseline_source": "RPC",
+  "verified_code_hash": "a1b2c3d4e5f6..."
+}
+```
 
 ## Reading the Report
 
