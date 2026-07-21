@@ -864,7 +864,10 @@ fn compare_unions(
 /// Compare cases of two unions with the same name.
 ///
 /// Soroban unions serialize cases by positional discriminant, so case reordering,
-/// removal, or payload type changes all break layout compatibility.
+/// removal, insertion, or payload type changes all break layout compatibility.
+///
+/// This uses name-based bipartite matching, identical to the approach in
+/// [`check_struct_fields`].
 fn check_union_cases(
     name: &str,
     old_union: &ScSpecUdtUnionV0,
@@ -875,10 +878,19 @@ fn check_union_cases(
     let old_cases: &[ScSpecUdtUnionCaseV0] = old_union.cases.as_ref();
     let new_cases: &[ScSpecUdtUnionCaseV0] = new_union.cases.as_ref();
 
-    for old_case in old_cases {
-        let old_name = union_case_name(old_case);
-        let still_exists = new_cases.iter().any(|c| union_case_name(c) == old_name);
-        if !still_exists {
+    // Phase 1: Build name→index maps (first occurrence wins)
+    let mut old_by_name: HashMap<String, usize> = HashMap::with_capacity(old_cases.len());
+    for (i, c) in old_cases.iter().enumerate() {
+        old_by_name.entry(union_case_name(c)).or_insert(i);
+    }
+    let mut new_by_name: HashMap<String, usize> = HashMap::with_capacity(new_cases.len());
+    for (i, c) in new_cases.iter().enumerate() {
+        new_by_name.entry(union_case_name(c)).or_insert(i);
+    }
+
+    // Phase 2: Deletions — old case name not present in new
+    for (old_name, &_old_idx) in &old_by_name {
+        if !new_by_name.contains_key(old_name) {
             report.findings.push(Finding {
                 severity: Severity::Critical,
                 category: "Union Case Removed".to_string(),
@@ -892,56 +904,81 @@ fn check_union_cases(
         }
     }
 
-    for (i, (old_case, new_case)) in old_cases.iter().zip(new_cases.iter()).enumerate() {
-        let old_name = union_case_name(old_case);
-        let new_name = union_case_name(new_case);
-
-        if old_name != new_name {
-            report.findings.push(Finding {
-                severity: Severity::Critical,
-                category: "Union Case Reordered".to_string(),
-                message: format!(
-                    "Union '{}': case at position {} changed from '{}' to '{}'. \
-                     Positional discriminant breaks layout compatibility.",
-                    name, i, old_name, new_name
-                ),
-                type_name: Some(name.to_string()),
-                target: Some(format!("{}.{}", name, old_name)),
-            });
-        }
-
-        if !union_cases_equal(old_case, new_case, policy)? {
-            report.findings.push(Finding {
-                severity: Severity::Critical,
-                category: "Union Case Type Changed".to_string(),
-                message: format!(
-                    "Union '{}': case '{}' (position {}) type changed from `{}` to `{}`.",
-                    name,
-                    old_name,
-                    i,
-                    union_case_type_signature(old_case, policy)?,
-                    union_case_type_signature(new_case, policy)?
-                ),
-                type_name: Some(name.to_string()),
-                target: Some(format!("{}.{}", name, old_name)),
-            });
+    // Phase 3: Insertions — new case name not present in old
+    for (new_name, &new_idx) in &new_by_name {
+        if !old_by_name.contains_key(new_name) {
+            if new_idx >= old_cases.len() {
+                // Tail append → Info (existing behaviour)
+                let sig = union_case_type_signature(&new_cases[new_idx], policy)?;
+                report.findings.push(Finding {
+                    severity: Severity::Info,
+                    category: "Union Case Added".to_string(),
+                    message: format!(
+                        "Union '{}': new case '{}' ({}) added.",
+                        name, new_name, sig
+                    ),
+                    type_name: Some(name.to_string()),
+                    target: Some(format!("{}.{}", name, new_name)),
+                });
+            } else {
+                // Mid-sequence insertion → Critical
+                let sig = union_case_type_signature(&new_cases[new_idx], policy)?;
+                report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category: "Union Case Inserted".to_string(),
+                    message: format!(
+                        "Union '{}': case '{}' ({}) inserted at position {}. \
+                         Positional discriminant breaks layout compatibility.",
+                        name, new_name, sig, new_idx
+                    ),
+                    type_name: Some(name.to_string()),
+                    target: Some(format!("{}.{}", name, new_name)),
+                });
+            }
         }
     }
 
-    if new_cases.len() > old_cases.len() {
-        for new_case in &new_cases[old_cases.len()..] {
-            report.findings.push(Finding {
-                severity: Severity::Info,
-                category: "Union Case Added".to_string(),
-                message: format!(
-                    "Union '{}': new case '{}' ({}) added.",
-                    name,
-                    union_case_name(new_case),
-                    union_case_type_signature(new_case, policy)?
-                ),
-                type_name: Some(name.to_string()),
-                target: Some(format!("{}.{}", name, union_case_name(new_case))),
-            });
+    // Phase 4: Matched cases — same name in both versions
+    for (shared_name, &old_idx) in &old_by_name {
+        if let Some(&new_idx) = new_by_name.get(shared_name) {
+            let old_case = &old_cases[old_idx];
+            let new_case = &new_cases[new_idx];
+
+            // Position change (move / reorder)
+            if old_idx != new_idx {
+                report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category: "Union Case Reordered".to_string(),
+                    message: format!(
+                        "Union '{}': case at position {} changed from '{}' to '{}'. \
+                         Positional discriminant breaks layout compatibility.",
+                        name,
+                        old_idx,
+                        union_case_name(old_case),
+                        union_case_name(new_case)
+                    ),
+                    type_name: Some(name.to_string()),
+                    target: Some(format!("{}.{}", name, shared_name)),
+                });
+            }
+
+            // Type / payload change
+            if !union_cases_equal(old_case, new_case, policy)? {
+                report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category: "Union Case Type Changed".to_string(),
+                    message: format!(
+                        "Union '{}': case '{}' (position {}) type changed from `{}` to `{}`.",
+                        name,
+                        shared_name,
+                        old_idx,
+                        union_case_type_signature(old_case, policy)?,
+                        union_case_type_signature(new_case, policy)?
+                    ),
+                    type_name: Some(name.to_string()),
+                    target: Some(format!("{}.{}", name, shared_name)),
+                });
+            }
         }
     }
 
