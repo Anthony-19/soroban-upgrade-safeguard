@@ -3,6 +3,7 @@ use crate::mapper::{try_type_to_string, LayoutMapper};
 use crate::parser::ContractEnvMeta;
 use crate::spec::ContractSpec;
 use serde::Serialize;
+use std::collections::HashMap;
 use stellar_xdr::curr::{
     ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef, ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0,
     ScSpecUdtErrorEnumCaseV0, ScSpecUdtErrorEnumV0, ScSpecUdtStructFieldV0, ScSpecUdtStructV0,
@@ -549,7 +550,18 @@ fn compare_structs(
 /// Compare fields of two structs with the same name.
 ///
 /// Soroban serializes struct fields by position order, so field reordering,
-/// removal, or type changes all break storage layout compatibility.
+/// removal, insertion, or type changes all break storage layout compatibility.
+///
+/// This uses name-based bipartite matching to produce a correct edit script:
+///
+///   1. Build name→index maps for old and new fields (first occurrence wins).
+///   2. Deletions — old names absent from new → Critical.
+///   3. Insertions — new names absent from old:
+///        - Position ≥ old.len() → Warning (tail append).
+///        - Else              → Critical (mid-sequence insertion).
+///   4. Matched fields — same name in both:
+///        - Position changed → Critical (reorder).
+///        - Type changed     → Critical (type change).
 fn check_struct_fields(
     name: &str,
     old_struct: &ScSpecUdtStructV0,
@@ -567,11 +579,19 @@ fn check_struct_fields(
     };
     let msg_prefix = if is_evt { "Event schema" } else { "Struct" };
 
-    // Check for removed fields
-    for old_field in old_fields {
-        let old_name = old_field.name.to_string();
-        let still_exists = new_fields.iter().any(|f| f.name.to_string() == old_name);
-        if !still_exists {
+    // Phase 1: Build name→index maps (first occurrence wins for duplicate names)
+    let mut old_by_name: HashMap<String, usize> = HashMap::with_capacity(old_fields.len());
+    for (i, f) in old_fields.iter().enumerate() {
+        old_by_name.entry(f.name.to_string()).or_insert(i);
+    }
+    let mut new_by_name: HashMap<String, usize> = HashMap::with_capacity(new_fields.len());
+    for (i, f) in new_fields.iter().enumerate() {
+        new_by_name.entry(f.name.to_string()).or_insert(i);
+    }
+
+    // Phase 2: Deletions — old name not present in new
+    for (old_name, &_old_idx) in &old_by_name {
+        if !new_by_name.contains_key(old_name) {
             report.findings.push(Finding {
                 severity: Severity::Critical,
                 category: format!("{} Removed", category_prefix),
@@ -585,61 +605,78 @@ fn check_struct_fields(
         }
     }
 
-    // Check fields that exist in both versions, by position
-    for (i, (old_field, new_field)) in old_fields.iter().zip(new_fields.iter()).enumerate() {
-        let old_name = old_field.name.to_string();
-        let new_name = new_field.name.to_string();
-
-        // Field at the same position has a different name — reordering detected
-        if old_name != new_name {
-            report.findings.push(Finding {
-                severity: Severity::Critical,
-                category: format!("{} Reordered", category_prefix),
-                message: format!(
-                    "{} '{}': field at position {} changed from '{}' to '{}'. \
-                     Positional serialization breaks layout compatibility.",
-                    msg_prefix, name, i, old_name, new_name
-                ),
-                type_name: Some(name.to_string()),
-                target: Some(format!("{}.{}", name, old_name)),
-            });
-        }
-
-        // Field type changed
-        if !types_equal(&old_field.type_, &new_field.type_, policy)? {
-            report.findings.push(Finding {
-                severity: Severity::Critical,
-                category: format!("{} Type Changed", category_prefix),
-                message: format!(
-                    "{} '{}': field '{}' (position {}) type changed from `{}` to `{}`.",
-                    msg_prefix,
-                    name,
-                    old_name,
-                    i,
-                    try_type_to_string(&old_field.type_, 0, policy.max_walk_depth)?,
-                    try_type_to_string(&new_field.type_, 0, policy.max_walk_depth)?
-                ),
-                type_name: Some(name.to_string()),
-                target: Some(format!("{}.{}", name, old_name)),
-            });
+    // Phase 3: Insertions — new name not present in old
+    for (new_name, &new_idx) in &new_by_name {
+        if !old_by_name.contains_key(new_name) {
+            if new_idx >= old_fields.len() {
+                // Tail append → Warning (existing behaviour)
+                report.findings.push(Finding {
+                    severity: Severity::Warning,
+                    category: "Struct Field Added".to_string(),
+                    message: format!(
+                        "Struct '{}': new field '{}' appended. \
+                         Existing storage entries won't have this field — ensure migration handles defaults.",
+                        name, new_name
+                    ),
+                    type_name: Some(name.to_string()),
+                    target: Some(format!("{}.{}", name, new_name)),
+                });
+            } else {
+                // Mid-sequence insertion → Critical
+                report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category: format!("{} Inserted", category_prefix),
+                    message: format!(
+                        "{} '{}': field '{}' inserted at position {}. \
+                         Positional serialization breaks layout compatibility.",
+                        msg_prefix, name, new_name, new_idx
+                    ),
+                    type_name: Some(name.to_string()),
+                    target: Some(format!("{}.{}", name, new_name)),
+                });
+            }
         }
     }
 
-    // Check for new fields appended at the end
-    if new_fields.len() > old_fields.len() {
-        for new_field in &new_fields[old_fields.len()..] {
-            report.findings.push(Finding {
-                severity: Severity::Warning,
-                category: "Struct Field Added".to_string(),
-                message: format!(
-                    "Struct '{}': new field '{}' appended. \
-                     Existing storage entries won't have this field — ensure migration handles defaults.",
-                    name,
-                    new_field.name
-                ),
-                type_name: Some(name.to_string()),
-                target: Some(format!("{}.{}", name, new_field.name)),
-            });
+    // Phase 4: Matched fields — same name in both versions
+    for (shared_name, &old_idx) in &old_by_name {
+        if let Some(&new_idx) = new_by_name.get(shared_name) {
+            let old_field = &old_fields[old_idx];
+            let new_field = &new_fields[new_idx];
+
+            // Position change (move / reorder)
+            if old_idx != new_idx {
+                report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category: format!("{} Reordered", category_prefix),
+                    message: format!(
+                        "{} '{}': field at position {} changed from '{}' to '{}'. \
+                         Positional serialization breaks layout compatibility.",
+                        msg_prefix, name, old_idx, old_field.name, new_field.name
+                    ),
+                    type_name: Some(name.to_string()),
+                    target: Some(format!("{}.{}", name, shared_name)),
+                });
+            }
+
+            // Type change
+            if !types_equal(&old_field.type_, &new_field.type_, policy)? {
+                report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category: format!("{} Type Changed", category_prefix),
+                    message: format!(
+                        "{} '{}': field '{}' (position {}) type changed from `{}` to `{}`.",
+                        msg_prefix,
+                        name,
+                        shared_name,
+                        old_idx,
+                        try_type_to_string(&old_field.type_, 0, policy.max_walk_depth)?,
+                        try_type_to_string(&new_field.type_, 0, policy.max_walk_depth)?
+                    ),
+                    type_name: Some(name.to_string()),
+                    target: Some(format!("{}.{}", name, shared_name)),
+                });
+            }
         }
     }
 
