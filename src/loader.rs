@@ -366,3 +366,143 @@ fn query_rpc(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<s
 
     Ok(response)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::LedgerKeyContractData;
+
+    #[test]
+    fn test_validate_rpc_url_accepts_https() {
+        assert!(validate_rpc_url("https://soroban-testnet.stellar.org", false).is_ok());
+        assert!(validate_rpc_url("https://localhost:8080", true).is_ok());
+    }
+
+    #[test]
+    fn test_validate_rpc_url_rejects_http_without_flag() {
+        let err = validate_rpc_url("http://evil-rpc.example.com", false).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("Insecure"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_validate_rpc_url_rejects_remote_http_even_with_flag() {
+        let err = validate_rpc_url("http://evil-rpc.example.com", true).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("only permits localhost"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_validate_rpc_url_accepts_local_http_with_flag() {
+        assert!(validate_rpc_url("http://localhost:8080", true).is_ok());
+        assert!(validate_rpc_url("http://127.0.0.1:12345", true).is_ok());
+    }
+
+    #[test]
+    fn test_validate_rpc_url_rejects_unsupported_scheme() {
+        let err = validate_rpc_url("ftp://rpc.example.com", false).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("Unsupported"), "got: {}", msg);
+    }
+
+    fn dummy_ledger_key() -> LedgerKey {
+        LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(Hash([0u8; 32])),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: stellar_xdr::curr::ContractDataDurability::Persistent,
+        })
+    }
+
+    fn key_b64(key: &LedgerKey) -> String {
+        key.to_xdr_base64(Limits::none()).unwrap()
+    }
+
+    fn make_entry(key_b64: &str, xdr_b64: &str) -> serde_json::Value {
+        serde_json::json!({
+            "key": key_b64,
+            "xdr": xdr_b64,
+        })
+    }
+
+    #[test]
+    fn test_find_entry_by_key_matches_correctly() {
+        let key = dummy_ledger_key();
+        let b64 = key_b64(&key);
+        let entries = vec![make_entry(&b64, "dummy")];
+
+        let result = find_entry_by_key(&entries, &key, "test");
+        assert!(result.is_ok(), "should find matching entry: {:?}", result);
+    }
+
+    #[test]
+    fn test_find_entry_by_key_rejects_empty_entries() {
+        let key = dummy_ledger_key();
+        let entries = vec![];
+
+        let err = find_entry_by_key(&entries, &key, "test").unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("zero entries"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_find_entry_by_key_rejects_mismatched_key() {
+        let key = dummy_ledger_key();
+        let other_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(Hash([1u8; 32])),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: stellar_xdr::curr::ContractDataDurability::Persistent,
+        });
+        let other_b64 = key_b64(&other_key);
+        let entries = vec![make_entry(&other_b64, "dummy")];
+
+        let err = find_entry_by_key(&entries, &key, "test").unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("no entry matches"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_find_entry_by_key_rejects_duplicate_matches() {
+        let key = dummy_ledger_key();
+        let b64 = key_b64(&key);
+        let entries = vec![make_entry(&b64, "first"), make_entry(&b64, "second")];
+
+        let err = find_entry_by_key(&entries, &key, "test").unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("share the same ledger key"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_find_entry_by_key_rejects_missing_key_field() {
+        let key = dummy_ledger_key();
+        let entries = vec![serde_json::json!({"xdr": "dummy"})];
+
+        let err = find_entry_by_key(&entries, &key, "test").unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("missing 'key'"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_find_entry_by_key_rejects_missing_xdr_field() {
+        let key = dummy_ledger_key();
+        let b64 = key_b64(&key);
+        let entries = vec![serde_json::json!({"key": b64})];
+
+        let err = find_entry_by_key(&entries, &key, "test").unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("missing 'xdr'") || msg.contains("missing 'key'"),
+            "got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_wasm_module_default_verified_hash_none() {
+        let module = WasmModule {
+            path: "/tmp/test.wasm".into(),
+            bytes: vec![0x00, 0x61, 0x73, 0x6d],
+            verified_hash: None,
+        };
+        assert!(module.verified_hash.is_none());
+    }
+}
