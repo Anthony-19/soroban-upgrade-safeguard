@@ -21,6 +21,15 @@ pub struct ReportedFinding {
     /// The justification copied from the matching rule, if it provided one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suppression_reason: Option<String>,
+    /// The author copied from the matching rule, if it provided one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppression_author: Option<String>,
+    /// The expiry copied from the matching rule, if it provided one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppression_expiry: Option<String>,
+    /// The fingerprint copied from the matching rule, if it provided one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppression_fingerprint: Option<String>,
     /// Optional remediation/explanation advice for the user.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remediation: Option<String>,
@@ -124,6 +133,9 @@ impl SafetyReport {
                     finding: finding.clone(),
                     suppressed,
                     suppression_reason: rule.and_then(|r| r.reason.clone()),
+                    suppression_author: rule.and_then(|r| r.author.clone()),
+                    suppression_expiry: rule.and_then(|r| r.expiry.clone()),
+                    suppression_fingerprint: rule.and_then(|r| r.fingerprint.clone()),
                     remediation,
                 });
         }
