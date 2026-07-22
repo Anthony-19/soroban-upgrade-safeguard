@@ -77,6 +77,10 @@
 //! | `(A, B)` | tuple |
 //! | `MyType` | a user-defined type, exported or declared in this manifest |
 
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use stellar_xdr::curr::{
@@ -84,11 +88,29 @@ use stellar_xdr::curr::{
     ScSpecTypeTuple, ScSpecTypeUdt, ScSpecTypeVec, VecM,
 };
 
+use crate::mapper::type_to_string;
+use crate::spec::ContractSpec;
+
 /// The default manifest file name looked up alongside a build.
 pub const DEFAULT_STORAGE_SCHEMA_FILE: &str = ".storage-schema.toml";
 
 /// Maximum number of element types in a tuple, fixed by the XDR encoding.
 const MAX_TUPLE_ARITY: usize = 12;
+
+/// Upper bound on declared types in one manifest.
+///
+/// A schema this large is far past anything a real contract needs and is more
+/// likely a generated or malformed file; refusing it keeps analysis bounded.
+const MAX_DECLARED_TYPES: usize = 2_000;
+
+/// Upper bound on members (fields/cases/variants) within a single declaration.
+const MAX_MEMBERS_PER_TYPE: usize = 500;
+
+/// XDR length limit for a struct field name.
+const MAX_FIELD_NAME_LEN: usize = 30;
+
+/// XDR length limit for a type, case, or variant name.
+const MAX_TYPE_NAME_LEN: usize = 60;
 
 /// Which storage durability a declared type is written under.
 ///
@@ -264,6 +286,495 @@ impl StorageSchema {
     /// Look up a declaration by name, across both roles.
     pub fn find(&self, name: &str) -> Option<(&DeclaredType, DeclarationRole)> {
         self.declarations().find(|(t, _)| t.name == name)
+    }
+
+    /// Parse a manifest from a TOML string, without validating it.
+    pub fn from_toml_str(contents: &str) -> Result<Self> {
+        toml::from_str(contents).context("Failed to parse storage schema as TOML")
+    }
+
+    /// Parse a manifest from a JSON string, without validating it.
+    pub fn from_json_str(contents: &str) -> Result<Self> {
+        serde_json::from_str(contents).context("Failed to parse storage schema as JSON")
+    }
+
+    /// Parse a manifest in whichever of TOML or JSON it is written in.
+    ///
+    /// The file extension picks the format to try first; the other is attempted
+    /// as a fallback so a `.txt` or extensionless manifest still works. If both
+    /// fail, the error from the *expected* format is surfaced, because that is
+    /// the one whose message will actually help.
+    pub fn from_str_auto(contents: &str, path: &Path) -> Result<Self> {
+        let looks_like_json = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("json"));
+
+        if looks_like_json {
+            Self::from_json_str(contents).or_else(|primary| Self::from_toml_str(contents).map_err(|_| primary))
+        } else {
+            Self::from_toml_str(contents).or_else(|primary| Self::from_json_str(contents).map_err(|_| primary))
+        }
+    }
+
+    /// Load and validate a manifest from disk.
+    ///
+    /// Validation runs here rather than being left to the caller: a manifest is
+    /// a safety input, and one that is silently half-understood would narrow
+    /// coverage while still looking like it widened it.
+    pub fn load_from_path(path: &Path) -> Result<Self> {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read storage schema '{}'", path.display()))?;
+        let schema = Self::from_str_auto(&contents, path)
+            .with_context(|| format!("Invalid storage schema '{}'", path.display()))?;
+        schema
+            .validate()
+            .with_context(|| format!("Invalid storage schema '{}'", path.display()))?;
+        Ok(schema)
+    }
+
+    /// Load a manifest if the file exists, returning `None` when it is absent.
+    /// A present-but-malformed file is still an error, so a typo never silently
+    /// disables storage analysis.
+    pub fn load_optional(path: &Path) -> Result<Option<Self>> {
+        if path.exists() {
+            Ok(Some(Self::load_from_path(path)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Check the manifest is internally consistent and encodable.
+    ///
+    /// Every failure here is a hard error. A storage schema exists to make the
+    /// verdict *more* trustworthy, so a manifest we only partly understand must
+    /// never be accepted as if it were fully understood.
+    pub fn validate(&self) -> Result<()> {
+        if self.declared_count() > MAX_DECLARED_TYPES {
+            bail!(
+                "Storage schema declares {} types, exceeding the supported maximum of {}",
+                self.declared_count(),
+                MAX_DECLARED_TYPES
+            );
+        }
+
+        let mut seen: HashMap<&str, DeclarationRole> = HashMap::new();
+        for (declared, role) in self.declarations() {
+            if let Some(previous) = seen.insert(declared.name.as_str(), role) {
+                bail!(
+                    "Storage schema declares type '{}' more than once (as a {} and again as a {}). \
+                     Declare each type exactly once; a type cannot have two layouts.",
+                    declared.name,
+                    previous.label(),
+                    role.label()
+                );
+            }
+            validate_declared_type(declared, role)?;
+        }
+
+        Ok(())
+    }
+
+    /// Fail if any declaration contradicts the exported spec of the same build.
+    ///
+    /// A type may legitimately be absent from the exported spec — that is the
+    /// whole point of the manifest. But when a name *is* exported, the manifest
+    /// must agree with it. A manifest that contradicts the spec is worse than no
+    /// manifest at all: it would silently certify a layout the contract does not
+    /// actually use, so disagreement is a hard error rather than a warning.
+    ///
+    /// `build_label` names the side being checked ("old" / "new") so the message
+    /// points at the right file.
+    pub fn reconcile_with_spec(&self, spec: &ContractSpec, build_label: &str) -> Result<()> {
+        for (declared, _role) in self.declarations() {
+            reconcile_declared_type(declared, spec, build_label).with_context(|| {
+                format!(
+                    "Storage schema for the {build_label} build disagrees with that build's \
+                     exported contract spec"
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Validate one declaration's shape, names, and type strings.
+fn validate_declared_type(declared: &DeclaredType, role: DeclarationRole) -> Result<()> {
+    let name = &declared.name;
+    let context = format!("{} '{}'", role.label(), name);
+
+    if !is_valid_type_name(name) {
+        bail!("Storage schema declares an invalid type name '{name}' ({context})");
+    }
+    if name.len() > MAX_TYPE_NAME_LEN {
+        bail!(
+            "Type name '{name}' is {} characters, exceeding the {MAX_TYPE_NAME_LEN}-character limit",
+            name.len()
+        );
+    }
+
+    // The `kind` selects exactly one member table. Supplying another is a
+    // mistake that would otherwise silently drop part of the declared layout.
+    let wrong = match declared.kind {
+        TypeKind::Struct => [
+            ("case", declared.cases.is_empty()),
+            ("variant", declared.variants.is_empty()),
+        ],
+        TypeKind::Enum => [
+            ("field", declared.fields.is_empty()),
+            ("variant", declared.variants.is_empty()),
+        ],
+        TypeKind::Union => [
+            ("field", declared.fields.is_empty()),
+            ("case", declared.cases.is_empty()),
+        ],
+    };
+    for (table, empty) in wrong {
+        if !empty {
+            bail!(
+                "{context} declares kind = \"{}\" but also supplies [[{table}]] entries. \
+                 A {} uses [[{}]] entries.",
+                declared.kind.label(),
+                declared.kind.label(),
+                expected_member_table(declared.kind)
+            );
+        }
+    }
+
+    match declared.kind {
+        TypeKind::Struct => {
+            check_member_count(declared.fields.len(), &context)?;
+            let mut seen = Vec::new();
+            for (index, field) in declared.fields.iter().enumerate() {
+                if field.name.is_empty() {
+                    bail!("{context}: field at position {index} has an empty name");
+                }
+                if field.name.len() > MAX_FIELD_NAME_LEN {
+                    bail!(
+                        "{context}: field name '{}' is {} characters, exceeding the \
+                         {MAX_FIELD_NAME_LEN}-character limit",
+                        field.name,
+                        field.name.len()
+                    );
+                }
+                if seen.contains(&field.name.as_str()) {
+                    bail!("{context}: duplicate field '{}'", field.name);
+                }
+                seen.push(field.name.as_str());
+                parse_type_str(&field.type_)
+                    .with_context(|| format!("{context}: field '{}'", field.name))?;
+            }
+        }
+        TypeKind::Enum => {
+            if declared.cases.is_empty() {
+                bail!("{context}: an enum must declare at least one [[case]]");
+            }
+            check_member_count(declared.cases.len(), &context)?;
+            let mut seen_names = Vec::new();
+            let mut seen_values = Vec::new();
+            for case in &declared.cases {
+                check_case_name(&case.name, &context)?;
+                if seen_names.contains(&case.name.as_str()) {
+                    bail!("{context}: duplicate case '{}'", case.name);
+                }
+                // Two cases sharing a discriminant is unrepresentable on chain.
+                if seen_values.contains(&case.value) {
+                    bail!(
+                        "{context}: case '{}' reuses discriminant {}. \
+                         Each case must have a distinct value.",
+                        case.name,
+                        case.value
+                    );
+                }
+                seen_names.push(case.name.as_str());
+                seen_values.push(case.value);
+            }
+        }
+        TypeKind::Union => {
+            if declared.variants.is_empty() {
+                bail!("{context}: a union must declare at least one [[variant]]");
+            }
+            check_member_count(declared.variants.len(), &context)?;
+            let mut seen = Vec::new();
+            for variant in &declared.variants {
+                check_case_name(&variant.name, &context)?;
+                if seen.contains(&variant.name.as_str()) {
+                    bail!("{context}: duplicate variant '{}'", variant.name);
+                }
+                seen.push(variant.name.as_str());
+                if variant.types.len() > MAX_TUPLE_ARITY {
+                    bail!(
+                        "{context}: variant '{}' carries {} payload types, exceeding the \
+                         maximum of {MAX_TUPLE_ARITY}",
+                        variant.name,
+                        variant.types.len()
+                    );
+                }
+                for type_ in &variant.types {
+                    parse_type_str(type_)
+                        .with_context(|| format!("{context}: variant '{}'", variant.name))?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The member table name a given kind is expected to use.
+fn expected_member_table(kind: TypeKind) -> &'static str {
+    match kind {
+        TypeKind::Struct => "field",
+        TypeKind::Enum => "case",
+        TypeKind::Union => "variant",
+    }
+}
+
+fn check_member_count(count: usize, context: &str) -> Result<()> {
+    if count > MAX_MEMBERS_PER_TYPE {
+        bail!("{context} declares {count} members, exceeding the maximum of {MAX_MEMBERS_PER_TYPE}");
+    }
+    Ok(())
+}
+
+fn check_case_name(name: &str, context: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("{context}: a case/variant has an empty name");
+    }
+    if name.len() > MAX_TYPE_NAME_LEN {
+        bail!(
+            "{context}: name '{name}' is {} characters, exceeding the \
+             {MAX_TYPE_NAME_LEN}-character limit",
+            name.len()
+        );
+    }
+    Ok(())
+}
+
+/// Compare one declaration against the exported spec, if that name is exported.
+fn reconcile_declared_type(
+    declared: &DeclaredType,
+    spec: &ContractSpec,
+    build_label: &str,
+) -> Result<()> {
+    let name = declared.name.as_str();
+
+    // A name exported under a different kind is always a contradiction: the
+    // manifest and the contract cannot both be describing the same type.
+    let exported_kind = exported_kind_of(name, spec);
+    match (declared.kind, exported_kind) {
+        // Not exported at all — exactly the internal-type case the manifest exists for.
+        (_, None) => return Ok(()),
+        (TypeKind::Struct, Some(ExportedKind::Struct)) => {
+            let exported = &spec.structs[name];
+            let exported_fields: &[stellar_xdr::curr::ScSpecUdtStructFieldV0] =
+                exported.fields.as_ref();
+
+            if exported_fields.len() != declared.fields.len() {
+                bail!(
+                    "struct '{name}' is declared with {} field(s) but the {build_label} build \
+                     exports it with {}. Fix the declaration to match the contract.",
+                    declared.fields.len(),
+                    exported_fields.len()
+                );
+            }
+            for (index, (declared_field, exported_field)) in
+                declared.fields.iter().zip(exported_fields).enumerate()
+            {
+                let exported_name = exported_field.name.to_string();
+                if declared_field.name != exported_name {
+                    bail!(
+                        "struct '{name}': field at position {index} is declared as '{}' but the \
+                         {build_label} build exports '{exported_name}' there. Field order is \
+                         layout, so this disagreement cannot be reconciled automatically.",
+                        declared_field.name
+                    );
+                }
+                let declared_type = parse_type_str(&declared_field.type_)?;
+                if declared_type != exported_field.type_ {
+                    bail!(
+                        "struct '{name}': field '{}' is declared as `{}` but the {build_label} \
+                         build exports it as `{}`.",
+                        declared_field.name,
+                        type_to_string(&declared_type),
+                        type_to_string(&exported_field.type_)
+                    );
+                }
+            }
+        }
+        (TypeKind::Enum, Some(ExportedKind::Enum)) => {
+            let exported = &spec.enums[name];
+            let exported_cases: &[stellar_xdr::curr::ScSpecUdtEnumCaseV0] = exported.cases.as_ref();
+            reconcile_enum_cases(
+                name,
+                build_label,
+                declared,
+                exported_cases
+                    .iter()
+                    .map(|c| (c.name.to_string(), c.value))
+                    .collect(),
+            )?;
+        }
+        (TypeKind::Enum, Some(ExportedKind::ErrorEnum)) => {
+            let exported = &spec.error_enums[name];
+            let exported_cases: &[stellar_xdr::curr::ScSpecUdtErrorEnumCaseV0] =
+                exported.cases.as_ref();
+            reconcile_enum_cases(
+                name,
+                build_label,
+                declared,
+                exported_cases
+                    .iter()
+                    .map(|c| (c.name.to_string(), c.value))
+                    .collect(),
+            )?;
+        }
+        (TypeKind::Union, Some(ExportedKind::Union)) => {
+            let exported = &spec.unions[name];
+            let exported_cases: &[stellar_xdr::curr::ScSpecUdtUnionCaseV0] = exported.cases.as_ref();
+
+            if exported_cases.len() != declared.variants.len() {
+                bail!(
+                    "union '{name}' is declared with {} variant(s) but the {build_label} build \
+                     exports it with {}.",
+                    declared.variants.len(),
+                    exported_cases.len()
+                );
+            }
+            for (index, (declared_variant, exported_case)) in
+                declared.variants.iter().zip(exported_cases).enumerate()
+            {
+                let (exported_name, exported_types) = union_case_parts(exported_case);
+                if declared_variant.name != exported_name {
+                    bail!(
+                        "union '{name}': variant at position {index} is declared as '{}' but the \
+                         {build_label} build exports '{exported_name}' there. Variant order is \
+                         the discriminant order.",
+                        declared_variant.name
+                    );
+                }
+                let declared_types = declared_variant
+                    .types
+                    .iter()
+                    .map(|t| parse_type_str(t))
+                    .collect::<Result<Vec<_>>>()?;
+                if declared_types != exported_types {
+                    bail!(
+                        "union '{name}': variant '{}' is declared with payload ({}) but the \
+                         {build_label} build exports payload ({}).",
+                        declared_variant.name,
+                        render_types(&declared_types),
+                        render_types(&exported_types)
+                    );
+                }
+            }
+        }
+        (declared_kind, Some(exported)) => {
+            bail!(
+                "'{name}' is declared as a {} but the {build_label} build exports it as a {}. \
+                 An internal type must not shadow an exported type of a different shape — \
+                 rename one of them.",
+                declared_kind.label(),
+                exported.label()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Compare declared enum cases against exported `(name, value)` pairs.
+///
+/// Unit enums are addressed by explicit discriminant rather than position, so
+/// this compares the name→value mapping rather than declaration order.
+fn reconcile_enum_cases(
+    name: &str,
+    build_label: &str,
+    declared: &DeclaredType,
+    exported: Vec<(String, u32)>,
+) -> Result<()> {
+    if exported.len() != declared.cases.len() {
+        bail!(
+            "enum '{name}' is declared with {} case(s) but the {build_label} build exports it \
+             with {}.",
+            declared.cases.len(),
+            exported.len()
+        );
+    }
+    for case in &declared.cases {
+        match exported.iter().find(|(n, _)| n == &case.name) {
+            None => bail!(
+                "enum '{name}': case '{}' is declared but the {build_label} build does not \
+                 export it.",
+                case.name
+            ),
+            Some((_, exported_value)) if *exported_value != case.value => bail!(
+                "enum '{name}': case '{}' is declared with discriminant {} but the \
+                 {build_label} build exports {}.",
+                case.name,
+                case.value,
+                exported_value
+            ),
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// The kinds a name can be exported under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportedKind {
+    Struct,
+    Enum,
+    Union,
+    ErrorEnum,
+}
+
+impl ExportedKind {
+    fn label(&self) -> &'static str {
+        match self {
+            ExportedKind::Struct => "struct",
+            ExportedKind::Enum => "enum",
+            ExportedKind::Union => "union",
+            ExportedKind::ErrorEnum => "error enum",
+        }
+    }
+}
+
+fn exported_kind_of(name: &str, spec: &ContractSpec) -> Option<ExportedKind> {
+    if spec.structs.contains_key(name) {
+        Some(ExportedKind::Struct)
+    } else if spec.enums.contains_key(name) {
+        Some(ExportedKind::Enum)
+    } else if spec.unions.contains_key(name) {
+        Some(ExportedKind::Union)
+    } else if spec.error_enums.contains_key(name) {
+        Some(ExportedKind::ErrorEnum)
+    } else {
+        None
+    }
+}
+
+/// Split an exported union case into its name and payload types.
+fn union_case_parts(case: &stellar_xdr::curr::ScSpecUdtUnionCaseV0) -> (String, Vec<ScSpecTypeDef>) {
+    match case {
+        stellar_xdr::curr::ScSpecUdtUnionCaseV0::VoidV0(v) => (v.name.to_string(), Vec::new()),
+        stellar_xdr::curr::ScSpecUdtUnionCaseV0::TupleV0(t) => {
+            let types: &[ScSpecTypeDef] = t.type_.as_ref();
+            (t.name.to_string(), types.to_vec())
+        }
+    }
+}
+
+fn render_types(types: &[ScSpecTypeDef]) -> String {
+    if types.is_empty() {
+        "void".to_string()
+    } else {
+        types
+            .iter()
+            .map(type_to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -676,5 +1187,363 @@ mod tests {
         let schema: StorageSchema = toml::from_str("").expect("empty manifest is valid");
         assert!(schema.is_empty());
         assert_eq!(schema.declarations().count(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Validation
+    // -----------------------------------------------------------------
+
+    /// Parse without validating, so validation itself is what is under test.
+    fn parse(toml_src: &str) -> StorageSchema {
+        StorageSchema::from_toml_str(toml_src).expect("manifest should parse")
+    }
+
+    fn validation_error(toml_src: &str) -> String {
+        parse(toml_src)
+            .validate()
+            .expect_err("manifest should have been rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn a_type_cannot_be_declared_twice() {
+        let error = validation_error(
+            r#"
+            [[storage_key]]
+            name = "DataKey"
+            kind = "enum"
+              [[storage_key.case]]
+              name = "Admin"
+              value = 0
+
+            [[value_type]]
+            name = "DataKey"
+            kind = "struct"
+            "#,
+        );
+        assert!(error.contains("more than once"), "got: {error}");
+    }
+
+    #[test]
+    fn member_table_must_match_the_declared_kind() {
+        // A struct that supplies [[case]] entries would silently lose its
+        // layout, so it is rejected rather than partly understood.
+        let error = validation_error(
+            r#"
+            [[value_type]]
+            name = "Thing"
+            kind = "struct"
+              [[value_type.case]]
+              name = "Nope"
+              value = 0
+            "#,
+        );
+        assert!(error.contains("kind = \"struct\""), "got: {error}");
+        assert!(error.contains("[[case]]"), "got: {error}");
+    }
+
+    #[test]
+    fn duplicate_members_are_rejected() {
+        let error = validation_error(
+            r#"
+            [[value_type]]
+            name = "Position"
+            kind = "struct"
+              [[value_type.field]]
+              name = "debt"
+              type = "i128"
+              [[value_type.field]]
+              name = "debt"
+              type = "u32"
+            "#,
+        );
+        assert!(error.contains("duplicate field 'debt'"), "got: {error}");
+    }
+
+    #[test]
+    fn two_enum_cases_cannot_share_a_discriminant() {
+        let error = validation_error(
+            r#"
+            [[storage_key]]
+            name = "Key"
+            kind = "enum"
+              [[storage_key.case]]
+              name = "A"
+              value = 0
+              [[storage_key.case]]
+              name = "B"
+              value = 0
+            "#,
+        );
+        assert!(error.contains("reuses discriminant 0"), "got: {error}");
+    }
+
+    #[test]
+    fn an_enum_or_union_must_declare_members() {
+        assert!(validation_error(
+            r#"
+            [[storage_key]]
+            name = "Key"
+            kind = "enum"
+            "#,
+        )
+        .contains("at least one [[case]]"));
+
+        assert!(validation_error(
+            r#"
+            [[storage_key]]
+            name = "Key"
+            kind = "union"
+            "#,
+        )
+        .contains("at least one [[variant]]"));
+    }
+
+    #[test]
+    fn unparseable_field_types_are_rejected_with_context() {
+        let error = validation_error(
+            r#"
+            [[value_type]]
+            name = "Position"
+            kind = "struct"
+              [[value_type.field]]
+              name = "debt"
+              type = "Vec<"
+            "#,
+        );
+        assert!(error.contains("Position"), "error should name the type: {error}");
+    }
+
+    #[test]
+    fn loading_from_disk_parses_and_validates() {
+        let dir = std::env::temp_dir().join("sus-schema-load-test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A valid TOML manifest loads.
+        let good = dir.join("good.storage-schema.toml");
+        std::fs::write(
+            &good,
+            r#"
+            [[value_type]]
+            name = "PositionState"
+            kind = "struct"
+              [[value_type.field]]
+              name = "collateral"
+              type = "i128"
+            "#,
+        )
+        .unwrap();
+        let schema = StorageSchema::load_from_path(&good).expect("valid manifest should load");
+        assert_eq!(schema.declared_count(), 1);
+
+        // JSON is detected from the extension.
+        let json = dir.join("good.json");
+        std::fs::write(
+            &json,
+            r#"{ "value_type": [ { "name": "S", "kind": "struct", "field": [] } ] }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            StorageSchema::load_from_path(&json).unwrap().declared_count(),
+            1
+        );
+
+        // A manifest that parses but is invalid still fails at load time.
+        let bad = dir.join("bad.storage-schema.toml");
+        std::fs::write(
+            &bad,
+            r#"
+            [[value_type]]
+            name = "Broken"
+            kind = "enum"
+            "#,
+        )
+        .unwrap();
+        assert!(StorageSchema::load_from_path(&bad).is_err());
+
+        // An absent optional manifest is simply absent.
+        assert!(StorageSchema::load_optional(&dir.join("missing.toml"))
+            .unwrap()
+            .is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // Reconciliation against the exported spec
+    // -----------------------------------------------------------------
+
+    use stellar_xdr::curr::{
+        ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0, ScSpecUdtStructFieldV0, ScSpecUdtStructV0, StringM,
+        VecM as XdrVecM,
+    };
+
+    fn spec_with_struct(name: &str, fields: &[(&str, ScSpecTypeDef)]) -> ContractSpec {
+        let mut spec = ContractSpec::default();
+        let xdr_fields: Vec<ScSpecUdtStructFieldV0> = fields
+            .iter()
+            .map(|(fname, ftype)| ScSpecUdtStructFieldV0 {
+                doc: StringM::default(),
+                name: (*fname).try_into().unwrap(),
+                type_: ftype.clone(),
+            })
+            .collect();
+        spec.structs.insert(
+            name.to_string(),
+            ScSpecUdtStructV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: name.try_into().unwrap(),
+                fields: XdrVecM::try_from(xdr_fields).unwrap(),
+            },
+        );
+        spec
+    }
+
+    fn spec_with_enum(name: &str, cases: &[(&str, u32)]) -> ContractSpec {
+        let mut spec = ContractSpec::default();
+        let xdr_cases: Vec<ScSpecUdtEnumCaseV0> = cases
+            .iter()
+            .map(|(cname, value)| ScSpecUdtEnumCaseV0 {
+                doc: StringM::default(),
+                name: (*cname).try_into().unwrap(),
+                value: *value,
+            })
+            .collect();
+        spec.enums.insert(
+            name.to_string(),
+            ScSpecUdtEnumV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: name.try_into().unwrap(),
+                cases: XdrVecM::try_from(xdr_cases).unwrap(),
+            },
+        );
+        spec
+    }
+
+    const POSITION_SCHEMA: &str = r#"
+        [[value_type]]
+        name = "PositionState"
+        kind = "struct"
+          [[value_type.field]]
+          name = "collateral"
+          type = "i128"
+          [[value_type.field]]
+          name = "debt"
+          type = "i128"
+    "#;
+
+    /// The central case the manifest exists for: a purely internal type that
+    /// the exported spec has never heard of reconciles cleanly.
+    #[test]
+    fn a_non_exported_type_reconciles_trivially() {
+        let schema = parse(POSITION_SCHEMA);
+        schema
+            .reconcile_with_spec(&ContractSpec::default(), "old")
+            .expect("an internal type need not be exported");
+    }
+
+    #[test]
+    fn a_declaration_matching_the_exported_spec_reconciles() {
+        let schema = parse(POSITION_SCHEMA);
+        let spec = spec_with_struct(
+            "PositionState",
+            &[
+                ("collateral", ScSpecTypeDef::I128),
+                ("debt", ScSpecTypeDef::I128),
+            ],
+        );
+        schema.reconcile_with_spec(&spec, "new").expect("layouts agree");
+    }
+
+    #[test]
+    fn a_manifest_that_contradicts_field_order_fails_loudly() {
+        let schema = parse(POSITION_SCHEMA);
+        // Exported spec has the fields the other way round.
+        let spec = spec_with_struct(
+            "PositionState",
+            &[
+                ("debt", ScSpecTypeDef::I128),
+                ("collateral", ScSpecTypeDef::I128),
+            ],
+        );
+        let error = schema
+            .reconcile_with_spec(&spec, "old")
+            .expect_err("contradiction must be rejected")
+            .to_string();
+        assert!(error.contains("disagrees"), "got: {error}");
+    }
+
+    #[test]
+    fn a_manifest_that_contradicts_a_field_type_fails_loudly() {
+        let schema = parse(POSITION_SCHEMA);
+        let spec = spec_with_struct(
+            "PositionState",
+            &[
+                ("collateral", ScSpecTypeDef::I128),
+                ("debt", ScSpecTypeDef::U32), // declared as i128
+            ],
+        );
+        assert!(schema.reconcile_with_spec(&spec, "old").is_err());
+    }
+
+    /// An internal type must not shadow an exported name of a different shape,
+    /// because then it is ambiguous which layout governs storage.
+    #[test]
+    fn an_internal_type_shadowing_an_exported_type_of_another_kind_fails() {
+        let schema = parse(POSITION_SCHEMA);
+        let spec = spec_with_enum("PositionState", &[("Active", 0)]);
+        let error = schema
+            .reconcile_with_spec(&spec, "new")
+            .expect_err("shadowing a different kind must be rejected")
+            .to_string();
+        assert!(error.contains("disagrees"), "got: {error}");
+    }
+
+    #[test]
+    fn enum_discriminants_are_reconciled_by_name_not_position() {
+        let schema = parse(
+            r#"
+            [[storage_key]]
+            name = "Status"
+            kind = "enum"
+              [[storage_key.case]]
+              name = "Paused"
+              value = 1
+              [[storage_key.case]]
+              name = "Active"
+              value = 0
+            "#,
+        );
+
+        // Same name->value mapping, listed in a different order: unit enums are
+        // addressed by discriminant, so this agrees.
+        let spec = spec_with_enum("Status", &[("Active", 0), ("Paused", 1)]);
+        schema
+            .reconcile_with_spec(&spec, "old")
+            .expect("discriminant mapping matches");
+
+        // A shifted discriminant is a genuine contradiction.
+        let shifted = spec_with_enum("Status", &[("Active", 0), ("Paused", 2)]);
+        assert!(schema.reconcile_with_spec(&shifted, "old").is_err());
+    }
+
+    #[test]
+    fn oversized_schemas_are_refused() {
+        let mut schema = StorageSchema::default();
+        for index in 0..(MAX_DECLARED_TYPES + 1) {
+            schema.value_types.push(DeclaredType {
+                name: format!("T{index}"),
+                kind: TypeKind::Struct,
+                doc: None,
+                durability: None,
+                fields: Vec::new(),
+                cases: Vec::new(),
+                variants: Vec::new(),
+            });
+        }
+        let error = schema.validate().expect_err("oversized schema").to_string();
+        assert!(error.contains("exceeding the supported maximum"), "got: {error}");
     }
 }
