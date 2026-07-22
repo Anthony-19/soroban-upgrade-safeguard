@@ -562,6 +562,16 @@ fn compare_structs(
 ///   4. Matched fields — same name in both:
 ///        - Position changed → Critical (reorder).
 ///        - Type changed     → Critical (type change).
+///
+/// ## Severity Table
+///
+/// | Finding | Severity | Category (struct) | Category (event) |
+/// |---|---|---|---|
+/// | Field removed | Critical | `Struct Field Removed` | `Event Schema Removed` |
+/// | Field inserted mid-sequence | Critical | `Struct Field Inserted` | `Event Field Inserted` |
+/// | Field appended at tail | Warning | `Struct Field Added` | `Struct Field Added` |
+/// | Field moved (position changed) | Critical | `Struct Field Reordered` | `Event Schema Reordered` |
+/// | Field type changed | Critical | `Struct Field Type Changed` | `Event Schema Type Changed` |
 fn check_struct_fields(
     name: &str,
     old_struct: &ScSpecUdtStructV0,
@@ -868,6 +878,16 @@ fn compare_unions(
 ///
 /// This uses name-based bipartite matching, identical to the approach in
 /// [`check_struct_fields`].
+///
+/// ## Severity Table
+///
+/// | Finding | Severity | Category |
+/// |---|---|---|
+/// | Case removed | Critical | `Union Case Removed` |
+/// | Case inserted mid-sequence | Critical | `Union Case Inserted` |
+/// | Case appended at tail | Info | `Union Case Added` |
+/// | Case moved (position changed) | Critical | `Union Case Reordered` |
+/// | Case payload type changed | Critical | `Union Case Type Changed` |
 fn check_union_cases(
     name: &str,
     old_union: &ScSpecUdtUnionV0,
