@@ -77,7 +77,7 @@
 //! | `(A, B)` | tuple |
 //! | `MyType` | a user-defined type, exported or declared in this manifest |
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -85,7 +85,9 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use stellar_xdr::curr::{
     ScSpecTypeBytesN, ScSpecTypeDef, ScSpecTypeMap, ScSpecTypeOption, ScSpecTypeResult,
-    ScSpecTypeTuple, ScSpecTypeUdt, ScSpecTypeVec, VecM,
+    ScSpecTypeTuple, ScSpecTypeUdt, ScSpecTypeVec, ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0,
+    ScSpecUdtStructFieldV0, ScSpecUdtStructV0, ScSpecUdtUnionCaseTupleV0, ScSpecUdtUnionCaseV0,
+    ScSpecUdtUnionCaseVoidV0, ScSpecUdtUnionV0, StringM, VecM,
 };
 
 use crate::mapper::type_to_string;
@@ -395,6 +397,259 @@ impl StorageSchema {
             })?;
         }
         Ok(())
+    }
+
+    /// Turn the manifest into the `ScSpecUdt`-shaped model the diff engine reads.
+    ///
+    /// This is the bridge that lets storage types — including ones the exported
+    /// spec never mentions — flow through exactly the same comparison and
+    /// severity logic as exported types. Each declaration becomes the same XDR
+    /// struct/enum/union the Soroban SDK would emit, so the resolved
+    /// [`ContractSpec`] is indistinguishable to the diff engine from one decoded
+    /// out of a WASM section.
+    ///
+    /// Types referenced by a declaration but not themselves declared are left as
+    /// opaque `Udt` references; that is correct for diffing the declaring type,
+    /// and [`StorageSchema::unresolved_references`] reports any that resolve to
+    /// nothing so the gap is visible rather than silent.
+    pub fn resolve(&self) -> Result<ResolvedStorageSchema> {
+        let mut spec = ContractSpec::default();
+        let mut meta: HashMap<String, ResolvedTypeMeta> = HashMap::new();
+
+        for (declared, role) in self.declarations() {
+            let durability = declared.durability.unwrap_or(Durability::Persistent);
+            meta.insert(
+                declared.name.clone(),
+                ResolvedTypeMeta { role, durability },
+            );
+
+            match declared.kind {
+                TypeKind::Struct => {
+                    spec.structs
+                        .insert(declared.name.clone(), resolve_struct(declared)?);
+                }
+                TypeKind::Enum => {
+                    spec.enums
+                        .insert(declared.name.clone(), resolve_enum(declared)?);
+                }
+                TypeKind::Union => {
+                    spec.unions
+                        .insert(declared.name.clone(), resolve_union(declared)?);
+                }
+            }
+        }
+
+        Ok(ResolvedStorageSchema { spec, meta })
+    }
+
+    /// UDT names a declaration refers to that resolve to nothing.
+    ///
+    /// A reference resolves if the name is declared in this manifest or, when an
+    /// exported spec is supplied, exported by the build. Anything left over is a
+    /// dangling reference — its layout is unknown, so a diff of the referring
+    /// type cannot fully reason about it. Returning these lets the caller state
+    /// the limitation instead of quietly analyzing an incomplete graph.
+    pub fn unresolved_references(&self, exported: Option<&ContractSpec>) -> Vec<String> {
+        let declared: HashSet<&str> = self.declarations().map(|(t, _)| t.name.as_str()).collect();
+        let mut unresolved: BTreeSet<String> = BTreeSet::new();
+
+        for (referring, _role) in self.declarations() {
+            let mut referenced = HashSet::new();
+            collect_declaration_references(referring, &mut referenced);
+            for name in referenced {
+                if declared.contains(name.as_str()) {
+                    continue;
+                }
+                if exported.is_some_and(|spec| exported_kind_of(&name, spec).is_some()) {
+                    continue;
+                }
+                unresolved.insert(name);
+            }
+        }
+
+        unresolved.into_iter().collect()
+    }
+}
+
+/// The resolved, diff-ready form of a storage schema.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedStorageSchema {
+    /// The declared types as a [`ContractSpec`] the diff engine compares.
+    pub spec: ContractSpec,
+    /// Role and durability metadata for each declared type, keyed by name.
+    pub meta: HashMap<String, ResolvedTypeMeta>,
+}
+
+impl ResolvedStorageSchema {
+    /// Number of declared storage-key types.
+    pub fn key_type_count(&self) -> usize {
+        self.meta
+            .values()
+            .filter(|m| m.role == DeclarationRole::StorageKey)
+            .count()
+    }
+
+    /// Number of declared storage value types.
+    pub fn value_type_count(&self) -> usize {
+        self.meta
+            .values()
+            .filter(|m| m.role == DeclarationRole::ValueType)
+            .count()
+    }
+}
+
+/// Role and durability carried alongside a resolved type, for reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedTypeMeta {
+    pub role: DeclarationRole,
+    pub durability: Durability,
+}
+
+fn doc_string(doc: &Option<String>) -> Result<StringM<1024>> {
+    doc.as_deref()
+        .unwrap_or("")
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("doc string exceeds the 1024-character limit"))
+}
+
+fn resolve_struct(declared: &DeclaredType) -> Result<ScSpecUdtStructV0> {
+    let fields = declared
+        .fields
+        .iter()
+        .map(|field| {
+            Ok(ScSpecUdtStructFieldV0 {
+                doc: doc_string(&field.doc)?,
+                name: field.name.as_str().try_into().map_err(|_| {
+                    anyhow::anyhow!("field name '{}' exceeds the length limit", field.name)
+                })?,
+                type_: parse_type_str(&field.type_)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(ScSpecUdtStructV0 {
+        doc: doc_string(&declared.doc)?,
+        lib: StringM::default(),
+        name: declared.name.as_str().try_into().map_err(|_| {
+            anyhow::anyhow!("type name '{}' exceeds the length limit", declared.name)
+        })?,
+        fields: VecM::try_from(fields)
+            .map_err(|e| anyhow::anyhow!("struct '{}': {e}", declared.name))?,
+    })
+}
+
+fn resolve_enum(declared: &DeclaredType) -> Result<ScSpecUdtEnumV0> {
+    let cases = declared
+        .cases
+        .iter()
+        .map(|case| {
+            Ok(ScSpecUdtEnumCaseV0 {
+                doc: doc_string(&case.doc)?,
+                name: case.name.as_str().try_into().map_err(|_| {
+                    anyhow::anyhow!("case name '{}' exceeds the length limit", case.name)
+                })?,
+                value: case.value,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(ScSpecUdtEnumV0 {
+        doc: doc_string(&declared.doc)?,
+        lib: StringM::default(),
+        name: declared.name.as_str().try_into().map_err(|_| {
+            anyhow::anyhow!("type name '{}' exceeds the length limit", declared.name)
+        })?,
+        cases: VecM::try_from(cases)
+            .map_err(|e| anyhow::anyhow!("enum '{}': {e}", declared.name))?,
+    })
+}
+
+fn resolve_union(declared: &DeclaredType) -> Result<ScSpecUdtUnionV0> {
+    let cases = declared
+        .variants
+        .iter()
+        .map(|variant| {
+            let doc = doc_string(&variant.doc)?;
+            let name: StringM<60> = variant.name.as_str().try_into().map_err(|_| {
+                anyhow::anyhow!("variant name '{}' exceeds the length limit", variant.name)
+            })?;
+
+            if variant.types.is_empty() {
+                Ok(ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
+                    doc,
+                    name,
+                }))
+            } else {
+                let types = variant
+                    .types
+                    .iter()
+                    .map(|t| parse_type_str(t))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(ScSpecUdtUnionCaseV0::TupleV0(ScSpecUdtUnionCaseTupleV0 {
+                    doc,
+                    name,
+                    type_: VecM::try_from(types)
+                        .map_err(|e| anyhow::anyhow!("variant '{}': {e}", variant.name))?,
+                }))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(ScSpecUdtUnionV0 {
+        doc: doc_string(&declared.doc)?,
+        lib: StringM::default(),
+        name: declared.name.as_str().try_into().map_err(|_| {
+            anyhow::anyhow!("type name '{}' exceeds the length limit", declared.name)
+        })?,
+        cases: VecM::try_from(cases)
+            .map_err(|e| anyhow::anyhow!("union '{}': {e}", declared.name))?,
+    })
+}
+
+/// Collect the UDT names a declaration references across all its members.
+///
+/// Type strings that fail to parse are skipped here rather than raised:
+/// resolution is only ever called after [`StorageSchema::validate`], which has
+/// already rejected unparseable types, so this stays a pure name walk.
+fn collect_declaration_references(declared: &DeclaredType, out: &mut HashSet<String>) {
+    let mut visit = |spelling: &str| {
+        if let Ok(type_def) = parse_type_str(spelling) {
+            collect_udt_names(&type_def, out);
+        }
+    };
+    for field in &declared.fields {
+        visit(&field.type_);
+    }
+    for variant in &declared.variants {
+        for type_ in &variant.types {
+            visit(type_);
+        }
+    }
+    // Unit enums carry no payload types, so they reference nothing.
+}
+
+/// Recursively collect UDT names appearing anywhere inside a type.
+fn collect_udt_names(type_def: &ScSpecTypeDef, out: &mut HashSet<String>) {
+    match type_def {
+        ScSpecTypeDef::Option(opt) => collect_udt_names(&opt.value_type, out),
+        ScSpecTypeDef::Result(res) => {
+            collect_udt_names(&res.ok_type, out);
+            collect_udt_names(&res.error_type, out);
+        }
+        ScSpecTypeDef::Vec(vec) => collect_udt_names(&vec.element_type, out),
+        ScSpecTypeDef::Map(map) => {
+            collect_udt_names(&map.key_type, out);
+            collect_udt_names(&map.value_type, out);
+        }
+        ScSpecTypeDef::Tuple(tuple) => {
+            for t in tuple.value_types.iter() {
+                collect_udt_names(t, out);
+            }
+        }
+        ScSpecTypeDef::Udt(udt) => {
+            out.insert(udt.name.to_string());
+        }
+        _ => {}
     }
 }
 
@@ -1527,6 +1782,156 @@ mod tests {
         // A shifted discriminant is a genuine contradiction.
         let shifted = spec_with_enum("Status", &[("Active", 0), ("Paused", 2)]);
         assert!(schema.reconcile_with_spec(&shifted, "old").is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Resolution into the diff engine's model
+    // -----------------------------------------------------------------
+
+    /// The whole point of the manifest: a type the exported spec never mentions
+    /// still becomes a first-class, diff-ready `ScSpecUdt`.
+    #[test]
+    fn a_non_exported_struct_resolves_to_a_diffable_udt() {
+        let resolved = parse(POSITION_SCHEMA).resolve().expect("should resolve");
+
+        let position = resolved
+            .spec
+            .structs
+            .get("PositionState")
+            .expect("declared struct should resolve into the spec");
+
+        assert_eq!(position.name.to_string(), "PositionState");
+        let fields: &[ScSpecUdtStructFieldV0] = position.fields.as_ref();
+        // Declaration order is preserved, because that order *is* the layout.
+        assert_eq!(fields[0].name.to_string(), "collateral");
+        assert_eq!(fields[0].type_, ScSpecTypeDef::I128);
+        assert_eq!(fields[1].name.to_string(), "debt");
+
+        assert_eq!(resolved.value_type_count(), 1);
+        assert_eq!(resolved.key_type_count(), 0);
+    }
+
+    #[test]
+    fn a_storage_key_union_resolves_with_void_and_tuple_variants() {
+        let resolved = parse(
+            r#"
+            [[storage_key]]
+            name = "DataKey"
+            kind = "union"
+              [[storage_key.variant]]
+              name = "Admin"
+              [[storage_key.variant]]
+              name = "Position"
+              type = ["Address"]
+            "#,
+        )
+        .resolve()
+        .expect("should resolve");
+
+        let key = resolved.spec.unions.get("DataKey").expect("union resolved");
+        let cases: &[ScSpecUdtUnionCaseV0] = key.cases.as_ref();
+        assert_eq!(cases.len(), 2);
+
+        // Variant order is discriminant order, so it must survive resolution.
+        match &cases[0] {
+            ScSpecUdtUnionCaseV0::VoidV0(v) => assert_eq!(v.name.to_string(), "Admin"),
+            other => panic!("expected a void variant first, got {other:?}"),
+        }
+        match &cases[1] {
+            ScSpecUdtUnionCaseV0::TupleV0(t) => {
+                assert_eq!(t.name.to_string(), "Position");
+                let types: &[ScSpecTypeDef] = t.type_.as_ref();
+                assert_eq!(types, &[ScSpecTypeDef::Address]);
+            }
+            other => panic!("expected a tuple variant second, got {other:?}"),
+        }
+
+        assert_eq!(resolved.key_type_count(), 1);
+        assert_eq!(
+            resolved.meta["DataKey"].role,
+            DeclarationRole::StorageKey
+        );
+        assert_eq!(resolved.meta["DataKey"].durability, Durability::Persistent);
+    }
+
+    #[test]
+    fn an_enum_resolves_with_its_declared_discriminants() {
+        let resolved = parse(
+            r#"
+            [[value_type]]
+            name = "Status"
+            kind = "enum"
+            durability = "instance"
+              [[value_type.case]]
+              name = "Active"
+              value = 0
+              [[value_type.case]]
+              name = "Closed"
+              value = 7
+            "#,
+        )
+        .resolve()
+        .expect("should resolve");
+
+        let status = resolved.spec.enums.get("Status").expect("enum resolved");
+        let cases: &[ScSpecUdtEnumCaseV0] = status.cases.as_ref();
+        assert_eq!(cases[1].name.to_string(), "Closed");
+        assert_eq!(cases[1].value, 7);
+        assert_eq!(resolved.meta["Status"].durability, Durability::Instance);
+    }
+
+    /// A type declared only in the manifest and referenced only by another
+    /// declared type still resolves — this is the "non-exported type referenced
+    /// only by the storage schema" case.
+    #[test]
+    fn references_between_declared_types_resolve() {
+        let schema = parse(
+            r#"
+            [[value_type]]
+            name = "Account"
+            kind = "struct"
+              [[value_type.field]]
+              name = "position"
+              type = "PositionState"
+
+            [[value_type]]
+            name = "PositionState"
+            kind = "struct"
+              [[value_type.field]]
+              name = "debt"
+              type = "i128"
+            "#,
+        );
+
+        assert!(
+            schema.unresolved_references(None).is_empty(),
+            "PositionState is declared, so the reference resolves"
+        );
+
+        let resolved = schema.resolve().expect("should resolve");
+        assert!(resolved.spec.structs.contains_key("Account"));
+        assert!(resolved.spec.structs.contains_key("PositionState"));
+    }
+
+    #[test]
+    fn dangling_references_are_reported_rather_than_hidden() {
+        let schema = parse(
+            r#"
+            [[value_type]]
+            name = "Account"
+            kind = "struct"
+              [[value_type.field]]
+              name = "balances"
+              type = "Map<Address, Vec<Mystery>>"
+            "#,
+        );
+
+        // Nothing declares or exports `Mystery`, so its layout is unknown.
+        assert_eq!(schema.unresolved_references(None), vec!["Mystery".to_string()]);
+
+        // Once the build exports it, the reference resolves.
+        let exported = spec_with_struct("Mystery", &[("x", ScSpecTypeDef::U32)]);
+        assert!(schema.unresolved_references(Some(&exported)).is_empty());
     }
 
     #[test]
