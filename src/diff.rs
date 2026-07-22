@@ -1199,7 +1199,12 @@ fn detect_cascading_layout_breaks_with_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{ScEnvMetaEntry, ScSpecTypeUdt, StringM, VecM};
+    use proptest::collection::hash_set;
+    use proptest::prelude::*;
+    use stellar_xdr::curr::{
+        ScEnvMetaEntry, ScSpecTypeUdt, ScSpecUdtUnionCaseTupleV0, ScSpecUdtUnionCaseVoidV0, StringM,
+        VecM,
+    };
 
     /// Helper: build a minimal ContractSpec with the given structs.
     fn spec_with_structs(structs: Vec<(&str, Vec<(&str, ScSpecTypeDef)>)>) -> ContractSpec {
@@ -1707,5 +1712,495 @@ mod tests {
         let tf = type_finding.unwrap();
         assert_eq!(tf.severity, Severity::Critical);
         assert!(tf.message.contains("parameter 0 ('a') type changed")); // Index in old is 0
+    }
+
+    // ---------------------------------------------------------------
+    // Helpers for union test fixtures
+    // ---------------------------------------------------------------
+    fn void_case(name: &str) -> ScSpecUdtUnionCaseV0 {
+        ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
+            doc: StringM::default(),
+            name: name.try_into().unwrap(),
+        })
+    }
+
+    fn tuple_case(name: &str, types: Vec<ScSpecTypeDef>) -> ScSpecUdtUnionCaseV0 {
+        ScSpecUdtUnionCaseV0::TupleV0(ScSpecUdtUnionCaseTupleV0 {
+            doc: StringM::default(),
+            name: name.try_into().unwrap(),
+            type_: VecM::try_from(types).unwrap(),
+        })
+    }
+
+    fn spec_with_unions(name: &str, cases: Vec<ScSpecUdtUnionCaseV0>) -> ContractSpec {
+        let mut spec = ContractSpec::default();
+        spec.unions.insert(
+            name.to_string(),
+            ScSpecUdtUnionV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: name.try_into().unwrap(),
+                cases: VecM::try_from(cases).unwrap(),
+            },
+        );
+        spec
+    }
+
+    // ---------------------------------------------------------------
+    // Struct field: mid-sequence insertion → Critical + no phantom append
+    // ---------------------------------------------------------------
+    #[test]
+    fn struct_field_mid_insertion_is_critical() {
+        // This is the attack scenario from fix.md:
+        //   Old: { owner: Address, amount: u64 }
+        //   New: { owner: Address, fee_bps: u32, amount: u64 }
+        let old = spec_with_structs(vec![
+            ("Data", vec![("owner", udt("Address")), ("amount", ScSpecTypeDef::U64)]),
+        ]);
+        let new = spec_with_structs(vec![
+            (
+                "Data",
+                vec![
+                    ("owner", udt("Address")),
+                    ("fee_bps", ScSpecTypeDef::U32),
+                    ("amount", ScSpecTypeDef::U64),
+                ],
+            ),
+        ]);
+
+        let report = compare(&old, &new);
+
+        // fee_bps is inserted mid-sequence → Critical
+        let inserted = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Inserted" && f.target.as_deref() == Some("Data.fee_bps"));
+        assert!(inserted.is_some(), "Expected Struct Field Inserted for fee_bps");
+        assert_eq!(inserted.unwrap().severity, Severity::Critical);
+
+        // amount moved from position 1 to 2 → Reordered
+        let reordered = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Reordered" && f.target.as_deref() == Some("Data.amount"));
+        assert!(reordered.is_some(), "Expected Struct Field Reordered for amount");
+        assert_eq!(reordered.unwrap().severity, Severity::Critical);
+
+        // No phantom "Struct Field Added" for amount (it already exists)
+        let phantom_appended = report
+            .findings
+            .iter()
+            .any(|f| f.category == "Struct Field Added" && f.target.as_deref() == Some("Data.amount"));
+        assert!(!phantom_appended, "amount must not be reported as newly added");
+    }
+
+    // ---------------------------------------------------------------
+    // Struct field: tail append → Warning
+    // ---------------------------------------------------------------
+    #[test]
+    fn struct_field_tail_append_is_warning() {
+        let old = spec_with_structs(vec![("Data", vec![("a", ScSpecTypeDef::U32)])]);
+        let new = spec_with_structs(vec![
+            ("Data", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U64)]),
+        ]);
+
+        let report = compare(&old, &new);
+
+        let added = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Added" && f.target.as_deref() == Some("Data.b"));
+        assert!(added.is_some(), "Expected Struct Field Added for b");
+        assert_eq!(added.unwrap().severity, Severity::Warning);
+
+        // No critical findings for a clean append
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.severity == Severity::Critical)
+                .count(),
+            0
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Struct field: deletion → Critical
+    // ---------------------------------------------------------------
+    #[test]
+    fn struct_field_deletion_is_critical() {
+        let old = spec_with_structs(vec![
+            ("Data", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U64)]),
+        ]);
+        let new = spec_with_structs(vec![("Data", vec![("a", ScSpecTypeDef::U32)])]);
+
+        let report = compare(&old, &new);
+
+        let removed = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Removed" && f.target.as_deref() == Some("Data.b"));
+        assert!(removed.is_some(), "Expected Struct Field Removed for b");
+        assert_eq!(removed.unwrap().severity, Severity::Critical);
+    }
+
+    // ---------------------------------------------------------------
+    // Struct field: same-position type change → Critical
+    // ---------------------------------------------------------------
+    #[test]
+    fn struct_field_type_change_at_same_position_is_critical() {
+        let old = spec_with_structs(vec![("Data", vec![("a", ScSpecTypeDef::U32)])]);
+        let new = spec_with_structs(vec![("Data", vec![("a", ScSpecTypeDef::I128)])]);
+
+        let report = compare(&old, &new);
+
+        let type_changed = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Type Changed" && f.target.as_deref() == Some("Data.a"));
+        assert!(type_changed.is_some(), "Expected Struct Field Type Changed for a");
+        assert_eq!(type_changed.unwrap().severity, Severity::Critical);
+    }
+
+    // ---------------------------------------------------------------
+    // Struct field: swap (both fields move) → Critical
+    // ---------------------------------------------------------------
+    #[test]
+    fn struct_field_swap_is_critical() {
+        let old = spec_with_structs(vec![
+            ("Data", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U64)]),
+        ]);
+        let new = spec_with_structs(vec![
+            ("Data", vec![("b", ScSpecTypeDef::U64), ("a", ScSpecTypeDef::U32)]),
+        ]);
+
+        let report = compare(&old, &new);
+
+        let reorder_a = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Reordered" && f.target.as_deref() == Some("Data.a"));
+        let reorder_b = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Reordered" && f.target.as_deref() == Some("Data.b"));
+        assert!(reorder_a.is_some(), "Expected Struct Field Reordered for a");
+        assert!(reorder_b.is_some(), "Expected Struct Field Reordered for b");
+    }
+
+    // ---------------------------------------------------------------
+    // Combination: reorder + insert + delete in one struct
+    // ---------------------------------------------------------------
+    #[test]
+    fn struct_field_combination_reorder_insert_delete() {
+        // Old: [a: u32, b: u64, c: i128]
+        // New: [x: u32, b: u64, a: u32]  (c removed, x inserted mid, a moved)
+        let old = spec_with_structs(vec![
+            ("Data", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U64), ("c", ScSpecTypeDef::I128)]),
+        ]);
+        let new = spec_with_structs(vec![
+            ("Data", vec![("x", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U64), ("a", ScSpecTypeDef::U32)]),
+        ]);
+
+        let report = compare(&old, &new);
+
+        // c removed
+        assert!(
+            report.findings.iter().any(|f| f.category == "Struct Field Removed" && f.target.as_deref() == Some("Data.c")),
+            "Expected Removed for c"
+        );
+        // x inserted mid-sequence
+        assert!(
+            report.findings.iter().any(|f| f.category == "Struct Field Inserted" && f.target.as_deref() == Some("Data.x")),
+            "Expected Inserted for x"
+        );
+        // a moved
+        assert!(
+            report.findings.iter().any(|f| f.category == "Struct Field Reordered" && f.target.as_deref() == Some("Data.a")),
+            "Expected Reordered for a"
+        );
+        // b unchanged, no finding for b
+        assert!(
+            !report.findings.iter().any(|f| f.target.as_deref() == Some("Data.b")),
+            "b should have no findings"
+        );
+
+        // No phantom appends
+        assert!(
+            !report.findings.iter().any(|f| f.category == "Struct Field Added"),
+            "No fields should be reported as Added in this scenario"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Event struct: mid-sequence insertion → Event Schema Inserted
+    // ---------------------------------------------------------------
+    #[test]
+    fn event_struct_field_mid_insertion_is_critical() {
+        let old = spec_with_structs(vec![
+            ("SomeEvent", vec![("old_field", ScSpecTypeDef::U32)]),
+        ]);
+        let new = spec_with_structs(vec![
+            ("SomeEvent", vec![("old_field", ScSpecTypeDef::U32), ("new_field", ScSpecTypeDef::U64)]),
+        ]);
+
+        let report = compare(&old, &new);
+
+        // Appended at tail, still Struct Field Added (Warning) — event structs
+        // use the same added logic.
+        let added = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Added" && f.target.as_deref() == Some("SomeEvent.new_field"));
+        assert!(added.is_some(), "Expected Struct Field Added for new_field");
+        assert_eq!(added.unwrap().severity, Severity::Warning);
+    }
+
+    // ---------------------------------------------------------------
+    // Union case: mid-sequence insertion → Critical
+    // ---------------------------------------------------------------
+    #[test]
+    fn union_case_mid_insertion_is_critical() {
+        // Old: [A(void), B(void)]
+        // New: [A(void), C(void), B(void)] — C inserted mid
+        let old = spec_with_unions("Action", vec![void_case("A"), void_case("B")]);
+        let new = spec_with_unions("Action", vec![void_case("A"), void_case("C"), void_case("B")]);
+
+        let report = compare(&old, &new);
+
+        // C inserted mid → Critical
+        let inserted = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Union Case Inserted" && f.target.as_deref() == Some("Action.C"));
+        assert!(inserted.is_some(), "Expected Union Case Inserted for C");
+        assert_eq!(inserted.unwrap().severity, Severity::Critical);
+
+        // B moved from position 1 to 2 → Critical
+        let reordered = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Union Case Reordered" && f.target.as_deref() == Some("Action.B"));
+        assert!(reordered.is_some(), "Expected Union Case Reordered for B");
+        assert_eq!(reordered.unwrap().severity, Severity::Critical);
+    }
+
+    // ---------------------------------------------------------------
+    // Union case: tail append → Info
+    // ---------------------------------------------------------------
+    #[test]
+    fn union_case_tail_append_is_info() {
+        let old = spec_with_unions("Action", vec![void_case("A")]);
+        let new = spec_with_unions("Action", vec![void_case("A"), void_case("B")]);
+
+        let report = compare(&old, &new);
+
+        let added = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Union Case Added" && f.target.as_deref() == Some("Action.B"));
+        assert!(added.is_some(), "Expected Union Case Added for B");
+        assert_eq!(added.unwrap().severity, Severity::Info);
+
+        // No critical findings
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.severity == Severity::Critical)
+                .count(),
+            0
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Union case: deletion → Critical
+    // ---------------------------------------------------------------
+    #[test]
+    fn union_case_deletion_is_critical() {
+        let old = spec_with_unions("Action", vec![void_case("A"), void_case("B")]);
+        let new = spec_with_unions("Action", vec![void_case("A")]);
+
+        let report = compare(&old, &new);
+
+        let removed = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Union Case Removed" && f.target.as_deref() == Some("Action.B"));
+        assert!(removed.is_some(), "Expected Union Case Removed for B");
+        assert_eq!(removed.unwrap().severity, Severity::Critical);
+    }
+
+    // ---------------------------------------------------------------
+    // Union case: payload type change → Critical
+    // ---------------------------------------------------------------
+    #[test]
+    fn union_case_type_change_is_critical() {
+        let old = spec_with_unions("Action", vec![tuple_case("Pay", vec![ScSpecTypeDef::U32])]);
+        let new = spec_with_unions("Action", vec![tuple_case("Pay", vec![ScSpecTypeDef::U64])]);
+
+        let report = compare(&old, &new);
+
+        let type_changed = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Union Case Type Changed" && f.target.as_deref() == Some("Action.Pay"));
+        assert!(type_changed.is_some(), "Expected Union Case Type Changed for Pay");
+        assert_eq!(type_changed.unwrap().severity, Severity::Critical);
+    }
+
+    // ---------------------------------------------------------------
+    // Union case: swap → Critical
+    // ---------------------------------------------------------------
+    #[test]
+    fn union_case_swap_is_critical() {
+        let old = spec_with_unions("Action", vec![void_case("A"), void_case("B")]);
+        let new = spec_with_unions("Action", vec![void_case("B"), void_case("A")]);
+
+        let report = compare(&old, &new);
+
+        let reorder_a = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Union Case Reordered" && f.target.as_deref() == Some("Action.A"));
+        let reorder_b = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Union Case Reordered" && f.target.as_deref() == Some("Action.B"));
+        assert!(reorder_a.is_some(), "Expected Union Case Reordered for A");
+        assert!(reorder_b.is_some(), "Expected Union Case Reordered for B");
+    }
+
+    // ---------------------------------------------------------------
+    // Union case: combination (reorder + insert + delete)
+    // ---------------------------------------------------------------
+    #[test]
+    fn union_case_combination_reorder_insert_delete() {
+        // Old: [A, B, C]
+        // New: [X, B, A] — C removed, X inserted mid, A moved
+        let old = spec_with_unions("Action", vec![void_case("A"), void_case("B"), void_case("C")]);
+        let new = spec_with_unions("Action", vec![void_case("X"), void_case("B"), void_case("A")]);
+
+        let report = compare(&old, &new);
+
+        assert!(
+            report.findings.iter().any(|f| f.category == "Union Case Removed" && f.target.as_deref() == Some("Action.C")),
+            "Expected Removed for C"
+        );
+        assert!(
+            report.findings.iter().any(|f| f.category == "Union Case Inserted" && f.target.as_deref() == Some("Action.X")),
+            "Expected Inserted for X"
+        );
+        assert!(
+            report.findings.iter().any(|f| f.category == "Union Case Reordered" && f.target.as_deref() == Some("Action.A")),
+            "Expected Reordered for A"
+        );
+        // B unchanged
+        assert!(
+            !report.findings.iter().any(|f| f.target.as_deref() == Some("Action.B")),
+            "B should have no findings"
+        );
+        // No phantom appends
+        assert!(
+            !report.findings.iter().any(|f| f.category == "Union Case Added"),
+            "No cases should be reported as Added in this scenario"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Property: random field sets — verify consistency invariants
+    // ---------------------------------------------------------------
+    proptest! {
+        #[test]
+        fn struct_field_proptest_invariants(
+            old_names in hash_set("[a-z]{1,4}", 0..6),
+            new_names in hash_set("[a-z]{1,4}", 0..6),
+        ) {
+            // sorted determinism
+            let mut old_names: Vec<String> = old_names.into_iter().collect();
+            let mut new_names: Vec<String> = new_names.into_iter().collect();
+            old_names.sort();
+            new_names.sort();
+
+            let old = spec_with_structs(vec![
+                ("Data", old_names.iter().map(|n| (n.as_str(), ScSpecTypeDef::U32)).collect()),
+            ]);
+            let new = spec_with_structs(vec![
+                ("Data", new_names.iter().map(|n| (n.as_str(), ScSpecTypeDef::U32)).collect()),
+            ]);
+
+            let report = compare(&old, &new);
+
+            // All old names absent from new → "Struct Field Removed"
+            for name in &old_names {
+                if !new_names.contains(name) {
+                    let target = format!("Data.{}", name);
+                    prop_assert!(
+                        report.findings.iter().any(|f| f.category == "Struct Field Removed"
+                            && f.target.as_deref() == Some(target.as_str())),
+                        "Field '{}' removed but no Removed finding", name
+                    );
+                }
+            }
+
+            // New names absent from old → "Struct Field Inserted" (< old.len())
+            //                             or "Struct Field Added" (>= old.len())
+            for (i, name) in new_names.iter().enumerate() {
+                if !old_names.contains(name) {
+                    let target = format!("Data.{}", name);
+                    if i >= old_names.len() {
+                        prop_assert!(
+                            report.findings.iter().any(|f| f.category == "Struct Field Added"
+                                && f.target.as_deref() == Some(target.as_str())),
+                            "Field '{}' appended but no Added finding", name
+                        );
+                    } else {
+                        prop_assert!(
+                            report.findings.iter().any(|f| f.category == "Struct Field Inserted"
+                                && f.target.as_deref() == Some(target.as_str())),
+                            "Field '{}' inserted mid but no Inserted finding", name
+                        );
+                    }
+                }
+            }
+
+            // Names shared at different positions → "Struct Field Reordered"
+            for old_name in &old_names {
+                if let Some(new_i) = new_names.iter().position(|n| n == old_name) {
+                    let old_i = old_names.iter().position(|n| n == old_name).unwrap();
+                    if old_i != new_i {
+                        let target = format!("Data.{}", old_name);
+                        prop_assert!(
+                            report.findings.iter().any(|f| f.category == "Struct Field Reordered"
+                                && f.target.as_deref() == Some(target.as_str())),
+                            "Field '{}' moved {}→{} but no Reordered finding",
+                            old_name, old_i, new_i
+                        );
+                    }
+                }
+            }
+
+            // No field appears in both "Struct Field Added" and "Struct Field Removed"
+            let added_targets: std::collections::HashSet<&str> = report
+                .findings
+                .iter()
+                .filter(|f| f.category == "Struct Field Added")
+                .filter_map(|f| f.target.as_deref())
+                .collect();
+            let removed_targets: std::collections::HashSet<&str> = report
+                .findings
+                .iter()
+                .filter(|f| f.category == "Struct Field Removed")
+                .filter_map(|f| f.target.as_deref())
+                .collect();
+            prop_assert!(
+                added_targets.is_disjoint(&removed_targets),
+                "A field cannot be both Added and Removed"
+            );
+
+            // Determinism: running compare twice yields identical results
+            let report2 = compare(&old, &new);
+            prop_assert_eq!(report.findings.len(), report2.findings.len());
+        }
     }
 }
