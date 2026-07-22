@@ -4,8 +4,9 @@ use std::fmt;
 use std::path::Path;
 use stellar_xdr::curr::{
     ContractExecutable, Hash, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyContractCode,
-    LedgerKeyContractData, ReadXdr, ScAddress, ScVal, WriteXdr,
+    LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
 };
+
 use wasmparser::{Parser, Payload};
 
 use crate::limits::{LimitError, ResourcePolicy};
@@ -132,8 +133,8 @@ pub fn fetch_wasm_from_rpc_with_policy(
         durability: stellar_xdr::curr::ContractDataDurability::Persistent,
     });
 
-    // 3. Serialize LedgerKey to Base64
-    let key_b64 = ledger_key
+    // 3. Serialize LedgerKey to Base64 with policy limits (for validation).
+    let _key_b64 = ledger_key
         .to_xdr_base64(policy.xdr_limits())
         .map_err(|e| anyhow::anyhow!("Failed to serialize LedgerKey to base64: {}", e))?;
 
@@ -189,7 +190,8 @@ pub fn fetch_wasm_from_rpc_with_policy(
         hash: wasm_hash.clone(),
     });
 
-    let code_key_b64 = code_ledger_key.to_xdr_base64(policy.xdr_limits()).map_err(|e| {
+    let _code_key_b64 = code_ledger_key.to_xdr_base64(policy.xdr_limits()).map_err(|e| {
+
         anyhow::anyhow!(
             "Failed to serialize ContractCode LedgerKey to base64: {}",
             e
@@ -268,6 +270,66 @@ pub fn fetch_wasm_from_rpc_with_policy(
     })
 }
 
+/// Find and return the single RPC ledger-entry whose `"key"` base64 matches
+/// `expected_key`, within the given JSON `entries` array.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - `entries` is empty ("zero entries returned")
+/// - No entry key matches — returns [`IntegrityError::KeyMismatch`] because the RPC
+///   returning a non-matching key is a ledger-integrity violation, not a "not found"
+/// - More than one entry matches ("share the same ledger key")
+/// - An entry is missing its `"key"` field ("missing 'key'")
+/// - An entry is missing its `"xdr"` field ("missing 'xdr'")
+fn find_entry_by_key<'a>(
+    entries: &'a [serde_json::Value],
+    expected_key: &LedgerKey,
+    context_label: &str,
+) -> Result<&'a serde_json::Value> {
+    if entries.is_empty() {
+        anyhow::bail!(
+            "{}: RPC returned zero entries for the ledger key",
+            context_label
+        );
+    }
+
+    let expected_b64 = expected_key
+        .to_xdr_base64(Limits::none())
+        .map_err(|e| anyhow::anyhow!("{}: failed to encode expected key: {}", context_label, e))?;
+
+    let mut matches: Vec<&serde_json::Value> = Vec::new();
+    for entry in entries {
+        let entry_key_b64 = entry["key"]
+            .as_str()
+            .with_context(|| format!("{}: entry missing 'key' field", context_label))?;
+        if entry_key_b64 == expected_b64 {
+            // Also verify the xdr field is present.
+            let _ = entry["xdr"]
+                .as_str()
+                .with_context(|| format!("{}: entry missing 'xdr' field", context_label))?;
+            matches.push(entry);
+        }
+    }
+
+    match matches.len() {
+        0 => Err(IntegrityError {
+            kind: IntegrityErrorKind::KeyMismatch,
+            details: format!(
+                "{}: no entry matches the requested ledger key",
+                context_label
+            ),
+        }
+        .into()),
+        1 => Ok(matches[0]),
+        _ => anyhow::bail!(
+            "{}: {} entries share the same ledger key — response is ambiguous",
+            context_label,
+            matches.len()
+        ),
+    }
+}
+
 /// Validates an RPC URL for secure transport.
 ///
 /// - Rejects non-`https` URLs unless `allow_http_local` is `true`.
@@ -275,6 +337,7 @@ pub fn fetch_wasm_from_rpc_with_policy(
 ///   accepted for `http://` URLs.
 /// - Rejects unknown/unexpected schemes.
 pub fn validate_rpc_url(rpc_url: &str, allow_http_local: bool) -> Result<()> {
+
     if rpc_url.starts_with("https://") {
         return Ok(());
     }
