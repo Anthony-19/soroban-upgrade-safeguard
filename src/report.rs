@@ -350,6 +350,53 @@ impl SafetyReport {
             }
         }
 
+        let mut suppressed_list = Vec::new();
+        for group in self.findings_by_category.values() {
+            for reported in group {
+                if reported.suppressed {
+                    suppressed_list.push(reported);
+                }
+            }
+        }
+
+        if !suppressed_list.is_empty() {
+            output.push_str(
+                &"\n========================================\n"
+                    .bold()
+                    .to_string(),
+            );
+            output.push_str(
+                &"🔕 APPLIED SUPPRESSIONS AUDIT LOG\n"
+                    .bold()
+                    .magenta()
+                    .to_string(),
+            );
+            output.push_str(
+                &"========================================\n"
+                    .bold()
+                    .to_string(),
+            );
+            for reported in suppressed_list {
+                let f = &reported.finding;
+                let target_str = f.target.as_deref().unwrap_or("<no target>");
+                output.push_str(&format!(
+                    " - Category:    {}\n   Target:      {}\n",
+                    f.category, target_str
+                ));
+                if let Some(fp) = &reported.suppression_fingerprint {
+                    output.push_str(&format!("   Fingerprint: {}\n", fp));
+                }
+                if let Some(author) = &reported.suppression_author {
+                    let expiry_str = reported.suppression_expiry.as_deref().unwrap_or("never");
+                    output.push_str(&format!("   Author:      {} (expires {})\n", author, expiry_str));
+                }
+                if let Some(reason) = &reported.suppression_reason {
+                    output.push_str(&format!("   Reason:      {}\n", reason));
+                }
+                output.push('\n');
+            }
+        }
+
         output
     }
 
@@ -420,6 +467,35 @@ impl SafetyReport {
             output.push_str("### ⚠️ Action Required\n\n");
             output.push_str("- The new contract version modifies existing storage layouts or function interfaces.\n");
             output.push_str("- Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n");
+        }
+
+        let mut suppressed_list = Vec::new();
+        for group in self.findings_by_category.values() {
+            for reported in group {
+                if reported.suppressed {
+                    suppressed_list.push(reported);
+                }
+            }
+        }
+
+        if !suppressed_list.is_empty() {
+            output.push_str("### 🔕 Applied Suppressions Audit Log\n\n");
+            output.push_str("| Category | Target | Fingerprint | Author | Expiry | Reason |\n");
+            output.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
+            for reported in suppressed_list {
+                let f = &reported.finding;
+                let category = &f.category;
+                let target = f.target.as_deref().unwrap_or("-");
+                let fingerprint = reported.suppression_fingerprint.as_deref().unwrap_or("-");
+                let author = reported.suppression_author.as_deref().unwrap_or("-");
+                let expiry = reported.suppression_expiry.as_deref().unwrap_or("-");
+                let reason = reported.suppression_reason.as_deref().unwrap_or("-");
+                output.push_str(&format!(
+                    "| {} | `{}` | `{}` | {} | {} | {} |\n",
+                    category, target, fingerprint, author, expiry, reason
+                ));
+            }
+            output.push_str("\n---\n\n");
         }
 
         output
