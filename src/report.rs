@@ -1,4 +1,6 @@
-use crate::diff::{DiffReport, Finding, Severity};
+use crate::diff::{
+    DiffReport, Finding, Severity, STORAGE_CATEGORY_PREFIX, STORAGE_UNRESOLVED_CATEGORY,
+};
 use crate::suppression::SuppressionConfig;
 use colored::Colorize;
 use serde::Serialize;
@@ -291,6 +293,26 @@ impl SafetyReport {
         }
     }
 
+    /// The passing status label, widened only as far as the analysis actually
+    /// went. Without a storage schema the claim stays bounded to the exported
+    /// interface; with one it may also speak to the declared storage types.
+    pub fn passed_status_label(&self) -> &'static str {
+        if self.scope.storage_analyzed() {
+            "✅ PASSED (No exported-interface or declared-storage breaks)"
+        } else {
+            "✅ PASSED (No exported-interface breaking changes)"
+        }
+    }
+
+    /// The failing status label, naming the scopes a break could have come from.
+    pub fn failed_status_label(&self) -> &'static str {
+        if self.scope.storage_analyzed() {
+            "❌ FAILED (Breaking changes detected in the exported interface or declared storage)"
+        } else {
+            "❌ FAILED (Exported-interface breaking changes detected)"
+        }
+    }
+
     /// Attach an [`AnalysisScope`] describing what this run inspected.
     ///
     /// Consuming builder so a caller can widen the reported scope (for example
@@ -366,13 +388,11 @@ impl SafetyReport {
         );
 
         let status = if self.is_safe {
-            "✅ PASSED (No exported-interface breaking changes)".green().bold()
+            self.passed_status_label().green().bold()
         } else if self.strict && self.critical_count == 0 {
             "❌ FAILED (Warnings detected in strict mode)".red().bold()
         } else {
-            "❌ FAILED (Exported-interface breaking changes detected)"
-                .red()
-                .bold()
+            self.failed_status_label().red().bold()
         };
         output.push_str(&format!("Status: {}\n", status));
         output.push_str(&format!("Scope:  {}\n", self.scope.summary_line().dimmed()));
@@ -514,9 +534,9 @@ impl SafetyReport {
         output.push_str("# Soroban Upgrade Safety Report\n\n");
 
         let status = if self.is_safe {
-            "✅ PASSED (No exported-interface breaking changes)"
+            self.passed_status_label()
         } else {
-            "❌ FAILED (Exported-interface breaking changes detected)"
+            self.failed_status_label()
         };
         output.push_str(&format!("## Status: {}\n\n", status));
         output.push_str(&format!("_{}_\n\n", self.scope.summary_line()));
@@ -585,7 +605,46 @@ impl SafetyReport {
 }
 
 /// Returns remediation/explanation guidance for a given finding category.
+///
+/// Storage-schema findings reuse the exported-interface categories behind a
+/// [`STORAGE_CATEGORY_PREFIX`], so guidance is looked up storage-first and then
+/// falls back to the shared advice for the underlying structural change.
 pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
+    if category == STORAGE_UNRESOLVED_CATEGORY {
+        return Some(
+            "Declare the referenced type in the storage schema, or confirm it is not \
+             serialized into storage. Until it resolves, its layout is not analyzed.",
+        );
+    }
+
+    if let Some(base) = category.strip_prefix(STORAGE_CATEGORY_PREFIX) {
+        return storage_remediation_guidance(base).or_else(|| interface_remediation_guidance(base));
+    }
+
+    interface_remediation_guidance(category)
+}
+
+/// Guidance specific to declared storage types, where the consequence of a
+/// structural change is stored-data corruption rather than a broken caller.
+fn storage_remediation_guidance(base_category: &str) -> Option<&'static str> {
+    match base_category {
+        "Struct Field Reordered" => Some("This corrupts stored data. Soroban serializes struct fields positionally, so reordering makes existing entries decode into the wrong fields. Restore the original field order and append any new field at the end."),
+        "Struct Field Removed" => Some("This corrupts stored data. Existing entries still contain bytes for this field. Restore the field, or perform an explicit migration that rewrites every affected entry before the upgrade."),
+        "Struct Field Type Changed" => Some("This corrupts stored data. Existing entries hold bytes in the old type's encoding. Revert the type, or migrate every affected entry."),
+        "Struct Field Added" => Some("For a storage value this needs a migration or default, because existing entries lack the field. For a storage key it is fatal: the key's bytes change, so every existing entry becomes unreachable."),
+        "Union Case Reordered" => Some("This orphans stored data. Union cases are addressed by positional discriminant, so reordering changes which variant existing bytes decode as. Restore the original case order and append new cases at the end."),
+        "Union Case Removed" => Some("This orphans stored data written under the removed discriminant. Restore the case, or migrate the affected entries before upgrading."),
+        "Union Case Type Changed" => Some("This corrupts stored data. The payload encoding changed under an unchanged discriminant. Revert the payload type, or migrate the affected entries."),
+        "Enum Case Value Changed" => Some("This orphans stored data. The discriminant is what was written to storage, so changing it makes existing entries resolve to a different case or to nothing. Restore the original value."),
+        "Enum Case Removed" => Some("This orphans stored data written under this discriminant. Restore the case, or migrate the affected entries."),
+        "Struct Removed" | "Enum Removed" | "Union Removed" => Some("A declared storage type disappeared while data written with it may still exist on chain. Restore the type, or migrate the affected entries before upgrading."),
+        "Cascading Layout Break" => Some("This type embeds a modified storage type, so its stored bytes are no longer decodable. Resolve the break in the referenced type."),
+        _ => None,
+    }
+}
+
+/// Guidance for exported-interface findings.
+fn interface_remediation_guidance(category: &str) -> Option<&'static str> {
     match category {
         "Environment" => Some("Verify that the target network supports the new protocol version and adjust any SDK/tooling dependencies accordingly."),
         "Function Removed" => Some("This is a breaking change. If the function is no longer needed, deprecate it in client integrations. Otherwise, restore the function signature."),

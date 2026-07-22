@@ -104,3 +104,89 @@ pub fn compare_wasm_files(old_path: &Path, new_path: &Path) -> Result<SafetyRepo
     let new = loader::load_wasm(new_path)?;
     compare_wasm_bytes(&old.bytes, &new.bytes)
 }
+
+/// Compare two builds *and* their declared storage layouts.
+///
+/// [`compare_wasm_bytes`] only sees the exported interface, so its report
+/// certifies nothing about storage. This overload additionally diffs the storage
+/// types each build declares, through the same engine and severities, and the
+/// returned report's [`report::AnalysisScope`] records that storage was actually
+/// analyzed.
+///
+/// Both schemas are required: a storage layout change is only observable as a
+/// difference between two snapshots.
+///
+/// # Errors
+///
+/// Returns an error if either WASM cannot be parsed, or if either schema
+/// contradicts its own build's exported spec. A manifest that disagrees with the
+/// contract is rejected rather than trusted, since acting on a wrong declaration
+/// is worse than having none.
+pub fn compare_wasm_bytes_with_storage_schemas(
+    old_wasm: &[u8],
+    new_wasm: &[u8],
+    old_schema: &storage_schema::StorageSchema,
+    new_schema: &storage_schema::StorageSchema,
+) -> Result<SafetyReport> {
+    let old_meta = parser::extract_metadata(old_wasm)
+        .context("Failed to extract metadata from the old WASM")?;
+    let new_meta = parser::extract_metadata(new_wasm)
+        .context("Failed to extract metadata from the new WASM")?;
+
+    let old_spec = ContractSpec::from_entries(&old_meta.spec);
+    let new_spec = ContractSpec::from_entries(&new_meta.spec);
+
+    let mut diff_report = diff::compare(&old_spec, &new_spec);
+    diff::compare_env_metadata(
+        old_meta.env_meta.as_ref(),
+        new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+
+    old_schema.reconcile_with_spec(&old_spec, "old")?;
+    new_schema.reconcile_with_spec(&new_spec, "new")?;
+
+    let old_resolved = old_schema.resolve()?;
+    let new_resolved = new_schema.resolve()?;
+
+    let storage_findings = diff::compare_storage_schemas(&old_resolved, &new_resolved);
+    diff_report.findings.extend(storage_findings.findings);
+
+    let mut unresolved = old_schema.unresolved_references(Some(&old_spec));
+    unresolved.extend(new_schema.unresolved_references(Some(&new_spec)));
+    unresolved.sort();
+    unresolved.dedup();
+    diff::report_unresolved_storage_references(&unresolved, &mut diff_report);
+
+    let scope = report::AnalysisScope {
+        exported_interface: true,
+        env_metadata: true,
+        storage_schema: report::StorageScopeState::Analyzed {
+            key_types: new_resolved.key_type_count(),
+            value_types: new_resolved.value_type_count(),
+        },
+    };
+
+    Ok(SafetyReport::new(&diff_report).with_scope(scope))
+}
+
+/// Compare two builds on disk together with their storage-schema manifests.
+///
+/// See [`compare_wasm_bytes_with_storage_schemas`] for what this certifies.
+///
+/// # Errors
+///
+/// Returns an error if any of the four files is missing, unparseable, or if a
+/// schema contradicts its build's exported spec.
+pub fn compare_wasm_files_with_storage_schemas(
+    old_path: &Path,
+    new_path: &Path,
+    old_schema_path: &Path,
+    new_schema_path: &Path,
+) -> Result<SafetyReport> {
+    let old = loader::load_wasm(old_path)?;
+    let new = loader::load_wasm(new_path)?;
+    let old_schema = storage_schema::StorageSchema::load_from_path(old_schema_path)?;
+    let new_schema = storage_schema::StorageSchema::load_from_path(new_schema_path)?;
+    compare_wasm_bytes_with_storage_schemas(&old.bytes, &new.bytes, &old_schema, &new_schema)
+}

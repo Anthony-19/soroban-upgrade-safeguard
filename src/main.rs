@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use soroban_upgrade_safeguard::{
     color::should_disable_color,
     diff, loader, parser, report, spec,
+    storage_schema::StorageSchema,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
 
@@ -84,6 +85,19 @@ struct Args {
     /// Directory containing the new versions of the contracts for directory comparison
     #[arg(long, value_name = "NEW_DIR", requires = "old_dir")]
     new_dir: Option<PathBuf>,
+
+    /// Storage-schema manifest describing the OLD build's storage layout.
+    ///
+    /// Declares the storage-key types and internal value types that govern
+    /// on-chain compatibility but need not appear in the exported spec. Must be
+    /// given together with --new-storage-schema: detecting a layout change
+    /// requires both snapshots.
+    #[arg(long, value_name = "PATH", requires = "new_storage_schema")]
+    old_storage_schema: Option<PathBuf>,
+
+    /// Storage-schema manifest describing the NEW build's storage layout.
+    #[arg(long, value_name = "PATH", requires = "old_storage_schema")]
+    new_storage_schema: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -110,6 +124,27 @@ fn main() -> Result<()> {
     if is_batch && !args.wasm_paths.is_empty() {
         anyhow::bail!("Cannot specify positional WASM paths when using batch mode (--manifest or --old-dir/--new-dir)");
     }
+
+    // A storage schema describes one specific contract's layout, so a single
+    // pair of manifests cannot be applied across a batch of different
+    // contracts. Refusing is better than silently analyzing the wrong layout.
+    if is_batch && args.old_storage_schema.is_some() {
+        anyhow::bail!(
+            "--old-storage-schema/--new-storage-schema describe a single contract's storage \
+             layout and cannot be used with batch mode. Run the pair on its own to analyze \
+             storage layout."
+        );
+    }
+
+    // Both manifests are loaded and validated up front so a malformed schema
+    // fails before any comparison work is reported.
+    let storage_schemas = match (&args.old_storage_schema, &args.new_storage_schema) {
+        (Some(old), Some(new)) => Some((
+            StorageSchema::load_from_path(old)?,
+            StorageSchema::load_from_path(new)?,
+        )),
+        _ => None,
+    };
 
     // In JSON or Markdown mode, decorative progress goes to stderr so stdout
     // stays a single, pristine document. In text mode it stays on stdout
@@ -179,6 +214,8 @@ fn main() -> Result<()> {
                     suppressions: &suppressions,
                     explain: args.explain,
                     strict: args.strict,
+                    // Rejected earlier: a schema is contract-specific.
+                    storage_schemas: None,
                 },
                 &progress,
             )?;
@@ -369,6 +406,9 @@ fn main() -> Result<()> {
             suppressions: &suppressions,
             explain: args.explain,
             strict: args.strict,
+            storage_schemas: storage_schemas
+                .as_ref()
+                .map(|(old_schema, new_schema)| (old_schema, new_schema)),
         },
         &progress,
     )?;
@@ -416,6 +456,9 @@ struct ContractComparison<'a> {
     suppressions: &'a SuppressionConfig,
     explain: bool,
     strict: bool,
+    /// The declared storage layouts of the old and new builds, when supplied.
+    /// Both sides are required: a layout change is only visible as a diff.
+    storage_schemas: Option<(&'a StorageSchema, &'a StorageSchema)>,
 }
 
 /// Helper function to run comparison for a single pair.
@@ -431,6 +474,7 @@ fn compare_contracts(
         suppressions,
         explain,
         strict,
+        storage_schemas,
     } = comparison;
     let old_meta = parser::extract_metadata(old_bytes)?;
     let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
@@ -463,14 +507,52 @@ fn compare_contracts(
         &mut diff_report,
     );
 
-    // The CLI always compares environment metadata (above); storage layout is
-    // not analyzed until a storage schema is wired in. Record that faithfully so
-    // the report states its own coverage rather than implying more.
-    let scope = report::AnalysisScope {
+    // The CLI always compares environment metadata (above). Storage layout is
+    // analyzed only when a schema is supplied for both builds, and the scope
+    // records which of those two situations actually held.
+    let mut scope = report::AnalysisScope {
         exported_interface: true,
         env_metadata: true,
         storage_schema: report::StorageScopeState::NotAnalyzed,
     };
+
+    if let Some((old_schema, new_schema)) = storage_schemas {
+        progress(format!(
+            "\n{}",
+            "🗄️  Analyzing declared storage layout...".cyan().bold()
+        ));
+
+        // A manifest that contradicts its own build is more dangerous than no
+        // manifest, so disagreement stops the run rather than being reported.
+        old_schema.reconcile_with_spec(&old_spec, "old")?;
+        new_schema.reconcile_with_spec(&new_spec, "new")?;
+
+        let old_resolved = old_schema.resolve()?;
+        let new_resolved = new_schema.resolve()?;
+
+        progress(format!(
+            "  {} {} key type(s), {} value type(s) declared",
+            "✅ Schema:".green().bold(),
+            new_resolved.key_type_count(),
+            new_resolved.value_type_count()
+        ));
+
+        let storage_findings = diff::compare_storage_schemas(&old_resolved, &new_resolved);
+        diff_report.findings.extend(storage_findings.findings);
+
+        // Any reference the schema could not resolve is a coverage gap, and is
+        // surfaced rather than silently absorbed into the verdict.
+        let mut unresolved = old_schema.unresolved_references(Some(&old_spec));
+        unresolved.extend(new_schema.unresolved_references(Some(&new_spec)));
+        unresolved.sort();
+        unresolved.dedup();
+        diff::report_unresolved_storage_references(&unresolved, &mut diff_report);
+
+        scope.storage_schema = report::StorageScopeState::Analyzed {
+            key_types: new_resolved.key_type_count(),
+            value_types: new_resolved.value_type_count(),
+        };
+    }
 
     Ok(report::SafetyReport::with_suppressions(
         &diff_report,
