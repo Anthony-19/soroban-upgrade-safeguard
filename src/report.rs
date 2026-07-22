@@ -37,6 +37,10 @@ pub struct SafetyReport {
     pub is_safe: bool,
     pub findings_by_category: HashMap<String, Vec<ReportedFinding>>,
     pub strict: bool,
+    /// Where the baseline (old) contract was sourced from (e.g. "RPC", "Local File").
+    pub baseline_source: Option<String>,
+    /// Verified SHA-256 hash of the baseline WASM bytecode (hex), if verified.
+    pub verified_code_hash: Option<String>,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -60,6 +64,8 @@ pub struct SafetyReportJson<'a> {
     pub suppressed_count: usize,
     pub total_findings: usize,
     pub recommended_bump: &'static str,
+    pub baseline_source: Option<&'a str>,
+    pub verified_code_hash: Option<&'a str>,
     pub findings_by_category: BTreeMap<&'a str, &'a Vec<ReportedFinding>>,
 }
 
@@ -143,6 +149,8 @@ impl SafetyReport {
             is_safe,
             findings_by_category,
             strict,
+            baseline_source: None,
+            verified_code_hash: None,
         }
     }
 
@@ -177,6 +185,8 @@ impl SafetyReport {
             suppressed_count: self.suppressed_count,
             total_findings: self.total_findings,
             recommended_bump: self.recommended_bump(),
+            baseline_source: self.baseline_source.as_deref(),
+            verified_code_hash: self.verified_code_hash.as_deref(),
             findings_by_category: self
                 .findings_by_category
                 .iter()
@@ -248,6 +258,14 @@ impl SafetyReport {
             _ => bump.normal(),
         };
         output.push_str(&format!("Recommended Bump: {}\n", bump_str));
+
+        if let Some(source) = &self.baseline_source {
+            output.push_str(&format!("Baseline Source: {}\n", source));
+        }
+        if let Some(hash) = &self.verified_code_hash {
+            output.push_str(&format!("Verified Code Hash: {}\n", hash.dimmed()));
+        }
+
         output.push_str(
             &"----------------------------------------\n\n"
                 .dimmed()
@@ -366,6 +384,14 @@ impl SafetyReport {
             "\n**Recommended SemVer Bump**: `{}`\n\n",
             self.recommended_bump()
         ));
+
+        if let Some(source) = &self.baseline_source {
+            output.push_str(&format!("**Baseline Source**: `{}`\n\n", source));
+        }
+        if let Some(hash) = &self.verified_code_hash {
+            output.push_str(&format!("**Verified Code Hash**: `{}`\n\n", hash));
+        }
+
         output.push_str("---\n\n");
 
         if self.total_findings == 0 {
@@ -567,6 +593,8 @@ mod tests {
             is_safe: true,
             findings_by_category: std::collections::HashMap::new(),
             strict: false,
+            baseline_source: None,
+            verified_code_hash: None,
         };
 
         // Identical upgrade -> patch

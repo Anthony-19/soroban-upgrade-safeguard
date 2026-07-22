@@ -75,6 +75,17 @@ struct Args {
     #[arg(long)]
     no_color: bool,
 
+    /// Allow HTTP connections for RPC when the host is localhost/127.0.0.1.
+    /// Without this flag only HTTPS URLs are accepted.
+    #[arg(long)]
+    allow_http_local: bool,
+
+    /// Expected SHA-256 hash (hex) of the on-chain WASM baseline.
+    /// When provided the tool verifies the hash of the fetched bytecode
+    /// matches this value and fails immediately on mismatch.
+    #[arg(long, value_name = "HEX_HASH")]
+    expected_wasm_hash: Option<String>,
+
     /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
     #[arg(long, value_name = "MANIFEST_PATH")]
     manifest: Option<PathBuf>,
@@ -534,6 +545,12 @@ fn run() -> Result<()> {
     }
 
     // Generate Safety Report using the factored helper
+    let baseline_source: Option<&str> = if old_source.is_some() {
+        Some("RPC")
+    } else {
+        Some("Local File")
+    };
+    let verified_hash_hex = old.verified_hash.as_ref().map(hex::encode);
     let safety_report = compare_contracts(
         &ContractComparison {
             old_bytes: &old.bytes,
@@ -648,12 +665,11 @@ fn compare_contracts(
         &mut diff_report,
     );
 
-    Ok(report::SafetyReport::with_suppressions(
-        &diff_report,
-        suppressions,
-        *explain,
-        *strict,
-    ))
+    let mut safety_report =
+        report::SafetyReport::with_suppressions(&diff_report, suppressions, *explain, *strict);
+    safety_report.baseline_source = baseline_source.map(|s| s.to_string());
+    safety_report.verified_code_hash = verified_code_hash.map(|s| s.to_string());
+    Ok(safety_report)
 }
 
 fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {
