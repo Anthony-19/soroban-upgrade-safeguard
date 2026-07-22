@@ -42,6 +42,7 @@ pub struct SafetyReport {
     pub info_count: usize,
     /// Number of findings (of any severity) acknowledged by a suppression rule.
     pub suppressed_count: usize,
+    pub suppressed_critical_count: usize,
     pub total_findings: usize,
     pub is_safe: bool,
     pub findings_by_category: HashMap<String, Vec<ReportedFinding>>,
@@ -97,6 +98,7 @@ impl SafetyReport {
         let mut warning_count = 0;
         let mut info_count = 0;
         let mut suppressed_count = 0;
+        let mut suppressed_critical_count = 0;
         let mut failing_critical_count = 0;
         let mut failing_warning_count = 0;
         let mut findings_by_category: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
@@ -112,6 +114,9 @@ impl SafetyReport {
             let suppressed = rule.is_some();
             if suppressed {
                 suppressed_count += 1;
+                if finding.severity == Severity::Critical {
+                    suppressed_critical_count += 1;
+                }
             } else {
                 match finding.severity {
                     Severity::Critical => failing_critical_count += 1,
@@ -151,6 +156,7 @@ impl SafetyReport {
             warning_count,
             info_count,
             suppressed_count,
+            suppressed_critical_count,
             total_findings: diff.findings.len(),
             is_safe,
             findings_by_category,
@@ -651,6 +657,7 @@ mod tests {
             warning_count: 0,
             info_count: 0,
             suppressed_count: 0,
+            suppressed_critical_count: 0,
             total_findings: 0,
             is_safe: true,
             findings_by_category: std::collections::HashMap::new(),
