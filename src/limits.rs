@@ -191,6 +191,7 @@ impl LimitError {
 /// mirrors [`crate::suppression::SuppressionConfig`] so a repo can commit both a
 /// suppression policy and a resource policy in the same file.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
     /// Overrides [`ResourcePolicy::max_xdr_depth`].
     #[serde(default)]
