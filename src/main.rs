@@ -217,6 +217,13 @@ fn run() -> Result<()> {
     // Load suppression config: an explicit --config must exist; otherwise fall
     // back to `.safeguard.toml` in the working directory if it happens to be
     // present. With neither, an empty config preserves today's behavior.
+    //
+    // SECURITY WARNING: Storing a suppression configuration file (`.safeguard.toml`)
+    // in the current working directory is a security risk if the directory is writable
+    // by untrusted actors (e.g. pull request contributors in CI environments). A contributor
+    // could place/edit this file to neutralize Critical breaking change warnings.
+    // Ensure changes to `.safeguard.toml` are strictly reviewed, or use the explicit
+    // `--config` flag pointing to a trusted/read-only location in production pipelines.
     let suppressions = match &args.config {
         Some(path) => SuppressionConfig::load_from_path(path)?,
         None => {
@@ -479,6 +486,20 @@ fn run() -> Result<()> {
         if !overall_safe {
             std::process::exit(1);
         }
+
+        let total_suppressed_criticals: usize = results.values().map(|r| r.suppressed_critical_count).sum();
+        if total_suppressed_criticals > 0 {
+            eprintln!(
+                "{}",
+                format!(
+                    "⚠️  SECURITY NOTICE: The gate passed because {} Critical breaking changes were suppressed. Ensure these suppressions are fully reviewed and authorized.",
+                    total_suppressed_criticals
+                )
+                .red()
+                .bold()
+            );
+        }
+
         return Ok(());
     }
 
@@ -603,6 +624,16 @@ fn run() -> Result<()> {
 
     if !safety_report.is_safe {
         std::process::exit(1);
+    } else if safety_report.suppressed_critical_count > 0 {
+        eprintln!(
+            "{}",
+            format!(
+                "⚠️  SECURITY NOTICE: The gate passed because {} Critical breaking changes were suppressed. Ensure these suppressions are fully reviewed and authorized.",
+                safety_report.suppressed_critical_count
+            )
+            .red()
+            .bold()
+        );
     }
 
     Ok(())

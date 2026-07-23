@@ -48,6 +48,10 @@ pub const DEFAULT_CONFIG_FILE: &str = ".safeguard.toml";
 /// A parsed suppression config: a flat list of reviewed acknowledgements.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SuppressionConfig {
+    /// Configurable maximum number of suppressions. Enforced globally.
+    pub max_suppressions: Option<usize>,
+    /// Explicit opt-in for targetless (wildcard) rules.
+    pub allow_targetless: Option<bool>,
     /// The acknowledged findings, one `[[suppress]]` table per entry.
     #[serde(default, rename = "suppress")]
     pub rules: Vec<SuppressionRule>,
@@ -62,22 +66,133 @@ pub struct SuppressionRule {
     /// only findings whose target is `None`.
     #[serde(default)]
     pub target: Option<String>,
-    /// An optional human-readable justification, surfaced in the report.
+    /// The author of the rule, required for security accountability in the new format.
+    #[serde(default)]
+    pub author: Option<String>,
+    /// The human-readable justification, surfaced in the report.
     #[serde(default)]
     pub reason: Option<String>,
+    /// Expiry date for the suppression rule in YYYY-MM-DD format.
+    #[serde(default)]
+    pub expiry: Option<String>,
+    /// Content fingerprint of the finding (SHA-256 hex).
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 impl SuppressionRule {
-    /// Whether this rule matches `finding` exactly on both category and target.
+    /// Whether this rule matches `finding` exactly on category, target, and fingerprint (if present).
     fn matches(&self, finding: &Finding) -> bool {
-        self.category == finding.category && self.target.as_deref() == finding.target.as_deref()
+        if self.category != finding.category || self.target.as_deref() != finding.target.as_deref() {
+            return false;
+        }
+
+        if let Some(rule_fingerprint) = &self.fingerprint {
+            // New format: calculate finding fingerprint and verify.
+            let computed_fingerprint = compute_fingerprint(finding);
+            rule_fingerprint.trim().to_lowercase() == computed_fingerprint
+        } else {
+            // Old format / compatibility mode fallback. Warn on stderr.
+            eprintln!(
+                "⚠️  Warning: Deprecated old-format suppression rule detected (category: \"{}\", target: \"{:?}\"). Please upgrade to the new format with 'author', 'reason', 'expiry', and 'fingerprint'. This will be a hard error in the next release.",
+                self.category,
+                self.target
+            );
+            true
+        }
     }
 }
 
+/// Compute the SHA-256 fingerprint for a finding based on category, target, and message.
+pub fn compute_fingerprint(finding: &Finding) -> String {
+    let normalized_message = normalize_whitespace(&finding.message);
+    let fingerprint_input = format!(
+        "category:{}\ntarget:{}\nmessage:{}",
+        finding.category,
+        finding.target.as_deref().unwrap_or(""),
+        normalized_message
+    );
+    let hash = sha256(fingerprint_input.as_bytes());
+    hex::encode(hash)
+}
+
 impl SuppressionConfig {
+    /// Validate the configuration for security limits, format correctness, and expiration.
+    pub fn validate(&self) -> Result<()> {
+        let max_allowed = self.max_suppressions.unwrap_or(10);
+        if self.rules.len() > max_allowed {
+            anyhow::bail!(
+                "Configured suppressions ({}) exceed the maximum limit of {}.",
+                self.rules.len(),
+                max_allowed
+            );
+        }
+
+        let mut targetless_count = 0;
+        for rule in &self.rules {
+            if rule.target.is_none() {
+                targetless_count += 1;
+            }
+        }
+
+        if targetless_count > 0 {
+            if !self.allow_targetless.unwrap_or(false) {
+                anyhow::bail!(
+                    "Targetless wildcard suppressions are disabled. Set 'allow_targetless = true' in config to enable."
+                );
+            }
+            if targetless_count > 3 {
+                anyhow::bail!(
+                    "Number of targetless wildcard suppressions ({}) exceeds the ceiling of 3.",
+                    targetless_count
+                );
+            }
+        }
+
+        for rule in &self.rules {
+            let is_new_format = rule.fingerprint.is_some() || rule.author.is_some() || rule.expiry.is_some();
+            if is_new_format {
+                if rule.author.is_none() {
+                    anyhow::bail!(
+                        "Missing 'author' for suppression rule under category '{}' (target: '{:?}').",
+                        rule.category,
+                        rule.target
+                    );
+                }
+                if rule.expiry.is_none() {
+                    anyhow::bail!(
+                        "Missing 'expiry' for suppression rule under category '{}' (target: '{:?}').",
+                        rule.category,
+                        rule.target
+                    );
+                }
+                if rule.fingerprint.is_none() {
+                    anyhow::bail!(
+                        "Missing 'fingerprint' for suppression rule under category '{}' (target: '{:?}').",
+                        rule.category,
+                        rule.target
+                    );
+                }
+            }
+
+            if let Some(expiry_str) = &rule.expiry {
+                if is_expired(expiry_str)? {
+                    anyhow::bail!(
+                        "Suppression rule for category '{}' has expired on {}.",
+                        rule.category,
+                        expiry_str
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Parse a config from a TOML string.
     pub fn from_toml_str(contents: &str) -> Result<Self> {
-        toml::from_str(contents).context("Failed to parse suppression config as TOML")
+        let config: Self = toml::from_str(contents).context("Failed to parse suppression config as TOML")?;
+        config.validate()?;
+        Ok(config)
     }
 
     /// Load a config from an explicit path. Errors if the file is missing or
@@ -110,6 +225,157 @@ impl SuppressionConfig {
         self.matching_rule(finding).is_some()
     }
 }
+
+/// Helper to convert Unix timestamp seconds to UTC (year, month, day).
+pub fn seconds_to_ymd(secs: u64) -> (i32, u32, u32) {
+    let days = (secs / 86400) as i64;
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1444 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + (if m <= 2 { 1 } else { 0 });
+    (year as i32, m, d)
+}
+
+/// Parses a date in YYYY-MM-DD format.
+pub fn parse_date(s: &str) -> Option<(i32, u32, u32)> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let y = parts[0].parse().ok()?;
+    let m = parts[1].parse().ok()?;
+    let d = parts[2].parse().ok()?;
+    Some((y, m, d))
+}
+
+/// Checks if an expiry date string is in the past.
+pub fn is_expired(expiry: &str) -> Result<bool> {
+    let (exp_year, exp_month, exp_day) = parse_date(expiry)
+        .ok_or_else(|| anyhow::anyhow!("Invalid date format: '{}', expected YYYY-MM-DD", expiry))?;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (cur_year, cur_month, cur_day) = seconds_to_ymd(now_secs);
+
+    if cur_year > exp_year {
+        Ok(true)
+    } else if cur_year < exp_year {
+        Ok(false)
+    } else if cur_month > exp_month {
+        Ok(true)
+    } else if cur_month < exp_month {
+        Ok(false)
+    } else {
+        Ok(cur_day > exp_day)
+    }
+}
+
+/// Collapses whitespace and trims leading/trailing whitespace.
+pub fn normalize_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+/// Pure Rust implementation of SHA-256.
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+    let k: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c82, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+
+    let mut blocks = Vec::new();
+    blocks.extend_from_slice(data);
+    blocks.push(0x80);
+    while (blocks.len() + 8) % 64 != 0 {
+        blocks.push(0x00);
+    }
+    let bit_len = (data.len() as u64) * 8;
+    blocks.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in blocks.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut h_val = h[7];
+
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h_val
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(k[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            h_val = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(h_val);
+    }
+
+    let mut result = [0u8; 32];
+    for i in 0..8 {
+        let bytes = h[i].to_be_bytes();
+        result[i * 4..i * 4 + 4].copy_from_slice(&bytes);
+    }
+    result
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -184,6 +450,7 @@ mod tests {
     fn rule_without_target_matches_only_targetless_findings() {
         let config = SuppressionConfig::from_toml_str(
             r#"
+            allow_targetless = true
             [[suppress]]
             category = "Environment"
             "#,
@@ -210,5 +477,117 @@ mod tests {
 
         assert!(config.is_suppressed(&finding("Function Removed", Some("legacy_init"))));
         assert!(!config.is_suppressed(&finding("Function Removed", Some("transfer"))));
+    }
+
+    #[test]
+    fn test_compute_fingerprint() {
+        let f = Finding {
+            severity: Severity::Critical,
+            category: "Struct Field Removed".to_string(),
+            message: "Struct field threshold of type ConfigData was removed".to_string(),
+            type_name: Some("ConfigData".to_string()),
+            target: Some("ConfigData.threshold".to_string()),
+        };
+        let fp = compute_fingerprint(&f);
+        let expected_input = "category:Struct Field Removed\ntarget:ConfigData.threshold\nmessage:Struct field threshold of type ConfigData was removed";
+        let expected_hash = sha256(expected_input.as_bytes());
+        let expected_fp = hex::encode(expected_hash);
+        assert_eq!(fp, expected_fp);
+    }
+
+    #[test]
+    fn test_seconds_to_ymd_and_is_expired() {
+        assert_eq!(seconds_to_ymd(0), (1970, 1, 1));
+        assert_eq!(seconds_to_ymd(1709164800), (2024, 2, 29));
+
+        assert!(is_expired("1970-01-01").unwrap());
+        assert!(!is_expired("2099-12-31").unwrap());
+
+        // Exact today must not be expired
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let (y, m, d) = seconds_to_ymd(now_secs);
+        let today_str = format!("{:04}-{:02}-{:02}", y, m, d);
+        assert!(!is_expired(&today_str).unwrap());
+
+        assert!(is_expired("invalid-date").is_err());
+    }
+
+    #[test]
+    fn test_config_validation_limits() {
+        let toml_exceed = r#"
+            max_suppressions = 1
+            [[suppress]]
+            category = "CatA"
+            [[suppress]]
+            category = "CatB"
+        "#;
+        assert!(SuppressionConfig::from_toml_str(toml_exceed).is_err());
+
+        let toml_wildcard_disabled = r#"
+            [[suppress]]
+            category = "Environment"
+        "#;
+        assert!(SuppressionConfig::from_toml_str(toml_wildcard_disabled).is_err());
+
+        let toml_wildcard_exceed = r#"
+            allow_targetless = true
+            [[suppress]]
+            category = "Env1"
+            [[suppress]]
+            category = "Env2"
+            [[suppress]]
+            category = "Env3"
+            [[suppress]]
+            category = "Env4"
+        "#;
+        assert!(SuppressionConfig::from_toml_str(toml_wildcard_exceed).is_err());
+
+        let toml_missing_new_format = r#"
+            [[suppress]]
+            category = "Struct Field Removed"
+            target = "ConfigData.threshold"
+            fingerprint = "8a3f..."
+        "#;
+        assert!(SuppressionConfig::from_toml_str(toml_missing_new_format).is_err());
+    }
+
+    #[test]
+    fn test_fingerprint_matching() {
+        let f = Finding {
+            severity: Severity::Critical,
+            category: "Struct Field Removed".to_string(),
+            message: "Struct field threshold of type ConfigData was removed".to_string(),
+            type_name: Some("ConfigData".to_string()),
+            target: Some("ConfigData.threshold".to_string()),
+        };
+        let fp = compute_fingerprint(&f);
+
+        let toml_str = format!(
+            r#"
+            [[suppress]]
+            category = "Struct Field Removed"
+            target = "ConfigData.threshold"
+            author = "Alice"
+            expiry = "2099-12-31"
+            fingerprint = "{}"
+            "#,
+            fp.to_uppercase()
+        );
+        let config = SuppressionConfig::from_toml_str(&toml_str).unwrap();
+        assert!(config.is_suppressed(&f));
+
+        let toml_mismatch = r#"
+            [[suppress]]
+            category = "Struct Field Removed"
+            target = "ConfigData.threshold"
+            author = "Alice"
+            expiry = "2099-12-31"
+            fingerprint = "incorrectfingerprint"
+        "#;
+        let config_mismatch = SuppressionConfig::from_toml_str(toml_mismatch).unwrap();
+        assert!(!config_mismatch.is_suppressed(&f));
     }
 }

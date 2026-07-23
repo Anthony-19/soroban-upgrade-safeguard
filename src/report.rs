@@ -15,12 +15,23 @@ pub struct ReportedFinding {
     /// (`severity`, `category`, `message`, `type_name`, `target`).
     #[serde(flatten)]
     pub finding: Finding,
+    /// The SHA-256 fingerprint computed for this finding.
+    pub fingerprint: String,
     /// Whether a suppression rule acknowledged this finding.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub suppressed: bool,
     /// The justification copied from the matching rule, if it provided one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suppression_reason: Option<String>,
+    /// The author copied from the matching rule, if it provided one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppression_author: Option<String>,
+    /// The expiry copied from the matching rule, if it provided one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppression_expiry: Option<String>,
+    /// The fingerprint copied from the matching rule, if it provided one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppression_fingerprint: Option<String>,
     /// Optional remediation/explanation advice for the user.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remediation: Option<String>,
@@ -33,6 +44,7 @@ pub struct SafetyReport {
     pub info_count: usize,
     /// Number of findings (of any severity) acknowledged by a suppression rule.
     pub suppressed_count: usize,
+    pub suppressed_critical_count: usize,
     pub total_findings: usize,
     pub is_safe: bool,
     pub findings_by_category: HashMap<String, Vec<ReportedFinding>>,
@@ -100,6 +112,7 @@ impl SafetyReport {
         let mut warning_count = 0;
         let mut info_count = 0;
         let mut suppressed_count = 0;
+        let mut suppressed_critical_count = 0;
         let mut failing_critical_count = 0;
         let mut failing_warning_count = 0;
         let mut findings_by_category: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
@@ -115,6 +128,9 @@ impl SafetyReport {
             let suppressed = rule.is_some();
             if suppressed {
                 suppressed_count += 1;
+                if finding.severity == Severity::Critical {
+                    suppressed_critical_count += 1;
+                }
             } else {
                 match finding.severity {
                     Severity::Critical => failing_critical_count += 1,
@@ -129,13 +145,18 @@ impl SafetyReport {
                 None
             };
 
+            let fingerprint = crate::suppression::compute_fingerprint(finding);
             findings_by_category
                 .entry(finding.category.clone())
                 .or_default()
                 .push(ReportedFinding {
                     finding: finding.clone(),
+                    fingerprint,
                     suppressed,
                     suppression_reason: rule.and_then(|r| r.reason.clone()),
+                    suppression_author: rule.and_then(|r| r.author.clone()),
+                    suppression_expiry: rule.and_then(|r| r.expiry.clone()),
+                    suppression_fingerprint: rule.and_then(|r| r.fingerprint.clone()),
                     remediation,
                 });
         }
@@ -151,6 +172,7 @@ impl SafetyReport {
             warning_count,
             info_count,
             suppressed_count,
+            suppressed_critical_count,
             total_findings: diff.findings.len(),
             is_safe,
             findings_by_category,
@@ -364,6 +386,53 @@ impl SafetyReport {
             }
         }
 
+        let mut suppressed_list = Vec::new();
+        for group in self.findings_by_category.values() {
+            for reported in group {
+                if reported.suppressed {
+                    suppressed_list.push(reported);
+                }
+            }
+        }
+
+        if !suppressed_list.is_empty() {
+            output.push_str(
+                &"\n========================================\n"
+                    .bold()
+                    .to_string(),
+            );
+            output.push_str(
+                &"🔕 APPLIED SUPPRESSIONS AUDIT LOG\n"
+                    .bold()
+                    .magenta()
+                    .to_string(),
+            );
+            output.push_str(
+                &"========================================\n"
+                    .bold()
+                    .to_string(),
+            );
+            for reported in suppressed_list {
+                let f = &reported.finding;
+                let target_str = f.target.as_deref().unwrap_or("<no target>");
+                output.push_str(&format!(
+                    " - Category:    {}\n   Target:      {}\n",
+                    f.category, target_str
+                ));
+                if let Some(fp) = &reported.suppression_fingerprint {
+                    output.push_str(&format!("   Fingerprint: {}\n", fp));
+                }
+                if let Some(author) = &reported.suppression_author {
+                    let expiry_str = reported.suppression_expiry.as_deref().unwrap_or("never");
+                    output.push_str(&format!("   Author:      {} (expires {})\n", author, expiry_str));
+                }
+                if let Some(reason) = &reported.suppression_reason {
+                    output.push_str(&format!("   Reason:      {}\n", reason));
+                }
+                output.push('\n');
+            }
+        }
+
         output
     }
 
@@ -442,6 +511,35 @@ impl SafetyReport {
             output.push_str("### ⚠️ Action Required\n\n");
             output.push_str("- The new contract version modifies existing storage layouts or function interfaces.\n");
             output.push_str("- Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n");
+        }
+
+        let mut suppressed_list = Vec::new();
+        for group in self.findings_by_category.values() {
+            for reported in group {
+                if reported.suppressed {
+                    suppressed_list.push(reported);
+                }
+            }
+        }
+
+        if !suppressed_list.is_empty() {
+            output.push_str("### 🔕 Applied Suppressions Audit Log\n\n");
+            output.push_str("| Category | Target | Fingerprint | Author | Expiry | Reason |\n");
+            output.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
+            for reported in suppressed_list {
+                let f = &reported.finding;
+                let category = &f.category;
+                let target = f.target.as_deref().unwrap_or("-");
+                let fingerprint = reported.suppression_fingerprint.as_deref().unwrap_or("-");
+                let author = reported.suppression_author.as_deref().unwrap_or("-");
+                let expiry = reported.suppression_expiry.as_deref().unwrap_or("-");
+                let reason = reported.suppression_reason.as_deref().unwrap_or("-");
+                output.push_str(&format!(
+                    "| {} | `{}` | `{}` | {} | {} | {} |\n",
+                    category, target, fingerprint, author, expiry, reason
+                ));
+            }
+            output.push_str("\n---\n\n");
         }
 
         output
@@ -600,6 +698,7 @@ mod tests {
             warning_count: 0,
             info_count: 0,
             suppressed_count: 0,
+            suppressed_critical_count: 0,
             total_findings: 0,
             is_safe: true,
             findings_by_category: std::collections::HashMap::new(),

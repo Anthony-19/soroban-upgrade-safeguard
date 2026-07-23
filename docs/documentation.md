@@ -316,52 +316,46 @@ suppressed and the tool behaves exactly as it always has. If you pass
 `--config` explicitly and the file is missing or malformed, that is a hard
 error rather than a silent no-op, so a typo never quietly disables suppression.
 
-Each `[[suppress]]` entry acknowledges exactly one finding:
+Each `[[suppress]]` entry acknowledges exactly one finding using the secure, content-bound format:
 
 ```toml
-[[suppress]]
-category = "Struct Field Removed"
-target   = "ConfigData.threshold"
-reason   = "Planned storage migration in v2 drops the unused threshold field."
+max_suppressions = 10
+allow_targetless = false
 
 [[suppress]]
-category = "Function Signature Changed"
-target   = "initialize"
-reason   = "Re-init is intentional and gated behind the migration admin call."
+category    = "Struct Field Removed"
+target      = "ConfigData.threshold"
+author      = "Alice <alice@example.com>"
+reason      = "Planned storage migration in v2 drops the unused threshold field."
+expiry      = "2026-12-31"
+fingerprint = "8a3f..." # SHA-256 hex fingerprint
 ```
 
 A ready-to-copy template lives at [`.safeguard.example.toml`](../.safeguard.example.toml).
 
 ### How matching works
 
-Matching is **exact**: a rule applies only when both its `category` and its
-`target` equal the finding's own values. This strictness keeps a suppression
-from over-applying to a sibling field, enum case, or parameter. A rule that
-omits `target` matches only findings that themselves have no target (for
-example `Environment` changes).
+Matching is **exact**: a rule applies only when its `category`, `target`, and `fingerprint` equal the finding's values:
 
-The `target` is a stable, structured identifier for the exact entity a finding
-is about, independent of the human-readable message:
+- **Category & Target**: matched verbatim.
+- **Fingerprint**: calculated as the SHA-256 hex hash of:
+  `category:<category>\ntarget:<target_or_empty>\nmessage:<normalized_message>`
+  where `<normalized_message>` has all consecutive whitespace collapsed to single spaces and leading/trailing whitespace removed. If the finding content changes or drifts, the fingerprint will mismatch and suppression stops applying.
+- **Expiry**: evaluated against the current system date (`YYYY-MM-DD`). Expired rules trigger a hard failure during config loading.
+- **Targetless Wildcards**: omitting `target` matches only targetless findings (e.g., `Environment`). This requires explicit opt-in (`allow_targetless = true`) and is capped at a ceiling of 3 rules.
 
-| Finding is about     | `target` form     | Example                  |
-| -------------------- | ----------------- | ------------------------ |
-| a function           | `function`        | `transfer`               |
-| a function parameter | `function.param`  | `transfer.to`            |
-| a type               | `Type`            | `ConfigData`             |
-| a struct field       | `Type.field`      | `ConfigData.threshold`   |
-| an enum case         | `Enum.case`       | `StatusEvent.Paused`     |
+### Legacy Format & Migration
 
-The easiest way to find the right `category` and `target` for a finding is to
-run with `--format json`; every finding carries both fields verbatim.
+For backwards compatibility, old-format rules (lacking `author`, `expiry`, or `fingerprint`) will trigger a warning on `stderr` during execution for one release before becoming a hard error. To migrate an old rule:
+1. Run `soroban-upgrade-safeguard` with `--format json`.
+2. Copy the finding's `category` and `target`.
+3. Add `author`, `reason`, `expiry` (`YYYY-MM-DD`), and compute or copy the `fingerprint`.
 
 ### What suppression does and does not change
 
-A suppressed finding is **not hidden**. It is still listed in the report, marked
-`[SUPPRESSED]` along with its reason, and still counted in the severity totals.
-What changes is the failing set: a suppressed Critical no longer contributes to
-the exit code. The run passes only when no *unsuppressed* Critical remains. The
-JSON output adds a top-level `suppressed_count`, and each suppressed finding
-gains `"suppressed": true` (and a `"suppression_reason"` when one was given).
+A suppressed finding is **not hidden**. It is still listed in the report, marked `[SUPPRESSED]`, and prominently summarized in the Applied Suppressions Audit Log in text and Markdown outputs. In JSON output, suppressed findings carry `"suppressed": true`, along with `suppression_reason`, `suppression_author`, `suppression_expiry`, and `suppression_fingerprint`.
+
+If any Critical findings are suppressed and the gate passes, a prominent **Security Notice** warning is printed on `stderr` at exit.
 
 ## Resource Limits and Hardening Against Malicious Input
 
