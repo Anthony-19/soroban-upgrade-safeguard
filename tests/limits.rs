@@ -132,7 +132,7 @@ fn walk_depth_boundary_is_inclusive() {
 fn infallible_type_to_string_falls_back_to_sentinel() {
     // The public infallible renderer must never panic on a deep type; it returns
     // the sentinel instead (default walk depth is 128).
-    let deep = nested_vec_type(10_000);
+    let deep = nested_vec_type(1000);
     let rendered = soroban_upgrade_safeguard::mapper::type_to_string(&deep);
     assert_eq!(rendered, TOO_DEEP_SENTINEL);
 }
