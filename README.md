@@ -17,6 +17,7 @@ A powerful CLI tool to analyze and validate Soroban smart contract upgrades on t
 - **Rich CLI Output**: Beautiful, color-coded reports with actionable severity levels (Critical, Warning, Info).
 - **CI/CD Friendly**: Exits with a non-zero code if critical breaking changes are detected.
 - **Suppression Config**: Acknowledge known, intentional breaking changes (e.g. a planned migration) in a `.safeguard.toml` so they no longer fail the run — while still listing them in the report.
+- **Hardened Against Malicious Input**: The WASM and its embedded XDR are treated as untrusted. Configurable resource limits bound decode depth, decoded byte length, entry count, and type-walk depth, so a crafted contract cannot crash the gate with an out-of-memory allocation or a stack overflow.
 
 ## Installation
 
@@ -41,15 +42,22 @@ soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
 ### Suppressing known breaking changes
 
 If a breaking change is deliberate and already accounted for, list it in a
-`.safeguard.toml` so it no longer fails the run. Matching is exact (by
-`category` and `target`), and suppressed findings are still shown in the report,
-marked `[SUPPRESSED]`:
+`.safeguard.toml` so it no longer fails the run. Rules require explicit `author`,
+`reason`, expiry date (`YYYY-MM-DD`), and SHA-256 content `fingerprint` binding.
+Matching is exact (by `category`, `target`, and `fingerprint`), and suppressed
+findings are prominently audited in report outputs:
 
 ```toml
+max_suppressions = 10
+allow_targetless = false
+
 [[suppress]]
-category = "Struct Field Removed"
-target   = "ConfigData.threshold"
-reason   = "Planned storage migration in v2."
+category    = "Struct Field Removed"
+target      = "ConfigData.threshold"
+author      = "Alice <alice@example.com>"
+reason      = "Planned storage migration in v2."
+expiry      = "2026-12-31"
+fingerprint = "8a3f..."  # SHA-256 hex of category + target + normalized message
 ```
 
 The tool auto-loads `.safeguard.toml` from the current directory, or use
@@ -103,6 +111,62 @@ Declaration order is layout order. A reorder, an insertion, or a shifted discrim
 template and the
 [documentation](docs/documentation.md#storage-schema-analysis) for the full
 format.
+
+#### Security Model & Trust Implications
+
+> [!WARNING]
+> By default, the gate loads `.safeguard.toml` from the current working directory.
+> Anyone with write access to the repository (such as PR contributors in CI)
+> can modify `.safeguard.toml` to neutralize Critical finding gates.
+> 
+> To secure your pipeline:
+> - Require mandatory code owners review for `.safeguard.toml`.
+> - Or pass `--config <PATH>` pointing to a read-only, privileged path.
+> - Wildcard/targetless rules require explicit opt-in (`allow_targetless = true`) capped at a ceiling of 3.
+> - Expired rules or exceeding `max_suppressions` will cause hard load-time failures.
+
+### Resource limits (untrusted input)
+
+The tool runs as a CI gate and, in RPC mode, decodes WASM fetched for an arbitrary
+contract ID — so the input and its embedded XDR are treated as **adversarial**. A
+central resource policy bounds every decode and every recursive type walk. When an
+input exceeds a limit, the run stops with a **controlled error and exit code 2**
+(distinct from `1` = breaking changes), never a crash.
+
+| Limit | Default | What it caps |
+| :--- | :--- | :--- |
+| `max_xdr_depth` | 64 | XDR nesting depth per entry (stack-overflow guard) |
+| `max_xdr_len` | 33554432 (32 MiB) | Bytes decoded per custom section (allocation guard) |
+| `max_entries` | 100000 | Decoded spec entries, summed across all sections |
+| `max_walk_depth` | 128 | Recursive type-walk depth (equality, rendering, cascade detection) |
+
+Defaults comfortably accept every real spec while blocking pathological input. To
+raise a limit, set it in a `[limits]` table in `.safeguard.toml`:
+
+```toml
+[limits]
+max_xdr_depth  = 128
+max_xdr_len    = 67108864   # 64 MiB
+max_entries    = 200000
+max_walk_depth = 256
+```
+
+…or override any of them for a single run with a flag (flags win over the file):
+
+```bash
+soroban-upgrade-safeguard old.wasm new.wasm --max-xdr-depth 128 --max-walk-depth 256
+```
+
+In batch mode a pair that trips a limit fails **only that pair** — the rest of the
+run continues — and the overall run exits `2` if any pair hit a limit.
+
+### Exit codes
+
+| Code | Meaning |
+| :--- | :--- |
+| `0` | Safe — no critical findings (or all suppressed). |
+| `1` | Breaking changes detected, or a generic error (missing/malformed file). |
+| `2` | A resource limit was exceeded on untrusted input (raise the relevant limit to proceed). |
 
 ## How it Works
 

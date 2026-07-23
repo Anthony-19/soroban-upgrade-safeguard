@@ -88,8 +88,11 @@ fn a_shifted_storage_key_discriminant_fails_the_run() {
     let (code, stdout, _) = run_with_schemas("lending_v1.toml", "lending_v2_key_shift.toml", &[]);
 
     assert_eq!(code, 1, "a discriminant shift must fail the run");
+    // Name-based union matching reports the renamed variant as removed + inserted;
+    // either way the entries under the old discriminant are orphaned.
     assert!(
-        stdout.contains("STORAGE UNION CASE REORDERED"),
+        stdout.contains("STORAGE UNION CASE REMOVED")
+            || stdout.contains("STORAGE UNION CASE REORDERED"),
         "the discriminant shift must be reported:\n{stdout}"
     );
     assert!(

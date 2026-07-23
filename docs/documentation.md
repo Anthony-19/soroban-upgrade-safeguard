@@ -17,10 +17,11 @@ This document explains what Soroban Upgrade Safeguard does, how it works interna
 11. [Cascading Layout Breaks](#cascading-layout-breaks)
 12. [Reading the Report](#reading-the-report)
 13. [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes)
-14. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
-15. [Limitations](#limitations)
-16. [Migration Note](#migration-note)
-17. [Frequently Asked Questions](#frequently-asked-questions)
+14. [Resource Limits and Hardening Against Malicious Input](#resource-limits-and-hardening-against-malicious-input)
+15. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
+16. [Limitations](#limitations)
+17. [Migration Note](#migration-note)
+18. [Frequently Asked Questions](#frequently-asked-questions)
 
 ## Overview
 
@@ -126,6 +127,26 @@ docker run --rm \
   /wasms/new.wasm
 ```
 
+For local development against a local RPC node:
+
+```bash
+soroban-upgrade-safeguard \
+  --contract-id C... \
+  --rpc-url http://localhost:8000 \
+  --allow-http-local \
+  new.wasm
+```
+
+To pin the expected on-chain WASM hash (CI/CD safety):
+
+```bash
+soroban-upgrade-safeguard \
+  --contract-id C... \
+  --rpc-url https://soroban-testnet.stellar.org \
+  --expected-wasm-hash a1b2c3d4e5f6... \
+  new.wasm
+```
+
 ### Suppression config
 
 Mount the directory that contains `.safeguard.toml` and point to it with `--config`:
@@ -166,11 +187,15 @@ soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
 
 The first argument should be the build that is currently deployed on chain. The second argument should be the build you intend to deploy. Order matters: the comparison is directional, because removing a field from the old version is treated differently from adding a field in the new version.
 
+Common flags: `--format <text|json|markdown>`, `--explain`, `--strict`, `--config <PATH>`, and the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)).
+
 ## How the Analysis Works
 
 The analysis runs as a short pipeline. Each stage lives in its own module under `src/`.
 
 1. **Load and validate (`loader.rs`).** Each file is read from disk and checked for the WASM magic header. The tool then walks every WASM payload to confirm the binary is structurally well formed before any deeper work happens. A corrupt or non-WASM file fails fast with a clear message.
+
+   When the baseline is fetched from an RPC endpoint (`--contract-id` / `--rpc-url`), the loader applies a **zero-trust pipeline**: the URL is validated for transport security (HTTPS required unless `--allow-http-local` is set), the RPC response entries are checked for matching ledger keys, and the SHA-256 hash of the fetched bytecode is verified against the on-chain contract instance hash. An optional `--expected-wasm-hash` flag provides additional hash pinning.
 
 2. **Extract metadata (`parser.rs`).** The Soroban SDK stores the contract interface in custom WASM sections. The parser scans for the `contractspecv0` section and decodes the concatenated XDR `ScSpecEntry` objects it contains. The `contractenvmetav0` section is captured as well for completeness.
 
@@ -363,6 +388,72 @@ The most subtle failures come from shared types. Suppose a small struct named `M
 
 To catch this, `mapper.rs` builds a reverse dependency graph: for each user-defined type, it records which other types embed it. After the direct comparison finds the set of types with critical changes, `diff.rs` walks that graph outward and marks every dependent type as broken too, transitively. These appear in the report under the **Cascading Layout Break** category, naming both the affected parent type and the underlying modified type that caused the break. Cyclic type references are handled safely so the walk always terminates.
 
+## Zero-Trust RPC Baseline Retrieval
+
+When using `--contract-id` and `--rpc-url` to fetch the on-chain baseline, the tool implements a **zero-trust pipeline** that protects against malicious or compromised RPC endpoints:
+
+### Cryptographic Hash Verification
+
+After fetching the contract bytecode from the RPC, the tool computes its SHA-256 hash and compares it against the hash stored in the contract instance's `ContractExecutable::Wasm` entry. If the hashes do not match — indicating tampered bytecode — execution aborts immediately with an `IntegrityError[HashMismatch]`.
+
+### Defensive Key Matching
+
+Every entry returned by `getLedgerEntries` is validated against the expected ledger key:
+
+- The RPC response entry's `key` field must match the XDR-base64 encoding of the ledger key that was requested.
+- Empty entry arrays are rejected.
+- Duplicate entries (multiple responses sharing the same key) are rejected as possible RPC manipulation.
+- Missing `key` or `xdr` fields in any entry are rejected.
+
+This replaces the insecure `entries[0]` pattern that previously trusted the RPC to return the correct entry.
+
+### StellarAsset Handling
+
+Contracts that are built-in `StellarAsset` contracts (which have no WASM bytecode) are detected upfront with a clear error message rather than producing confusing downstream failures.
+
+### Transport Security
+
+- By default, only `https://` URLs are accepted for RPC connections.
+- The `--allow-http-local` flag permits `http://` connections exclusively to `localhost` or `127.0.0.1` for local development.
+- Remote HTTP URLs are rejected even when `--allow-http-local` is set.
+- Redirect following is disabled in the HTTP client to prevent HTTPS-to-HTTP downgrade attacks.
+
+### Expected Hash Pinning
+
+The optional `--expected-wasm-hash <HEX>` flag lets callers pin the expected on-chain WASM hash. After the RPC fetch completes and the hash is verified against the instance entry, the tool also compares it against this user-supplied value. A mismatch fails immediately, providing an additional integrity check for CI/CD pipelines that know the expected deployment hash ahead of time.
+
+### IntegrityError Types
+
+| Error | Cause |
+|-------|-------|
+| `IntegrityError[HashMismatch]` | The SHA-256 of the fetched bytecode does not match the hash in the contract instance entry |
+| `IntegrityError[KeyMismatch]` | The ledger key in the RPC response does not match the requested key |
+
+### Report Metadata
+
+When the baseline is fetched from RPC, the report includes:
+
+- `baseline_source`: Set to `"RPC"` (or `"Local File"` for disk-based comparisons).
+- `verified_code_hash`: The verified SHA-256 hash of the on-chain WASM, expressed as a hex string.
+
+These fields appear in the JSON output (`--format json`) and in the text/Markdown summaries:
+
+```bash
+soroban-upgrade-safeguard --contract-id C... \
+  --rpc-url https://soroban-testnet.stellar.org \
+  --format json \
+  new.wasm
+```
+
+Example JSON excerpt:
+
+```json
+{
+  "baseline_source": "RPC",
+  "verified_code_hash": "a1b2c3d4e5f6..."
+}
+```
+
 ## Reading the Report
 
 A run prints a header for each loaded contract with a one line summary of how many functions, structs, enums, unions, and error enums it contains. It then prints the safety report.
@@ -393,52 +484,105 @@ suppressed and the tool behaves exactly as it always has. If you pass
 `--config` explicitly and the file is missing or malformed, that is a hard
 error rather than a silent no-op, so a typo never quietly disables suppression.
 
-Each `[[suppress]]` entry acknowledges exactly one finding:
+Each `[[suppress]]` entry acknowledges exactly one finding using the secure, content-bound format:
 
 ```toml
-[[suppress]]
-category = "Struct Field Removed"
-target   = "ConfigData.threshold"
-reason   = "Planned storage migration in v2 drops the unused threshold field."
+max_suppressions = 10
+allow_targetless = false
 
 [[suppress]]
-category = "Function Signature Changed"
-target   = "initialize"
-reason   = "Re-init is intentional and gated behind the migration admin call."
+category    = "Struct Field Removed"
+target      = "ConfigData.threshold"
+author      = "Alice <alice@example.com>"
+reason      = "Planned storage migration in v2 drops the unused threshold field."
+expiry      = "2026-12-31"
+fingerprint = "8a3f..." # SHA-256 hex fingerprint
 ```
 
 A ready-to-copy template lives at [`.safeguard.example.toml`](../.safeguard.example.toml).
 
 ### How matching works
 
-Matching is **exact**: a rule applies only when both its `category` and its
-`target` equal the finding's own values. This strictness keeps a suppression
-from over-applying to a sibling field, enum case, or parameter. A rule that
-omits `target` matches only findings that themselves have no target (for
-example `Environment` changes).
+Matching is **exact**: a rule applies only when its `category`, `target`, and `fingerprint` equal the finding's values:
 
-The `target` is a stable, structured identifier for the exact entity a finding
-is about, independent of the human-readable message:
+- **Category & Target**: matched verbatim.
+- **Fingerprint**: calculated as the SHA-256 hex hash of:
+  `category:<category>\ntarget:<target_or_empty>\nmessage:<normalized_message>`
+  where `<normalized_message>` has all consecutive whitespace collapsed to single spaces and leading/trailing whitespace removed. If the finding content changes or drifts, the fingerprint will mismatch and suppression stops applying.
+- **Expiry**: evaluated against the current system date (`YYYY-MM-DD`). Expired rules trigger a hard failure during config loading.
+- **Targetless Wildcards**: omitting `target` matches only targetless findings (e.g., `Environment`). This requires explicit opt-in (`allow_targetless = true`) and is capped at a ceiling of 3 rules.
 
-| Finding is about     | `target` form     | Example                  |
-| -------------------- | ----------------- | ------------------------ |
-| a function           | `function`        | `transfer`               |
-| a function parameter | `function.param`  | `transfer.to`            |
-| a type               | `Type`            | `ConfigData`             |
-| a struct field       | `Type.field`      | `ConfigData.threshold`   |
-| an enum case         | `Enum.case`       | `StatusEvent.Paused`     |
+### Legacy Format & Migration
 
-The easiest way to find the right `category` and `target` for a finding is to
-run with `--format json`; every finding carries both fields verbatim.
+For backwards compatibility, old-format rules (lacking `author`, `expiry`, or `fingerprint`) will trigger a warning on `stderr` during execution for one release before becoming a hard error. To migrate an old rule:
+1. Run `soroban-upgrade-safeguard` with `--format json`.
+2. Copy the finding's `category` and `target`.
+3. Add `author`, `reason`, `expiry` (`YYYY-MM-DD`), and compute or copy the `fingerprint`.
 
 ### What suppression does and does not change
 
-A suppressed finding is **not hidden**. It is still listed in the report, marked
-`[SUPPRESSED]` along with its reason, and still counted in the severity totals.
-What changes is the failing set: a suppressed Critical no longer contributes to
-the exit code. The run passes only when no *unsuppressed* Critical remains. The
-JSON output adds a top-level `suppressed_count`, and each suppressed finding
-gains `"suppressed": true` (and a `"suppression_reason"` when one was given).
+A suppressed finding is **not hidden**. It is still listed in the report, marked `[SUPPRESSED]`, and prominently summarized in the Applied Suppressions Audit Log in text and Markdown outputs. In JSON output, suppressed findings carry `"suppressed": true`, along with `suppression_reason`, `suppression_author`, `suppression_expiry`, and `suppression_fingerprint`.
+
+If any Critical findings are suppressed and the gate passes, a prominent **Security Notice** warning is printed on `stderr` at exit.
+
+## Resource Limits and Hardening Against Malicious Input
+
+The tool runs as a CI gate and, in RPC mode, decodes WASM fetched for an arbitrary
+contract ID. The input WASM and its embedded `contractspecv0` / `contractenvmetav0`
+sections are therefore treated as **adversarial**. Without bounds, a crafted section
+could declare an enormous vector length (a multi-gigabyte allocation) or nest a type
+to arbitrary depth (a native stack overflow that aborts the process). A gate that can
+be crashed on demand is a gate that can be bypassed.
+
+A single resource policy is threaded through every decode and every recursive type
+walk. Four limits, each independently configurable:
+
+| Limit | Default | Bounds |
+| :--- | :--- | :--- |
+| `max_xdr_depth` | 64 | XDR recursion depth per entry. Guards against stack overflow at decode time. |
+| `max_xdr_len` | 33554432 (32 MiB) | Bytes decoded per custom section — shared across every entry in the section, so it also caps the total decoded bytes. Guards against oversized-length allocations. |
+| `max_entries` | 100000 | Decoded spec entries, **summed across all `contractspecv0` sections** (a module may carry more than one). Env-metadata entries are budgeted separately. |
+| `max_walk_depth` | 128 | Recursion depth for the type walkers — structural equality, finding-message rendering, and cascade detection — which operate on already-decoded types. |
+
+The distinction between `max_xdr_len` (a **per-section byte cap**) and `max_entries`
+(a **cross-section count cap**) matters: many individually valid sections cannot be
+summed to exhaust memory, and a single section cannot over-allocate before the entry
+cap trips.
+
+### Configuring limits
+
+Set a `[limits]` table in `.safeguard.toml` (the same file used for suppressions).
+Every field is optional; an omitted field keeps the default:
+
+```toml
+[limits]
+max_xdr_depth  = 128
+max_xdr_len    = 67108864   # 64 MiB
+max_entries    = 200000
+max_walk_depth = 256
+```
+
+Or override any single limit for one run with a flag. Precedence is **flags > file >
+defaults**:
+
+```bash
+soroban-upgrade-safeguard old.wasm new.wasm --max-xdr-depth 128 --max-walk-depth 256
+```
+
+The defaults accept every fixture and a representative corpus of real mainnet specs.
+Raise a limit only if a legitimate, unusually large contract is rejected.
+
+### Behavior when a limit is exceeded
+
+An input that exceeds a limit is rejected with a controlled, typed error and the CLI
+exits with **code 2** — distinct from `1` (breaking changes) so a pipeline can tell
+"the input was rejected as adversarial" apart from "the upgrade is unsafe". The
+process never aborts with a stack overflow or an out-of-memory kill.
+
+In **batch mode**, the policy is enforced **per pair**: a pair that trips a limit (or
+otherwise errors) fails only that pair and is reported as errored — the rest of the
+run continues rather than aborting. The overall run then exits `2` if any pair hit a
+limit, else `1` if any pair had breaking changes, else `0`.
 
 ## Exit Codes and CI Integration
 
@@ -446,6 +590,7 @@ The tool is designed to drop into a continuous integration pipeline.
 
 - Exit code `0`: no critical findings. The upgrade is considered safe to deploy.
 - Exit code `1`: at least one critical finding, or a fatal error such as a missing or malformed WASM file.
+- Exit code `2`: a resource limit was exceeded on untrusted input (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)). Raise the relevant limit to proceed.
 
 Because the process exits non-zero on critical findings, you can gate a deployment job on it directly:
 
