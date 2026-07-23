@@ -190,13 +190,14 @@ pub fn fetch_wasm_from_rpc_with_policy(
         hash: wasm_hash.clone(),
     });
 
-    let _code_key_b64 = code_ledger_key.to_xdr_base64(policy.xdr_limits()).map_err(|e| {
-
-        anyhow::anyhow!(
-            "Failed to serialize ContractCode LedgerKey to base64: {}",
-            e
-        )
-    })?;
+    let _code_key_b64 = code_ledger_key
+        .to_xdr_base64(policy.xdr_limits())
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to serialize ContractCode LedgerKey to base64: {}",
+                e
+            )
+        })?;
 
     let code_response = query_rpc(
         rpc_url,
@@ -337,7 +338,6 @@ fn find_entry_by_key<'a>(
 ///   accepted for `http://` URLs.
 /// - Rejects unknown/unexpected schemes.
 pub fn validate_rpc_url(rpc_url: &str, allow_http_local: bool) -> Result<()> {
-
     if rpc_url.starts_with("https://") {
         return Ok(());
     }

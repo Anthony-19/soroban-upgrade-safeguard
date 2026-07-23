@@ -14,6 +14,11 @@
 //! - [`diff`] compares two specs and produces a list of findings.
 //! - [`report`] aggregates findings into a [`report::SafetyReport`].
 //!
+//! The exported spec only describes a contract's *callable surface*. Storage
+//! compatibility is governed by internal storage-key and value types that need
+//! not appear in it at all, so [`storage_schema`] defines an opt-in manifest in
+//! which a team declares those types for analysis.
+//!
 //! Most callers only need the two top-level helpers, [`compare_wasm_files`] and
 //! [`compare_wasm_bytes`], which run the whole pipeline and return a structured
 //! [`report::SafetyReport`]. The individual modules are public so that more
@@ -44,6 +49,7 @@ pub mod mapper;
 pub mod parser;
 pub mod report;
 pub mod spec;
+pub mod storage_schema;
 pub mod suppression;
 
 use std::path::Path;
@@ -99,6 +105,17 @@ pub struct CompareOptions<'a> {
     pub explain: bool,
     /// Treat `Warning`-severity findings as failures (strict mode).
     pub strict: bool,
+    /// Declared storage layouts of the old and new builds. When supplied, the
+    /// pipeline additionally diffs these internal storage types through the same
+    /// engine and records that storage was analyzed in the report's scope.
+    ///
+    /// Both sides are required together: a storage layout change is only
+    /// observable as a difference between two snapshots. `None` (the default)
+    /// leaves storage layout unanalyzed and the scope says so plainly.
+    pub storage_schemas: Option<(
+        &'a storage_schema::StorageSchema,
+        &'a storage_schema::StorageSchema,
+    )>,
 }
 
 /// Compare two Soroban contract builds supplied as raw WASM byte slices.
@@ -201,6 +218,42 @@ pub fn compare_wasm_bytes_with_options(
         &mut diff_report,
     );
 
+    // The pipeline always compares the exported interface and environment
+    // metadata; storage layout is analyzed only when a schema is supplied for
+    // both builds. The scope records which of those actually held so the verdict
+    // is never read as broader than the analysis behind it.
+    let mut scope = report::AnalysisScope {
+        exported_interface: true,
+        env_metadata: true,
+        storage_schema: report::StorageScopeState::NotAnalyzed,
+    };
+
+    if let Some((old_schema, new_schema)) = options.storage_schemas {
+        // A manifest that contradicts its own build is more dangerous than no
+        // manifest, so disagreement stops the run rather than being reported.
+        old_schema.reconcile_with_spec(&old_spec, "old")?;
+        new_schema.reconcile_with_spec(&new_spec, "new")?;
+
+        let old_resolved = old_schema.resolve()?;
+        let new_resolved = new_schema.resolve()?;
+
+        let storage_findings = diff::compare_storage_schemas(&old_resolved, &new_resolved);
+        diff_report.findings.extend(storage_findings.findings);
+
+        // Any reference the schema could not resolve is a coverage gap, surfaced
+        // rather than silently absorbed into the verdict.
+        let mut unresolved = old_schema.unresolved_references(Some(&old_spec));
+        unresolved.extend(new_schema.unresolved_references(Some(&new_spec)));
+        unresolved.sort();
+        unresolved.dedup();
+        diff::report_unresolved_storage_references(&unresolved, &mut diff_report);
+
+        scope.storage_schema = report::StorageScopeState::Analyzed {
+            key_types: new_resolved.key_type_count(),
+            value_types: new_resolved.value_type_count(),
+        };
+    }
+
     let mut safety_report = report::SafetyReport::with_suppressions(
         &diff_report,
         suppressions,
@@ -209,6 +262,7 @@ pub fn compare_wasm_bytes_with_options(
     );
     safety_report.old_spec_summary = Some(old_spec_summary);
     safety_report.new_spec_summary = Some(new_spec_summary);
+    safety_report.scope = scope;
 
     Ok(safety_report)
 }
@@ -264,4 +318,63 @@ pub fn compare_wasm_files_with_options(
     let old = loader::load_wasm(old_path)?;
     let new = loader::load_wasm(new_path)?;
     compare_wasm_bytes_with_options(&old.bytes, &new.bytes, options)
+}
+
+/// Compare two builds *and* their declared storage layouts.
+///
+/// [`compare_wasm_bytes`] only sees the exported interface, so its report
+/// certifies nothing about storage. This overload additionally diffs the storage
+/// types each build declares, through the same engine and severities, and the
+/// returned report's [`report::AnalysisScope`] records that storage was actually
+/// analyzed.
+///
+/// Both schemas are required: a storage layout change is only observable as a
+/// difference between two snapshots.
+///
+/// # Errors
+///
+/// Returns an error if either WASM cannot be parsed, or if either schema
+/// contradicts its own build's exported spec. A manifest that disagrees with the
+/// contract is rejected rather than trusted, since acting on a wrong declaration
+/// is worse than having none.
+pub fn compare_wasm_bytes_with_storage_schemas(
+    old_wasm: &[u8],
+    new_wasm: &[u8],
+    old_schema: &storage_schema::StorageSchema,
+    new_schema: &storage_schema::StorageSchema,
+) -> Result<SafetyReport> {
+    compare_wasm_bytes_with_options(
+        old_wasm,
+        new_wasm,
+        &CompareOptions {
+            storage_schemas: Some((old_schema, new_schema)),
+            ..Default::default()
+        },
+    )
+}
+
+/// Compare two builds on disk together with their storage-schema manifests.
+///
+/// See [`compare_wasm_bytes_with_storage_schemas`] for what this certifies.
+///
+/// # Errors
+///
+/// Returns an error if any of the four files is missing, unparseable, or if a
+/// schema contradicts its build's exported spec.
+pub fn compare_wasm_files_with_storage_schemas(
+    old_path: &Path,
+    new_path: &Path,
+    old_schema_path: &Path,
+    new_schema_path: &Path,
+) -> Result<SafetyReport> {
+    let old_schema = storage_schema::StorageSchema::load_from_path(old_schema_path)?;
+    let new_schema = storage_schema::StorageSchema::load_from_path(new_schema_path)?;
+    compare_wasm_files_with_options(
+        old_path,
+        new_path,
+        &CompareOptions {
+            storage_schemas: Some((&old_schema, &new_schema)),
+            ..Default::default()
+        },
+    )
 }

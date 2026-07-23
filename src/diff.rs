@@ -2,6 +2,7 @@ use crate::limits::{LimitError, ResourcePolicy};
 use crate::mapper::{try_type_to_string, LayoutMapper};
 use crate::parser::ContractEnvMeta;
 use crate::spec::ContractSpec;
+use crate::storage_schema::{DeclarationRole, ResolvedStorageSchema};
 use serde::Serialize;
 use std::collections::HashMap;
 use stellar_xdr::curr::{
@@ -111,6 +112,99 @@ pub fn compare_with_policy(
 
 /// Category label for contract environment metadata findings.
 pub const ENVIRONMENT_CATEGORY: &str = "Environment";
+
+/// Prefix applied to every finding that came from a declared storage schema.
+///
+/// Storage findings deliberately reuse the exported-interface categories, since
+/// they are the same structural breaks; the prefix keeps the two scopes visibly
+/// distinct in the report and in `findings_by_category` without duplicating the
+/// comparison logic.
+pub const STORAGE_CATEGORY_PREFIX: &str = "Storage ";
+
+/// Category for a storage-schema reference whose target layout is unknown.
+pub const STORAGE_UNRESOLVED_CATEGORY: &str = "Storage Reference Unresolved";
+
+/// Compare the declared storage layouts of two builds.
+///
+/// This runs the *same* [`compare`] engine used for the exported interface, on
+/// the resolved schema types, so a reorder in an internal storage struct is
+/// judged by exactly the rules and severities that already govern an exported
+/// struct. Reusing the engine is the point: storage types are not a special case
+/// needing parallel logic, they were simply invisible before.
+///
+/// Two adjustments are layered on the result:
+///
+/// 1. Every category is prefixed with [`STORAGE_CATEGORY_PREFIX`] and every
+///    message is qualified with the declared role and durability, so an operator
+///    can tell at a glance that a finding came from the schema rather than the
+///    exported spec.
+/// 2. Severities are re-evaluated for storage **keys**, where a change that is
+///    merely a migration concern for a value is fatal for a key.
+pub fn compare_storage_schemas(
+    old: &ResolvedStorageSchema,
+    new: &ResolvedStorageSchema,
+) -> DiffReport {
+    let mut report = compare(&old.spec, &new.spec);
+
+    for finding in &mut report.findings {
+        // Prefer the old build's declaration: it describes the layout that
+        // existing on-chain data was actually written with.
+        let meta = finding
+            .type_name
+            .as_deref()
+            .and_then(|name| old.meta.get(name).or_else(|| new.meta.get(name)));
+
+        if let Some(meta) = meta {
+            finding.severity = storage_severity(meta.role, &finding.category, &finding.severity);
+            finding.message = format!(
+                "[declared {} ({})] {}",
+                meta.role.label(),
+                meta.durability.label(),
+                finding.message
+            );
+        } else {
+            finding.message = format!("[declared storage type] {}", finding.message);
+        }
+
+        finding.category = format!("{}{}", STORAGE_CATEGORY_PREFIX, finding.category);
+    }
+
+    report
+}
+
+/// Re-evaluate a finding's severity in light of the role the type plays.
+///
+/// A storage key's serialized bytes *are* the address of every entry written
+/// under it. Appending a field to a value type is a migration concern, because
+/// existing bytes still decode for the fields that were already there. Appending
+/// a field to a *key* changes the address itself, so every existing entry
+/// becomes unreachable: the same edit, a categorically worse outcome.
+fn storage_severity(role: DeclarationRole, category: &str, current: &Severity) -> Severity {
+    if role == DeclarationRole::StorageKey && category == "Struct Field Added" {
+        return Severity::Critical;
+    }
+    current.clone()
+}
+
+/// Record schema references whose target layout could not be resolved.
+///
+/// A dangling reference means part of the declared graph was not analyzed. That
+/// is a coverage gap, and the whole point of this work is that coverage gaps are
+/// stated rather than silently absorbed into a green verdict.
+pub fn report_unresolved_storage_references(names: &[String], report: &mut DiffReport) {
+    for name in names {
+        report.findings.push(Finding {
+            severity: Severity::Info,
+            category: STORAGE_UNRESOLVED_CATEGORY.to_string(),
+            message: format!(
+                "Storage schema references type '{name}', which is neither declared in the \
+                 schema nor exported by the contract. Its layout could not be analyzed.",
+            ),
+            type_name: Some(name.clone()),
+            target: Some(name.clone()),
+        });
+    }
+}
 
 /// Compare decoded environment metadata between two contract builds.
 pub fn compare_env_metadata(
@@ -933,10 +1027,7 @@ fn check_union_cases(
                 report.findings.push(Finding {
                     severity: Severity::Info,
                     category: "Union Case Added".to_string(),
-                    message: format!(
-                        "Union '{}': new case '{}' ({}) added.",
-                        name, new_name, sig
-                    ),
+                    message: format!("Union '{}': new case '{}' ({}) added.", name, new_name, sig),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, new_name)),
                 });
@@ -1222,8 +1313,8 @@ mod tests {
     use proptest::collection::hash_set;
     use proptest::prelude::*;
     use stellar_xdr::curr::{
-        ScEnvMetaEntry, ScSpecTypeUdt, ScSpecUdtUnionCaseTupleV0, ScSpecUdtUnionCaseVoidV0, StringM,
-        VecM,
+        ScEnvMetaEntry, ScSpecTypeUdt, ScSpecUdtUnionCaseTupleV0, ScSpecUdtUnionCaseVoidV0,
+        StringM, VecM,
     };
 
     /// Helper: build a minimal ContractSpec with the given structs.
@@ -1595,6 +1686,383 @@ mod tests {
         spec
     }
 
+    // ---------------------------------------------------------------
+    // Storage-schema comparison
+    //
+    // These exercise the scenario the tool previously reported as SAFE: a
+    // contract whose exported interface is byte-identical while its internal
+    // storage layout changes underneath it.
+    // ---------------------------------------------------------------
+
+    /// Parse, validate, and resolve a manifest the way the CLI does.
+    fn resolved(toml_src: &str) -> ResolvedStorageSchema {
+        let schema = crate::storage_schema::StorageSchema::from_toml_str(toml_src)
+            .expect("manifest should parse");
+        schema.validate().expect("manifest should validate");
+        schema.resolve().expect("manifest should resolve")
+    }
+
+    fn categories(report: &DiffReport) -> Vec<&str> {
+        report
+            .findings
+            .iter()
+            .map(|f| f.category.as_str())
+            .collect()
+    }
+
+    const POSITION_V1: &str = r#"
+        [[value_type]]
+        name = "PositionState"
+        kind = "struct"
+          [[value_type.field]]
+          name = "collateral"
+          type = "i128"
+          [[value_type.field]]
+          name = "debt"
+          type = "i128"
+    "#;
+
+    #[test]
+    fn identical_storage_schemas_produce_no_findings() {
+        let report = compare_storage_schemas(&resolved(POSITION_V1), &resolved(POSITION_V1));
+        assert!(
+            report.findings.is_empty(),
+            "unchanged storage layout must be silent, got: {:?}",
+            categories(&report)
+        );
+    }
+
+    /// The core issue scenario: the two fields are swapped, so every stored
+    /// position would decode with collateral and debt reversed.
+    #[test]
+    fn reordering_an_internal_storage_struct_is_critical() {
+        let reordered = r#"
+            [[value_type]]
+            name = "PositionState"
+            kind = "struct"
+              [[value_type.field]]
+              name = "debt"
+              type = "i128"
+              [[value_type.field]]
+              name = "collateral"
+              type = "i128"
+        "#;
+
+        let report = compare_storage_schemas(&resolved(POSITION_V1), &resolved(reordered));
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Storage Struct Field Reordered")
+            .expect("a reorder must be detected");
+        assert_eq!(finding.severity, Severity::Critical);
+        assert_eq!(finding.type_name.as_deref(), Some("PositionState"));
+        // The message names the scope so it is not mistaken for an exported break.
+        assert!(
+            finding
+                .message
+                .contains("[declared storage value (persistent)]"),
+            "message should be scope-qualified: {}",
+            finding.message
+        );
+    }
+
+    /// Inserting a field mid-struct shifts every later field's position.
+    #[test]
+    fn inserting_a_field_into_an_internal_storage_struct_is_critical() {
+        let inserted = r#"
+            [[value_type]]
+            name = "PositionState"
+            kind = "struct"
+              [[value_type.field]]
+              name = "collateral"
+              type = "i128"
+              [[value_type.field]]
+              name = "liquidation_price"
+              type = "i128"
+              [[value_type.field]]
+              name = "debt"
+              type = "i128"
+        "#;
+
+        let report = compare_storage_schemas(&resolved(POSITION_V1), &resolved(inserted));
+
+        assert!(
+            report.findings.iter().any(|f| {
+                f.severity == Severity::Critical && f.category == "Storage Struct Field Reordered"
+            }),
+            "an inserted field shifts later fields and must be Critical, got: {:?}",
+            categories(&report)
+        );
+    }
+
+    /// Appending to a value type stays a migration concern, not a corruption.
+    #[test]
+    fn appending_to_a_storage_value_struct_remains_a_warning() {
+        let appended = r#"
+            [[value_type]]
+            name = "PositionState"
+            kind = "struct"
+              [[value_type.field]]
+              name = "collateral"
+              type = "i128"
+              [[value_type.field]]
+              name = "debt"
+              type = "i128"
+              [[value_type.field]]
+              name = "opened_at"
+              type = "u64"
+        "#;
+
+        let report = compare_storage_schemas(&resolved(POSITION_V1), &resolved(appended));
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Storage Struct Field Added")
+            .expect("an appended field should be reported");
+        assert_eq!(finding.severity, Severity::Warning);
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.severity == Severity::Critical),
+            "appending to a value type is not corruption"
+        );
+    }
+
+    /// The same append against a *key* is fatal: the key bytes change, so every
+    /// existing entry becomes unreachable.
+    #[test]
+    fn appending_to_a_storage_key_struct_is_elevated_to_critical() {
+        let before = r#"
+            [[storage_key]]
+            name = "PositionKey"
+            kind = "struct"
+              [[storage_key.field]]
+              name = "user"
+              type = "Address"
+        "#;
+        let after = r#"
+            [[storage_key]]
+            name = "PositionKey"
+            kind = "struct"
+              [[storage_key.field]]
+              name = "user"
+              type = "Address"
+              [[storage_key.field]]
+              name = "market"
+              type = "u32"
+        "#;
+
+        let report = compare_storage_schemas(&resolved(before), &resolved(after));
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Storage Struct Field Added")
+            .expect("the added key field should be reported");
+        assert_eq!(
+            finding.severity,
+            Severity::Critical,
+            "a key's shape change orphans every existing entry"
+        );
+        assert!(finding.message.contains("[declared storage key"));
+    }
+
+    /// Renaming a storage-key variant shifts what its discriminant addresses.
+    #[test]
+    fn a_storage_key_discriminant_change_is_critical() {
+        let before = r#"
+            [[storage_key]]
+            name = "DataKey"
+            kind = "union"
+              [[storage_key.variant]]
+              name = "Admin"
+              [[storage_key.variant]]
+              name = "Position"
+              type = ["Address"]
+        "#;
+        let after = r#"
+            [[storage_key]]
+            name = "DataKey"
+            kind = "union"
+              [[storage_key.variant]]
+              name = "Admin"
+              [[storage_key.variant]]
+              name = "Positions"
+              type = ["Address"]
+        "#;
+
+        let report = compare_storage_schemas(&resolved(before), &resolved(after));
+
+        // Name-based matching reports the old variant as removed and the renamed
+        // one as inserted. Both are Critical, and both must be attributed to the
+        // storage key, because either way the discriminant no longer addresses
+        // the entries written under the old name.
+        let key_criticals: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| {
+                f.severity == Severity::Critical
+                    && f.category.starts_with("Storage Union Case")
+                    && f.message.contains("[declared storage key (persistent)]")
+            })
+            .collect();
+        assert!(
+            !key_criticals.is_empty(),
+            "a shifted discriminant must be detected as Critical, got: {:?}",
+            report
+                .findings
+                .iter()
+                .map(|f| (&f.category, &f.severity))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.category == "Storage Union Case Removed"),
+            "the entry written under the old variant name is orphaned"
+        );
+    }
+
+    /// A unit storage-key enum whose discriminant value moves is equally fatal.
+    #[test]
+    fn a_storage_key_enum_value_change_is_critical() {
+        let before = r#"
+            [[storage_key]]
+            name = "Bucket"
+            kind = "enum"
+              [[storage_key.case]]
+              name = "Active"
+              value = 0
+              [[storage_key.case]]
+              name = "Closed"
+              value = 1
+        "#;
+        let after = r#"
+            [[storage_key]]
+            name = "Bucket"
+            kind = "enum"
+              [[storage_key.case]]
+              name = "Active"
+              value = 0
+              [[storage_key.case]]
+              name = "Closed"
+              value = 2
+        "#;
+
+        let report = compare_storage_schemas(&resolved(before), &resolved(after));
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Storage Enum Case Value Changed")
+            .expect("a moved discriminant must be detected");
+        assert_eq!(finding.severity, Severity::Critical);
+    }
+
+    /// Storage findings must actually gate the run, not merely be displayed.
+    #[test]
+    fn storage_findings_drive_is_safe() {
+        let reordered = r#"
+            [[value_type]]
+            name = "PositionState"
+            kind = "struct"
+              [[value_type.field]]
+              name = "debt"
+              type = "i128"
+              [[value_type.field]]
+              name = "collateral"
+              type = "i128"
+        "#;
+
+        // An exported diff that is completely clean, as in the attack scenario.
+        let mut combined = compare(&ContractSpec::default(), &ContractSpec::default());
+        assert!(
+            combined.findings.is_empty(),
+            "exported interface is unchanged"
+        );
+
+        let safety_before = crate::report::SafetyReport::new(&combined);
+        assert!(
+            safety_before.is_safe,
+            "without storage analysis this upgrade looks safe"
+        );
+
+        // Folding in the storage findings flips the verdict.
+        combined
+            .findings
+            .extend(compare_storage_schemas(&resolved(POSITION_V1), &resolved(reordered)).findings);
+
+        let safety_after = crate::report::SafetyReport::new(&combined);
+        assert!(
+            !safety_after.is_safe,
+            "a storage break must fail the run and therefore the exit code"
+        );
+        assert!(safety_after.critical_count > 0);
+    }
+
+    /// A cascade through declared storage types is still detected, because the
+    /// storage diff reuses the same engine.
+    #[test]
+    fn cascades_propagate_through_declared_storage_types() {
+        let before = r#"
+            [[value_type]]
+            name = "Money"
+            kind = "struct"
+              [[value_type.field]]
+              name = "amount"
+              type = "i128"
+
+            [[value_type]]
+            name = "Account"
+            kind = "struct"
+              [[value_type.field]]
+              name = "balance"
+              type = "Money"
+        "#;
+        let after = r#"
+            [[value_type]]
+            name = "Money"
+            kind = "struct"
+              [[value_type.field]]
+              name = "amount"
+              type = "u32"
+
+            [[value_type]]
+            name = "Account"
+            kind = "struct"
+              [[value_type.field]]
+              name = "balance"
+              type = "Money"
+        "#;
+
+        let report = compare_storage_schemas(&resolved(before), &resolved(after));
+
+        assert!(
+            report.findings.iter().any(|f| {
+                f.category == "Storage Cascading Layout Break"
+                    && f.type_name.as_deref() == Some("Account")
+            }),
+            "Account embeds the modified Money and must cascade, got: {:?}",
+            categories(&report)
+        );
+    }
+
+    #[test]
+    fn unresolved_references_are_reported_as_visible_gaps() {
+        let mut report = DiffReport::default();
+        report_unresolved_storage_references(&["Mystery".to_string()], &mut report);
+
+        assert_eq!(report.findings.len(), 1);
+        let finding = &report.findings[0];
+        assert_eq!(finding.category, STORAGE_UNRESOLVED_CATEGORY);
+        assert_eq!(finding.severity, Severity::Info);
+        assert!(finding.message.contains("could not be analyzed"));
+    }
+
     #[test]
     fn param_reorder_same_type_produces_critical_finding() {
         let old = spec_with_functions(vec![(
@@ -1774,44 +2242,49 @@ mod tests {
         // This is the attack scenario from fix.md:
         //   Old: { owner: Address, amount: u64 }
         //   New: { owner: Address, fee_bps: u32, amount: u64 }
-        let old = spec_with_structs(vec![
-            ("Data", vec![("owner", udt("Address")), ("amount", ScSpecTypeDef::U64)]),
-        ]);
-        let new = spec_with_structs(vec![
-            (
-                "Data",
-                vec![
-                    ("owner", udt("Address")),
-                    ("fee_bps", ScSpecTypeDef::U32),
-                    ("amount", ScSpecTypeDef::U64),
-                ],
-            ),
-        ]);
+        let old = spec_with_structs(vec![(
+            "Data",
+            vec![("owner", udt("Address")), ("amount", ScSpecTypeDef::U64)],
+        )]);
+        let new = spec_with_structs(vec![(
+            "Data",
+            vec![
+                ("owner", udt("Address")),
+                ("fee_bps", ScSpecTypeDef::U32),
+                ("amount", ScSpecTypeDef::U64),
+            ],
+        )]);
 
         let report = compare(&old, &new);
 
         // fee_bps is inserted mid-sequence → Critical
-        let inserted = report
-            .findings
-            .iter()
-            .find(|f| f.category == "Struct Field Inserted" && f.target.as_deref() == Some("Data.fee_bps"));
-        assert!(inserted.is_some(), "Expected Struct Field Inserted for fee_bps");
+        let inserted = report.findings.iter().find(|f| {
+            f.category == "Struct Field Inserted" && f.target.as_deref() == Some("Data.fee_bps")
+        });
+        assert!(
+            inserted.is_some(),
+            "Expected Struct Field Inserted for fee_bps"
+        );
         assert_eq!(inserted.unwrap().severity, Severity::Critical);
 
         // amount moved from position 1 to 2 → Reordered
-        let reordered = report
-            .findings
-            .iter()
-            .find(|f| f.category == "Struct Field Reordered" && f.target.as_deref() == Some("Data.amount"));
-        assert!(reordered.is_some(), "Expected Struct Field Reordered for amount");
+        let reordered = report.findings.iter().find(|f| {
+            f.category == "Struct Field Reordered" && f.target.as_deref() == Some("Data.amount")
+        });
+        assert!(
+            reordered.is_some(),
+            "Expected Struct Field Reordered for amount"
+        );
         assert_eq!(reordered.unwrap().severity, Severity::Critical);
 
         // No phantom "Struct Field Added" for amount (it already exists)
-        let phantom_appended = report
-            .findings
-            .iter()
-            .any(|f| f.category == "Struct Field Added" && f.target.as_deref() == Some("Data.amount"));
-        assert!(!phantom_appended, "amount must not be reported as newly added");
+        let phantom_appended = report.findings.iter().any(|f| {
+            f.category == "Struct Field Added" && f.target.as_deref() == Some("Data.amount")
+        });
+        assert!(
+            !phantom_appended,
+            "amount must not be reported as newly added"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -1820,9 +2293,10 @@ mod tests {
     #[test]
     fn struct_field_tail_append_is_warning() {
         let old = spec_with_structs(vec![("Data", vec![("a", ScSpecTypeDef::U32)])]);
-        let new = spec_with_structs(vec![
-            ("Data", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U64)]),
-        ]);
+        let new = spec_with_structs(vec![(
+            "Data",
+            vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U64)],
+        )]);
 
         let report = compare(&old, &new);
 
@@ -1849,17 +2323,17 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn struct_field_deletion_is_critical() {
-        let old = spec_with_structs(vec![
-            ("Data", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U64)]),
-        ]);
+        let old = spec_with_structs(vec![(
+            "Data",
+            vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U64)],
+        )]);
         let new = spec_with_structs(vec![("Data", vec![("a", ScSpecTypeDef::U32)])]);
 
         let report = compare(&old, &new);
 
-        let removed = report
-            .findings
-            .iter()
-            .find(|f| f.category == "Struct Field Removed" && f.target.as_deref() == Some("Data.b"));
+        let removed = report.findings.iter().find(|f| {
+            f.category == "Struct Field Removed" && f.target.as_deref() == Some("Data.b")
+        });
         assert!(removed.is_some(), "Expected Struct Field Removed for b");
         assert_eq!(removed.unwrap().severity, Severity::Critical);
     }
@@ -1874,11 +2348,13 @@ mod tests {
 
         let report = compare(&old, &new);
 
-        let type_changed = report
-            .findings
-            .iter()
-            .find(|f| f.category == "Struct Field Type Changed" && f.target.as_deref() == Some("Data.a"));
-        assert!(type_changed.is_some(), "Expected Struct Field Type Changed for a");
+        let type_changed = report.findings.iter().find(|f| {
+            f.category == "Struct Field Type Changed" && f.target.as_deref() == Some("Data.a")
+        });
+        assert!(
+            type_changed.is_some(),
+            "Expected Struct Field Type Changed for a"
+        );
         assert_eq!(type_changed.unwrap().severity, Severity::Critical);
     }
 
@@ -1887,23 +2363,23 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn struct_field_swap_is_critical() {
-        let old = spec_with_structs(vec![
-            ("Data", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U64)]),
-        ]);
-        let new = spec_with_structs(vec![
-            ("Data", vec![("b", ScSpecTypeDef::U64), ("a", ScSpecTypeDef::U32)]),
-        ]);
+        let old = spec_with_structs(vec![(
+            "Data",
+            vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U64)],
+        )]);
+        let new = spec_with_structs(vec![(
+            "Data",
+            vec![("b", ScSpecTypeDef::U64), ("a", ScSpecTypeDef::U32)],
+        )]);
 
         let report = compare(&old, &new);
 
-        let reorder_a = report
-            .findings
-            .iter()
-            .find(|f| f.category == "Struct Field Reordered" && f.target.as_deref() == Some("Data.a"));
-        let reorder_b = report
-            .findings
-            .iter()
-            .find(|f| f.category == "Struct Field Reordered" && f.target.as_deref() == Some("Data.b"));
+        let reorder_a = report.findings.iter().find(|f| {
+            f.category == "Struct Field Reordered" && f.target.as_deref() == Some("Data.a")
+        });
+        let reorder_b = report.findings.iter().find(|f| {
+            f.category == "Struct Field Reordered" && f.target.as_deref() == Some("Data.b")
+        });
         assert!(reorder_a.is_some(), "Expected Struct Field Reordered for a");
         assert!(reorder_b.is_some(), "Expected Struct Field Reordered for b");
     }
@@ -1915,39 +2391,67 @@ mod tests {
     fn struct_field_combination_reorder_insert_delete() {
         // Old: [a: u32, b: u64, c: i128]
         // New: [x: u32, b: u64, a: u32]  (c removed, x inserted mid, a moved)
-        let old = spec_with_structs(vec![
-            ("Data", vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U64), ("c", ScSpecTypeDef::I128)]),
-        ]);
-        let new = spec_with_structs(vec![
-            ("Data", vec![("x", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U64), ("a", ScSpecTypeDef::U32)]),
-        ]);
+        let old = spec_with_structs(vec![(
+            "Data",
+            vec![
+                ("a", ScSpecTypeDef::U32),
+                ("b", ScSpecTypeDef::U64),
+                ("c", ScSpecTypeDef::I128),
+            ],
+        )]);
+        let new = spec_with_structs(vec![(
+            "Data",
+            vec![
+                ("x", ScSpecTypeDef::U32),
+                ("b", ScSpecTypeDef::U64),
+                ("a", ScSpecTypeDef::U32),
+            ],
+        )]);
 
         let report = compare(&old, &new);
 
         // c removed
         assert!(
-            report.findings.iter().any(|f| f.category == "Struct Field Removed" && f.target.as_deref() == Some("Data.c")),
+            report
+                .findings
+                .iter()
+                .any(|f| f.category == "Struct Field Removed"
+                    && f.target.as_deref() == Some("Data.c")),
             "Expected Removed for c"
         );
         // x inserted mid-sequence
         assert!(
-            report.findings.iter().any(|f| f.category == "Struct Field Inserted" && f.target.as_deref() == Some("Data.x")),
+            report
+                .findings
+                .iter()
+                .any(|f| f.category == "Struct Field Inserted"
+                    && f.target.as_deref() == Some("Data.x")),
             "Expected Inserted for x"
         );
         // a moved
         assert!(
-            report.findings.iter().any(|f| f.category == "Struct Field Reordered" && f.target.as_deref() == Some("Data.a")),
+            report
+                .findings
+                .iter()
+                .any(|f| f.category == "Struct Field Reordered"
+                    && f.target.as_deref() == Some("Data.a")),
             "Expected Reordered for a"
         );
         // b unchanged, no finding for b
         assert!(
-            !report.findings.iter().any(|f| f.target.as_deref() == Some("Data.b")),
+            !report
+                .findings
+                .iter()
+                .any(|f| f.target.as_deref() == Some("Data.b")),
             "b should have no findings"
         );
 
         // No phantom appends
         assert!(
-            !report.findings.iter().any(|f| f.category == "Struct Field Added"),
+            !report
+                .findings
+                .iter()
+                .any(|f| f.category == "Struct Field Added"),
             "No fields should be reported as Added in this scenario"
         );
     }
@@ -1957,21 +2461,22 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn event_struct_field_mid_insertion_is_critical() {
-        let old = spec_with_structs(vec![
-            ("SomeEvent", vec![("old_field", ScSpecTypeDef::U32)]),
-        ]);
-        let new = spec_with_structs(vec![
-            ("SomeEvent", vec![("old_field", ScSpecTypeDef::U32), ("new_field", ScSpecTypeDef::U64)]),
-        ]);
+        let old = spec_with_structs(vec![("SomeEvent", vec![("old_field", ScSpecTypeDef::U32)])]);
+        let new = spec_with_structs(vec![(
+            "SomeEvent",
+            vec![
+                ("old_field", ScSpecTypeDef::U32),
+                ("new_field", ScSpecTypeDef::U64),
+            ],
+        )]);
 
         let report = compare(&old, &new);
 
         // Appended at tail, still Struct Field Added (Warning) — event structs
         // use the same added logic.
-        let added = report
-            .findings
-            .iter()
-            .find(|f| f.category == "Struct Field Added" && f.target.as_deref() == Some("SomeEvent.new_field"));
+        let added = report.findings.iter().find(|f| {
+            f.category == "Struct Field Added" && f.target.as_deref() == Some("SomeEvent.new_field")
+        });
         assert!(added.is_some(), "Expected Struct Field Added for new_field");
         assert_eq!(added.unwrap().severity, Severity::Warning);
     }
@@ -1984,23 +2489,24 @@ mod tests {
         // Old: [A(void), B(void)]
         // New: [A(void), C(void), B(void)] — C inserted mid
         let old = spec_with_unions("Action", vec![void_case("A"), void_case("B")]);
-        let new = spec_with_unions("Action", vec![void_case("A"), void_case("C"), void_case("B")]);
+        let new = spec_with_unions(
+            "Action",
+            vec![void_case("A"), void_case("C"), void_case("B")],
+        );
 
         let report = compare(&old, &new);
 
         // C inserted mid → Critical
-        let inserted = report
-            .findings
-            .iter()
-            .find(|f| f.category == "Union Case Inserted" && f.target.as_deref() == Some("Action.C"));
+        let inserted = report.findings.iter().find(|f| {
+            f.category == "Union Case Inserted" && f.target.as_deref() == Some("Action.C")
+        });
         assert!(inserted.is_some(), "Expected Union Case Inserted for C");
         assert_eq!(inserted.unwrap().severity, Severity::Critical);
 
         // B moved from position 1 to 2 → Critical
-        let reordered = report
-            .findings
-            .iter()
-            .find(|f| f.category == "Union Case Reordered" && f.target.as_deref() == Some("Action.B"));
+        let reordered = report.findings.iter().find(|f| {
+            f.category == "Union Case Reordered" && f.target.as_deref() == Some("Action.B")
+        });
         assert!(reordered.is_some(), "Expected Union Case Reordered for B");
         assert_eq!(reordered.unwrap().severity, Severity::Critical);
     }
@@ -2043,10 +2549,9 @@ mod tests {
 
         let report = compare(&old, &new);
 
-        let removed = report
-            .findings
-            .iter()
-            .find(|f| f.category == "Union Case Removed" && f.target.as_deref() == Some("Action.B"));
+        let removed = report.findings.iter().find(|f| {
+            f.category == "Union Case Removed" && f.target.as_deref() == Some("Action.B")
+        });
         assert!(removed.is_some(), "Expected Union Case Removed for B");
         assert_eq!(removed.unwrap().severity, Severity::Critical);
     }
@@ -2061,11 +2566,13 @@ mod tests {
 
         let report = compare(&old, &new);
 
-        let type_changed = report
-            .findings
-            .iter()
-            .find(|f| f.category == "Union Case Type Changed" && f.target.as_deref() == Some("Action.Pay"));
-        assert!(type_changed.is_some(), "Expected Union Case Type Changed for Pay");
+        let type_changed = report.findings.iter().find(|f| {
+            f.category == "Union Case Type Changed" && f.target.as_deref() == Some("Action.Pay")
+        });
+        assert!(
+            type_changed.is_some(),
+            "Expected Union Case Type Changed for Pay"
+        );
         assert_eq!(type_changed.unwrap().severity, Severity::Critical);
     }
 
@@ -2079,14 +2586,12 @@ mod tests {
 
         let report = compare(&old, &new);
 
-        let reorder_a = report
-            .findings
-            .iter()
-            .find(|f| f.category == "Union Case Reordered" && f.target.as_deref() == Some("Action.A"));
-        let reorder_b = report
-            .findings
-            .iter()
-            .find(|f| f.category == "Union Case Reordered" && f.target.as_deref() == Some("Action.B"));
+        let reorder_a = report.findings.iter().find(|f| {
+            f.category == "Union Case Reordered" && f.target.as_deref() == Some("Action.A")
+        });
+        let reorder_b = report.findings.iter().find(|f| {
+            f.category == "Union Case Reordered" && f.target.as_deref() == Some("Action.B")
+        });
         assert!(reorder_a.is_some(), "Expected Union Case Reordered for A");
         assert!(reorder_b.is_some(), "Expected Union Case Reordered for B");
     }
@@ -2098,31 +2603,55 @@ mod tests {
     fn union_case_combination_reorder_insert_delete() {
         // Old: [A, B, C]
         // New: [X, B, A] — C removed, X inserted mid, A moved
-        let old = spec_with_unions("Action", vec![void_case("A"), void_case("B"), void_case("C")]);
-        let new = spec_with_unions("Action", vec![void_case("X"), void_case("B"), void_case("A")]);
+        let old = spec_with_unions(
+            "Action",
+            vec![void_case("A"), void_case("B"), void_case("C")],
+        );
+        let new = spec_with_unions(
+            "Action",
+            vec![void_case("X"), void_case("B"), void_case("A")],
+        );
 
         let report = compare(&old, &new);
 
         assert!(
-            report.findings.iter().any(|f| f.category == "Union Case Removed" && f.target.as_deref() == Some("Action.C")),
+            report
+                .findings
+                .iter()
+                .any(|f| f.category == "Union Case Removed"
+                    && f.target.as_deref() == Some("Action.C")),
             "Expected Removed for C"
         );
         assert!(
-            report.findings.iter().any(|f| f.category == "Union Case Inserted" && f.target.as_deref() == Some("Action.X")),
+            report
+                .findings
+                .iter()
+                .any(|f| f.category == "Union Case Inserted"
+                    && f.target.as_deref() == Some("Action.X")),
             "Expected Inserted for X"
         );
         assert!(
-            report.findings.iter().any(|f| f.category == "Union Case Reordered" && f.target.as_deref() == Some("Action.A")),
+            report
+                .findings
+                .iter()
+                .any(|f| f.category == "Union Case Reordered"
+                    && f.target.as_deref() == Some("Action.A")),
             "Expected Reordered for A"
         );
         // B unchanged
         assert!(
-            !report.findings.iter().any(|f| f.target.as_deref() == Some("Action.B")),
+            !report
+                .findings
+                .iter()
+                .any(|f| f.target.as_deref() == Some("Action.B")),
             "B should have no findings"
         );
         // No phantom appends
         assert!(
-            !report.findings.iter().any(|f| f.category == "Union Case Added"),
+            !report
+                .findings
+                .iter()
+                .any(|f| f.category == "Union Case Added"),
             "No cases should be reported as Added in this scenario"
         );
     }

@@ -8,6 +8,7 @@ use soroban_upgrade_safeguard::{
     color::should_disable_color,
     limits::{find_limit_error, LimitsConfig, ResourcePolicy},
     loader, report,
+    storage_schema::StorageSchema,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
     CompareOptions,
 };
@@ -97,6 +98,19 @@ struct Args {
     /// Directory containing the new versions of the contracts for directory comparison
     #[arg(long, value_name = "NEW_DIR", requires = "old_dir")]
     new_dir: Option<PathBuf>,
+
+    /// Storage-schema manifest describing the OLD build's storage layout.
+    ///
+    /// Declares the storage-key types and internal value types that govern
+    /// on-chain compatibility but need not appear in the exported spec. Must be
+    /// given together with --new-storage-schema: detecting a layout change
+    /// requires both snapshots.
+    #[arg(long, value_name = "PATH", requires = "new_storage_schema")]
+    old_storage_schema: Option<PathBuf>,
+
+    /// Storage-schema manifest describing the NEW build's storage layout.
+    #[arg(long, value_name = "PATH", requires = "old_storage_schema")]
+    new_storage_schema: Option<PathBuf>,
 
     /// Maximum XDR decode depth per entry. Overrides `[limits]` in the config
     /// file and the built-in default. Guards against stack-overflow inputs.
@@ -202,6 +216,27 @@ fn run() -> Result<()> {
         anyhow::bail!("Cannot specify positional WASM paths when using batch mode (--manifest or --old-dir/--new-dir)");
     }
 
+    // A storage schema describes one specific contract's layout, so a single
+    // pair of manifests cannot be applied across a batch of different
+    // contracts. Refusing is better than silently analyzing the wrong layout.
+    if is_batch && args.old_storage_schema.is_some() {
+        anyhow::bail!(
+            "--old-storage-schema/--new-storage-schema describe a single contract's storage \
+             layout and cannot be used with batch mode. Run the pair on its own to analyze \
+             storage layout."
+        );
+    }
+
+    // Both manifests are loaded and validated up front so a malformed schema
+    // fails before any comparison work is reported.
+    let storage_schemas = match (&args.old_storage_schema, &args.new_storage_schema) {
+        (Some(old), Some(new)) => Some((
+            StorageSchema::load_from_path(old)?,
+            StorageSchema::load_from_path(new)?,
+        )),
+        _ => None,
+    };
+
     // In JSON or Markdown mode, decorative progress goes to stderr so stdout
     // stays a single, pristine document. In text mode it stays on stdout
     // exactly as before.
@@ -294,6 +329,9 @@ fn run() -> Result<()> {
                         new_path: &new_wasm.path,
                         suppressions: &suppressions,
                         policy: &policy,
+                        // Storage schemas are contract-specific and rejected in
+                        // batch mode, so no pair carries one.
+                        storage_schemas: None,
                     },
                     &args,
                     &progress,
@@ -401,10 +439,7 @@ fn run() -> Result<()> {
                     } else {
                         "⛔ ERROR"
                     };
-                    markdown.push_str(&format!(
-                        "| {} | {} | — | — | — | — |\n",
-                        name, status_str
-                    ));
+                    markdown.push_str(&format!("| {} | {} | — | — | — | — |\n", name, status_str));
                 }
 
                 markdown.push_str("\n---\n\n");
@@ -487,7 +522,8 @@ fn run() -> Result<()> {
             std::process::exit(1);
         }
 
-        let total_suppressed_criticals: usize = results.values().map(|r| r.suppressed_critical_count).sum();
+        let total_suppressed_criticals: usize =
+            results.values().map(|r| r.suppressed_critical_count).sum();
         if total_suppressed_criticals > 0 {
             eprintln!(
                 "{}",
@@ -556,12 +592,17 @@ fn run() -> Result<()> {
         if let Some(expected_hex) = &args.expected_wasm_hash {
             let expected_bytes = hex::decode(expected_hex)
                 .context("--expected-wasm-hash must be a valid hex string")?;
-            let actual = module.verified_hash.as_ref().map(|h| h.as_slice()).unwrap_or(&[]);
+            let actual = module
+                .verified_hash
+                .as_ref()
+                .map(|h| h.as_slice())
+                .unwrap_or(&[]);
             if actual != expected_bytes.as_slice() {
                 anyhow::bail!(
                     "Hash mismatch: expected on-chain WASM hash {}, but fetched hash was {}",
                     expected_hex,
-                    module.verified_hash
+                    module
+                        .verified_hash
                         .map(hex::encode)
                         .unwrap_or_else(|| "<none>".to_string()),
                 );
@@ -572,7 +613,6 @@ fn run() -> Result<()> {
     } else {
         loader::load_wasm(&args.wasm_paths[0])?
     };
-
 
     // New WASM
     let new = loader::load_wasm(new_wasm_path)?;
@@ -599,6 +639,9 @@ fn run() -> Result<()> {
             new_path: &new.path,
             suppressions: &suppressions,
             policy: &policy,
+            storage_schemas: storage_schemas
+                .as_ref()
+                .map(|(old_schema, new_schema)| (old_schema, new_schema)),
         },
         &args,
         &progress,
@@ -666,6 +709,9 @@ struct ContractComparison<'a> {
     new_path: &'a str,
     suppressions: &'a SuppressionConfig,
     policy: &'a ResourcePolicy,
+    /// The declared storage layouts of the old and new builds, when supplied.
+    /// Both sides are required: a layout change is only visible as a diff.
+    storage_schemas: Option<(&'a StorageSchema, &'a StorageSchema)>,
 }
 
 /// Helper function to run comparison for a single pair.
@@ -684,6 +730,7 @@ fn compare_contracts(
         new_path,
         suppressions,
         policy,
+        storage_schemas,
     } = comparison;
 
     // Show per-file progress lines before running the pipeline.
@@ -706,6 +753,18 @@ fn compare_contracts(
         "🔬 Analyzing structural compatibility...".cyan().bold()
     ));
 
+    if storage_schemas.is_some() {
+        progress(format!(
+            "\n{}",
+            "🗄️  Analyzing declared storage layout...".cyan().bold()
+        ));
+    }
+
+    // Delegate to the single canonical pipeline. Storage-schema analysis,
+    // reconciliation against the exported spec, and the resulting scope are all
+    // handled inside it, so the CLI and every library caller run the same
+    // stages. Reconciliation failure (a manifest that contradicts its build)
+    // surfaces here as an error and stops the run.
     let safety_report = soroban_upgrade_safeguard::compare_wasm_bytes_with_options(
         old_bytes,
         new_bytes,
@@ -714,6 +773,7 @@ fn compare_contracts(
             suppressions: Some(suppressions),
             explain: args.explain,
             strict: args.strict,
+            storage_schemas: *storage_schemas,
         },
     )?;
 
@@ -723,6 +783,13 @@ fn compare_contracts(
     }
     if let Some(ref summary) = safety_report.new_spec_summary {
         progress(format!("     └─ {}", summary.dimmed()));
+    }
+
+    if safety_report.scope.storage_analyzed() {
+        progress(format!(
+            "     └─ {}",
+            safety_report.scope.storage_status_line().dimmed()
+        ));
     }
 
     Ok(safety_report)

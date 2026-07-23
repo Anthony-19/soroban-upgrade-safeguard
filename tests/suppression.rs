@@ -33,8 +33,7 @@ fn write_config(name: &str, contents: &str) -> PathBuf {
 /// Returns (stdout, stderr, exit code).
 fn run_raw(config: Option<&PathBuf>, format_json: bool) -> (String, String, i32) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"));
-    cmd.arg(wasm("v1.wasm"))
-        .arg(wasm("v2.wasm"));
+    cmd.arg(wasm("v1.wasm")).arg(wasm("v2.wasm"));
     if format_json {
         cmd.args(["--format", "json"]);
     }
@@ -239,7 +238,9 @@ fn test_new_format_suppression_success() {
 
     assert_eq!(code, 0, "all findings suppressed -> must exit 0");
     assert!(
-        stderr.contains("SECURITY NOTICE: The gate passed because 3 Critical breaking changes were suppressed"),
+        stderr.contains(
+            "SECURITY NOTICE: The gate passed because 3 Critical breaking changes were suppressed"
+        ),
         "stderr must contain the security notice. Stderr: {}",
         stderr
     );
@@ -334,7 +335,10 @@ fn test_allow_targetless_disabled_fails() {
 
     let config = write_config("targetless-disabled", &toml_str);
     let (_, stderr, code) = run_raw(Some(&config), true);
-    assert_ne!(code, 0, "targetless with allow_targetless = false must fail");
+    assert_ne!(
+        code, 0,
+        "targetless with allow_targetless = false must fail"
+    );
     assert!(
         stderr.contains("Targetless wildcard suppressions are disabled"),
         "stderr should mention targetless disabled: {}",

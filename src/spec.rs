@@ -8,7 +8,7 @@ use stellar_xdr::curr::{
 
 /// A structured representation of a Soroban contract's public interface,
 /// organized by type for easy comparison between contract versions.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ContractSpec {
     /// Contract functions, keyed by name.
     pub functions: HashMap<String, ScSpecFunctionV0>,

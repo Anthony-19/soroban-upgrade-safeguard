@@ -38,12 +38,9 @@ fn cli_report_json(old: &str, new: &str) -> Value {
 
 /// Call the library path and serialise its report to a JSON value.
 fn lib_report_json(old: &str, new: &str) -> Value {
-    let report = compare_wasm_files_with_options(
-        &wasm(old),
-        &wasm(new),
-        &CompareOptions::default(),
-    )
-    .expect("library comparison should succeed on valid fixtures");
+    let report =
+        compare_wasm_files_with_options(&wasm(old), &wasm(new), &CompareOptions::default())
+            .expect("library comparison should succeed on valid fixtures");
 
     serde_json::to_value(report.to_json()).expect("library report serialisation should succeed")
 }
@@ -83,10 +80,7 @@ fn normalise_findings(findings_by_category: &Value) -> serde_json::Map<String, V
     let mut result = serde_json::Map::new();
     if let Some(obj) = findings_by_category.as_object() {
         for (category, findings) in obj {
-            let mut arr: Vec<Value> = findings
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+            let mut arr: Vec<Value> = findings.as_array().cloned().unwrap_or_default();
             arr.sort_by(|a, b| {
                 let ta = a["target"].as_str().unwrap_or("");
                 let tb = b["target"].as_str().unwrap_or("");
@@ -161,9 +155,7 @@ fn identical_fixtures_produce_no_environment_findings_from_library() {
     .expect("should succeed");
 
     assert!(
-        !report
-            .findings_by_category
-            .contains_key("Environment"),
+        !report.findings_by_category.contains_key("Environment"),
         "Identical contracts must not produce Environment findings from the library; \
          got: {:?}",
         report.findings_by_category.get("Environment"),
