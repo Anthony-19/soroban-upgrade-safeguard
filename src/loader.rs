@@ -7,7 +7,7 @@ use stellar_xdr::curr::{
     LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
 };
 
-use wasmparser::{Parser, Payload};
+use wasmparser::Parser;
 
 use crate::limits::{LimitError, ResourcePolicy};
 
@@ -78,23 +78,7 @@ pub fn load_wasm(path: &Path) -> Result<WasmModule> {
 fn validate_wasm_structure(bytes: &[u8]) -> Result<()> {
     let parser = Parser::new(0);
     for payload in parser.parse_all(bytes) {
-        match payload.context("Malformed WASM payload encountered")? {
-            Payload::Version { .. } => {}
-            Payload::TypeSection(_) => {}
-            Payload::FunctionSection(_) => {}
-            Payload::TableSection(_) => {}
-            Payload::MemorySection(_) => {}
-            Payload::GlobalSection(_) => {}
-            Payload::ExportSection(_) => {}
-            Payload::ImportSection(_) => {}
-            Payload::ElementSection(_) => {}
-            Payload::DataSection(_) => {}
-            Payload::CodeSectionStart { .. } => {}
-            Payload::CodeSectionEntry(_) => {}
-            Payload::CustomSection(_) => {}
-            Payload::End(_) => {}
-            _ => {}
-        }
+        payload.context("Malformed WASM payload encountered")?;
     }
     Ok(())
 }
