@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 
 use soroban_upgrade_safeguard::{
     color::should_disable_color,
-    diff,
     limits::{find_limit_error, LimitsConfig, ResourcePolicy},
-    loader, parser, report, spec,
+    loader, report,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
+    CompareOptions,
 };
 
 /// Output format for the safety report.
@@ -286,10 +286,9 @@ fn run() -> Result<()> {
                         new_bytes: &new_wasm.bytes,
                         new_path: &new_wasm.path,
                         suppressions: &suppressions,
-                        explain: args.explain,
-                        strict: args.strict,
                         policy: &policy,
                     },
+                    &args,
                     &progress,
                 )
             })();
@@ -529,10 +528,30 @@ fn run() -> Result<()> {
     // same resource policy as file input.
     let old = if let Some(contract_id) = old_source {
         let rpc_url = args.rpc_url.as_ref().unwrap();
-        loader::fetch_wasm_from_rpc_with_policy(contract_id, rpc_url, &policy)?
+        let module = loader::fetch_wasm_from_rpc_with_policy(contract_id, rpc_url, &policy)?;
+
+        // If the caller pinned an expected hash, verify it now against the hash
+        // that was verified on-chain during the RPC fetch.
+        if let Some(expected_hex) = &args.expected_wasm_hash {
+            let expected_bytes = hex::decode(expected_hex)
+                .context("--expected-wasm-hash must be a valid hex string")?;
+            let actual = module.verified_hash.as_ref().map(|h| h.as_slice()).unwrap_or(&[]);
+            if actual != expected_bytes.as_slice() {
+                anyhow::bail!(
+                    "Hash mismatch: expected on-chain WASM hash {}, but fetched hash was {}",
+                    expected_hex,
+                    module.verified_hash
+                        .map(hex::encode)
+                        .unwrap_or_else(|| "<none>".to_string()),
+                );
+            }
+        }
+
+        module
     } else {
         loader::load_wasm(&args.wasm_paths[0])?
     };
+
 
     // New WASM
     let new = loader::load_wasm(new_wasm_path)?;
@@ -551,19 +570,20 @@ fn run() -> Result<()> {
         Some("Local File")
     };
     let verified_hash_hex = old.verified_hash.as_ref().map(hex::encode);
-    let safety_report = compare_contracts(
+    let mut safety_report = compare_contracts(
         &ContractComparison {
             old_bytes: &old.bytes,
             old_path: &old.path,
             new_bytes: &new.bytes,
             new_path: &new.path,
             suppressions: &suppressions,
-            explain: args.explain,
-            strict: args.strict,
             policy: &policy,
         },
+        &args,
         &progress,
     )?;
+    safety_report.baseline_source = baseline_source.map(|s| s.to_string());
+    safety_report.verified_code_hash = verified_hash_hex;
 
     match args.format {
         OutputFormat::Json => {
@@ -614,14 +634,16 @@ struct ContractComparison<'a> {
     new_bytes: &'a [u8],
     new_path: &'a str,
     suppressions: &'a SuppressionConfig,
-    explain: bool,
-    strict: bool,
     policy: &'a ResourcePolicy,
 }
 
 /// Helper function to run comparison for a single pair.
+///
+/// Delegates to the canonical library pipeline ([`soroban_upgrade_safeguard::compare_wasm_bytes_with_options`])
+/// so both the CLI and library callers always run exactly the same stages.
 fn compare_contracts(
     comparison: &ContractComparison<'_>,
+    args: &Args,
     progress: &impl Fn(String),
 ) -> Result<report::SafetyReport> {
     let ContractComparison {
@@ -630,45 +652,48 @@ fn compare_contracts(
         new_bytes,
         new_path,
         suppressions,
-        explain,
-        strict,
         policy,
     } = comparison;
-    let old_meta = parser::extract_metadata_with_policy(old_bytes, policy)?;
-    let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
+
+    // Show per-file progress lines before running the pipeline.
+    // spec summaries are recovered from the returned report.
     progress(format!(
         "  {} {} ({} bytes)",
         "✅ Old:".green().bold(),
         old_path,
         old_bytes.len()
     ));
-    progress(format!("     └─ {}", old_spec.summary().dimmed()));
-
-    let new_meta = parser::extract_metadata_with_policy(new_bytes, policy)?;
-    let new_spec = spec::ContractSpec::from_entries(&new_meta.spec);
     progress(format!(
         "  {} {} ({} bytes)",
         "✅ New:".green().bold(),
         new_path,
         new_bytes.len()
     ));
-    progress(format!("     └─ {}", new_spec.summary().dimmed()));
 
     progress(format!(
         "\n{}",
         "🔬 Analyzing structural compatibility...".cyan().bold()
     ));
-    let mut diff_report = diff::compare_with_policy(&old_spec, &new_spec, policy)?;
-    diff::compare_env_metadata(
-        old_meta.env_meta.as_ref(),
-        new_meta.env_meta.as_ref(),
-        &mut diff_report,
-    );
 
-    let mut safety_report =
-        report::SafetyReport::with_suppressions(&diff_report, suppressions, *explain, *strict);
-    safety_report.baseline_source = baseline_source.map(|s| s.to_string());
-    safety_report.verified_code_hash = verified_code_hash.map(|s| s.to_string());
+    let safety_report = soroban_upgrade_safeguard::compare_wasm_bytes_with_options(
+        old_bytes,
+        new_bytes,
+        &CompareOptions {
+            policy: Some(policy),
+            suppressions: Some(suppressions),
+            explain: args.explain,
+            strict: args.strict,
+        },
+    )?;
+
+    // Print spec summaries now that we have them from the report.
+    if let Some(ref summary) = safety_report.old_spec_summary {
+        progress(format!("     └─ {}", summary.dimmed()));
+    }
+    if let Some(ref summary) = safety_report.new_spec_summary {
+        progress(format!("     └─ {}", summary.dimmed()));
+    }
+
     Ok(safety_report)
 }
 

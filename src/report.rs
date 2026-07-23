@@ -41,6 +41,12 @@ pub struct SafetyReport {
     pub baseline_source: Option<String>,
     /// Verified SHA-256 hash of the baseline WASM bytecode (hex), if verified.
     pub verified_code_hash: Option<String>,
+    /// Human-readable summary of the old contract spec (e.g. "3 fns, 2 types").
+    /// Populated by the canonical pipeline so callers don't need to re-extract metadata.
+    pub old_spec_summary: Option<String>,
+    /// Human-readable summary of the new contract spec.
+    /// Populated by the canonical pipeline so callers don't need to re-extract metadata.
+    pub new_spec_summary: Option<String>,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -151,6 +157,8 @@ impl SafetyReport {
             strict,
             baseline_source: None,
             verified_code_hash: None,
+            old_spec_summary: None,
+            new_spec_summary: None,
         }
     }
 
@@ -598,6 +606,8 @@ mod tests {
             strict: false,
             baseline_source: None,
             verified_code_hash: None,
+            old_spec_summary: None,
+            new_spec_summary: None,
         };
 
         // Identical upgrade -> patch
