@@ -149,9 +149,9 @@ impl ResolvedConfig {
         // 2. Load file if present
         let file_config = if let Some(path) = &config_file_path {
             let content = std::fs::read_to_string(path)
-                .with_context(|| format!("Failed to read configuration file '{}'", path.display()))?;
+                .with_context(|| format!("Failed to read suppression config file '{}'", path.display()))?;
             let parsed: FileConfig = toml::from_str(&content)
-                .with_context(|| format!("Invalid configuration file '{}'", path.display()))?;
+                .with_context(|| format!("Invalid suppression config file '{}'", path.display()))?;
             Some(parsed)
         } else {
             None
@@ -424,4 +424,200 @@ fn env_format(var_name: &str) -> Option<OutputFormat> {
             _ => None,
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_path_absolute() {
+        let base = Path::new("/base");
+        let abs = PathBuf::from("c:/absolute/path.toml");
+        assert_eq!(resolve_path(base, abs.clone()), abs);
+    }
+
+    #[test]
+    fn test_resolve_path_relative() {
+        let base = Path::new("/base/dir");
+        let rel = PathBuf::from("relative/file.toml");
+        assert_eq!(resolve_path(base, rel), Path::new("/base/dir").join("relative/file.toml"));
+    }
+
+    #[test]
+    fn test_env_bool_parsing() {
+        let var = "TEST_ENV_BOOL_VAR";
+        
+        std::env::set_var(var, "true");
+        assert_eq!(env_bool(var), Some(true));
+        
+        std::env::set_var(var, "1");
+        assert_eq!(env_bool(var), Some(true));
+        
+        std::env::set_var(var, "TRUE");
+        assert_eq!(env_bool(var), Some(true));
+        
+        std::env::set_var(var, "false");
+        assert_eq!(env_bool(var), Some(false));
+        
+        std::env::set_var(var, "0");
+        assert_eq!(env_bool(var), Some(false));
+        
+        std::env::set_var(var, "invalid");
+        assert_eq!(env_bool(var), None);
+        
+        std::env::remove_var(var);
+        assert_eq!(env_bool(var), None);
+    }
+
+    #[test]
+    fn test_env_usize_parsing() {
+        let var = "TEST_ENV_USIZE_VAR";
+        
+        std::env::set_var(var, "12345");
+        assert_eq!(env_usize(var), Some(12345));
+        
+        std::env::set_var(var, "invalid");
+        assert_eq!(env_usize(var), None);
+        
+        std::env::remove_var(var);
+        assert_eq!(env_usize(var), None);
+    }
+
+    #[test]
+    fn test_env_u32_parsing() {
+        let var = "TEST_ENV_U32_VAR";
+        
+        std::env::set_var(var, "999");
+        assert_eq!(env_u32(var), Some(999));
+        
+        std::env::set_var(var, "invalid");
+        assert_eq!(env_u32(var), None);
+        
+        std::env::remove_var(var);
+        assert_eq!(env_u32(var), None);
+    }
+
+    #[test]
+    fn test_env_string_parsing() {
+        let var = "TEST_ENV_STRING_VAR";
+        
+        std::env::set_var(var, "hello");
+        assert_eq!(env_string(var), Some("hello".to_string()));
+        
+        std::env::set_var(var, "");
+        assert_eq!(env_string(var), None);
+        
+        std::env::remove_var(var);
+        assert_eq!(env_string(var), None);
+    }
+
+    #[test]
+    fn test_env_path_parsing() {
+        let var = "TEST_ENV_PATH_VAR";
+        
+        std::env::set_var(var, "some/path/file.wasm");
+        assert_eq!(env_path(var), Some(PathBuf::from("some/path/file.wasm")));
+        
+        std::env::set_var(var, "");
+        assert_eq!(env_path(var), None);
+        
+        std::env::remove_var(var);
+        assert_eq!(env_path(var), None);
+    }
+
+    #[test]
+    fn test_env_path_list_parsing() {
+        let var = "TEST_ENV_PATH_LIST_VAR";
+        
+        std::env::set_var(var, "a.wasm, b.wasm, c.wasm");
+        assert_eq!(
+            env_path_list(var),
+            Some(vec![
+                PathBuf::from("a.wasm"),
+                PathBuf::from("b.wasm"),
+                PathBuf::from("c.wasm")
+            ])
+        );
+        
+        std::env::set_var(var, "  path1 , , path2 ");
+        assert_eq!(
+            env_path_list(var),
+            Some(vec![
+                PathBuf::from("path1"),
+                PathBuf::from("path2")
+            ])
+        );
+        
+        std::env::set_var(var, "");
+        assert_eq!(env_path_list(var), None);
+        
+        std::env::remove_var(var);
+        assert_eq!(env_path_list(var), None);
+    }
+
+    #[test]
+    fn test_env_format_parsing() {
+        let var = "TEST_ENV_FORMAT_VAR";
+        
+        std::env::set_var(var, "text");
+        assert_eq!(env_format(var), Some(OutputFormat::Text));
+        
+        std::env::set_var(var, "JSON");
+        assert_eq!(env_format(var), Some(OutputFormat::Json));
+        
+        std::env::set_var(var, "markdown");
+        assert_eq!(env_format(var), Some(OutputFormat::Markdown));
+        
+        std::env::set_var(var, "invalid");
+        assert_eq!(env_format(var), None);
+        
+        std::env::remove_var(var);
+        assert_eq!(env_format(var), None);
+    }
+
+    #[test]
+    fn test_env_bool_parsing_edge_cases() {
+        let var = "TEST_ENV_BOOL_EDGE";
+        
+        std::env::set_var(var, "  true  ");
+        assert_eq!(env_bool(var), None);
+        
+        std::env::set_var(var, "yes");
+        assert_eq!(env_bool(var), None);
+        
+        std::env::set_var(var, "no");
+        assert_eq!(env_bool(var), None);
+        
+        std::env::set_var(var, "");
+        assert_eq!(env_bool(var), None);
+        
+        std::env::remove_var(var);
+    }
+
+    #[test]
+    fn test_env_usize_parsing_overflow() {
+        let var = "TEST_ENV_USIZE_OVERFLOW";
+        
+        std::env::set_var(var, "-100");
+        assert_eq!(env_usize(var), None);
+        
+        std::env::set_var(var, "99999999999999999999999999999999999999999999");
+        assert_eq!(env_usize(var), None);
+        
+        std::env::remove_var(var);
+    }
+
+    #[test]
+    fn test_env_u32_parsing_overflow() {
+        let var = "TEST_ENV_U32_OVERFLOW";
+        
+        std::env::set_var(var, "-1");
+        assert_eq!(env_u32(var), None);
+        
+        std::env::set_var(var, "4294967296");
+        assert_eq!(env_u32(var), None);
+        
+        std::env::remove_var(var);
+    }
 }
