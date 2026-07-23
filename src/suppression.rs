@@ -33,6 +33,19 @@
 //! - types: the type name (e.g. `Data`)
 //! - struct fields: `Type.field` (e.g. `Data.amount`)
 //! - enum cases: `Enum.case` (e.g. `Status.Active`)
+//!
+//! ## Stable category keys
+//!
+//! Categories describe **structure only** — `"Enum Case Value Changed"`, never
+//! `"Event Enum Case Value Changed"`. Whether a type is an event is reported
+//! separately in the finding's `classification` field and affects only wording
+//! and remediation. That separation is deliberate: a suppression key can never
+//! shift because the event classification changed, so a reclassification cannot
+//! silently un-suppress (or newly suppress) a real breaking change.
+//!
+//! Configs written against the older event-flavored names keep working —
+//! [`stable_category`] maps each one onto its structural replacement — but new
+//! rules should use the structural keys.
 
 use std::fs;
 use std::path::Path;
@@ -45,12 +58,22 @@ use crate::diff::Finding;
 /// The default config file name looked up in the current working directory.
 pub const DEFAULT_CONFIG_FILE: &str = ".safeguard.toml";
 
-/// A parsed suppression config: a flat list of reviewed acknowledgements.
+/// A parsed suppression config: a flat list of reviewed acknowledgements plus
+/// the optional type-classification settings that drive event vs. storage
+/// wording. Both live in the same `.safeguard.toml`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SuppressionConfig {
     /// The acknowledged findings, one `[[suppress]]` table per entry.
     #[serde(default, rename = "suppress")]
     pub rules: Vec<SuppressionRule>,
+    /// Explicit event/storage classification (the `[classification]` table).
+    ///
+    /// Classification only affects a finding's wording, remediation, and
+    /// `classification` metadata — never the structural `category` used for
+    /// suppression matching — so changing it can never silently move a finding
+    /// out from under an existing suppression rule.
+    #[serde(default)]
+    pub classification: crate::classification::ClassificationConfig,
 }
 
 /// A single whitelisted finding, keyed by category and (optionally) target.
@@ -67,10 +90,41 @@ pub struct SuppressionRule {
     pub reason: Option<String>,
 }
 
+/// Map a pre-1.0 event-flavored category onto the structural category that
+/// replaced it.
+///
+/// Categories used to encode the event/storage guess in the string itself
+/// (`"Event Enum Case Value Changed"`), which meant a change to the
+/// classification heuristic silently moved a finding out from under an
+/// existing suppression. Categories are now purely structural and event-ness
+/// lives in the separate `classification` field, so these names are no longer
+/// emitted — but configs in the wild still reference them. Translating them
+/// here keeps those configs working; the docs list the mapping so teams can
+/// migrate to the stable keys at their own pace.
+pub fn stable_category(category: &str) -> &str {
+    match category {
+        "Event Definition Removed" => "Struct Removed",
+        "Event Field Removed" => "Struct Field Removed",
+        "Event Field Reordered" => "Struct Field Reordered",
+        "Event Field Type Changed" => "Struct Field Type Changed",
+        "Event Enum Removed" => "Enum Removed",
+        "Event Enum Case Removed" => "Enum Case Removed",
+        "Event Enum Case Value Changed" => "Enum Case Value Changed",
+        "Event Enum Case Added" => "Enum Case Added",
+        other => other,
+    }
+}
+
 impl SuppressionRule {
     /// Whether this rule matches `finding` exactly on both category and target.
+    ///
+    /// The rule's category is normalized through [`stable_category`] first so a
+    /// legacy event-flavored key still matches the structural category that
+    /// replaced it. Findings always carry structural categories, so this only
+    /// ever widens what an old config matches — never what a current one does.
     fn matches(&self, finding: &Finding) -> bool {
-        self.category == finding.category && self.target.as_deref() == finding.target.as_deref()
+        stable_category(&self.category) == finding.category
+            && self.target.as_deref() == finding.target.as_deref()
     }
 }
 
@@ -124,6 +178,7 @@ mod tests {
             message: "irrelevant to matching".to_string(),
             type_name: target.map(|t| t.split('.').next().unwrap().to_string()),
             target: target.map(|t| t.to_string()),
+            classification: None,
         }
     }
 
@@ -194,6 +249,43 @@ mod tests {
         assert!(config.is_suppressed(&finding("Environment", None)));
         // A finding that *has* a target in the same category does not.
         assert!(!config.is_suppressed(&finding("Environment", Some("Whatever"))));
+    }
+
+    #[test]
+    fn legacy_event_category_still_matches_its_structural_replacement() {
+        // A config written before categories became purely structural must keep
+        // suppressing the same finding, not silently stop applying.
+        let config = SuppressionConfig::from_toml_str(
+            r#"
+            [[suppress]]
+            category = "Event Enum Case Value Changed"
+            target   = "StatusEvent.Paused"
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.is_suppressed(&finding(
+            "Enum Case Value Changed",
+            Some("StatusEvent.Paused")
+        )));
+        // Aliasing must not widen the target match.
+        assert!(!config.is_suppressed(&finding(
+            "Enum Case Value Changed",
+            Some("StatusEvent.Active")
+        )));
+    }
+
+    #[test]
+    fn stable_categories_are_passed_through_unchanged() {
+        for cat in [
+            "Struct Field Removed",
+            "Enum Case Value Changed",
+            "Function Signature Changed",
+            "Type Renamed",
+            "Environment",
+        ] {
+            assert_eq!(stable_category(cat), cat);
+        }
     }
 
     #[test]

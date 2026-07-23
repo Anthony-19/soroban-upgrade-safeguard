@@ -36,11 +36,13 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+pub mod classification;
 pub mod color;
 pub mod diff;
 pub mod loader;
 pub mod mapper;
 pub mod parser;
+pub mod rename;
 pub mod report;
 pub mod spec;
 pub mod suppression;
