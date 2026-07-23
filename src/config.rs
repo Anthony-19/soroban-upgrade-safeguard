@@ -295,6 +295,77 @@ impl ResolvedConfig {
             suppressions,
         })
     }
+
+    /// Centralized mode detection and validation.
+    /// Ensures there are no conflicting options, missing dependencies, or invalid positional arg counts.
+    pub fn validate_and_resolve_mode(&self) -> Result<RunMode> {
+        let has_manifest = self.manifest.is_some();
+        let has_dir_scan = self.old_dir.is_some() || self.new_dir.is_some();
+        let has_rpc = self.contract_id.is_some() || self.rpc_url.is_some();
+
+        if has_manifest && has_dir_scan {
+            anyhow::bail!("Cannot specify both --manifest and --old-dir/--new-dir at the same time");
+        }
+
+        // Verify rpc settings are co-dependent
+        if self.contract_id.is_some() != self.rpc_url.is_some() {
+            anyhow::bail!("Both --contract-id and --rpc-url must be specified together");
+        }
+
+        // Check if batch mode is used
+        let is_batch = has_manifest || has_dir_scan;
+        if is_batch && !self.wasm_paths.is_empty() {
+            anyhow::bail!("Cannot specify positional WASM paths when using batch mode (--manifest or --old-dir/--new-dir)");
+        }
+
+        if has_manifest {
+            Ok(RunMode::Manifest)
+        } else if has_dir_scan {
+            if self.old_dir.is_none() || self.new_dir.is_none() {
+                anyhow::bail!("Both --old-dir and --new-dir must be specified together for directory scanning");
+            }
+            Ok(RunMode::DirScan)
+        } else if has_rpc {
+            // RPC Mode: exactly 1 positional WASM path (the new one)
+            match self.wasm_paths.len() {
+                1 => Ok(RunMode::Rpc),
+                2 => anyhow::bail!("When using --contract-id, provide only the NEW_WASM path as a positional argument"),
+                _ => anyhow::bail!(
+                    "Expected exactly 1 positional WASM path when using --contract-id.\n\n\
+                     Usage: soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>"
+                ),
+            }
+        } else {
+            // Local Mode: exactly 2 positional WASM paths
+            match self.wasm_paths.len() {
+                2 => Ok(RunMode::Local),
+                1 => anyhow::bail!(
+                    "Missing OLD_WASM path. Provide two WASM files, or use --contract-id and --rpc-url \
+                     to fetch the old contract from chain.\n\n\
+                     Usage: soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>\n       \
+                     soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>"
+                ),
+                _ => anyhow::bail!(
+                    "Expected 2 WASM path arguments.\n\n\
+                     Usage: soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>\n       \
+                     soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>\n\n\
+                     Or use batch mode:\n       \
+                     soroban-upgrade-safeguard --manifest <MANIFEST_PATH>\n       \
+                     soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>"
+                ),
+            }
+        }
+    }
+}
+
+/// The detected operating mode of the safeguard execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunMode {
+    Local,
+    Rpc,
+    Manifest,
+    DirScan,
 }
 
 fn resolve_path(base_dir: &Path, path: PathBuf) -> PathBuf {
