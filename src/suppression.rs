@@ -89,16 +89,8 @@ impl SuppressionRule {
 
         if let Some(rule_fingerprint) = &self.fingerprint {
             // New format: calculate finding fingerprint and verify.
-            let normalized_message = normalize_whitespace(&finding.message);
-            let fingerprint_input = format!(
-                "category:{}\ntarget:{}\nmessage:{}",
-                finding.category,
-                finding.target.as_deref().unwrap_or(""),
-                normalized_message
-            );
-            let hash = sha256(fingerprint_input.as_bytes());
-            let computed_fingerprint = hex::encode(hash);
-            rule_fingerprint == &computed_fingerprint
+            let computed_fingerprint = compute_fingerprint(finding);
+            rule_fingerprint.trim().to_lowercase() == computed_fingerprint
         } else {
             // Old format / compatibility mode fallback. Warn on stderr.
             eprintln!(
@@ -109,6 +101,19 @@ impl SuppressionRule {
             true
         }
     }
+}
+
+/// Compute the SHA-256 fingerprint for a finding based on category, target, and message.
+pub fn compute_fingerprint(finding: &Finding) -> String {
+    let normalized_message = normalize_whitespace(&finding.message);
+    let fingerprint_input = format!(
+        "category:{}\ntarget:{}\nmessage:{}",
+        finding.category,
+        finding.target.as_deref().unwrap_or(""),
+        normalized_message
+    );
+    let hash = sha256(fingerprint_input.as_bytes());
+    hex::encode(hash)
 }
 
 impl SuppressionConfig {
@@ -445,6 +450,7 @@ mod tests {
     fn rule_without_target_matches_only_targetless_findings() {
         let config = SuppressionConfig::from_toml_str(
             r#"
+            allow_targetless = true
             [[suppress]]
             category = "Environment"
             "#,
@@ -471,5 +477,117 @@ mod tests {
 
         assert!(config.is_suppressed(&finding("Function Removed", Some("legacy_init"))));
         assert!(!config.is_suppressed(&finding("Function Removed", Some("transfer"))));
+    }
+
+    #[test]
+    fn test_compute_fingerprint() {
+        let f = Finding {
+            severity: Severity::Critical,
+            category: "Struct Field Removed".to_string(),
+            message: "Struct field threshold of type ConfigData was removed".to_string(),
+            type_name: Some("ConfigData".to_string()),
+            target: Some("ConfigData.threshold".to_string()),
+        };
+        let fp = compute_fingerprint(&f);
+        let expected_input = "category:Struct Field Removed\ntarget:ConfigData.threshold\nmessage:Struct field threshold of type ConfigData was removed";
+        let expected_hash = sha256(expected_input.as_bytes());
+        let expected_fp = hex::encode(expected_hash);
+        assert_eq!(fp, expected_fp);
+    }
+
+    #[test]
+    fn test_seconds_to_ymd_and_is_expired() {
+        assert_eq!(seconds_to_ymd(0), (1970, 1, 1));
+        assert_eq!(seconds_to_ymd(1709164800), (2024, 2, 29));
+
+        assert!(is_expired("1970-01-01").unwrap());
+        assert!(!is_expired("2099-12-31").unwrap());
+
+        // Exact today must not be expired
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let (y, m, d) = seconds_to_ymd(now_secs);
+        let today_str = format!("{:04}-{:02}-{:02}", y, m, d);
+        assert!(!is_expired(&today_str).unwrap());
+
+        assert!(is_expired("invalid-date").is_err());
+    }
+
+    #[test]
+    fn test_config_validation_limits() {
+        let toml_exceed = r#"
+            max_suppressions = 1
+            [[suppress]]
+            category = "CatA"
+            [[suppress]]
+            category = "CatB"
+        "#;
+        assert!(SuppressionConfig::from_toml_str(toml_exceed).is_err());
+
+        let toml_wildcard_disabled = r#"
+            [[suppress]]
+            category = "Environment"
+        "#;
+        assert!(SuppressionConfig::from_toml_str(toml_wildcard_disabled).is_err());
+
+        let toml_wildcard_exceed = r#"
+            allow_targetless = true
+            [[suppress]]
+            category = "Env1"
+            [[suppress]]
+            category = "Env2"
+            [[suppress]]
+            category = "Env3"
+            [[suppress]]
+            category = "Env4"
+        "#;
+        assert!(SuppressionConfig::from_toml_str(toml_wildcard_exceed).is_err());
+
+        let toml_missing_new_format = r#"
+            [[suppress]]
+            category = "Struct Field Removed"
+            target = "ConfigData.threshold"
+            fingerprint = "8a3f..."
+        "#;
+        assert!(SuppressionConfig::from_toml_str(toml_missing_new_format).is_err());
+    }
+
+    #[test]
+    fn test_fingerprint_matching() {
+        let f = Finding {
+            severity: Severity::Critical,
+            category: "Struct Field Removed".to_string(),
+            message: "Struct field threshold of type ConfigData was removed".to_string(),
+            type_name: Some("ConfigData".to_string()),
+            target: Some("ConfigData.threshold".to_string()),
+        };
+        let fp = compute_fingerprint(&f);
+
+        let toml_str = format!(
+            r#"
+            [[suppress]]
+            category = "Struct Field Removed"
+            target = "ConfigData.threshold"
+            author = "Alice"
+            expiry = "2099-12-31"
+            fingerprint = "{}"
+            "#,
+            fp.to_uppercase()
+        );
+        let config = SuppressionConfig::from_toml_str(&toml_str).unwrap();
+        assert!(config.is_suppressed(&f));
+
+        let toml_mismatch = r#"
+            [[suppress]]
+            category = "Struct Field Removed"
+            target = "ConfigData.threshold"
+            author = "Alice"
+            expiry = "2099-12-31"
+            fingerprint = "incorrectfingerprint"
+        "#;
+        let config_mismatch = SuppressionConfig::from_toml_str(toml_mismatch).unwrap();
+        assert!(!config_mismatch.is_suppressed(&f));
     }
 }

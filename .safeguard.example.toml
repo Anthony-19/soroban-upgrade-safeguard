@@ -19,15 +19,24 @@
 #
 # Omit `target` to match only findings that have no target (e.g. "Environment").
 
-[[suppress]]
-category = "Struct Field Removed"
-target   = "ConfigData.threshold"
-reason   = "Planned storage migration in v2 drops the unused threshold field."
+max_suppressions = 10
+allow_targetless = false
 
 [[suppress]]
-category = "Function Signature Changed"
-target   = "initialize"
-reason   = "Re-init is intentional and gated behind the migration admin call."
+category    = "Struct Field Removed"
+target      = "ConfigData.threshold"
+author      = "Alice <alice@example.com>"
+reason      = "Planned storage migration in v2 drops the unused threshold field."
+expiry      = "2026-12-31"
+fingerprint = "8a3f..."
+
+[[suppress]]
+category    = "Function Signature Changed"
+target      = "initialize"
+author      = "Bob <bob@example.com>"
+reason      = "Re-init is intentional and gated behind the migration admin call."
+expiry      = "2026-12-31"
+fingerprint = "7b2e..."
 
 # ---------------------------------------------------------------------------
 # Resource limits (optional).

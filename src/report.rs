@@ -15,6 +15,8 @@ pub struct ReportedFinding {
     /// (`severity`, `category`, `message`, `type_name`, `target`).
     #[serde(flatten)]
     pub finding: Finding,
+    /// The SHA-256 fingerprint computed for this finding.
+    pub fingerprint: String,
     /// Whether a suppression rule acknowledged this finding.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub suppressed: bool,
@@ -131,11 +133,13 @@ impl SafetyReport {
                 None
             };
 
+            let fingerprint = crate::suppression::compute_fingerprint(finding);
             findings_by_category
                 .entry(finding.category.clone())
                 .or_default()
                 .push(ReportedFinding {
                     finding: finding.clone(),
+                    fingerprint,
                     suppressed,
                     suppression_reason: rule.and_then(|r| r.reason.clone()),
                     suppression_author: rule.and_then(|r| r.author.clone()),

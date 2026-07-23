@@ -38,15 +38,22 @@ soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
 ### Suppressing known breaking changes
 
 If a breaking change is deliberate and already accounted for, list it in a
-`.safeguard.toml` so it no longer fails the run. Matching is exact (by
-`category` and `target`), and suppressed findings are still shown in the report,
-marked `[SUPPRESSED]`:
+`.safeguard.toml` so it no longer fails the run. Rules require explicit `author`,
+`reason`, expiry date (`YYYY-MM-DD`), and SHA-256 content `fingerprint` binding.
+Matching is exact (by `category`, `target`, and `fingerprint`), and suppressed
+findings are prominently audited in report outputs:
 
 ```toml
+max_suppressions = 10
+allow_targetless = false
+
 [[suppress]]
-category = "Struct Field Removed"
-target   = "ConfigData.threshold"
-reason   = "Planned storage migration in v2."
+category    = "Struct Field Removed"
+target      = "ConfigData.threshold"
+author      = "Alice <alice@example.com>"
+reason      = "Planned storage migration in v2."
+expiry      = "2026-12-31"
+fingerprint = "8a3f..."  # SHA-256 hex of category + target + normalized message
 ```
 
 The tool auto-loads `.safeguard.toml` from the current directory, or use
@@ -54,6 +61,19 @@ The tool auto-loads `.safeguard.toml` from the current directory, or use
 [`.safeguard.example.toml`](.safeguard.example.toml) for a documented template
 and the [documentation](docs/documentation.md#suppressing-known-breaking-changes)
 for the full `target` convention.
+
+#### Security Model & Trust Implications
+
+> [!WARNING]
+> By default, the gate loads `.safeguard.toml` from the current working directory.
+> Anyone with write access to the repository (such as PR contributors in CI)
+> can modify `.safeguard.toml` to neutralize Critical finding gates.
+> 
+> To secure your pipeline:
+> - Require mandatory code owners review for `.safeguard.toml`.
+> - Or pass `--config <PATH>` pointing to a read-only, privileged path.
+> - Wildcard/targetless rules require explicit opt-in (`allow_targetless = true`) capped at a ceiling of 3.
+> - Expired rules or exceeding `max_suppressions` will cause hard load-time failures.
 
 ### Resource limits (untrusted input)
 
