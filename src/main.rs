@@ -1,168 +1,19 @@
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use colored::Colorize;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use soroban_upgrade_safeguard::{
     color::should_disable_color,
+    config::{Args, OutputFormat, ResolvedConfig, RunMode},
+    diff,
     limits::{find_limit_error, LimitsConfig, ResourcePolicy},
     loader, report,
     storage_schema::StorageSchema,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
     CompareOptions,
 };
-
-/// Output format for the safety report.
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
-enum OutputFormat {
-    /// Colored, human-readable report (default).
-    #[default]
-    Text,
-    /// A single machine-readable JSON document for CI and dashboards.
-    Json,
-    /// Markdown document suitable for PR descriptions and comments.
-    Markdown,
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    author,
-    version,
-    about,
-    long_about = None,
-    // Four usage modes:
-    //   1. Local:      soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM> [OPTIONS]
-    //   2. RPC:        soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM> [OPTIONS]
-    //   3. Manifest:   soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]
-    //   4. Dir Scan:   soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]
-    override_usage = "soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM> [OPTIONS]\n       \
-                      soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM> [OPTIONS]\n       \
-                      soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]\n       \
-                      soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]"
-)]
-struct Args {
-    /// WASM paths: <OLD_WASM> <NEW_WASM> in local mode, or just <NEW_WASM> in RPC mode
-    #[arg(value_name = "WASM", num_args = 0..=2)]
-    wasm_paths: Vec<PathBuf>,
-
-    /// Output format
-    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-    format: OutputFormat,
-
-    /// Stellar/Soroban Contract ID to fetch from on-chain (e.g. C...)
-    #[arg(long, value_name = "CONTRACT_ID", requires = "rpc_url")]
-    contract_id: Option<String>,
-
-    /// Stellar RPC URL (e.g. https://soroban-testnet.stellar.org)
-    #[arg(long, value_name = "RPC_URL", requires = "contract_id")]
-    rpc_url: Option<String>,
-
-    /// Path to a suppression config acknowledging known, intentional breaking
-    /// changes. When omitted, `.safeguard.toml` in the current directory is
-    /// used if present; otherwise no suppressions are applied.
-    #[arg(long, value_name = "CONFIG")]
-    config: Option<PathBuf>,
-
-    /// Print a concise remediation explanation for each finding.
-    #[arg(long)]
-    explain: bool,
-
-    /// Exit with a non-zero code if any Warnings or Critical findings are found
-    #[arg(long)]
-    strict: bool,
-
-    /// Do not color output
-    #[arg(long)]
-    no_color: bool,
-
-    /// Allow HTTP connections for RPC when the host is localhost/127.0.0.1.
-    /// Without this flag only HTTPS URLs are accepted.
-    #[arg(long)]
-    allow_http_local: bool,
-
-    /// Expected SHA-256 hash (hex) of the on-chain WASM baseline.
-    /// When provided the tool verifies the hash of the fetched bytecode
-    /// matches this value and fails immediately on mismatch.
-    #[arg(long, value_name = "HEX_HASH")]
-    expected_wasm_hash: Option<String>,
-
-    /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
-    #[arg(long, value_name = "MANIFEST_PATH")]
-    manifest: Option<PathBuf>,
-
-    /// Directory containing the old versions of the contracts for directory comparison
-    #[arg(long, value_name = "OLD_DIR", requires = "new_dir")]
-    old_dir: Option<PathBuf>,
-
-    /// Directory containing the new versions of the contracts for directory comparison
-    #[arg(long, value_name = "NEW_DIR", requires = "old_dir")]
-    new_dir: Option<PathBuf>,
-
-    /// Storage-schema manifest describing the OLD build's storage layout.
-    ///
-    /// Declares the storage-key types and internal value types that govern
-    /// on-chain compatibility but need not appear in the exported spec. Must be
-    /// given together with --new-storage-schema: detecting a layout change
-    /// requires both snapshots.
-    #[arg(long, value_name = "PATH", requires = "new_storage_schema")]
-    old_storage_schema: Option<PathBuf>,
-
-    /// Storage-schema manifest describing the NEW build's storage layout.
-    #[arg(long, value_name = "PATH", requires = "old_storage_schema")]
-    new_storage_schema: Option<PathBuf>,
-
-    /// Maximum XDR decode depth per entry. Overrides `[limits]` in the config
-    /// file and the built-in default. Guards against stack-overflow inputs.
-    #[arg(long, value_name = "N")]
-    max_xdr_depth: Option<u32>,
-
-    /// Maximum bytes decoded per WASM custom section. Overrides `[limits]` and
-    /// the default. Guards against oversized-length allocation inputs.
-    #[arg(long, value_name = "BYTES")]
-    max_xdr_len: Option<usize>,
-
-    /// Maximum decoded spec entries, summed across all sections. Overrides
-    /// `[limits]` and the default.
-    #[arg(long, value_name = "N")]
-    max_entries: Option<usize>,
-
-    /// Maximum recursive type-walk depth (equality, rendering, cascade
-    /// detection). Overrides `[limits]` and the default.
-    #[arg(long, value_name = "N")]
-    max_walk_depth: Option<usize>,
-}
-
-/// Resolve the effective [`ResourcePolicy`]: built-in defaults, overlaid by the
-/// `[limits]` table in the config file, overlaid by any `--max-*` CLI flags
-/// (flags win). `config_path` is the same file the suppression config is read
-/// from, if any.
-fn resolve_policy(args: &Args, config_path: Option<&Path>) -> Result<ResourcePolicy> {
-    let mut policy = ResourcePolicy::default();
-
-    if let Some(path) = config_path {
-        if let Some(file_limits) = LimitsConfig::load_optional(path)? {
-            policy = file_limits.apply_to(policy);
-        }
-    }
-
-    // CLI flags take precedence over the file and defaults.
-    if let Some(v) = args.max_xdr_depth {
-        policy.max_xdr_depth = v;
-    }
-    if let Some(v) = args.max_xdr_len {
-        policy.max_xdr_len = v;
-    }
-    if let Some(v) = args.max_entries {
-        policy.max_entries = v;
-    }
-    if let Some(v) = args.max_walk_depth {
-        policy.max_walk_depth = v;
-    }
-
-    Ok(policy)
-}
-
 /// Exit codes:
 /// - `0`: safe (no breaking changes, or all suppressed).
 /// - `1`: breaking changes detected, or a generic/IO/parse error.
