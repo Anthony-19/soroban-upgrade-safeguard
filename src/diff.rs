@@ -1469,7 +1469,11 @@ mod tests {
     }
 
     fn categories(report: &DiffReport) -> Vec<&str> {
-        report.findings.iter().map(|f| f.category.as_str()).collect()
+        report
+            .findings
+            .iter()
+            .map(|f| f.category.as_str())
+            .collect()
     }
 
     const POSITION_V1: &str = r#"
@@ -1521,7 +1525,9 @@ mod tests {
         assert_eq!(finding.type_name.as_deref(), Some("PositionState"));
         // The message names the scope so it is not mistaken for an exported break.
         assert!(
-            finding.message.contains("[declared storage value (persistent)]"),
+            finding
+                .message
+                .contains("[declared storage value (persistent)]"),
             "message should be scope-qualified: {}",
             finding.message
         );
@@ -1583,7 +1589,10 @@ mod tests {
             .expect("an appended field should be reported");
         assert_eq!(finding.severity, Severity::Warning);
         assert!(
-            !report.findings.iter().any(|f| f.severity == Severity::Critical),
+            !report
+                .findings
+                .iter()
+                .any(|f| f.severity == Severity::Critical),
             "appending to a value type is not corruption"
         );
     }
@@ -1659,7 +1668,9 @@ mod tests {
             .find(|f| f.category == "Storage Union Case Reordered")
             .expect("a shifted discriminant must be detected");
         assert_eq!(reorder.severity, Severity::Critical);
-        assert!(reorder.message.contains("[declared storage key (persistent)]"));
+        assert!(reorder
+            .message
+            .contains("[declared storage key (persistent)]"));
     }
 
     /// A unit storage-key enum whose discriminant value moves is equally fatal.
@@ -1715,7 +1726,10 @@ mod tests {
 
         // An exported diff that is completely clean, as in the attack scenario.
         let mut combined = compare(&ContractSpec::default(), &ContractSpec::default());
-        assert!(combined.findings.is_empty(), "exported interface is unchanged");
+        assert!(
+            combined.findings.is_empty(),
+            "exported interface is unchanged"
+        );
 
         let safety_before = crate::report::SafetyReport::new(&combined);
         assert!(

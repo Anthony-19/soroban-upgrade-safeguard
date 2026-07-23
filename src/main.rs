@@ -554,13 +554,10 @@ fn compare_contracts(
         };
     }
 
-    Ok(report::SafetyReport::with_suppressions(
-        &diff_report,
-        suppressions,
-        *explain,
-        *strict,
+    Ok(
+        report::SafetyReport::with_suppressions(&diff_report, suppressions, *explain, *strict)
+            .with_scope(scope),
     )
-    .with_scope(scope))
 }
 
 fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {

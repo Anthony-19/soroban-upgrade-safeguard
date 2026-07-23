@@ -244,9 +244,7 @@ impl DeclaredType {
     /// conservative assumption, since it is the durability whose corruption is
     /// permanent.
     pub fn durability_label(&self) -> &'static str {
-        self.durability
-            .unwrap_or(Durability::Persistent)
-            .label()
+        self.durability.unwrap_or(Durability::Persistent).label()
     }
 }
 
@@ -313,9 +311,11 @@ impl StorageSchema {
             .is_some_and(|e| e.eq_ignore_ascii_case("json"));
 
         if looks_like_json {
-            Self::from_json_str(contents).or_else(|primary| Self::from_toml_str(contents).map_err(|_| primary))
+            Self::from_json_str(contents)
+                .or_else(|primary| Self::from_toml_str(contents).map_err(|_| primary))
         } else {
-            Self::from_toml_str(contents).or_else(|primary| Self::from_json_str(contents).map_err(|_| primary))
+            Self::from_toml_str(contents)
+                .or_else(|primary| Self::from_json_str(contents).map_err(|_| primary))
         }
     }
 
@@ -418,10 +418,7 @@ impl StorageSchema {
 
         for (declared, role) in self.declarations() {
             let durability = declared.durability.unwrap_or(Durability::Persistent);
-            meta.insert(
-                declared.name.clone(),
-                ResolvedTypeMeta { role, durability },
-            );
+            meta.insert(declared.name.clone(), ResolvedTypeMeta { role, durability });
 
             match declared.kind {
                 TypeKind::Struct => {
@@ -787,7 +784,9 @@ fn expected_member_table(kind: TypeKind) -> &'static str {
 
 fn check_member_count(count: usize, context: &str) -> Result<()> {
     if count > MAX_MEMBERS_PER_TYPE {
-        bail!("{context} declares {count} members, exceeding the maximum of {MAX_MEMBERS_PER_TYPE}");
+        bail!(
+            "{context} declares {count} members, exceeding the maximum of {MAX_MEMBERS_PER_TYPE}"
+        );
     }
     Ok(())
 }
@@ -886,7 +885,8 @@ fn reconcile_declared_type(
         }
         (TypeKind::Union, Some(ExportedKind::Union)) => {
             let exported = &spec.unions[name];
-            let exported_cases: &[stellar_xdr::curr::ScSpecUdtUnionCaseV0] = exported.cases.as_ref();
+            let exported_cases: &[stellar_xdr::curr::ScSpecUdtUnionCaseV0] =
+                exported.cases.as_ref();
 
             if exported_cases.len() != declared.variants.len() {
                 bail!(
@@ -1011,7 +1011,9 @@ fn exported_kind_of(name: &str, spec: &ContractSpec) -> Option<ExportedKind> {
 }
 
 /// Split an exported union case into its name and payload types.
-fn union_case_parts(case: &stellar_xdr::curr::ScSpecUdtUnionCaseV0) -> (String, Vec<ScSpecTypeDef>) {
+fn union_case_parts(
+    case: &stellar_xdr::curr::ScSpecUdtUnionCaseV0,
+) -> (String, Vec<ScSpecTypeDef>) {
     match case {
         stellar_xdr::curr::ScSpecUdtUnionCaseV0::VoidV0(v) => (v.name.to_string(), Vec::new()),
         stellar_xdr::curr::ScSpecUdtUnionCaseV0::TupleV0(t) => {
@@ -1306,12 +1308,12 @@ mod tests {
             "",
             "Vec<",
             "Vec<u32",
-            "Map<u32>",             // wrong arity
-            "Option<u32, u32>",     // wrong arity
-            "Unknown<u32>",         // unsupported container
-            "BytesN<abc>",          // non-numeric length
-            "(u32,)",               // trailing comma
-            "123Bad",               // not an identifier
+            "Map<u32>",         // wrong arity
+            "Option<u32, u32>", // wrong arity
+            "Unknown<u32>",     // unsupported container
+            "BytesN<abc>",      // non-numeric length
+            "(u32,)",           // trailing comma
+            "123Bad",           // not an identifier
         ] {
             assert!(
                 parse_type_str(bad).is_err(),
@@ -1414,24 +1416,21 @@ mod tests {
     /// and every type spelling in it must resolve.
     #[test]
     fn the_shipped_example_manifest_is_valid() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(".storage-schema.example.toml");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".storage-schema.example.toml");
         let contents = std::fs::read_to_string(&path).expect("example manifest must exist");
-        let schema: StorageSchema =
-            toml::from_str(&contents).expect("example manifest must parse");
+        let schema: StorageSchema = toml::from_str(&contents).expect("example manifest must parse");
 
         assert!(!schema.is_empty(), "example should declare types");
         for (declared, _role) in schema.declarations() {
             for field in &declared.fields {
-                parse_type_str(&field.type_).unwrap_or_else(|e| {
-                    panic!("{}.{}: {e}", declared.name, field.name)
-                });
+                parse_type_str(&field.type_)
+                    .unwrap_or_else(|e| panic!("{}.{}: {e}", declared.name, field.name));
             }
             for variant in &declared.variants {
                 for type_ in &variant.types {
-                    parse_type_str(type_).unwrap_or_else(|e| {
-                        panic!("{}::{}: {e}", declared.name, variant.name)
-                    });
+                    parse_type_str(type_)
+                        .unwrap_or_else(|e| panic!("{}::{}: {e}", declared.name, variant.name));
                 }
             }
         }
@@ -1566,7 +1565,10 @@ mod tests {
               type = "Vec<"
             "#,
         );
-        assert!(error.contains("Position"), "error should name the type: {error}");
+        assert!(
+            error.contains("Position"),
+            "error should name the type: {error}"
+        );
     }
 
     #[test]
@@ -1599,7 +1601,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            StorageSchema::load_from_path(&json).unwrap().declared_count(),
+            StorageSchema::load_from_path(&json)
+                .unwrap()
+                .declared_count(),
             1
         );
 
@@ -1709,7 +1713,9 @@ mod tests {
                 ("debt", ScSpecTypeDef::I128),
             ],
         );
-        schema.reconcile_with_spec(&spec, "new").expect("layouts agree");
+        schema
+            .reconcile_with_spec(&spec, "new")
+            .expect("layouts agree");
     }
 
     #[test]
@@ -1847,10 +1853,7 @@ mod tests {
         }
 
         assert_eq!(resolved.key_type_count(), 1);
-        assert_eq!(
-            resolved.meta["DataKey"].role,
-            DeclarationRole::StorageKey
-        );
+        assert_eq!(resolved.meta["DataKey"].role, DeclarationRole::StorageKey);
         assert_eq!(resolved.meta["DataKey"].durability, Durability::Persistent);
     }
 
@@ -1927,7 +1930,10 @@ mod tests {
         );
 
         // Nothing declares or exports `Mystery`, so its layout is unknown.
-        assert_eq!(schema.unresolved_references(None), vec!["Mystery".to_string()]);
+        assert_eq!(
+            schema.unresolved_references(None),
+            vec!["Mystery".to_string()]
+        );
 
         // Once the build exports it, the reference resolves.
         let exported = spec_with_struct("Mystery", &[("x", ScSpecTypeDef::U32)]);
@@ -1949,6 +1955,9 @@ mod tests {
             });
         }
         let error = schema.validate().expect_err("oversized schema").to_string();
-        assert!(error.contains("exceeding the supported maximum"), "got: {error}");
+        assert!(
+            error.contains("exceeding the supported maximum"),
+            "got: {error}"
+        );
     }
 }

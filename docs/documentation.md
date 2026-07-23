@@ -6,18 +6,21 @@ This document explains what Soroban Upgrade Safeguard does, how it works interna
 
 1. [Overview](#overview)
 2. [Why Upgrade Safety Matters](#why-upgrade-safety-matters)
-3. [Installation](#installation)
-4. [Docker](#docker)
-5. [Command Line Usage](#command-line-usage)
-6. [How the Analysis Works](#how-the-analysis-works)
-7. [Detection Categories](#detection-categories)
-8. [Severity Levels](#severity-levels)
-9. [Cascading Layout Breaks](#cascading-layout-breaks)
-10. [Reading the Report](#reading-the-report)
-11. [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes)
-12. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
-13. [Limitations](#limitations)
-14. [Frequently Asked Questions](#frequently-asked-questions)
+3. [What a Passing Verdict Guarantees](#what-a-passing-verdict-guarantees)
+4. [Installation](#installation)
+5. [Docker](#docker)
+6. [Command Line Usage](#command-line-usage)
+7. [How the Analysis Works](#how-the-analysis-works)
+8. [Storage Schema Analysis](#storage-schema-analysis)
+9. [Detection Categories](#detection-categories)
+10. [Severity Levels](#severity-levels)
+11. [Cascading Layout Breaks](#cascading-layout-breaks)
+12. [Reading the Report](#reading-the-report)
+13. [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes)
+14. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
+15. [Limitations](#limitations)
+16. [Migration Note](#migration-note)
+17. [Frequently Asked Questions](#frequently-asked-questions)
 
 ## Overview
 
@@ -36,6 +39,37 @@ On Stellar, a Soroban contract can be upgraded in place by swapping the WASM beh
 Soroban serializes most user-defined types by field position rather than by field name. If the new version of a struct removes a field, reorders fields, or changes a field type, the bytes already stored on chain no longer match what the new code expects. The result is orphaned data, deserialization panics, or integrations that quietly read the wrong values.
 
 These problems usually do not appear at compile time. They appear in production, after the upgrade is live and real data is involved. The goal of this tool is to surface those problems before you deploy.
+
+## What a Passing Verdict Guarantees
+
+This section is the most important one in this document. Read it before you treat a green run as permission to deploy.
+
+By default, the tool reads only the `contractspecv0` custom section, which describes a contract's **callable surface**: its exported functions and the user-defined types those functions mention. Everything the tool says by default is a statement about that surface and nothing else.
+
+**A passing run certifies:**
+
+- No exported function was removed, and none changed its parameters or return types.
+- No exported user-defined type changed in a way that breaks its layout.
+- The environment metadata (`contractenvmetav0`) was compared.
+
+**A passing run does NOT certify:**
+
+- That the upgrade is **storage compatible**.
+- That internal types serialized into persistent, instance, or temporary storage kept their layout.
+- That storage-key types kept their discriminants, so existing entries still resolve.
+- That function bodies behave the same way.
+
+The reason for that gap is structural. Soroban storage compatibility is decided by the bytes a contract writes: the layout of the values it serializes into storage, and the discriminants of the types it builds storage keys from. Neither has to appear in `contractspecv0`. A type used only as a storage payload is invisible to the exported spec, so a contract can keep its public interface byte-identical while reordering the fields of an internal struct or shifting a storage-key discriminant. That is guaranteed data corruption on upgrade, and by default the tool cannot see it.
+
+This is why the verdict vocabulary is deliberately bounded. A pass reads:
+
+```
+Status: ✅ PASSED (No exported-interface breaking changes)
+Scope:  Exported interface + environment metadata only — storage layout is NOT verified by this result.
+        Storage layout: NOT analyzed — no storage schema supplied.
+```
+
+"No exported-interface breaks" and "storage compatible" are different claims, and the tool only makes the first one unless you give it more to work with. To close the gap, supply a [storage schema](#storage-schema-analysis).
 
 ## Installation
 
@@ -147,6 +181,140 @@ The analysis runs as a short pipeline. Each stage lives in its own module under 
 5. **Map dependencies (`mapper.rs`).** A `LayoutMapper` builds a reverse dependency graph over user-defined types. This is what lets the tool understand that a change to a small shared type can break every larger type that embeds it.
 
 6. **Report (`report.rs`).** All findings are aggregated into a `SafetyReport`, grouped by category, counted by severity, and rendered as a colored summary. The overall run is considered safe only when there are zero critical findings.
+
+Every report also carries an **analysis scope**, which records which of these dimensions actually ran. It is printed under the status line and exposed as a `scope` object in JSON, so neither a human nor a CI job has to guess how much a verdict covers.
+
+## Storage Schema Analysis
+
+A storage schema is an opt-in manifest in which you declare the types that actually govern your storage layout. It is the bridge between what the exported spec exposes and what determines on-chain compatibility.
+
+### Why it is needed
+
+Consider a lending contract that stores positions under a key enum `DataKey::Position(Address)` and serializes an internal struct `PositionState { collateral: i128, debt: i128 }`. Neither type is exported. An upgrade that swaps those two fields, or renames the key variant, leaves the public interface byte-identical. Without a schema the tool reports PASSED, and on deploy every stored position decodes with collateral and debt reversed while existing keys stop resolving.
+
+Declaring those two types lets the tool diff them with the same engine and the same severities it already applies to exported types.
+
+### Supplying a schema
+
+A manifest describes the storage layout of **one build**. Detecting a reorder requires two snapshots, so you supply one manifest per side:
+
+```bash
+soroban-upgrade-safeguard ./on-chain.wasm ./candidate.wasm \
+  --old-storage-schema ./schemas/v1.storage-schema.toml \
+  --new-storage-schema ./schemas/v2.storage-schema.toml
+```
+
+Both flags are required together. Supplying only one is an error, because a single snapshot cannot show a change. Keep the manifest versioned next to your contract and update it in the same commit that changes a storage type.
+
+### Manifest format
+
+TOML and JSON are both accepted with the same shape. A ready-to-copy template lives at [`.storage-schema.example.toml`](../.storage-schema.example.toml).
+
+```toml
+# Storage-key types: what addresses your entries.
+[[storage_key]]
+name = "DataKey"
+kind = "union"             # "union" for data-carrying, "enum" for unit variants
+durability = "persistent"  # persistent | instance | temporary (optional)
+
+  [[storage_key.variant]]
+  name = "Admin"           # void variant, no payload
+
+  [[storage_key.variant]]
+  name = "Position"
+  type = ["Address"]       # tuple payload types, in order
+
+# Internal value types: what you serialize into those entries.
+[[value_type]]
+name = "PositionState"
+kind = "struct"
+durability = "persistent"
+
+  [[value_type.field]]
+  name = "collateral"
+  type = "i128"
+
+  [[value_type.field]]
+  name = "debt"
+  type = "i128"
+```
+
+A unit enum declares explicit discriminants instead of variants:
+
+```toml
+[[value_type]]
+name = "Status"
+kind = "enum"
+
+  [[value_type.case]]
+  name = "Active"
+  value = 0
+
+  [[value_type.case]]
+  name = "Paused"
+  value = 1
+```
+
+**Declaration order is layout order.** Soroban serializes struct fields and union variants positionally, so the order you write them in is the order stored on chain. Write them in the order your Rust type declares them. For a unit enum the `value` is the discriminant that is actually written, so order in the file does not matter but the numbers do.
+
+### Type spelling
+
+Type strings use the same Rust-like spelling the report prints, so a type named in a finding can be pasted straight back into a manifest.
+
+| Spelling | Meaning |
+| :--- | :--- |
+| `bool`, `u32`, `i32`, `u64`, `i64`, `u128`, `i128`, `u256`, `i256` | scalars |
+| `Bytes`, `String`, `Symbol`, `Address`, `Timepoint`, `Duration` | built-ins |
+| `Val`, `Error`, `()` | raw value, error, void |
+| `Option<T>`, `Vec<T>`, `Map<K, V>`, `Result<T, E>` | containers |
+| `BytesN<32>` | fixed-length bytes |
+| `(Address, u32)` | tuple |
+| `PositionState` | a user-defined type, exported or declared in the manifest |
+
+### Validation and reconciliation
+
+A manifest is a safety input, so it is validated strictly rather than interpreted loosely. Unknown keys, a `kind` that does not match the member table supplied, duplicate fields, two enum cases sharing a discriminant, and unparseable type strings are all hard errors. A typo fails loudly instead of silently narrowing coverage.
+
+Each manifest is also reconciled against its own build's exported spec. A declared type that the spec has never heard of is fine, since that is precisely the internal-type case the manifest exists for. But when a declared name **is** exported, the two must agree on field order, field types, variant order, payloads, and discriminants. Disagreement stops the run:
+
+```
+Error: Storage schema for the old build disagrees with that build's exported contract spec
+
+Caused by:
+    struct 'ConfigData': field at position 0 is declared as 'threshold' but the old build
+    exports 'admin' there. Field order is layout, so this disagreement cannot be reconciled
+    automatically.
+```
+
+This is deliberate. A manifest that contradicts the contract is more dangerous than no manifest, because it would certify a layout the contract does not use.
+
+### How storage findings are reported
+
+Storage findings reuse the exported-interface categories behind a `Storage ` prefix, and each message is qualified with the declared role and durability:
+
+```
+--- [STORAGE STRUCT FIELD REORDERED] ---
+🔴 [declared storage value (persistent)] Struct 'PositionState': field at position 0 changed
+   from 'collateral' to 'debt'. Positional serialization breaks layout compatibility.
+```
+
+Severities match the exported rules with one deliberate exception. Appending a field is a **Warning** for a storage value, because existing entries still decode for the fields that were already there and only need a migration or default. The same append to a storage **key** is **Critical**, because a key's bytes are the address of every entry written under it, so changing its shape orphans all existing data.
+
+When a schema is analyzed, the verdict widens but stays bounded:
+
+```
+Status: ✅ PASSED (No exported-interface or declared-storage breaks)
+Scope:  Exported interface + environment metadata, plus a declared storage schema
+        (1 key type(s), 1 value type(s)). Storage coverage is limited to the declared types.
+```
+
+Storage findings count toward `is_safe` and therefore toward the exit code, so a declared-layout break blocks a deployment exactly as an exported break does.
+
+### Coverage limits
+
+Coverage is bounded by what you declare. A storage type you forget to declare is not analyzed, and the report does not pretend otherwise. If a declaration references a type that is neither declared in the manifest nor exported by the contract, that dangling reference is reported as an informational finding rather than quietly skipped.
+
+Storage schemas apply to a single contract pair and are refused in batch mode, since one manifest cannot describe several different contracts.
 
 ## Detection Categories
 
@@ -289,10 +457,56 @@ If that command fails, the pipeline stops before the upgrade is published.
 
 ## Limitations
 
+- **Storage layout is only analyzed when you declare it.** Without a storage schema, the tool sees only the exported interface and says so explicitly in every format. With one, coverage extends exactly as far as the types you declared and no further.
+- **The schema is a declaration, not a measurement.** The tool trusts what you declare, after checking it does not contradict the exported spec. It does not read the compiled code to confirm that the declared types are the ones actually written to storage. Keeping the manifest truthful is the team's responsibility, in the same way a type signature is.
+- Storage access patterns are not extracted from the WASM code section. A future change could infer storage writes and key construction statically, which would remove the need to declare them by hand. That work is deliberately out of scope here.
 - Event detection relies on a name heuristic. A type that represents an event but does not contain `event` in its name will be analyzed as an ordinary struct or enum.
 - The tool reasons about the declared interface in the spec sections. It does not analyze the function bodies, so a change in internal logic that keeps the same interface is invisible to it.
-- Appended struct fields are reported as warnings rather than errors. Whether they are truly safe depends on having a migration or default in place, which the tool cannot verify.
+- Appended struct fields on values are reported as warnings rather than errors. Whether they are truly safe depends on having a migration or default in place, which the tool cannot verify.
 - Comparison is by name. Renaming a type is seen as removing the old name and adding a new one, not as a rename.
+- Storage schemas are not supported in batch mode, because a manifest describes one specific contract's layout.
+
+## Migration Note
+
+This release changes the wording of the verdict and adds a new optional input. Nothing you already run breaks, but two things look different.
+
+### The verdict wording changed
+
+The status line is now explicit about the scope it covers.
+
+| Before | After |
+| :--- | :--- |
+| `✅ PASSED (No breaking changes detected)` | `✅ PASSED (No exported-interface breaking changes)` |
+| `❌ FAILED (Critical breaking changes detected)` | `❌ FAILED (Exported-interface breaking changes detected)` |
+
+When a storage schema is supplied, the passing wording widens to `✅ PASSED (No exported-interface or declared-storage breaks)`.
+
+The old wording was not inaccurate about what had been checked, but it implied a broader guarantee than the analysis supported. A reader could reasonably take "no breaking changes detected" to mean "safe to upgrade", including storage. It did not mean that, and it never had. The new wording states the boundary instead of leaving it to be inferred, and every format now carries a scope line saying whether storage layout was analyzed.
+
+**If you match on output text**, update any assertion on the old status strings. The severity counts, category names, `is_safe`, and exit-code semantics are unchanged, so tooling that keys on those needs no changes.
+
+### JSON gained scope fields
+
+Two additive fields appear at the top level. Existing fields are untouched, so consumers that ignore unknown keys need no changes.
+
+```json
+{
+  "is_safe": true,
+  "certifies": "Exported interface + environment metadata only — storage layout is NOT verified by this result.",
+  "scope": {
+    "exported_interface_analyzed": true,
+    "env_metadata_analyzed": true,
+    "storage_layout_analyzed": false,
+    "summary": "..."
+  }
+}
+```
+
+If your pipeline treats `is_safe: true` as "storage compatible", check `scope.storage_layout_analyzed` as well. When it is `false`, storage was not examined at all. When it is `true`, `storage_key_types` and `storage_value_types` report how many declared types were covered.
+
+### The new storage-schema input
+
+`--old-storage-schema` and `--new-storage-schema` are optional. Omitting them reproduces the previous behavior exactly, now with honest scope reporting. Adopting them is incremental: declare your storage-key types and the internal types you serialize into storage, starting with the ones holding value-bearing data. Partial coverage is genuinely useful, and the report always states how far it reached. See [Storage Schema Analysis](#storage-schema-analysis) for the format.
 
 ## Frequently Asked Questions
 
@@ -303,9 +517,18 @@ No. It works entirely from the two local WASM files.
 It works on any WASM that embeds a standard `contractspecv0` custom section. If that section is missing, there is nothing to compare and the spec will appear empty.
 
 **Why is an appended field only a warning?**
-Appending a field does not move existing fields, so old data still deserializes for the fields that were already there. The new field, however, has no stored value in old entries, so you need a migration or a default. The tool flags this so you remember to handle it.
+Appending a field does not move existing fields, so old data still deserializes for the fields that were already there. The new field, however, has no stored value in old entries, so you need a migration or a default. The tool flags this so you remember to handle it. Note that appending to a declared storage **key** is Critical rather than a warning, because it changes the address of every entry.
 
 **What counts as a safe upgrade?**
-Any run that finishes with zero critical findings. Warnings and info findings are worth reviewing but do not block deployment.
+Any run that finishes with zero critical findings, *within the scope that was analyzed*. Warnings and info findings are worth reviewing but do not block deployment. Read [What a Passing Verdict Guarantees](#what-a-passing-verdict-guarantees) before treating a pass as storage compatibility.
+
+**Does a green run mean my upgrade is storage safe?**
+Not on its own. By default the tool analyzes only the exported interface, and it says so in the report. Storage layout is analyzed only when you supply a [storage schema](#storage-schema-analysis), and then only for the types you declared.
+
+**Do I have to declare every storage type?**
+No. Partial coverage is useful and the report always states how far the analysis reached. Start with your storage-key types and the internal types that hold value-bearing data, since those are where a silent layout change is most costly.
+
+**Why do I need two schema files instead of one?**
+A layout change is only observable as a difference between two snapshots. One file describes one build, so detecting that a field moved requires the layout before and after. Keeping the manifest in version control means you usually already have both.
 
 For guidance on contributing changes to this tool, see [contributing.md](contributing.md).

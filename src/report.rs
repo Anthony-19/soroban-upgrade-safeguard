@@ -540,7 +540,10 @@ impl SafetyReport {
         };
         output.push_str(&format!("## Status: {}\n\n", status));
         output.push_str(&format!("_{}_\n\n", self.scope.summary_line()));
-        output.push_str(&format!("**Scope:** {}\n\n", self.scope.storage_status_line()));
+        output.push_str(&format!(
+            "**Scope:** {}\n\n",
+            self.scope.storage_status_line()
+        ));
 
         output.push_str("### Summary Table\n\n");
         output.push_str("| Finding Severity | Count |\n");
