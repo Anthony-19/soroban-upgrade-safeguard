@@ -903,22 +903,22 @@ fn check_enum_cases(
         }
     }
 
-    // Check for new enum cases (usually safe, but good to know)
-    if new_cases.len() > old_cases.len() {
-        for new_case in new_cases {
-            let new_name = new_case.name.to_string();
-            if !old_cases.iter().any(|c| c.name.to_string() == new_name) {
-                report.findings.push(Finding {
-                    severity: Severity::Info,
-                    category: format!("{} Added", category_prefix),
-                    message: format!(
-                        "{} '{}': new case '{}' (value {}) added.",
-                        msg_prefix, name, new_name, new_case.value
-                    ),
-                    type_name: Some(name.to_string()),
-                    target: Some(format!("{}.{}", name, new_name)),
-                });
-            }
+    // Check for new enum cases (usually safe, but good to know).
+    // Note: no count guard here — a swap (one removal + one addition) keeps the
+    // count equal but still introduces a new case that must be reported.
+    for new_case in new_cases {
+        let new_name = new_case.name.to_string();
+        if !old_cases.iter().any(|c| c.name.to_string() == new_name) {
+            report.findings.push(Finding {
+                severity: Severity::Info,
+                category: format!("{} Added", category_prefix),
+                message: format!(
+                    "{} '{}': new case '{}' (value {}) added.",
+                    msg_prefix, name, new_name, new_case.value
+                ),
+                type_name: Some(name.to_string()),
+                target: Some(format!("{}.{}", name, new_name)),
+            });
         }
     }
 }
@@ -2751,5 +2751,121 @@ mod tests {
             let report2 = compare(&old, &new);
             prop_assert_eq!(report.findings.len(), report2.findings.len());
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Helper: build a ContractSpec with a single named enum.
+    // ---------------------------------------------------------------
+    fn spec_with_enum(enum_name: &str, cases: Vec<(&str, u32)>) -> ContractSpec {
+        let mut spec = ContractSpec::default();
+        let xdr_cases: Vec<ScSpecUdtEnumCaseV0> = cases
+            .into_iter()
+            .map(|(name, value)| ScSpecUdtEnumCaseV0 {
+                doc: StringM::default(),
+                name: name.try_into().unwrap(),
+                value,
+            })
+            .collect();
+        spec.enums.insert(
+            enum_name.to_string(),
+            ScSpecUdtEnumV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: enum_name.try_into().unwrap(),
+                cases: VecM::try_from(xdr_cases).unwrap(),
+            },
+        );
+        spec
+    }
+
+    // ---------------------------------------------------------------
+    // Test: swap (one removal + one addition) reports both findings.
+    // ---------------------------------------------------------------
+    #[test]
+    fn enum_case_swap_reports_removed_and_added() {
+        // v1: Status { Active = 0, Pending = 1 }
+        let old = spec_with_enum("Status", vec![("Active", 0), ("Pending", 1)]);
+        // v2: Status { Active = 0, Completed = 2 }  (Pending removed, Completed added)
+        let new = spec_with_enum("Status", vec![("Active", 0), ("Completed", 2)]);
+
+        let report = compare(&old, &new);
+
+        // Removal must be reported as Critical
+        let removal = report.findings.iter().find(|f| {
+            f.category == "Enum Case Removed" && f.target.as_deref() == Some("Status.Pending")
+        });
+        assert!(
+            removal.is_some(),
+            "Expected a critical finding for removed case 'Pending'"
+        );
+        assert_eq!(removal.unwrap().severity, Severity::Critical);
+
+        // Addition must be reported as Info
+        let addition = report.findings.iter().find(|f| {
+            f.category == "Enum Case Added" && f.target.as_deref() == Some("Status.Completed")
+        });
+        assert!(
+            addition.is_some(),
+            "Expected an info finding for added case 'Completed' (count-equal swap was previously missed)"
+        );
+        assert_eq!(addition.unwrap().severity, Severity::Info);
+    }
+
+    // ---------------------------------------------------------------
+    // Test: only additions (counts differ) still works.
+    // ---------------------------------------------------------------
+    #[test]
+    fn enum_case_only_additions_still_reported() {
+        let old = spec_with_enum("Color", vec![("Red", 0)]);
+        let new = spec_with_enum("Color", vec![("Red", 0), ("Blue", 1), ("Green", 2)]);
+
+        let report = compare(&old, &new);
+
+        let added: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.category == "Enum Case Added")
+            .collect();
+        assert_eq!(added.len(), 2, "Expected findings for both Blue and Green");
+    }
+
+    // ---------------------------------------------------------------
+    // Test: only removals still reported as Critical.
+    // ---------------------------------------------------------------
+    #[test]
+    fn enum_case_only_removals_still_reported() {
+        let old = spec_with_enum("Color", vec![("Red", 0), ("Blue", 1)]);
+        let new = spec_with_enum("Color", vec![("Red", 0)]);
+
+        let report = compare(&old, &new);
+
+        let removed: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.category == "Enum Case Removed")
+            .collect();
+        assert_eq!(removed.len(), 1, "Expected one removal finding for Blue");
+        assert_eq!(removed[0].severity, Severity::Critical);
+    }
+
+    // ---------------------------------------------------------------
+    // Test: no changes produce no enum findings.
+    // ---------------------------------------------------------------
+    #[test]
+    fn enum_no_changes_no_findings() {
+        let old = spec_with_enum("State", vec![("On", 1), ("Off", 0)]);
+        let new = spec_with_enum("State", vec![("On", 1), ("Off", 0)]);
+
+        let report = compare(&old, &new);
+
+        let enum_findings: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.category.starts_with("Enum Case"))
+            .collect();
+        assert!(
+            enum_findings.is_empty(),
+            "Identical enums should produce no findings"
+        );
     }
 }
