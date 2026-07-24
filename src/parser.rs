@@ -4,6 +4,7 @@ use stellar_xdr::curr::{Limited, ReadXdr, ScEnvMetaEntry, ScSpecEntry};
 use wasmparser::{Parser, Payload};
 
 use crate::limits::{find_limit_error, EntryKind, LimitError, ResourcePolicy};
+use crate::spec::TaggedSpecEntry;
 
 /// Decoded contents of a contract's `contractenvmetav0` custom section.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +48,10 @@ impl ContractEnvMeta {
 /// Represents the extracted Soroban-specific custom sections from a WASM module.
 #[derive(Debug, Default)]
 pub struct SorobanMetadata {
-    pub spec: Vec<ScSpecEntry>,
+    /// Decoded spec entries in order, each tagged with their source section index.
+    pub spec: Vec<TaggedSpecEntry>,
+    /// Number of distinct `contractspecv0` custom sections found.
+    pub spec_section_count: usize,
     pub env_meta: Option<ContractEnvMeta>,
 }
 
@@ -204,7 +208,14 @@ pub fn extract_metadata_with_policy(
                             section.data_offset()
                         )
                     })?;
-                    metadata.spec.extend(entries);
+                    // Tag each decoded entry with its source section index so
+                    // duplicate detection can report exactly which sections
+                    // carry conflicting definitions.
+                    let tagged = entries
+                        .into_iter()
+                        .map(|e| TaggedSpecEntry::new(e, section_index));
+                    metadata.spec.extend(tagged);
+                    metadata.spec_section_count += 1;
                 }
                 "contractenvmetav0" => {
                     // A malformed env-meta section is tolerated (best-effort, as

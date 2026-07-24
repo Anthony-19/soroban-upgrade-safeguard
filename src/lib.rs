@@ -205,13 +205,32 @@ pub fn compare_wasm_bytes_with_options(
     let new_meta = parser::extract_metadata_with_policy(new_wasm, policy)
         .context("Failed to extract metadata from the new WASM")?;
 
-    let old_spec = ContractSpec::from_entries(&old_meta.spec);
-    let new_spec = ContractSpec::from_entries(&new_meta.spec);
+    // Build specs with duplicate detection. Conflicting duplicates are wired
+    // into the diff report as Critical findings so they affect the exit code
+    // and appear in JSON output; identical duplicates become Info findings.
+    let (old_spec, old_dups) = ContractSpec::from_entries_checked(&old_meta.spec);
+    let (new_spec, new_dups) = ContractSpec::from_entries_checked(&new_meta.spec);
 
     let old_spec_summary = old_spec.summary();
     let new_spec_summary = new_spec.summary();
 
     let mut diff_report = diff::compare_with_policy(&old_spec, &new_spec, policy)?;
+
+    // Inject duplicate findings before the structural diff so that the report
+    // presents them alongside the regular findings in JSON/text/markdown.
+    diff::report_duplicate_spec_entries(
+        "old",
+        &old_dups,
+        old_meta.spec_section_count,
+        &mut diff_report,
+    );
+    diff::report_duplicate_spec_entries(
+        "new",
+        &new_dups,
+        new_meta.spec_section_count,
+        &mut diff_report,
+    );
+
     diff::compare_env_metadata(
         old_meta.env_meta.as_ref(),
         new_meta.env_meta.as_ref(),
@@ -226,6 +245,22 @@ pub fn compare_wasm_bytes_with_options(
         exported_interface: true,
         env_metadata: true,
         storage_schema: report::StorageScopeState::NotAnalyzed,
+        old_spec_section_count: old_meta.spec_section_count,
+        new_spec_section_count: new_meta.spec_section_count,
+        old_duplicate_names: {
+            let mut names: Vec<String> =
+                old_dups.iter().map(|d| d.name.clone()).collect();
+            names.sort();
+            names.dedup();
+            names
+        },
+        new_duplicate_names: {
+            let mut names: Vec<String> =
+                new_dups.iter().map(|d| d.name.clone()).collect();
+            names.sort();
+            names.dedup();
+            names
+        },
     };
 
     if let Some((old_schema, new_schema)) = options.storage_schemas {
