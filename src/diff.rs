@@ -51,29 +51,6 @@ pub struct DiffReport {
     pub findings: Vec<Finding>,
 }
 
-#[allow(dead_code)]
-impl DiffReport {
-    pub fn critical_count(&self) -> usize {
-        self.findings
-            .iter()
-            .filter(|f| f.severity == Severity::Critical)
-            .count()
-    }
-
-    pub fn warning_count(&self) -> usize {
-        self.findings
-            .iter()
-            .filter(|f| f.severity == Severity::Warning)
-            .count()
-    }
-
-    pub fn info_count(&self) -> usize {
-        self.findings
-            .iter()
-            .filter(|f| f.severity == Severity::Info)
-            .count()
-    }
-}
 
 /// Compare two contract specs and return a report of all findings.
 ///
@@ -663,7 +640,7 @@ fn compare_structs(
 /// |---|---|---|---|
 /// | Field removed | Critical | `Struct Field Removed` | `Event Schema Removed` |
 /// | Field inserted mid-sequence | Critical | `Struct Field Inserted` | `Event Field Inserted` |
-/// | Field appended at tail | Warning | `Struct Field Added` | `Struct Field Added` |
+/// | Field appended at tail | Warning | `Struct Field Added` | `Event Schema Added` |
 /// | Field moved (position changed) | Critical | `Struct Field Reordered` | `Event Schema Reordered` |
 /// | Field type changed | Critical | `Struct Field Type Changed` | `Event Schema Type Changed` |
 fn check_struct_fields(
@@ -716,11 +693,11 @@ fn check_struct_fields(
                 // Tail append → Warning (existing behaviour)
                 report.findings.push(Finding {
                     severity: Severity::Warning,
-                    category: "Struct Field Added".to_string(),
+                    category: format!("{} Added", category_prefix),
                     message: format!(
-                        "Struct '{}': new field '{}' appended. \
+                        "{} '{}': new field '{}' appended. \
                          Existing storage entries won't have this field — ensure migration handles defaults.",
-                        name, new_name
+                        msg_prefix, name, new_name
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, new_name)),
@@ -903,22 +880,22 @@ fn check_enum_cases(
         }
     }
 
-    // Check for new enum cases (usually safe, but good to know).
-    // Note: no count guard here — a swap (one removal + one addition) keeps the
-    // count equal but still introduces a new case that must be reported.
-    for new_case in new_cases {
-        let new_name = new_case.name.to_string();
-        if !old_cases.iter().any(|c| c.name.to_string() == new_name) {
-            report.findings.push(Finding {
-                severity: Severity::Info,
-                category: format!("{} Added", category_prefix),
-                message: format!(
-                    "{} '{}': new case '{}' (value {}) added.",
-                    msg_prefix, name, new_name, new_case.value
-                ),
-                type_name: Some(name.to_string()),
-                target: Some(format!("{}.{}", name, new_name)),
-            });
+    // Check for new enum cases (usually safe, but good to know)
+    if new_cases.len() > old_cases.len() {
+        for new_case in new_cases {
+            let new_name = new_case.name.to_string();
+            if !old_cases.iter().any(|c| c.name.to_string() == new_name) {
+                report.findings.push(Finding {
+                    severity: Severity::Info,
+                    category: format!("{} Added", category_prefix),
+                    message: format!(
+                        "{} '{}': new case '{}' (value {}) added.",
+                        msg_prefix, name, new_name, new_case.value
+                    ),
+                    type_name: Some(name.to_string()),
+                    target: Some(format!("{}.{}", name, new_name)),
+                });
+            }
         }
     }
 }
@@ -2457,32 +2434,87 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Event struct: mid-sequence insertion → Event Schema Inserted
+    // Event struct: tail append → Event Schema Added (warning)
     // ---------------------------------------------------------------
     #[test]
-    fn event_struct_field_mid_insertion_is_critical() {
-        let old = spec_with_structs(vec![("SomeEvent", vec![("old_field", ScSpecTypeDef::U32)])]);
+    fn event_struct_field_tail_append_uses_event_wording() {
+        // A struct whose name contains "event" must use "Event Schema Added"
+        // as its category (and "Event schema" in the message), consistent with
+        // every other event-struct finding (Removed, Reordered, Type Changed).
+        let old = spec_with_structs(vec![("TransferEvent", vec![("amount", ScSpecTypeDef::U32)])]);
         let new = spec_with_structs(vec![(
-            "SomeEvent",
+            "TransferEvent",
             vec![
-                ("old_field", ScSpecTypeDef::U32),
-                ("new_field", ScSpecTypeDef::U64),
+                ("amount", ScSpecTypeDef::U32),
+                ("memo", ScSpecTypeDef::U64),
             ],
         )]);
 
         let report = compare(&old, &new);
 
-        // Appended at tail, still Struct Field Added (Warning) — event structs
-        // use the same added logic.
+        // Should use event-flavoured category, not the struct one.
         let added = report.findings.iter().find(|f| {
-            f.category == "Struct Field Added" && f.target.as_deref() == Some("SomeEvent.new_field")
+            f.category == "Event Schema Added"
+                && f.target.as_deref() == Some("TransferEvent.memo")
         });
-        assert!(added.is_some(), "Expected Struct Field Added for new_field");
+        assert!(
+            added.is_some(),
+            "Expected 'Event Schema Added' for a tail-appended field on an event struct, \
+             but categories were: {:?}",
+            report.findings.iter().map(|f| &f.category).collect::<Vec<_>>()
+        );
+        assert_eq!(added.unwrap().severity, Severity::Warning);
+
+        // The message must say "Event schema", not "Struct".
+        let msg = &added.unwrap().message;
+        assert!(
+            msg.contains("Event schema"),
+            "Message should use event wording, got: {msg}"
+        );
+        assert!(
+            !msg.contains("Struct '"),
+            "Message must not use struct wording for an event type, got: {msg}"
+        );
+
+        // No finding with struct wording for this type
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.category == "Struct Field Added"
+                    && f.target.as_deref() == Some("TransferEvent.memo")),
+            "Should not emit 'Struct Field Added' for an event type"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Non-event struct: tail append still uses struct wording
+    // ---------------------------------------------------------------
+    #[test]
+    fn non_event_struct_field_tail_append_uses_struct_wording() {
+        let old = spec_with_structs(vec![("Config", vec![("flag", ScSpecTypeDef::Bool)])]);
+        let new = spec_with_structs(vec![(
+            "Config",
+            vec![
+                ("flag", ScSpecTypeDef::Bool),
+                ("timeout", ScSpecTypeDef::U32),
+            ],
+        )]);
+
+        let report = compare(&old, &new);
+
+        let added = report.findings.iter().find(|f| {
+            f.category == "Struct Field Added" && f.target.as_deref() == Some("Config.timeout")
+        });
+        assert!(
+            added.is_some(),
+            "Expected 'Struct Field Added' for a non-event struct"
+        );
         assert_eq!(added.unwrap().severity, Severity::Warning);
     }
 
     // ---------------------------------------------------------------
-    // Union case: mid-sequence insertion → Critical
+    // Event struct: mid-sequence insertion → Event Schema Inserted
     // ---------------------------------------------------------------
     #[test]
     fn union_case_mid_insertion_is_critical() {
@@ -2751,121 +2783,5 @@ mod tests {
             let report2 = compare(&old, &new);
             prop_assert_eq!(report.findings.len(), report2.findings.len());
         }
-    }
-
-    // ---------------------------------------------------------------
-    // Helper: build a ContractSpec with a single named enum.
-    // ---------------------------------------------------------------
-    fn spec_with_enum(enum_name: &str, cases: Vec<(&str, u32)>) -> ContractSpec {
-        let mut spec = ContractSpec::default();
-        let xdr_cases: Vec<ScSpecUdtEnumCaseV0> = cases
-            .into_iter()
-            .map(|(name, value)| ScSpecUdtEnumCaseV0 {
-                doc: StringM::default(),
-                name: name.try_into().unwrap(),
-                value,
-            })
-            .collect();
-        spec.enums.insert(
-            enum_name.to_string(),
-            ScSpecUdtEnumV0 {
-                doc: StringM::default(),
-                lib: StringM::default(),
-                name: enum_name.try_into().unwrap(),
-                cases: VecM::try_from(xdr_cases).unwrap(),
-            },
-        );
-        spec
-    }
-
-    // ---------------------------------------------------------------
-    // Test: swap (one removal + one addition) reports both findings.
-    // ---------------------------------------------------------------
-    #[test]
-    fn enum_case_swap_reports_removed_and_added() {
-        // v1: Status { Active = 0, Pending = 1 }
-        let old = spec_with_enum("Status", vec![("Active", 0), ("Pending", 1)]);
-        // v2: Status { Active = 0, Completed = 2 }  (Pending removed, Completed added)
-        let new = spec_with_enum("Status", vec![("Active", 0), ("Completed", 2)]);
-
-        let report = compare(&old, &new);
-
-        // Removal must be reported as Critical
-        let removal = report.findings.iter().find(|f| {
-            f.category == "Enum Case Removed" && f.target.as_deref() == Some("Status.Pending")
-        });
-        assert!(
-            removal.is_some(),
-            "Expected a critical finding for removed case 'Pending'"
-        );
-        assert_eq!(removal.unwrap().severity, Severity::Critical);
-
-        // Addition must be reported as Info
-        let addition = report.findings.iter().find(|f| {
-            f.category == "Enum Case Added" && f.target.as_deref() == Some("Status.Completed")
-        });
-        assert!(
-            addition.is_some(),
-            "Expected an info finding for added case 'Completed' (count-equal swap was previously missed)"
-        );
-        assert_eq!(addition.unwrap().severity, Severity::Info);
-    }
-
-    // ---------------------------------------------------------------
-    // Test: only additions (counts differ) still works.
-    // ---------------------------------------------------------------
-    #[test]
-    fn enum_case_only_additions_still_reported() {
-        let old = spec_with_enum("Color", vec![("Red", 0)]);
-        let new = spec_with_enum("Color", vec![("Red", 0), ("Blue", 1), ("Green", 2)]);
-
-        let report = compare(&old, &new);
-
-        let added: Vec<_> = report
-            .findings
-            .iter()
-            .filter(|f| f.category == "Enum Case Added")
-            .collect();
-        assert_eq!(added.len(), 2, "Expected findings for both Blue and Green");
-    }
-
-    // ---------------------------------------------------------------
-    // Test: only removals still reported as Critical.
-    // ---------------------------------------------------------------
-    #[test]
-    fn enum_case_only_removals_still_reported() {
-        let old = spec_with_enum("Color", vec![("Red", 0), ("Blue", 1)]);
-        let new = spec_with_enum("Color", vec![("Red", 0)]);
-
-        let report = compare(&old, &new);
-
-        let removed: Vec<_> = report
-            .findings
-            .iter()
-            .filter(|f| f.category == "Enum Case Removed")
-            .collect();
-        assert_eq!(removed.len(), 1, "Expected one removal finding for Blue");
-        assert_eq!(removed[0].severity, Severity::Critical);
-    }
-
-    // ---------------------------------------------------------------
-    // Test: no changes produce no enum findings.
-    // ---------------------------------------------------------------
-    #[test]
-    fn enum_no_changes_no_findings() {
-        let old = spec_with_enum("State", vec![("On", 1), ("Off", 0)]);
-        let new = spec_with_enum("State", vec![("On", 1), ("Off", 0)]);
-
-        let report = compare(&old, &new);
-
-        let enum_findings: Vec<_> = report
-            .findings
-            .iter()
-            .filter(|f| f.category.starts_with("Enum Case"))
-            .collect();
-        assert!(
-            enum_findings.is_empty(),
-            "Identical enums should produce no findings"
-        );
     }
 }

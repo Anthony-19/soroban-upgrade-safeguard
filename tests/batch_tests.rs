@@ -244,3 +244,480 @@ fn batch_conflicting_options_exit_with_error() {
         "positional args + manifest must fail"
     );
 }
+
+#[test]
+fn malformed_toml_manifest_surfaces_toml_error_detail() {
+    // A .toml file with a deliberate syntax error (missing closing bracket).
+    let bad_toml = r#"
+[[pairs]
+old = "v1.wasm"
+new = "v2.wasm"
+"#;
+    let manifest_path = write_manifest("bad_manifest.toml", bad_toml);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .output()
+        .expect("failed to run binary");
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_ne!(code, 0, "malformed TOML manifest must exit non-zero");
+    // The TOML parser's own diagnostic must appear in the error chain.
+    assert!(
+        stderr.contains("TOML") || stderr.contains("toml") || stderr.contains("expected"),
+        "Error output should contain the TOML parser's diagnostic, got: {stderr}"
+    );
+    // Must NOT fall through to the generic "as either TOML or JSON" message.
+    assert!(
+        !stderr.contains("as either TOML or JSON"),
+        "Should not show generic both-format error for a .toml file, got: {stderr}"
+    );
+}
+
+#[test]
+fn malformed_json_manifest_surfaces_json_error_detail() {
+    // A .json file with a deliberate syntax error (trailing comma).
+    let bad_json = r#"{
+  "pairs": [
+    {
+      "old": "v1.wasm",
+      "new": "v2.wasm",
+    }
+  ]
+}"#;
+    let manifest_path = write_manifest("bad_manifest.json", bad_json);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .output()
+        .expect("failed to run binary");
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_ne!(code, 0, "malformed JSON manifest must exit non-zero");
+    // The JSON parser's own diagnostic (line/column) must appear.
+    assert!(
+        stderr.contains("JSON") || stderr.contains("json") || stderr.contains("line"),
+        "Error output should contain the JSON parser's diagnostic, got: {stderr}"
+    );
+    // Must NOT fall through to the generic "as either TOML or JSON" message.
+    assert!(
+        !stderr.contains("as either TOML or JSON"),
+        "Should not show generic both-format error for a .json file, got: {stderr}"
+    );
+}
+
+#[test]
+fn unknown_extension_manifest_shows_both_errors() {
+    // A file with no recognised extension that is invalid in both formats.
+    let garbage = "this is not toml or json @@@###";
+    let manifest_path = write_manifest("bad_manifest.cfg", garbage);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .output()
+        .expect("failed to run binary");
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_ne!(code, 0, "unrecognised-extension invalid manifest must exit non-zero");
+    // Both parser errors should appear when the extension gives no hint.
+    assert!(
+        stderr.contains("TOML error") || stderr.contains("toml error"),
+        "Should mention TOML error for unknown extension, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("JSON error") || stderr.contains("json error"),
+        "Should mention JSON error for unknown extension, got: {stderr}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cross-contract dependency tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn direct_dependency_propagates_breaking_change() {
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "token"
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "pool"
+
+        [[dependencies]]
+        caller = "pool"
+        callee = "token"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v2.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+    );
+
+    let manifest_path = write_manifest("cross_contract_direct.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args(["--manifest", manifest_path.to_str().unwrap(), "--format", "json"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+
+    assert_eq!(json["is_safe"], Value::Bool(false));
+    assert_eq!(json["results"]["token"]["is_safe"], Value::Bool(false));
+    assert_eq!(json["results"]["pool"]["is_safe"], Value::Bool(true));
+
+    let cross_findings = json["cross_contract_findings"]["pool"]
+        .as_array()
+        .expect("pool must have cross-contract findings");
+    assert!(!cross_findings.is_empty(), "pool must receive propagated findings from token");
+    assert_eq!(cross_findings[0]["propagation_depth"], 1);
+    assert_eq!(cross_findings[0]["changed_contract"], "token");
+    assert_eq!(cross_findings[0]["affected_contract"], "pool");
+
+    let code = output.status.code().expect("process terminated by signal");
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn transitive_dependency_propagates_breaking_change() {
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "token"
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "pool"
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "router"
+
+        [[dependencies]]
+        caller = "pool"
+        callee = "token"
+
+        [[dependencies]]
+        caller = "router"
+        callee = "pool"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v2.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+    );
+
+    let manifest_path = write_manifest("cross_contract_transitive.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args(["--manifest", manifest_path.to_str().unwrap(), "--format", "json"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+
+    assert_eq!(json["is_safe"], Value::Bool(false));
+
+    let pool_cross = json["cross_contract_findings"]["pool"]
+        .as_array()
+        .expect("pool must have findings");
+    let router_cross = json["cross_contract_findings"]["router"]
+        .as_array()
+        .expect("router must have findings");
+
+    assert!(!pool_cross.is_empty(), "pool directly depends on token");
+    assert!(!router_cross.is_empty(), "router transitively depends on token via pool");
+    assert_eq!(pool_cross[0]["propagation_depth"], 1);
+    assert_eq!(router_cross[0]["propagation_depth"], 2);
+    assert_eq!(pool_cross[0]["changed_contract"], "token");
+    assert_eq!(router_cross[0]["changed_contract"], "token");
+}
+
+#[test]
+fn cyclic_dependency_terminates_and_reports() {
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "contract_a"
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "contract_b"
+
+        [[dependencies]]
+        caller = "contract_a"
+        callee = "contract_b"
+
+        [[dependencies]]
+        caller = "contract_b"
+        callee = "contract_a"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v2.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+    );
+
+    let manifest_path = write_manifest("cross_contract_cyclic.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args(["--manifest", manifest_path.to_str().unwrap(), "--format", "json"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+
+    assert_eq!(json["is_safe"], Value::Bool(false));
+
+    let dep_findings = json["dependency_findings"]
+        .as_array()
+        .expect("must have dependency findings");
+    let cycle_finding = dep_findings.iter().find(|f| f["category"] == "Cyclic Contract Dependency");
+    assert!(cycle_finding.is_some(), "must report the cycle");
+
+    let cross_a = json["cross_contract_findings"]["contract_a"].as_array();
+    let cross_b = json["cross_contract_findings"]["contract_b"].as_array();
+    let total_cross = cross_a.map(|a| a.len()).unwrap_or(0)
+        + cross_b.map(|b| b.len()).unwrap_or(0);
+    assert!(total_cross > 0, "cycle must propagate findings");
+    assert!(total_cross < 100, "cycle must not produce unbounded findings");
+}
+
+#[test]
+fn missing_dependency_contract_reported() {
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "pool"
+
+        [[dependencies]]
+        caller = "pool"
+        callee = "oracle"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+    );
+
+    let manifest_path = write_manifest("cross_contract_missing.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args(["--manifest", manifest_path.to_str().unwrap(), "--format", "json"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+
+    assert_eq!(json["is_safe"], Value::Bool(false));
+
+    let dep_findings = json["dependency_findings"]
+        .as_array()
+        .expect("must have dependency findings");
+    let missing_finding = dep_findings.iter().find(|f| {
+        f["category"] == "Missing Dependency Contract"
+            && f["message"].as_str().unwrap_or("").contains("oracle")
+    });
+    assert!(missing_finding.is_some(), "must report missing oracle contract");
+    assert_eq!(missing_finding.unwrap()["severity"], "warning");
+}
+
+#[test]
+fn no_dependencies_means_no_cross_contract_findings() {
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "token"
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "pool"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v2.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+    );
+
+    let manifest_path = write_manifest("cross_contract_none.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args(["--manifest", manifest_path.to_str().unwrap(), "--format", "json"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+
+    assert_eq!(json["results"]["token"]["is_safe"], Value::Bool(false));
+    assert_eq!(json["results"]["pool"]["is_safe"], Value::Bool(true));
+
+    let cross_findings_obj = json["cross_contract_findings"].as_object();
+    if let Some(obj) = cross_findings_obj {
+        let pool_findings = obj.get("pool").and_then(|v| v.as_array());
+        assert!(
+            pool_findings.map(|a| a.is_empty()).unwrap_or(true),
+            "pool has no dependencies so should have no cross-contract findings"
+        );
+    }
+}
+
+#[test]
+fn text_output_displays_cross_contract_findings() {
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "token"
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "pool"
+
+        [[dependencies]]
+        caller = "pool"
+        callee = "token"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v2.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+    );
+
+    let manifest_path = write_manifest("cross_contract_text.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args(["--manifest", manifest_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+
+    assert!(
+        stdout.contains("Cross-Contract") || stdout.contains("cross-contract"),
+        "text output must mention cross-contract findings"
+    );
+    assert!(
+        stdout.contains("pool") && stdout.contains("token"),
+        "text output must name both contracts"
+    );
+}
+
+#[test]
+fn markdown_output_includes_cross_contract_table() {
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "token"
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "pool"
+
+        [[dependencies]]
+        caller = "pool"
+        callee = "token"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v2.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+    );
+
+    let manifest_path = write_manifest("cross_contract_md.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args(["--manifest", manifest_path.to_str().unwrap(), "--format", "markdown"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+
+    assert!(
+        stdout.contains("Cross-Contract") || stdout.contains("Dependency"),
+        "markdown must have cross-contract section"
+    );
+    assert!(
+        stdout.contains("|") && (stdout.contains("Affected") || stdout.contains("Changed")),
+        "markdown must have a table with affected/changed columns"
+    );
+}
+
+#[test]
+fn strict_mode_fails_on_cross_contract_warnings() {
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "token"
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "pool"
+
+        [[dependencies]]
+        caller = "pool"
+        callee = "token"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v2.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+    );
+
+    let manifest_path = write_manifest("cross_contract_strict.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args([
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--format",
+            "json",
+            "--strict",
+        ])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+
+    assert_eq!(json["strict"], Value::Bool(true));
+    assert_eq!(json["is_safe"], Value::Bool(false));
+}
