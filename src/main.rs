@@ -131,6 +131,16 @@ struct Args {
     /// detection). Overrides `[limits]` and the default.
     #[arg(long, value_name = "N")]
     max_walk_depth: Option<usize>,
+
+    /// Treat identical duplicate spec entries (same name, byte-identical
+    /// definition) as informational rather than warnings.
+    ///
+    /// This is a compatibility mode for toolchains that legitimately emit
+    /// split contractspecv0 sections with identical entries (e.g., some
+    /// SDK versions). Conflicting duplicates (different definitions) are
+    /// always Critical regardless of this flag.
+    #[arg(long)]
+    compat_duplicates: bool,
 }
 
 /// Resolve the effective [`ResourcePolicy`]: built-in defaults, overlaid by the
@@ -773,6 +783,7 @@ fn compare_contracts(
             suppressions: Some(suppressions),
             explain: args.explain,
             strict: args.strict,
+            compat_duplicates: args.compat_duplicates,
             storage_schemas: *storage_schemas,
         },
     )?;

@@ -234,6 +234,7 @@ pub fn report_duplicate_spec_entries(
     duplicates: &[DuplicateEntry],
     spec_section_count: usize,
     report: &mut DiffReport,
+    compat_duplicates: bool,
 ) {
     for dup in duplicates {
         let section_note = if spec_section_count > 1 {
@@ -253,8 +254,15 @@ pub fn report_duplicate_spec_entries(
         };
 
         if dup.is_identical {
+            // In compat mode: informational (safe to ignore for clean WASMs).
+            // Without compat mode: Warning (non-canonical WASM is suspicious).
+            let severity = if compat_duplicates {
+                Severity::Info
+            } else {
+                Severity::Warning
+            };
             report.findings.push(Finding {
-                severity: Severity::Info,
+                severity,
                 category: SPEC_DUPLICATE_CATEGORY.to_string(),
                 message: format!(
                     "{side} WASM: {} '{}' appears {} times with an identical definition{section_note}. \

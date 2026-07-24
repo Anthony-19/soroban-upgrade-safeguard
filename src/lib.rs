@@ -105,6 +105,12 @@ pub struct CompareOptions<'a> {
     pub explain: bool,
     /// Treat `Warning`-severity findings as failures (strict mode).
     pub strict: bool,
+    /// When `true`, identical duplicate spec entries (same name, byte-identical
+    /// definition) are downgraded to `Info` instead of failing the run.
+    /// Conflicting duplicates (different definitions) always remain `Critical`
+    /// even in compat mode — the analysis cannot be trusted when two definitions
+    /// disagree, regardless of this flag.
+    pub compat_duplicates: bool,
     /// Declared storage layouts of the old and new builds. When supplied, the
     /// pipeline additionally diffs these internal storage types through the same
     /// engine and records that storage was analyzed in the report's scope.
@@ -223,12 +229,14 @@ pub fn compare_wasm_bytes_with_options(
         &old_dups,
         old_meta.spec_section_count,
         &mut diff_report,
+        options.compat_duplicates,
     );
     diff::report_duplicate_spec_entries(
         "new",
         &new_dups,
         new_meta.spec_section_count,
         &mut diff_report,
+        options.compat_duplicates,
     );
 
     diff::compare_env_metadata(
