@@ -6,8 +6,15 @@ use std::path::{Path, PathBuf};
 
 use soroban_upgrade_safeguard::{
     color::should_disable_color,
-    diff, loader, parser, report, spec,
+    dependency::{
+        cycle_findings, missing_contract_findings, ContractDependency, CrossContractFinding,
+        DependencyGraph,
+    },
+    limits::{find_limit_error, LimitsConfig, ResourcePolicy},
+    loader, report,
+    storage_schema::StorageSchema,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
+    CompareOptions,
 };
 
 /// Output format for the safety report.
@@ -73,6 +80,17 @@ struct Args {
     #[arg(long)]
     no_color: bool,
 
+    /// Allow HTTP connections for RPC when the host is localhost/127.0.0.1.
+    /// Without this flag only HTTPS URLs are accepted.
+    #[arg(long)]
+    allow_http_local: bool,
+
+    /// Expected SHA-256 hash (hex) of the on-chain WASM baseline.
+    /// When provided the tool verifies the hash of the fetched bytecode
+    /// matches this value and fails immediately on mismatch.
+    #[arg(long, value_name = "HEX_HASH")]
+    expected_wasm_hash: Option<String>,
+
     /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
     #[arg(long, value_name = "MANIFEST_PATH")]
     manifest: Option<PathBuf>,
@@ -84,9 +102,100 @@ struct Args {
     /// Directory containing the new versions of the contracts for directory comparison
     #[arg(long, value_name = "NEW_DIR", requires = "old_dir")]
     new_dir: Option<PathBuf>,
+
+    /// Storage-schema manifest describing the OLD build's storage layout.
+    ///
+    /// Declares the storage-key types and internal value types that govern
+    /// on-chain compatibility but need not appear in the exported spec. Must be
+    /// given together with --new-storage-schema: detecting a layout change
+    /// requires both snapshots.
+    #[arg(long, value_name = "PATH", requires = "new_storage_schema")]
+    old_storage_schema: Option<PathBuf>,
+
+    /// Storage-schema manifest describing the NEW build's storage layout.
+    #[arg(long, value_name = "PATH", requires = "old_storage_schema")]
+    new_storage_schema: Option<PathBuf>,
+
+    /// Maximum XDR decode depth per entry. Overrides `[limits]` in the config
+    /// file and the built-in default. Guards against stack-overflow inputs.
+    #[arg(long, value_name = "N")]
+    max_xdr_depth: Option<u32>,
+
+    /// Maximum bytes decoded per WASM custom section. Overrides `[limits]` and
+    /// the default. Guards against oversized-length allocation inputs.
+    #[arg(long, value_name = "BYTES")]
+    max_xdr_len: Option<usize>,
+
+    /// Maximum decoded spec entries, summed across all sections. Overrides
+    /// `[limits]` and the default.
+    #[arg(long, value_name = "N")]
+    max_entries: Option<usize>,
+
+    /// Maximum recursive type-walk depth (equality, rendering, cascade
+    /// detection). Overrides `[limits]` and the default.
+    #[arg(long, value_name = "N")]
+    max_walk_depth: Option<usize>,
 }
 
-fn main() -> Result<()> {
+/// Resolve the effective [`ResourcePolicy`]: built-in defaults, overlaid by the
+/// `[limits]` table in the config file, overlaid by any `--max-*` CLI flags
+/// (flags win). `config_path` is the same file the suppression config is read
+/// from, if any.
+fn resolve_policy(args: &Args, config_path: Option<&Path>) -> Result<ResourcePolicy> {
+    let mut policy = ResourcePolicy::default();
+
+    if let Some(path) = config_path {
+        if let Some(file_limits) = LimitsConfig::load_optional(path)? {
+            policy = file_limits.apply_to(policy);
+        }
+    }
+
+    // CLI flags take precedence over the file and defaults.
+    if let Some(v) = args.max_xdr_depth {
+        policy.max_xdr_depth = v;
+    }
+    if let Some(v) = args.max_xdr_len {
+        policy.max_xdr_len = v;
+    }
+    if let Some(v) = args.max_entries {
+        policy.max_entries = v;
+    }
+    if let Some(v) = args.max_walk_depth {
+        policy.max_walk_depth = v;
+    }
+
+    Ok(policy)
+}
+
+/// Exit codes:
+/// - `0`: safe (no breaking changes, or all suppressed).
+/// - `1`: breaking changes detected, or a generic/IO/parse error.
+/// - `2`: a resource-limit violation on untrusted input (distinct so CI can tell
+///   "input was rejected as adversarial" apart from "the upgrade is unsafe").
+fn main() {
+    match run() {
+        Ok(()) => {}
+        Err(err) => {
+            if let Some(limit_err) = find_limit_error(&err) {
+                eprintln!("⛔ Resource limit exceeded: {limit_err}");
+                eprintln!(
+                    "   The input was rejected as potentially adversarial before it could \
+                     exhaust memory or the stack."
+                );
+                eprintln!(
+                    "   Raise the relevant limit via the [limits] table in .safeguard.toml or a \
+                     --max-* flag (see README)."
+                );
+                std::process::exit(2);
+            }
+            // Preserve anyhow's full error-chain formatting for everything else.
+            eprintln!("Error: {err:?}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run() -> Result<()> {
     let args = Args::parse();
 
     if should_disable_color(
@@ -111,6 +220,27 @@ fn main() -> Result<()> {
         anyhow::bail!("Cannot specify positional WASM paths when using batch mode (--manifest or --old-dir/--new-dir)");
     }
 
+    // A storage schema describes one specific contract's layout, so a single
+    // pair of manifests cannot be applied across a batch of different
+    // contracts. Refusing is better than silently analyzing the wrong layout.
+    if is_batch && args.old_storage_schema.is_some() {
+        anyhow::bail!(
+            "--old-storage-schema/--new-storage-schema describe a single contract's storage \
+             layout and cannot be used with batch mode. Run the pair on its own to analyze \
+             storage layout."
+        );
+    }
+
+    // Both manifests are loaded and validated up front so a malformed schema
+    // fails before any comparison work is reported.
+    let storage_schemas = match (&args.old_storage_schema, &args.new_storage_schema) {
+        (Some(old), Some(new)) => Some((
+            StorageSchema::load_from_path(old)?,
+            StorageSchema::load_from_path(new)?,
+        )),
+        _ => None,
+    };
+
     // In JSON or Markdown mode, decorative progress goes to stderr so stdout
     // stays a single, pristine document. In text mode it stays on stdout
     // exactly as before.
@@ -126,6 +256,13 @@ fn main() -> Result<()> {
     // Load suppression config: an explicit --config must exist; otherwise fall
     // back to `.safeguard.toml` in the working directory if it happens to be
     // present. With neither, an empty config preserves today's behavior.
+    //
+    // SECURITY WARNING: Storing a suppression configuration file (`.safeguard.toml`)
+    // in the current working directory is a security risk if the directory is writable
+    // by untrusted actors (e.g. pull request contributors in CI environments). A contributor
+    // could place/edit this file to neutralize Critical breaking change warnings.
+    // Ensure changes to `.safeguard.toml` are strictly reviewed, or use the explicit
+    // `--config` flag pointing to a trusted/read-only location in production pipelines.
     let suppressions = match &args.config {
         Some(path) => SuppressionConfig::load_from_path(path)?,
         None => {
@@ -133,14 +270,28 @@ fn main() -> Result<()> {
         }
     };
 
+    // The resource-limit policy is read from the same file as the suppression
+    // config (an explicit --config, else `.safeguard.toml` if present), then any
+    // --max-* flags applied on top.
+    let config_path: Option<PathBuf> = match &args.config {
+        Some(path) => Some(path.clone()),
+        None => {
+            let default = Path::new(DEFAULT_CONFIG_FILE);
+            default.exists().then(|| default.to_path_buf())
+        }
+    };
+    let policy = resolve_policy(&args, config_path.as_deref())?;
+
     if is_batch {
-        let pairs = if let Some(manifest_path) = &args.manifest {
+        let (pairs, dep_declarations) = if let Some(manifest_path) = &args.manifest {
             parse_manifest(manifest_path)?
         } else {
-            scan_directories(
+            // Directory scan mode has no dependency declaration mechanism.
+            let pairs = scan_directories(
                 args.old_dir.as_ref().unwrap(),
                 args.new_dir.as_ref().unwrap(),
-            )?
+            )?;
+            (pairs, vec![])
         };
 
         progress("🔍 Soroban Upgrade Safeguard (Batch Mode)".to_string());
@@ -148,7 +299,10 @@ fn main() -> Result<()> {
         progress(format!("Loaded {} pair(s) for comparison.\n", pairs.len()));
 
         let mut results = std::collections::BTreeMap::new();
+        let mut failed: std::collections::BTreeMap<String, PairFailure> =
+            std::collections::BTreeMap::new();
         let mut overall_safe = true;
+        let mut any_limit_violation = false;
 
         for (i, pair) in pairs.iter().enumerate() {
             let default_name = format!("pair_{}", i + 1);
@@ -167,28 +321,143 @@ fn main() -> Result<()> {
                 contract_name.bold()
             ));
 
-            let old_wasm = loader::load_wasm(&pair.old)?;
-            let new_wasm = loader::load_wasm(&pair.new)?;
+            // Per-pair policy: a pair that trips a resource limit (or otherwise
+            // errors) fails only that pair — it must not abort the whole batch,
+            // so its result is recorded and the loop continues.
+            let outcome = (|| -> Result<report::SafetyReport> {
+                let old_wasm = loader::load_wasm(&pair.old)?;
+                let new_wasm = loader::load_wasm(&pair.new)?;
+                compare_contracts(
+                    &ContractComparison {
+                        old_bytes: &old_wasm.bytes,
+                        old_path: &old_wasm.path,
+                        new_bytes: &new_wasm.bytes,
+                        new_path: &new_wasm.path,
+                        suppressions: &suppressions,
+                        policy: &policy,
+                        // Storage schemas are contract-specific and rejected in
+                        // batch mode, so no pair carries one.
+                        storage_schemas: None,
+                    },
+                    &args,
+                    &progress,
+                )
+            })();
 
-            let report = compare_contracts(
-                &ContractComparison {
-                    old_bytes: &old_wasm.bytes,
-                    old_path: &old_wasm.path,
-                    new_bytes: &new_wasm.bytes,
-                    new_path: &new_wasm.path,
-                    suppressions: &suppressions,
-                    explain: args.explain,
-                    strict: args.strict,
-                },
-                &progress,
-            )?;
-
-            if !report.is_safe {
-                overall_safe = false;
+            match outcome {
+                Ok(report) => {
+                    if !report.is_safe {
+                        overall_safe = false;
+                    }
+                    results.insert(contract_name, report);
+                }
+                Err(err) => {
+                    overall_safe = false;
+                    let limit = find_limit_error(&err);
+                    let is_limit = limit.is_some();
+                    if is_limit {
+                        any_limit_violation = true;
+                    }
+                    let message = match limit {
+                        Some(limit_err) => limit_err.to_string(),
+                        None => format!("{err:#}"),
+                    };
+                    progress(format!(
+                        "  {} {}",
+                        if is_limit {
+                            "⛔ Resource limit exceeded:".red().bold()
+                        } else {
+                            "⚠️  Failed:".red().bold()
+                        },
+                        message
+                    ));
+                    failed.insert(contract_name, PairFailure { message, is_limit });
+                }
             }
 
-            results.insert(contract_name, report);
             progress("\n----------------------------------------\n".to_string());
+        }
+
+        // ── Cross-contract dependency propagation ──────────────────────────
+        // After all individual pairs have been analyzed, build the dependency
+        // graph and propagate caller-visible breaking changes from callees to
+        // every contract that depends on them.
+        let dep_graph = DependencyGraph::from_declarations(&dep_declarations);
+
+        // Detect and report cycles.
+        let cycles = dep_graph.detect_cycles();
+        let cycle_findings_list = cycle_findings(&cycles);
+        if !cycle_findings_list.is_empty() {
+            progress(format!(
+                "\n⚠️  {} cyclic dependency/ies detected in the declared graph.",
+                cycles.len()
+            ));
+            for f in &cycle_findings_list {
+                progress(format!("   {}", f.message));
+            }
+            if args.strict {
+                overall_safe = false;
+            }
+        }
+
+        // Detect dependencies on contracts absent from this batch.
+        let known_contracts: std::collections::HashSet<String> =
+            results.keys().cloned().collect();
+        let missing = dep_graph.missing_contracts(&known_contracts);
+        let missing_findings_list = missing_contract_findings(&missing);
+        if !missing_findings_list.is_empty() {
+            progress(format!(
+                "\n⚠️  {} dependency contract(s) not present in this batch:",
+                missing.len()
+            ));
+            for name in &missing {
+                progress(format!("   - {}", name));
+            }
+            overall_safe = false;
+        }
+
+        // Collect per-contract raw findings for propagation.
+        let mut per_contract_findings: std::collections::HashMap<
+            String,
+            Vec<soroban_upgrade_safeguard::diff::Finding>,
+        > = std::collections::HashMap::new();
+        for (name, report) in &results {
+            let all: Vec<_> = report
+                .findings_by_category
+                .values()
+                .flat_map(|v| v.iter().map(|rf| rf.finding.clone()))
+                .collect();
+            per_contract_findings.insert(name.clone(), all);
+        }
+
+        let cross_findings: Vec<CrossContractFinding> =
+            dep_graph.propagate(&per_contract_findings);
+
+        // Cross-contract criticals always fail; warnings only fail under --strict.
+        let cross_critical_count = cross_findings
+            .iter()
+            .filter(|f| {
+                f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Critical
+            })
+            .count();
+        let cross_warning_count = cross_findings
+            .iter()
+            .filter(|f| {
+                f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Warning
+            })
+            .count();
+        if cross_critical_count > 0 {
+            overall_safe = false;
+        }
+        if args.strict && cross_warning_count > 0 {
+            overall_safe = false;
+        }
+
+        if !cross_findings.is_empty() {
+            progress(format!(
+                "\n🔗 {} cross-contract finding(s) propagated from dependency analysis.",
+                cross_findings.len()
+            ));
         }
 
         match args.format {
@@ -198,11 +467,59 @@ fn main() -> Result<()> {
                     results_json.insert(name.clone(), serde_json::to_value(report.to_json())?);
                 }
 
+                let mut failed_json = serde_json::Map::new();
+                for (name, failure) in &failed {
+                    failed_json.insert(
+                        name.clone(),
+                        serde_json::json!({
+                            "error": failure.message,
+                            "limit_violation": failure.is_limit,
+                        }),
+                    );
+                }
+
+                // Cross-contract findings grouped by affected contract.
+                let mut cross_by_contract: serde_json::Map<String, serde_json::Value> =
+                    serde_json::Map::new();
+                for cf in &cross_findings {
+                    cross_by_contract
+                        .entry(cf.affected_contract.clone())
+                        .or_insert_with(|| serde_json::json!([]))
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::to_value(cf)?);
+                }
+
+                let infra_findings: Vec<serde_json::Value> = cycle_findings_list
+                    .iter()
+                    .chain(missing_findings_list.iter())
+                    .map(|f| serde_json::to_value(f))
+                    .collect::<Result<_, _>>()?;
+
+                // Overall recommended bump: the most severe bump across all
+                // pairs in the batch, since batch mode compares a whole set
+                // of contracts that ship together.
+                let bump_rank = |bump: &str| match bump {
+                    "major" => 2,
+                    "minor" => 1,
+                    _ => 0,
+                };
+                let overall_bump = results
+                    .values()
+                    .map(|report| report.recommended_bump())
+                    .max_by_key(|bump| bump_rank(bump))
+                    .unwrap_or("patch");
+
                 let batch_json = serde_json::json!({
                     "is_safe": overall_safe,
                     "strict": args.strict,
                     "total_pairs": pairs.len(),
+                    "limit_violation": any_limit_violation,
+                    "recommended_bump": overall_bump,
                     "results": results_json,
+                    "failed": failed_json,
+                    "cross_contract_findings": cross_by_contract,
+                    "dependency_findings": infra_findings,
                 });
 
                 println!("{}", serde_json::to_string_pretty(&batch_json)?);
@@ -223,11 +540,7 @@ fn main() -> Result<()> {
                 markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
 
                 for (name, report) in &results {
-                    let status_str = if report.is_safe {
-                        "✅ PASSED"
-                    } else {
-                        "❌ FAILED"
-                    };
+                    let status_str = if report.is_safe { "✅ PASSED" } else { "❌ FAILED" };
                     markdown.push_str(&format!(
                         "| {} | {} | {} | {} | {} | {} |\n",
                         name,
@@ -239,13 +552,64 @@ fn main() -> Result<()> {
                     ));
                 }
 
+                for (name, failure) in &failed {
+                    let status_str =
+                        if failure.is_limit { "⛔ ERROR (limit)" } else { "⛔ ERROR" };
+                    markdown
+                        .push_str(&format!("| {} | {} | — | — | — | — |\n", name, status_str));
+                }
+
                 markdown.push_str("\n---\n\n");
+
+                if !failed.is_empty() {
+                    markdown.push_str("### Errored Pairs\n\n");
+                    for (name, failure) in &failed {
+                        markdown.push_str(&format!("- **{}**: {}\n", name, failure.message));
+                    }
+                    markdown.push_str("\n---\n\n");
+                }
 
                 for (name, report) in &results {
                     markdown.push_str(&format!("## Details: {}\n\n", name));
                     let report_md = report.generate_summary_markdown();
-                    let stripped_md = report_md.replace("# Soroban Upgrade Safety Report\n\n", "");
+                    let stripped_md =
+                        report_md.replace("# Soroban Upgrade Safety Report\n\n", "");
                     markdown.push_str(&stripped_md);
+                    markdown.push_str("\n---\n\n");
+                }
+
+                if !cross_findings.is_empty() {
+                    markdown.push_str("## Cross-Contract Dependency Findings\n\n");
+                    markdown.push_str("| Affected Contract | Changed Contract | Depth | Severity | Category | Target |\n");
+                    markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
+                    for cf in &cross_findings {
+                        let sev = match cf.finding.severity {
+                            soroban_upgrade_safeguard::diff::Severity::Critical => "🔴 Critical",
+                            soroban_upgrade_safeguard::diff::Severity::Warning => "🟡 Warning",
+                            soroban_upgrade_safeguard::diff::Severity::Info => "🔵 Info",
+                        };
+                        markdown.push_str(&format!(
+                            "| {} | {} | {} | {} | {} | {} |\n",
+                            cf.affected_contract,
+                            cf.changed_contract,
+                            cf.propagation_depth,
+                            sev,
+                            cf.finding.category,
+                            cf.finding.target.as_deref().unwrap_or("-")
+                        ));
+                    }
+                    markdown.push_str("\n---\n\n");
+                }
+
+                if !cycle_findings_list.is_empty() || !missing_findings_list.is_empty() {
+                    markdown.push_str("## Dependency Graph Findings\n\n");
+                    for f in cycle_findings_list.iter().chain(missing_findings_list.iter()) {
+                        let emoji = match f.severity {
+                            soroban_upgrade_safeguard::diff::Severity::Warning => "🟡",
+                            _ => "🔵",
+                        };
+                        markdown.push_str(&format!("- {} {}\n", emoji, f.message));
+                    }
                     markdown.push_str("\n---\n\n");
                 }
 
@@ -282,6 +646,65 @@ fn main() -> Result<()> {
                         report.suppressed_count
                     );
                 }
+                for (name, failure) in &failed {
+                    let status_str = if failure.is_limit {
+                        "⛔ ERROR (resource limit)".red().bold()
+                    } else {
+                        "⛔ ERROR".red().bold()
+                    };
+                    println!("  - {}: {} — {}", name.bold(), status_str, failure.message);
+                }
+
+                if !cross_findings.is_empty() {
+                    println!("\n🔗 Cross-Contract Dependency Findings:");
+                    let mut by_affected: std::collections::BTreeMap<
+                        &str,
+                        Vec<&CrossContractFinding>,
+                    > = std::collections::BTreeMap::new();
+                    for cf in &cross_findings {
+                        by_affected
+                            .entry(cf.affected_contract.as_str())
+                            .or_default()
+                            .push(cf);
+                    }
+                    for (affected, cfs) in &by_affected {
+                        println!("  Contract '{}' is affected by changes in:", affected.bold());
+                        for cf in cfs {
+                            let sev_icon = match cf.finding.severity {
+                                soroban_upgrade_safeguard::diff::Severity::Critical => "🔴",
+                                soroban_upgrade_safeguard::diff::Severity::Warning => "🟡",
+                                soroban_upgrade_safeguard::diff::Severity::Info => "🔵",
+                            };
+                            let depth_label = if cf.propagation_depth == 1 {
+                                "direct".to_string()
+                            } else {
+                                format!("transitive depth {}", cf.propagation_depth)
+                            };
+                            println!(
+                                "    {} [{}] '{}' → {} ({})",
+                                sev_icon,
+                                cf.finding.category,
+                                cf.finding.target.as_deref().unwrap_or(""),
+                                cf.changed_contract.bold(),
+                                depth_label
+                            );
+                        }
+                    }
+                }
+
+                if !cycle_findings_list.is_empty() {
+                    println!("\n⚠️  Cyclic Dependencies:");
+                    for f in &cycle_findings_list {
+                        println!("  🟡 {}", f.message);
+                    }
+                }
+
+                if !missing_findings_list.is_empty() {
+                    println!("\n⚠️  Missing Dependency Contracts:");
+                    for f in &missing_findings_list {
+                        println!("  🟡 {}", f.message);
+                    }
+                }
 
                 println!("\n========================================\n");
 
@@ -293,9 +716,28 @@ fn main() -> Result<()> {
             }
         }
 
+        // Exit precedence: resource-limit violation (2) > breaking changes (1) > safe (0).
+        if any_limit_violation {
+            std::process::exit(2);
+        }
         if !overall_safe {
             std::process::exit(1);
         }
+
+        let total_suppressed_criticals: usize =
+            results.values().map(|r| r.suppressed_critical_count).sum();
+        if total_suppressed_criticals > 0 {
+            eprintln!(
+                "{}",
+                format!(
+                    "⚠️  SECURITY NOTICE: The gate passed because {} Critical breaking changes were suppressed. Ensure these suppressions are fully reviewed and authorized.",
+                    total_suppressed_criticals
+                )
+                .red()
+                .bold()
+            );
+        }
+
         return Ok(());
     }
 
@@ -341,10 +783,35 @@ fn main() -> Result<()> {
         "📦 Loading and Parsing contracts...".cyan().bold()
     ));
 
-    // Old WASM — from file or from RPC
+    // Old WASM — from file or from RPC. RPC-fetched bytes are subject to the
+    // same resource policy as file input.
     let old = if let Some(contract_id) = old_source {
         let rpc_url = args.rpc_url.as_ref().unwrap();
-        loader::fetch_wasm_from_rpc(contract_id, rpc_url)?
+        let module = loader::fetch_wasm_from_rpc_with_policy(contract_id, rpc_url, &policy)?;
+
+        // If the caller pinned an expected hash, verify it now against the hash
+        // that was verified on-chain during the RPC fetch.
+        if let Some(expected_hex) = &args.expected_wasm_hash {
+            let expected_bytes = hex::decode(expected_hex)
+                .context("--expected-wasm-hash must be a valid hex string")?;
+            let actual = module
+                .verified_hash
+                .as_ref()
+                .map(|h| h.as_slice())
+                .unwrap_or(&[]);
+            if actual != expected_bytes.as_slice() {
+                anyhow::bail!(
+                    "Hash mismatch: expected on-chain WASM hash {}, but fetched hash was {}",
+                    expected_hex,
+                    module
+                        .verified_hash
+                        .map(hex::encode)
+                        .unwrap_or_else(|| "<none>".to_string()),
+                );
+            }
+        }
+
+        module
     } else {
         loader::load_wasm(&args.wasm_paths[0])?
     };
@@ -360,18 +827,29 @@ fn main() -> Result<()> {
     }
 
     // Generate Safety Report using the factored helper
-    let safety_report = compare_contracts(
+    let baseline_source: Option<&str> = if old_source.is_some() {
+        Some("RPC")
+    } else {
+        Some("Local File")
+    };
+    let verified_hash_hex = old.verified_hash.as_ref().map(hex::encode);
+    let mut safety_report = compare_contracts(
         &ContractComparison {
             old_bytes: &old.bytes,
             old_path: &old.path,
             new_bytes: &new.bytes,
             new_path: &new.path,
             suppressions: &suppressions,
-            explain: args.explain,
-            strict: args.strict,
+            policy: &policy,
+            storage_schemas: storage_schemas
+                .as_ref()
+                .map(|(old_schema, new_schema)| (old_schema, new_schema)),
         },
+        &args,
         &progress,
     )?;
+    safety_report.baseline_source = baseline_source.map(|s| s.to_string());
+    safety_report.verified_code_hash = verified_hash_hex;
 
     match args.format {
         OutputFormat::Json => {
@@ -391,6 +869,16 @@ fn main() -> Result<()> {
 
     if !safety_report.is_safe {
         std::process::exit(1);
+    } else if safety_report.suppressed_critical_count > 0 {
+        eprintln!(
+            "{}",
+            format!(
+                "⚠️  SECURITY NOTICE: The gate passed because {} Critical breaking changes were suppressed. Ensure these suppressions are fully reviewed and authorized.",
+                safety_report.suppressed_critical_count
+            )
+            .red()
+            .bold()
+        );
     }
 
     Ok(())
@@ -403,9 +891,19 @@ struct ContractPair {
     name: Option<String>,
 }
 
+/// A batch pair that could not be compared. Recorded so one bad pair fails only
+/// itself; `is_limit` distinguishes an adversarial-input rejection (exit 2) from
+/// an ordinary failure such as a missing or malformed file.
+struct PairFailure {
+    message: String,
+    is_limit: bool,
+}
+
 #[derive(serde::Deserialize, Clone, Debug)]
 struct Manifest {
     pairs: Vec<ContractPair>,
+    #[serde(default)]
+    dependencies: Vec<ContractDependency>,
 }
 
 struct ContractComparison<'a> {
@@ -414,13 +912,19 @@ struct ContractComparison<'a> {
     new_bytes: &'a [u8],
     new_path: &'a str,
     suppressions: &'a SuppressionConfig,
-    explain: bool,
-    strict: bool,
+    policy: &'a ResourcePolicy,
+    /// The declared storage layouts of the old and new builds, when supplied.
+    /// Both sides are required: a layout change is only visible as a diff.
+    storage_schemas: Option<(&'a StorageSchema, &'a StorageSchema)>,
 }
 
 /// Helper function to run comparison for a single pair.
+///
+/// Delegates to the canonical library pipeline ([`soroban_upgrade_safeguard::compare_wasm_bytes_with_options`])
+/// so both the CLI and library callers always run exactly the same stages.
 fn compare_contracts(
     comparison: &ContractComparison<'_>,
+    args: &Args,
     progress: &impl Fn(String),
 ) -> Result<report::SafetyReport> {
     let ContractComparison {
@@ -429,64 +933,109 @@ fn compare_contracts(
         new_bytes,
         new_path,
         suppressions,
-        explain,
-        strict,
+        policy,
+        storage_schemas,
     } = comparison;
-    let old_meta = parser::extract_metadata(old_bytes)?;
-    let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
+
+    // Show per-file progress lines before running the pipeline.
+    // spec summaries are recovered from the returned report.
     progress(format!(
         "  {} {} ({} bytes)",
         "✅ Old:".green().bold(),
         old_path,
         old_bytes.len()
     ));
-    progress(format!("     └─ {}", old_spec.summary().dimmed()));
-
-    let new_meta = parser::extract_metadata(new_bytes)?;
-    let new_spec = spec::ContractSpec::from_entries(&new_meta.spec);
     progress(format!(
         "  {} {} ({} bytes)",
         "✅ New:".green().bold(),
         new_path,
         new_bytes.len()
     ));
-    progress(format!("     └─ {}", new_spec.summary().dimmed()));
 
     progress(format!(
         "\n{}",
         "🔬 Analyzing structural compatibility...".cyan().bold()
     ));
-    let mut diff_report = diff::compare(&old_spec, &new_spec);
-    diff::compare_env_metadata(
-        old_meta.env_meta.as_ref(),
-        new_meta.env_meta.as_ref(),
-        &mut diff_report,
-    );
 
-    Ok(report::SafetyReport::with_suppressions(
-        &diff_report,
-        suppressions,
-        *explain,
-        *strict,
-    ))
+    if storage_schemas.is_some() {
+        progress(format!(
+            "\n{}",
+            "🗄️  Analyzing declared storage layout...".cyan().bold()
+        ));
+    }
+
+    // Delegate to the single canonical pipeline. Storage-schema analysis,
+    // reconciliation against the exported spec, and the resulting scope are all
+    // handled inside it, so the CLI and every library caller run the same
+    // stages. Reconciliation failure (a manifest that contradicts its build)
+    // surfaces here as an error and stops the run.
+    let safety_report = soroban_upgrade_safeguard::compare_wasm_bytes_with_options(
+        old_bytes,
+        new_bytes,
+        &CompareOptions {
+            policy: Some(policy),
+            suppressions: Some(suppressions),
+            explain: args.explain,
+            strict: args.strict,
+            storage_schemas: *storage_schemas,
+        },
+    )?;
+
+    // Print spec summaries now that we have them from the report.
+    if let Some(ref summary) = safety_report.old_spec_summary {
+        progress(format!("     └─ {}", summary.dimmed()));
+    }
+    if let Some(ref summary) = safety_report.new_spec_summary {
+        progress(format!("     └─ {}", summary.dimmed()));
+    }
+
+    if safety_report.scope.storage_analyzed() {
+        progress(format!(
+            "     └─ {}",
+            safety_report.scope.storage_status_line().dimmed()
+        ));
+    }
+
+    Ok(safety_report)
 }
 
-fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {
+fn parse_manifest(path: &Path) -> Result<(Vec<ContractPair>, Vec<ContractDependency>)> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read manifest file: {}", path.display()))?;
 
-    // Try TOML, then JSON
-    if let Ok(manifest) = toml::from_str::<Manifest>(&content) {
-        return Ok(manifest.pairs);
-    }
-    if let Ok(manifest) = serde_json::from_str::<Manifest>(&content) {
-        return Ok(manifest.pairs);
-    }
+    // Capture both errors before deciding which to surface.
+    let toml_err = match toml::from_str::<Manifest>(&content) {
+        Ok(manifest) => return Ok((manifest.pairs, manifest.dependencies)),
+        Err(e) => e,
+    };
+    let json_err = match serde_json::from_str::<Manifest>(&content) {
+        Ok(manifest) => return Ok((manifest.pairs, manifest.dependencies)),
+        Err(e) => e,
+    };
 
-    anyhow::bail!(
-        "Failed to parse manifest '{}' as either TOML or JSON.",
-        path.display()
-    )
+    // Use the file extension to pick the most relevant error; fall back to
+    // showing both when the extension is absent or unrecognised.
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_lowercase);
+
+    match ext.as_deref() {
+        Some("toml") => Err(toml_err).with_context(|| {
+            format!("Failed to parse TOML manifest '{}'", path.display())
+        }),
+        Some("json") => Err(json_err).with_context(|| {
+            format!("Failed to parse JSON manifest '{}'", path.display())
+        }),
+        _ => Err(anyhow::anyhow!(
+            "Failed to parse manifest '{}' as either TOML or JSON.\n\
+             TOML error: {}\n\
+             JSON error: {}",
+            path.display(),
+            toml_err,
+            json_err,
+        )),
+    }
 }
 
 fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>> {

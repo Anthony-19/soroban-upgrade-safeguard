@@ -39,7 +39,7 @@ fn markdown_breaking_upgrade_reports_critical_and_exits_one() {
         "Missing title"
     );
     assert!(
-        stdout.contains("## Status: ❌ FAILED (Critical breaking changes detected)"),
+        stdout.contains("## Status: ❌ FAILED (Exported-interface breaking changes detected)"),
         "Missing status"
     );
     assert!(
@@ -93,7 +93,7 @@ fn markdown_identical_upgrade_is_safe_and_exits_zero() {
         "Missing title"
     );
     assert!(
-        stdout.contains("## Status: ✅ PASSED (No breaking changes detected)"),
+        stdout.contains("## Status: ✅ PASSED (No exported-interface breaking changes)"),
         "Missing status"
     );
     assert!(
