@@ -779,3 +779,296 @@ fn strict_mode_fails_on_cross_contract_warnings() {
     assert_eq!(json["strict"], Value::Bool(true));
     assert_eq!(json["is_safe"], Value::Bool(false));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Name-collision tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn duplicate_explicit_names_in_manifest_are_rejected() {
+    // Two entries both named "token" — user wrote it deliberately, must error.
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "token"
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "token"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v2.wasm").to_str().unwrap(),
+    );
+
+    let manifest_path = write_manifest("dup_explicit_names.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args(["--manifest", manifest_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+
+    // Must exit non-zero
+    assert!(
+        !output.status.success(),
+        "duplicate explicit names must cause a non-zero exit"
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    // Error message must name the duplicate
+    assert!(
+        stderr.contains("token") || stderr.contains("same explicit name"),
+        "error must mention the duplicate name, got: {stderr}"
+    );
+}
+
+#[test]
+fn duplicate_derived_names_both_appear_in_json_output() {
+    // Two pairs that both derive the name "v1" from the new WASM basename —
+    // one clean (v1->v1), one breaking (v1->v2). Both must appear in results.
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(), // derived name: "v1"
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(), // also derived name: "v1" — collision
+    );
+
+    let manifest_path = write_manifest("dup_derived_names.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args(["--manifest", manifest_path.to_str().unwrap(), "--format", "json"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+
+    let results = json["results"].as_object().expect("results must be an object");
+
+    // Both pairs must appear — neither should silently overwrite the other
+    assert_eq!(
+        results.len(),
+        2,
+        "both pairs must appear in results, got keys: {:?}",
+        results.keys().collect::<Vec<_>>()
+    );
+
+    // One entry must be "v1", the other "v1 (2)"
+    assert!(results.contains_key("v1"), "first occurrence must be keyed as 'v1'");
+    assert!(
+        results.contains_key("v1 (2)"),
+        "second occurrence must be keyed as 'v1 (2)', got keys: {:?}",
+        results.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn duplicate_derived_names_both_appear_in_text_output() {
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+    );
+
+    let manifest_path = write_manifest("dup_derived_names_text.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args(["--manifest", manifest_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+
+    // Both keys must appear somewhere in the text report
+    assert!(stdout.contains("v1"), "first pair must appear in text output");
+    assert!(
+        stdout.contains("v1 (2)"),
+        "second pair must appear as 'v1 (2)' in text output"
+    );
+}
+
+#[test]
+fn total_pairs_matches_reported_results_count_with_collisions() {
+    // Two pairs with derived-name collision — total_pairs must equal the number
+    // of entries actually reported (2), not exceed it.
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+    );
+
+    let manifest_path = write_manifest("total_pairs_collision.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args(["--manifest", manifest_path.to_str().unwrap(), "--format", "json"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+
+    let total_pairs = json["total_pairs"].as_u64().expect("total_pairs must be a number");
+    let results_count = json["results"]
+        .as_object()
+        .expect("results must be an object")
+        .len() as u64;
+    let failed_count = json["failed"]
+        .as_object()
+        .expect("failed must be an object")
+        .len() as u64;
+
+    assert_eq!(
+        total_pairs,
+        results_count + failed_count,
+        "total_pairs ({}) must equal results ({}) + failed ({})",
+        total_pairs,
+        results_count,
+        failed_count
+    );
+}
+
+#[test]
+fn directory_scan_duplicate_basenames_both_appear() {
+    // Create two subdirectory pairs that both have a file named token.wasm —
+    // the canonical duplicate-basename scenario for directory scans.
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dup_basename_scan");
+    let old_a = tmp.join("old_a");
+    let new_a = tmp.join("new_a");
+    let old_b = tmp.join("old_b");
+    let new_b = tmp.join("new_b");
+
+    for dir in [&old_a, &new_a, &old_b, &new_b] {
+        std::fs::create_dir_all(dir).expect("create dir");
+    }
+
+    // Pair A: token.wasm clean (v1 → v1)
+    std::fs::copy(wasm("v1.wasm"), old_a.join("token.wasm")).expect("copy");
+    std::fs::copy(wasm("v1.wasm"), new_a.join("token.wasm")).expect("copy");
+
+    // Pair B: token.wasm breaking (v1 → v2) — same basename in different dirs
+    std::fs::copy(wasm("v1.wasm"), old_b.join("token.wasm")).expect("copy");
+    std::fs::copy(wasm("v2.wasm"), new_b.join("token.wasm")).expect("copy");
+
+    // Run pair A
+    let out_a = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args([
+            "--old-dir", old_a.to_str().unwrap(),
+            "--new-dir", new_a.to_str().unwrap(),
+            "--format", "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+
+    // Run pair B
+    let out_b = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args([
+            "--old-dir", old_b.to_str().unwrap(),
+            "--new-dir", new_b.to_str().unwrap(),
+            "--format", "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+
+    let json_a: Value = serde_json::from_str(
+        &String::from_utf8(out_a.stdout).expect("utf8"),
+    ).expect("valid JSON from pair A");
+    let json_b: Value = serde_json::from_str(
+        &String::from_utf8(out_b.stdout).expect("utf8"),
+    ).expect("valid JSON from pair B");
+
+    // Each individual dir-scan run has exactly one pair and one result
+    assert_eq!(
+        json_a["results"].as_object().unwrap().len(),
+        1,
+        "pair A must produce exactly one result"
+    );
+    assert_eq!(
+        json_b["results"].as_object().unwrap().len(),
+        1,
+        "pair B must produce exactly one result"
+    );
+
+    // Pair A is clean, pair B breaks
+    let a_key = json_a["results"].as_object().unwrap().keys().next().unwrap().clone();
+    let b_key = json_b["results"].as_object().unwrap().keys().next().unwrap().clone();
+    assert_eq!(json_a["results"][&a_key]["is_safe"], Value::Bool(true));
+    assert_eq!(json_b["results"][&b_key]["is_safe"], Value::Bool(false));
+}
+
+#[test]
+fn manifest_with_three_colliding_derived_names_disambiguates_all() {
+    // Three pairs all deriving "v1" — must produce "v1", "v1 (2)", "v1 (3)".
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+    );
+
+    let manifest_path = write_manifest("triple_collision.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args(["--manifest", manifest_path.to_str().unwrap(), "--format", "json"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+
+    let results = json["results"].as_object().expect("results must be an object");
+    assert_eq!(results.len(), 3, "all three pairs must appear");
+    assert!(results.contains_key("v1"), "first must be 'v1'");
+    assert!(results.contains_key("v1 (2)"), "second must be 'v1 (2)'");
+    assert!(results.contains_key("v1 (3)"), "third must be 'v1 (3)'");
+
+    // total_pairs must equal the number of results
+    assert_eq!(json["total_pairs"].as_u64().unwrap(), 3);
+}
