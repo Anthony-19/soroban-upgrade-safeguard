@@ -829,6 +829,7 @@ fn interface_remediation_guidance(category: &str) -> Option<&'static str> {
         "Error Enum Case Removed" => Some("This is a breaking change. Clients matching on this error code will break. Restore the case."),
         "Error Enum Case Value Changed" => Some("This is a breaking change. Modifying error case values breaks error-code compatibility. Revert the value change."),
         "Error Enum Case Added" => Some("No action required. Ensure clients can handle the new error case gracefully."),
+        "Type Library Changed" => Some("No code changes required. The type's declaring library changed, so its definition is now controlled by a different dependency and can drift independently. Confirm the new source is intended and pin/review that dependency."),
         "Cascading Layout Break" => Some("This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type."),
         _ => None,
     }

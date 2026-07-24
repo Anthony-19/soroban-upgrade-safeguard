@@ -549,6 +549,50 @@ fn types_equal_inner(
     Ok(equal)
 }
 
+/// Compare the declaring library (`lib`) of a user-defined type and, on a
+/// change, record an informational finding.
+///
+/// Every UDT kind (struct, enum, union, error enum) carries a `lib` recording
+/// the crate the type was declared in. A type can move from a local definition
+/// to one imported from a shared crate, or switch which crate it comes from,
+/// while keeping its name and even its layout. The layout comparisons see
+/// nothing, yet control of the definition has moved to a different dependency
+/// that can drift independently in a future release. We surface the change of
+/// origin so a reviewer knows the definition changed hands.
+///
+/// This is informational only: relocating a type does not by itself change the
+/// serialized layout, so it never affects `is_safe`. `type_name` and `target`
+/// are set to the type name so the finding groups and suppresses like the other
+/// type-level findings.
+fn compare_type_lib(name: &str, kind: &str, old_lib: &str, new_lib: &str, report: &mut DiffReport) {
+    if old_lib == new_lib {
+        return;
+    }
+    let message = if old_lib.is_empty() {
+        format!(
+            "{} '{}' is now declared in library '{}' (previously defined locally).",
+            kind, name, new_lib
+        )
+    } else if new_lib.is_empty() {
+        format!(
+            "{} '{}' is now defined locally (previously declared in library '{}').",
+            kind, name, old_lib
+        )
+    } else {
+        format!(
+            "{} '{}' declaring library changed from '{}' to '{}'.",
+            kind, name, old_lib, new_lib
+        )
+    };
+    report.findings.push(Finding {
+        severity: Severity::Info,
+        category: "Type Library Changed".to_string(),
+        message,
+        type_name: Some(name.to_string()),
+        target: Some(name.to_string()),
+    });
+}
+
 /// Compare struct definitions between old and new contract specs.
 fn compare_structs(
     old: &ContractSpec,
@@ -598,6 +642,14 @@ fn compare_structs(
                         target: Some(name.clone()),
                     });
                 }
+                // Compare declaring library (informational only)
+                compare_type_lib(
+                    name,
+                    "Struct",
+                    &old_struct.lib.to_string(),
+                    &new_struct.lib.to_string(),
+                    report,
+                );
             }
         }
     }
@@ -808,6 +860,14 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                         target: Some(name.clone()),
                     });
                 }
+                // Compare declaring library (informational only)
+                compare_type_lib(
+                    name,
+                    "Enum",
+                    &old_enum.lib.to_string(),
+                    &new_enum.lib.to_string(),
+                    report,
+                );
             }
         }
     }
@@ -923,6 +983,14 @@ fn compare_unions(
             }
             Some(new_union) => {
                 check_union_cases(name, old_union, new_union, report, policy)?;
+                // Compare declaring library (informational only)
+                compare_type_lib(
+                    name,
+                    "Union",
+                    &old_union.lib.to_string(),
+                    &new_union.lib.to_string(),
+                    report,
+                );
             }
         }
     }
@@ -1142,6 +1210,14 @@ fn compare_error_enums(old: &ContractSpec, new: &ContractSpec, report: &mut Diff
             }
             Some(new_error_enum) => {
                 check_error_enum_cases(name, old_error_enum, new_error_enum, report);
+                // Compare declaring library (informational only)
+                compare_type_lib(
+                    name,
+                    "Error enum",
+                    &old_error_enum.lib.to_string(),
+                    &new_error_enum.lib.to_string(),
+                    report,
+                );
             }
         }
     }
@@ -1586,6 +1662,104 @@ mod tests {
         assert!(
             report.findings.is_empty(),
             "Expected no findings when docs identical"
+        );
+    }
+
+    #[test]
+    fn struct_lib_change_produces_info() {
+        let mut old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let mut new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+
+        // The type switches which crate it is declared in.
+        old.structs.get_mut("Data").unwrap().lib = "old_crate".try_into().unwrap();
+        new.structs.get_mut("Data").unwrap().lib = "new_crate".try_into().unwrap();
+
+        let report = compare(&old, &new);
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Type Library Changed")
+            .expect("expected a lib-change finding");
+        assert_eq!(finding.severity, Severity::Info);
+        assert_eq!(finding.type_name.as_deref(), Some("Data"));
+        assert_eq!(finding.target.as_deref(), Some("Data"));
+        // The message names both the old and new value.
+        assert!(finding.message.contains("old_crate"), "{}", finding.message);
+        assert!(finding.message.contains("new_crate"), "{}", finding.message);
+
+        // Info findings must not influence safety.
+        let safety = crate::report::SafetyReport::new(&report);
+        assert!(safety.is_safe);
+        assert_eq!(safety.critical_count, 0);
+    }
+
+    #[test]
+    fn struct_lib_added_produces_info() {
+        let mut old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let mut new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+
+        // Was defined locally (empty lib), now imported from a crate.
+        old.structs.get_mut("Data").unwrap().lib = StringM::default();
+        new.structs.get_mut("Data").unwrap().lib = "shared_types".try_into().unwrap();
+
+        let report = compare(&old, &new);
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Type Library Changed")
+            .expect("expected a lib-change finding");
+        assert_eq!(finding.severity, Severity::Info);
+        assert!(
+            finding.message.contains("shared_types"),
+            "{}",
+            finding.message
+        );
+
+        let safety = crate::report::SafetyReport::new(&report);
+        assert!(safety.is_safe);
+    }
+
+    #[test]
+    fn struct_lib_removed_produces_info() {
+        let mut old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let mut new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+
+        // Was imported from a crate, now defined locally (empty lib).
+        old.structs.get_mut("Data").unwrap().lib = "shared_types".try_into().unwrap();
+        new.structs.get_mut("Data").unwrap().lib = StringM::default();
+
+        let report = compare(&old, &new);
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Type Library Changed")
+            .expect("expected a lib-change finding");
+        assert_eq!(finding.severity, Severity::Info);
+        assert!(
+            finding.message.contains("shared_types"),
+            "{}",
+            finding.message
+        );
+
+        let safety = crate::report::SafetyReport::new(&report);
+        assert!(safety.is_safe);
+    }
+
+    #[test]
+    fn identical_struct_lib_produces_no_finding() {
+        let mut old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let mut new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+
+        old.structs.get_mut("Data").unwrap().lib = "shared_types".try_into().unwrap();
+        new.structs.get_mut("Data").unwrap().lib = "shared_types".try_into().unwrap();
+
+        let report = compare(&old, &new);
+        assert!(
+            report.findings.is_empty(),
+            "Expected no findings when lib is unchanged"
         );
     }
 
