@@ -46,7 +46,12 @@ use crate::diff::Finding;
 pub const DEFAULT_CONFIG_FILE: &str = ".safeguard.toml";
 
 /// A parsed suppression config: a flat list of reviewed acknowledgements.
+///
+/// `deny_unknown_fields` is deliberate: this is the one config file that can
+/// turn the safety gate off, so a mistyped key (`targets`, `[[suppression]]`)
+/// must be a loud parse error rather than a silently dropped rule.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SuppressionConfig {
     /// Configurable maximum number of suppressions. Enforced globally.
     pub max_suppressions: Option<usize>,
@@ -55,10 +60,21 @@ pub struct SuppressionConfig {
     /// The acknowledged findings, one `[[suppress]]` table per entry.
     #[serde(default, rename = "suppress")]
     pub rules: Vec<SuppressionRule>,
+    /// The `[limits]` table is parsed independently by [`crate::limits`]. We
+    /// still declare it here so `deny_unknown_fields` accepts a combined config
+    /// carrying both `[[suppress]]` rules and `[limits]`; its contents are
+    /// ignored by this parser.
+    #[serde(default)]
+    #[allow(dead_code)] // Present only so deny_unknown_fields accepts `[limits]`.
+    limits: Option<toml::Value>,
 }
 
 /// A single whitelisted finding, keyed by category and (optionally) target.
+///
+/// `deny_unknown_fields` guards against a typo (e.g. `targets` for `target`)
+/// silently changing what the rule matches.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SuppressionRule {
     /// The finding category to match exactly (e.g. `"Struct Field Type Changed"`).
     pub category: String,
@@ -418,6 +434,91 @@ mod tests {
         let f = finding("Struct Field Type Changed", Some("Data.amount"));
         let rule = config.matching_rule(&f).expect("should match exactly");
         assert_eq!(rule.reason.as_deref(), Some("Planned migration"));
+    }
+
+    #[test]
+    fn unknown_key_in_suppress_entry_is_rejected() {
+        // `targets` is a typo for `target`; without deny_unknown_fields it would
+        // silently load as a targetless rule and change what it matches.
+        let err = SuppressionConfig::from_toml_str(
+            r#"
+            [[suppress]]
+            category = "Struct Field Type Changed"
+            targets  = "Data.amount"
+            reason   = "Planned migration"
+            "#,
+        )
+        .expect_err("an unknown key in a suppress entry must be a parse error");
+
+        // The error, including the anyhow context added by load_from_path, must
+        // name the offending key so the user can find it.
+        let full = format!("{:#}", err);
+        assert!(
+            full.contains("targets"),
+            "error should name the unknown key `targets`, got: {}",
+            full
+        );
+    }
+
+    #[test]
+    fn unknown_top_level_key_is_rejected() {
+        // `[[suppression]]` (wrong table name) plus a stray scalar: both are
+        // unknown top-level keys and must fail rather than parse to zero rules.
+        let err = SuppressionConfig::from_toml_str(
+            r#"
+            max_supressions = 10
+
+            [[suppression]]
+            category = "Struct Field Type Changed"
+            target   = "Data.amount"
+            "#,
+        )
+        .expect_err("an unknown top-level key must be a parse error");
+
+        let full = format!("{:#}", err);
+        assert!(
+            full.contains("max_supressions") || full.contains("suppression"),
+            "error should name the unknown top-level key, got: {}",
+            full
+        );
+    }
+
+    #[test]
+    fn limits_table_still_parses_alongside_suppressions() {
+        // `[limits]` is parsed independently by crate::limits, but the same file
+        // flows through SuppressionConfig too, so the stricter rules must still
+        // accept it.
+        let config = SuppressionConfig::from_toml_str(
+            r#"
+            max_suppressions = 10
+            allow_targetless = false
+
+            [[suppress]]
+            category    = "Struct Field Removed"
+            target      = "ConfigData.threshold"
+            author      = "Alice <alice@example.com>"
+            reason      = "Planned migration."
+            expiry      = "2026-12-31"
+            fingerprint = "8a3f..."
+
+            [limits]
+            max_xdr_depth = 64
+            "#,
+        )
+        .expect("a config carrying both [[suppress]] and [limits] must parse");
+        assert_eq!(config.rules.len(), 1);
+    }
+
+    #[test]
+    fn example_config_still_parses() {
+        // Acceptance: the shipped example must keep parsing under the stricter rules.
+        let contents = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/.safeguard.example.toml"
+        ))
+        .expect("failed to read .safeguard.example.toml");
+        SuppressionConfig::from_toml_str(&contents)
+            .expect(".safeguard.example.toml must parse under deny_unknown_fields");
     }
 
     #[test]
