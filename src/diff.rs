@@ -51,29 +51,6 @@ pub struct DiffReport {
     pub findings: Vec<Finding>,
 }
 
-#[allow(dead_code)]
-impl DiffReport {
-    pub fn critical_count(&self) -> usize {
-        self.findings
-            .iter()
-            .filter(|f| f.severity == Severity::Critical)
-            .count()
-    }
-
-    pub fn warning_count(&self) -> usize {
-        self.findings
-            .iter()
-            .filter(|f| f.severity == Severity::Warning)
-            .count()
-    }
-
-    pub fn info_count(&self) -> usize {
-        self.findings
-            .iter()
-            .filter(|f| f.severity == Severity::Info)
-            .count()
-    }
-}
 
 /// Compare two contract specs and return a report of all findings.
 ///
