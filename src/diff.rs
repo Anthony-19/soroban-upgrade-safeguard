@@ -663,7 +663,7 @@ fn compare_structs(
 /// |---|---|---|---|
 /// | Field removed | Critical | `Struct Field Removed` | `Event Schema Removed` |
 /// | Field inserted mid-sequence | Critical | `Struct Field Inserted` | `Event Field Inserted` |
-/// | Field appended at tail | Warning | `Struct Field Added` | `Struct Field Added` |
+/// | Field appended at tail | Warning | `Struct Field Added` | `Event Schema Added` |
 /// | Field moved (position changed) | Critical | `Struct Field Reordered` | `Event Schema Reordered` |
 /// | Field type changed | Critical | `Struct Field Type Changed` | `Event Schema Type Changed` |
 fn check_struct_fields(
@@ -716,11 +716,11 @@ fn check_struct_fields(
                 // Tail append → Warning (existing behaviour)
                 report.findings.push(Finding {
                     severity: Severity::Warning,
-                    category: "Struct Field Added".to_string(),
+                    category: format!("{} Added", category_prefix),
                     message: format!(
-                        "Struct '{}': new field '{}' appended. \
+                        "{} '{}': new field '{}' appended. \
                          Existing storage entries won't have this field — ensure migration handles defaults.",
-                        name, new_name
+                        msg_prefix, name, new_name
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, new_name)),
@@ -2457,32 +2457,87 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Event struct: mid-sequence insertion → Event Schema Inserted
+    // Event struct: tail append → Event Schema Added (warning)
     // ---------------------------------------------------------------
     #[test]
-    fn event_struct_field_mid_insertion_is_critical() {
-        let old = spec_with_structs(vec![("SomeEvent", vec![("old_field", ScSpecTypeDef::U32)])]);
+    fn event_struct_field_tail_append_uses_event_wording() {
+        // A struct whose name contains "event" must use "Event Schema Added"
+        // as its category (and "Event schema" in the message), consistent with
+        // every other event-struct finding (Removed, Reordered, Type Changed).
+        let old = spec_with_structs(vec![("TransferEvent", vec![("amount", ScSpecTypeDef::U32)])]);
         let new = spec_with_structs(vec![(
-            "SomeEvent",
+            "TransferEvent",
             vec![
-                ("old_field", ScSpecTypeDef::U32),
-                ("new_field", ScSpecTypeDef::U64),
+                ("amount", ScSpecTypeDef::U32),
+                ("memo", ScSpecTypeDef::U64),
             ],
         )]);
 
         let report = compare(&old, &new);
 
-        // Appended at tail, still Struct Field Added (Warning) — event structs
-        // use the same added logic.
+        // Should use event-flavoured category, not the struct one.
         let added = report.findings.iter().find(|f| {
-            f.category == "Struct Field Added" && f.target.as_deref() == Some("SomeEvent.new_field")
+            f.category == "Event Schema Added"
+                && f.target.as_deref() == Some("TransferEvent.memo")
         });
-        assert!(added.is_some(), "Expected Struct Field Added for new_field");
+        assert!(
+            added.is_some(),
+            "Expected 'Event Schema Added' for a tail-appended field on an event struct, \
+             but categories were: {:?}",
+            report.findings.iter().map(|f| &f.category).collect::<Vec<_>>()
+        );
+        assert_eq!(added.unwrap().severity, Severity::Warning);
+
+        // The message must say "Event schema", not "Struct".
+        let msg = &added.unwrap().message;
+        assert!(
+            msg.contains("Event schema"),
+            "Message should use event wording, got: {msg}"
+        );
+        assert!(
+            !msg.contains("Struct '"),
+            "Message must not use struct wording for an event type, got: {msg}"
+        );
+
+        // No finding with struct wording for this type
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.category == "Struct Field Added"
+                    && f.target.as_deref() == Some("TransferEvent.memo")),
+            "Should not emit 'Struct Field Added' for an event type"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Non-event struct: tail append still uses struct wording
+    // ---------------------------------------------------------------
+    #[test]
+    fn non_event_struct_field_tail_append_uses_struct_wording() {
+        let old = spec_with_structs(vec![("Config", vec![("flag", ScSpecTypeDef::Bool)])]);
+        let new = spec_with_structs(vec![(
+            "Config",
+            vec![
+                ("flag", ScSpecTypeDef::Bool),
+                ("timeout", ScSpecTypeDef::U32),
+            ],
+        )]);
+
+        let report = compare(&old, &new);
+
+        let added = report.findings.iter().find(|f| {
+            f.category == "Struct Field Added" && f.target.as_deref() == Some("Config.timeout")
+        });
+        assert!(
+            added.is_some(),
+            "Expected 'Struct Field Added' for a non-event struct"
+        );
         assert_eq!(added.unwrap().severity, Severity::Warning);
     }
 
     // ---------------------------------------------------------------
-    // Union case: mid-sequence insertion → Critical
+    // Event struct: mid-sequence insertion → Event Schema Inserted
     // ---------------------------------------------------------------
     #[test]
     fn union_case_mid_insertion_is_critical() {
