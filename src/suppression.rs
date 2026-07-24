@@ -49,39 +49,18 @@ pub const DEFAULT_CONFIG_FILE: &str = ".safeguard.toml";
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SuppressionConfig {
-    /// Configurable maximum number of suppressions. Enforced globally.
-    #[cfg(feature = "unstable")]
-    pub max_suppressions: Option<usize>,
-    #[cfg(not(feature = "unstable"))]
-    pub(crate) max_suppressions: Option<usize>,
-
-    /// Explicit opt-in for targetless (wildcard) rules.
-    #[cfg(feature = "unstable")]
-    pub allow_targetless: Option<bool>,
-    #[cfg(not(feature = "unstable"))]
-    pub(crate) allow_targetless: Option<bool>,
-
     /// The acknowledged findings, one `[[suppress]]` table per entry.
     #[serde(default, rename = "suppress")]
     #[cfg(feature = "unstable")]
     pub rules: Vec<SuppressionRule>,
+    /// The acknowledged findings, one `[[suppress]]` table per entry.
     #[serde(default, rename = "suppress")]
     #[cfg(not(feature = "unstable"))]
     pub(crate) rules: Vec<SuppressionRule>,
 }
 
 impl SuppressionConfig {
-    /// Get the maximum permitted suppressions limit.
-    pub fn max_suppressions(&self) -> Option<usize> {
-        self.max_suppressions
-    }
-
-    /// Get whether targetless (wildcard) suppressions are allowed.
-    pub fn allow_targetless(&self) -> Option<bool> {
-        self.allow_targetless
-    }
-
-    /// Get the raw slice of suppression rules.
+    /// Get reference to raw slice of rules.
     pub fn rules(&self) -> &[SuppressionRule] {
         &self.rules
     }
@@ -94,6 +73,7 @@ pub struct SuppressionRule {
     /// The finding category to match exactly (e.g. `"Struct Field Type Changed"`).
     #[cfg(feature = "unstable")]
     pub category: String,
+    /// The finding category to match exactly (e.g. `"Struct Field Type Changed"`).
     #[cfg(not(feature = "unstable"))]
     pub(crate) category: String,
 
@@ -102,41 +82,20 @@ pub struct SuppressionRule {
     #[serde(default)]
     #[cfg(feature = "unstable")]
     pub target: Option<String>,
+    /// The exact [`Finding::target`] to match. When omitted, the rule matches
+    /// only findings whose target is `None`.
     #[serde(default)]
     #[cfg(not(feature = "unstable"))]
     pub(crate) target: Option<String>,
 
-    /// The author of the rule, required for security accountability in the new format.
-    #[serde(default)]
-    #[cfg(feature = "unstable")]
-    pub author: Option<String>,
-    #[serde(default)]
-    #[cfg(not(feature = "unstable"))]
-    pub(crate) author: Option<String>,
-
-    /// The human-readable justification, surfaced in the report.
+    /// An optional human-readable justification, surfaced in the report.
     #[serde(default)]
     #[cfg(feature = "unstable")]
     pub reason: Option<String>,
+    /// An optional human-readable justification, surfaced in the report.
     #[serde(default)]
     #[cfg(not(feature = "unstable"))]
     pub(crate) reason: Option<String>,
-
-    /// Expiry date for the suppression rule in YYYY-MM-DD format.
-    #[serde(default)]
-    #[cfg(feature = "unstable")]
-    pub expiry: Option<String>,
-    #[serde(default)]
-    #[cfg(not(feature = "unstable"))]
-    pub(crate) expiry: Option<String>,
-
-    /// Content fingerprint of the finding (SHA-256 hex).
-    #[serde(default)]
-    #[cfg(feature = "unstable")]
-    pub fingerprint: Option<String>,
-    #[serde(default)]
-    #[cfg(not(feature = "unstable"))]
-    pub(crate) fingerprint: Option<String>,
 }
 
 impl SuppressionRule {
@@ -150,24 +109,9 @@ impl SuppressionRule {
         self.target.as_deref()
     }
 
-    /// Get the author of the rule.
-    pub fn author(&self) -> Option<&str> {
-        self.author.as_deref()
-    }
-
     /// Get the human-readable reason/justification.
     pub fn reason(&self) -> Option<&str> {
         self.reason.as_deref()
-    }
-
-    /// Get the expiry date in YYYY-MM-DD format.
-    pub fn expiry(&self) -> Option<&str> {
-        self.expiry.as_deref()
-    }
-
-    /// Get the content fingerprint of the finding.
-    pub fn fingerprint(&self) -> Option<&str> {
-        self.fingerprint.as_deref()
     }
 }
 
