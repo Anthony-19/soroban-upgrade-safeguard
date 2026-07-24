@@ -799,18 +799,39 @@ fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read manifest file: {}", path.display()))?;
 
-    // Try TOML, then JSON
-    if let Ok(manifest) = toml::from_str::<Manifest>(&content) {
-        return Ok(manifest.pairs);
-    }
-    if let Ok(manifest) = serde_json::from_str::<Manifest>(&content) {
-        return Ok(manifest.pairs);
-    }
+    // Capture both errors before deciding which to surface.
+    let toml_err = match toml::from_str::<Manifest>(&content) {
+        Ok(manifest) => return Ok(manifest.pairs),
+        Err(e) => e,
+    };
+    let json_err = match serde_json::from_str::<Manifest>(&content) {
+        Ok(manifest) => return Ok(manifest.pairs),
+        Err(e) => e,
+    };
 
-    anyhow::bail!(
-        "Failed to parse manifest '{}' as either TOML or JSON.",
-        path.display()
-    )
+    // Use the file extension to pick the most relevant error; fall back to
+    // showing both when the extension is absent or unrecognised.
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_lowercase);
+
+    match ext.as_deref() {
+        Some("toml") => Err(toml_err).with_context(|| {
+            format!("Failed to parse TOML manifest '{}'", path.display())
+        }),
+        Some("json") => Err(json_err).with_context(|| {
+            format!("Failed to parse JSON manifest '{}'", path.display())
+        }),
+        _ => Err(anyhow::anyhow!(
+            "Failed to parse manifest '{}' as either TOML or JSON.\n\
+             TOML error: {}\n\
+             JSON error: {}",
+            path.display(),
+            toml_err,
+            json_err,
+        )),
+    }
 }
 
 fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>> {

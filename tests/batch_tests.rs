@@ -244,3 +244,97 @@ fn batch_conflicting_options_exit_with_error() {
         "positional args + manifest must fail"
     );
 }
+
+#[test]
+fn malformed_toml_manifest_surfaces_toml_error_detail() {
+    // A .toml file with a deliberate syntax error (missing closing bracket).
+    let bad_toml = r#"
+[[pairs]
+old = "v1.wasm"
+new = "v2.wasm"
+"#;
+    let manifest_path = write_manifest("bad_manifest.toml", bad_toml);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .output()
+        .expect("failed to run binary");
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_ne!(code, 0, "malformed TOML manifest must exit non-zero");
+    // The TOML parser's own diagnostic must appear in the error chain.
+    assert!(
+        stderr.contains("TOML") || stderr.contains("toml") || stderr.contains("expected"),
+        "Error output should contain the TOML parser's diagnostic, got: {stderr}"
+    );
+    // Must NOT fall through to the generic "as either TOML or JSON" message.
+    assert!(
+        !stderr.contains("as either TOML or JSON"),
+        "Should not show generic both-format error for a .toml file, got: {stderr}"
+    );
+}
+
+#[test]
+fn malformed_json_manifest_surfaces_json_error_detail() {
+    // A .json file with a deliberate syntax error (trailing comma).
+    let bad_json = r#"{
+  "pairs": [
+    {
+      "old": "v1.wasm",
+      "new": "v2.wasm",
+    }
+  ]
+}"#;
+    let manifest_path = write_manifest("bad_manifest.json", bad_json);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .output()
+        .expect("failed to run binary");
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_ne!(code, 0, "malformed JSON manifest must exit non-zero");
+    // The JSON parser's own diagnostic (line/column) must appear.
+    assert!(
+        stderr.contains("JSON") || stderr.contains("json") || stderr.contains("line"),
+        "Error output should contain the JSON parser's diagnostic, got: {stderr}"
+    );
+    // Must NOT fall through to the generic "as either TOML or JSON" message.
+    assert!(
+        !stderr.contains("as either TOML or JSON"),
+        "Should not show generic both-format error for a .json file, got: {stderr}"
+    );
+}
+
+#[test]
+fn unknown_extension_manifest_shows_both_errors() {
+    // A file with no recognised extension that is invalid in both formats.
+    let garbage = "this is not toml or json @@@###";
+    let manifest_path = write_manifest("bad_manifest.cfg", garbage);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .output()
+        .expect("failed to run binary");
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_ne!(code, 0, "unrecognised-extension invalid manifest must exit non-zero");
+    // Both parser errors should appear when the extension gives no hint.
+    assert!(
+        stderr.contains("TOML error") || stderr.contains("toml error"),
+        "Should mention TOML error for unknown extension, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("JSON error") || stderr.contains("json error"),
+        "Should mention JSON error for unknown extension, got: {stderr}"
+    );
+}
