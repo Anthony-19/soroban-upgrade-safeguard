@@ -1,5 +1,8 @@
 # Soroban Upgrade Safeguard 🛡️
 
+[![CI](https://github.com/ShippedLabs/soroban-upgrade-safeguard/actions/workflows/ci.yml/badge.svg)](https://github.com/ShippedLabs/soroban-upgrade-safeguard/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 ![Soroban Upgrade Safeguard Demo](assets/demo.png)
 
 A powerful CLI tool to analyze and validate Soroban smart contract upgrades on the Stellar network. It detects breaking changes in storage layout, function signatures, and event schemas before you deploy.

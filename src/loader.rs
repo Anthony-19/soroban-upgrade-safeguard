@@ -51,8 +51,8 @@ impl std::error::Error for IntegrityError {}
 /// Reads a WASM file from disk, validates it is a valid WASM binary,
 /// and returns a `WasmModule` ready for further analysis.
 pub fn load_wasm(path: &Path) -> Result<WasmModule> {
-    if !path.exists() {
-        bail!("File not found: {}", path.display());
+    if path.is_dir() {
+        bail!("'{}' is a directory, not a WASM file", path.display());
     }
 
     let bytes =
@@ -510,6 +510,28 @@ mod tests {
             "got: {}",
             msg
         );
+    }
+
+    #[test]
+    fn test_load_wasm_rejects_directory() {
+        let dir = std::env::temp_dir().join("soroban-upgrade-safeguard-test-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let err = load_wasm(&dir).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("is a directory"), "got: {}", msg);
+
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_load_wasm_reports_missing_file() {
+        let path = std::env::temp_dir().join("soroban-upgrade-safeguard-does-not-exist.wasm");
+        let _ = std::fs::remove_file(&path);
+
+        let err = load_wasm(&path).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains(&path.display().to_string()), "got: {}", msg);
     }
 
     #[test]

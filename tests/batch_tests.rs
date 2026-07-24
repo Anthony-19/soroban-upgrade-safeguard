@@ -177,6 +177,64 @@ fn batch_manifest_json_mode_json_output() {
 }
 
 #[test]
+fn batch_json_overall_recommended_bump_is_the_most_severe_pair() {
+    // Three pairs that individually recommend patch, minor, and major
+    // respectively. The batch-level bump must be "major", the most severe
+    // of the three, even though it appears last in the manifest.
+    let manifest_content = format!(
+        r#"{{
+            "pairs": [
+                {{
+                    "old": {:?},
+                    "new": {:?},
+                    "name": "patch_pair"
+                }},
+                {{
+                    "old": {:?},
+                    "new": {:?},
+                    "name": "minor_pair"
+                }},
+                {{
+                    "old": {:?},
+                    "new": {:?},
+                    "name": "major_pair"
+                }}
+            ]
+        }}"#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v3.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v2.wasm").to_str().unwrap()
+    );
+
+    let manifest_path = write_manifest("manifest_bump_disagreement.json", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .args(["--format", "json"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+
+    let results = json["results"]
+        .as_object()
+        .expect("results must be an object");
+    assert_eq!(results["patch_pair"]["recommended_bump"], "patch");
+    assert_eq!(results["minor_pair"]["recommended_bump"], "minor");
+    assert_eq!(results["major_pair"]["recommended_bump"], "major");
+
+    assert_eq!(
+        json["recommended_bump"], "major",
+        "batch-level bump must be the most severe across all pairs"
+    );
+}
+
+#[test]
 fn batch_directory_scanning_fails_on_breaking_contract() {
     let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dir_test");
     let old_dir = tmp_dir.join("old");
