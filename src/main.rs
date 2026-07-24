@@ -496,11 +496,26 @@ fn run() -> Result<()> {
                     .map(|f| serde_json::to_value(f))
                     .collect::<Result<_, _>>()?;
 
+                // Overall recommended bump: the most severe bump across all
+                // pairs in the batch, since batch mode compares a whole set
+                // of contracts that ship together.
+                let bump_rank = |bump: &str| match bump {
+                    "major" => 2,
+                    "minor" => 1,
+                    _ => 0,
+                };
+                let overall_bump = results
+                    .values()
+                    .map(|report| report.recommended_bump())
+                    .max_by_key(|bump| bump_rank(bump))
+                    .unwrap_or("patch");
+
                 let batch_json = serde_json::json!({
                     "is_safe": overall_safe,
                     "strict": args.strict,
                     "total_pairs": pairs.len(),
                     "limit_violation": any_limit_violation,
+                    "recommended_bump": overall_bump,
                     "results": results_json,
                     "failed": failed_json,
                     "cross_contract_findings": cross_by_contract,
