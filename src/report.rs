@@ -2,6 +2,7 @@ use crate::diff::{
     DiffReport, Finding, Severity, STORAGE_CATEGORY_PREFIX, STORAGE_UNRESOLVED_CATEGORY,
 };
 use crate::suppression::SuppressionConfig;
+use crate::classification::TypeClass;
 use colored::Colorize;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -312,7 +313,7 @@ impl SafetyReport {
             }
 
             let remediation = if explain {
-                get_remediation_guidance(&finding.category).map(String::from)
+                remediation_for(&finding.category, finding.classification.as_ref())
             } else {
                 None
             };
@@ -827,11 +828,27 @@ impl SafetyReport {
     }
 }
 
-/// Returns remediation/explanation guidance for a given finding category.
+/// Remediation guidance for a finding, tailored by how its type is classified.
 ///
-/// Storage-schema findings reuse the exported-interface categories behind a
-/// [`STORAGE_CATEGORY_PREFIX`], so guidance is looked up storage-first and then
-/// falls back to the shared advice for the underlying structural change.
+/// Categories are purely structural, so the base advice is about layout and
+/// call sites. When the type is classified as an event, off-chain indexers and
+/// subscribers are also affected, so that consequence is appended rather than
+/// baked into a separate `"Event …"` category — which is exactly what used to
+/// couple suppression keys to the classification guess.
+pub fn remediation_for(category: &str, class: Option<&TypeClass>) -> Option<String> {
+    let base = get_remediation_guidance(category)?;
+    match class {
+        Some(c) if c.is_event() => Some(format!(
+            "{base} This type is classified as an event, so off-chain indexers, \
+             subscribers, and monitoring that consume it must be updated too."
+        )),
+        _ => Some(base.to_string()),
+    }
+}
+
+/// Returns structural remediation/explanation guidance for a finding category.
+///
+/// Use [`remediation_for`] to also account for a finding's classification.
 pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
     if category == STORAGE_UNRESOLVED_CATEGORY {
         return Some(
@@ -878,16 +895,12 @@ fn interface_remediation_guidance(category: &str) -> Option<&'static str> {
         "Parameter Reordered" => Some("This is a breaking change. Reordering parameters breaks positional RPC invocation. Restore the original parameter order."),
         "Parameter Type Changed" => Some("This is a breaking change. Update caller arguments and client SDKs to match the new parameter type."),
         "Return Type Changed" => Some("This is a breaking change. Update caller expectations and client SDKs to match the new return type."),
-        "Event Definition Removed" => Some("This is a breaking change. Update or remove downstream event indexing or monitoring systems that consume this event."),
         "Struct Removed" => Some("This is a breaking change. Ensure no stored data or active interfaces reference this struct. If they do, restore the struct."),
         "Struct Documentation Changed" => Some("No code changes required. Ensure documentation changes are aligned with the struct's intended usage."),
         "Struct Added" => Some("No action required. New structs can be safely integrated into storage layouts or interface parameters."),
         "Struct Field Removed" => Some("This is a breaking change. Removing fields breaks serialized storage layouts. Restore the field or perform a state migration."),
-        "Event Field Removed" => Some("This is a breaking change. Update event indexers and consumers that expect this field to be present."),
         "Struct Field Reordered" => Some("This is a breaking change. Reordering fields breaks positional serialization layouts. Restore the original field order."),
-        "Event Field Reordered" => Some("This is a breaking change. Update event indexers and consumers to handle the new positional field order."),
         "Struct Field Type Changed" => Some("This is a breaking change. Changing field types breaks layout serialization. Revert the type change or migrate existing data."),
-        "Event Field Type Changed" => Some("This is a breaking change. Update event indexers and consumers to handle the new field type."),
         "Struct Field Added" => Some("Warning: Ensure existing storage entries are migrated or initialized with correct default values for the new field."),
         "Event Schema Added" => Some("Warning: Ensure event consumers and indexers handle the new field gracefully, since existing stored or emitted events won't contain it."),
         "Struct Field Inserted" => Some("This is a breaking change. A field was inserted in the middle of the struct, shifting all subsequent fields. Restore the original field order or perform a state migration."),
@@ -897,11 +910,8 @@ fn interface_remediation_guidance(category: &str) -> Option<&'static str> {
         "Enum Documentation Changed" => Some("No code changes required. Ensure the updated docs are clear for consumers."),
         "Enum Added" => Some("No action required. Ensure consumers are aware of the new enum type if needed."),
         "Enum Case Removed" => Some("This is a breaking change. On-chain data or parameters using this case will be invalid. Restore the case."),
-        "Event Enum Case Removed" => Some("This is a breaking change. Downstream event indexers or consumers relying on this case will fail. Restore the case."),
         "Enum Case Value Changed" => Some("This is a breaking change. Modifying case values breaks serialization/deserialization. Revert the value change."),
-        "Event Enum Case Value Changed" => Some("This is a breaking change. Downstream event indexers or consumers relying on these values will fail. Revert the value change."),
         "Enum Case Added" => Some("No action required. Ensure consumers can handle the new case gracefully."),
-        "Event Enum Case Added" => Some("No action required. Update event indexers and consumers to handle the new event enum case if necessary."),
         "Union Removed" => Some("This is a breaking change. Stored data or parameters using this union will be invalid. Restore the union."),
         "Union Added" => Some("No action required. Ensure consumers are aware of the new union type if needed."),
         "Union Case Removed" => Some("This is a breaking change. On-chain data using this union case will be invalid. Restore the case."),
@@ -938,7 +948,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_every_emitted_category_has_guidance() {
+    fn every_category_in_the_inventory_has_guidance() {
+        for cat in crate::diff::ALL_CATEGORIES {
+            assert!(
+                get_remediation_guidance(cat).is_some(),
+                "Category '{cat}' does not have remediation guidance!"
+            );
+        }
+    }
+
+    #[test]
+    fn no_category_is_event_flavored() {
+        // Event-ness must live in `classification`, never in the suppression
+        // key, so that reclassifying a type cannot move a finding out from
+        // under an existing suppression rule.
+        for cat in crate::diff::ALL_CATEGORIES {
+            assert!(
+                !cat.contains("Event") || cat.starts_with("Error Enum"),
+                "Category '{cat}' encodes classification in the suppression key"
+            );
+        }
+    }
+
+    /// The inventory is only trustworthy if it actually covers what `diff.rs`
+    /// emits, so scan the source for category literals and require each one to
+    /// be listed. This catches a new category added without guidance.
+    #[test]
+    fn every_emitted_category_is_in_the_inventory() {
         let diff_rs_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("diff.rs");
@@ -1020,25 +1056,27 @@ mod tests {
                         }
                     }
                 }
+                // A literal that *looks* like a category (Title Case words,
+                // no punctuation) but is not in the inventory is a bug.
+                let looks_like_category = literal.len() > 3
+                    && literal.split(' ').count() >= 2
+                    && literal
+                        .split(' ')
+                        .all(|w| w.chars().next().is_some_and(|c| c.is_ascii_uppercase()));
+                assert!(
+                    !looks_like_category
+                        || crate::diff::ALL_CATEGORIES.contains(&literal)
+                        || literal == "TOTALLY CUSTOM CATEGORY",
+                    "'{literal}' looks like a category but is not in diff::ALL_CATEGORIES"
+                );
             }
         }
 
-        // Remove test custom categories
-        checked_categories.remove("TOTALLY CUSTOM CATEGORY");
-
         assert!(
-            !checked_categories.is_empty(),
-            "Sanity check: should have found categories"
+            found.len() > 20,
+            "sanity check: expected to find most categories in the source, found {}",
+            found.len()
         );
-
-        for cat in &checked_categories {
-            let guidance = get_remediation_guidance(cat);
-            assert!(
-                guidance.is_some(),
-                "Category '{}' does not have remediation guidance!",
-                cat
-            );
-        }
     }
 
     #[test]

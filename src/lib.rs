@@ -41,6 +41,7 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+pub mod classification;
 pub mod color;
 pub mod dependency;
 pub mod diff;
@@ -48,6 +49,7 @@ pub mod limits;
 pub mod loader;
 pub mod mapper;
 pub mod parser;
+pub mod rename;
 pub mod report;
 pub mod spec;
 pub mod storage_schema;

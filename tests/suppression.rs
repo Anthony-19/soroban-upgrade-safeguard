@@ -3,11 +3,19 @@
 //! These drive the compiled binary with `--config` against the checked-in
 //! `v1 -> v2` fixtures, which produce three Critical findings:
 //!
-//! - `Event Enum Case Value Changed` on `StatusEvent.Paused`
-//! - `Function Signature Changed`     on `initialize`
-//! - `Struct Field Removed`           on `ConfigData.threshold`
+//! - `Enum Case Value Changed`    on `StatusEvent.Paused`
+//! - `Function Signature Changed` on `initialize`
+//! - `Struct Field Removed`       on `ConfigData.threshold`
 //!
 //! and assert that suppressions flip the failing set without hiding findings.
+//!
+//! Note the category for `StatusEvent.Paused` is the structural
+//! `Enum Case Value Changed`, not an event-specific key. Categories (and thus
+//! suppression keys) are purely structural; whether a type reads as an "event"
+//! is separate classification metadata that never changes the category. So even
+//! though `StatusEvent` contains the substring "event", with the default
+//! classification (no `[classification]` table, name heuristic off) it is a
+//! plain storage type and its suppression key is the structural one.
 
 use serde_json::Value;
 use std::path::PathBuf;
@@ -99,7 +107,7 @@ fn suppressing_all_criticals_passes_but_still_lists_them() {
         "all",
         r#"
         [[suppress]]
-        category = "Event Enum Case Value Changed"
+        category = "Enum Case Value Changed"
         target   = "StatusEvent.Paused"
         reason   = "Reviewed: indexers already updated."
 
@@ -165,7 +173,7 @@ fn partial_suppression_still_fails_on_remaining_critical() {
         "partial",
         r#"
         [[suppress]]
-        category = "Event Enum Case Value Changed"
+        category = "Enum Case Value Changed"
         target   = "StatusEvent.Paused"
 
         [[suppress]]
