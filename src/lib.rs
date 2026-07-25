@@ -249,6 +249,12 @@ pub fn compare_wasm_bytes_with_options(
         &mut diff_report,
     );
 
+    diff::compare_wasm_imports(
+        &old_meta.imports,
+        &new_meta.imports,
+        &mut diff_report,
+    );
+
     // The pipeline always compares the exported interface and environment
     // metadata; storage layout is analyzed only when a schema is supplied for
     // both builds. The scope records which of those actually held so the verdict

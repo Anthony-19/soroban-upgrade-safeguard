@@ -1,7 +1,7 @@
 use crate::diff::Severity;
 
 /// A single registered detection rule.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RuleDefinition {
     pub id: &'static str,
     pub label: &'static str,
@@ -261,6 +261,18 @@ pub const RULES: &[RuleDefinition] = &[
         label: "Cascading Layout Break",
         severity: Severity::Critical,
         guidance: "This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type.",
+    },
+    RuleDefinition {
+        id: "host_import_added",
+        label: "Host Import Added",
+        severity: Severity::Warning,
+        guidance: "The new build requires a host function that the old one did not. Verify that the target network's protocol version provides this function. Deploying to an older protocol will cause a runtime trap.",
+    },
+    RuleDefinition {
+        id: "host_import_removed",
+        label: "Host Import Removed",
+        severity: Severity::Info,
+        guidance: "The new build no longer requires this host function. No action needed — this relaxes the environment requirement.",
     },
 ];
 
