@@ -1,9 +1,173 @@
-use crate::classification::TypeClass;
-use crate::diff::{DiffReport, Finding, Severity};
+use crate::diff::{
+    DiffReport, Finding, Severity, STORAGE_CATEGORY_PREFIX, STORAGE_UNRESOLVED_CATEGORY,
+};
 use crate::suppression::SuppressionConfig;
+use crate::classification::TypeClass;
 use colored::Colorize;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
+
+/// One-line summary of exactly what a verdict from this tool certifies.
+///
+/// Displayed under the status in every human-readable format and mirrored into
+/// the JSON `certifies` field. It exists to stop a green result from being read
+/// as "storage-compatible": the analysis only sees the exported `contractspecv0`
+/// interface and environment metadata, never the internal storage layout that
+/// actually governs on-chain upgrade compatibility.
+pub const SCOPE_SUMMARY_LINE: &str = "Exported interface + environment metadata only — \
+     storage layout is NOT verified by this result.";
+
+/// Longer bounded-claim paragraph appended to reports so an operator cannot
+/// mistake "no exported-interface breaks" for "storage-compatible".
+pub const STORAGE_NOT_VERIFIED_NOTE: &str = "Note: this result does NOT certify storage-layout \
+     compatibility. Internal value types serialized into storage and storage-key discriminants \
+     need not appear in the exported spec, so a green verdict here says nothing about whether \
+     stored data will still deserialize after the upgrade.";
+
+/// Whether — and how much — storage layout was analyzed for this run.
+///
+/// A verdict is only as trustworthy as its scope. When no storage schema is
+/// supplied the tool has no view of internal storage layout at all, and this
+/// state records that plainly so neither a human nor a machine consumer mistakes
+/// "no exported-interface breaks" for "storage-compatible".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageScopeState {
+    /// No storage schema was supplied — storage layout was not analyzed.
+    NotAnalyzed,
+    /// A storage schema was supplied and diffed; coverage is bounded to the
+    /// declared key and value types.
+    Analyzed {
+        key_types: usize,
+        value_types: usize,
+    },
+}
+
+/// A structured description of what a given run actually inspected.
+///
+/// Every field answers "was this dimension analyzed?" so the scope can be
+/// reported faithfully in all formats and consumed as machine-readable coverage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalysisScope {
+    /// The exported `contractspecv0` interface is always compared.
+    pub exported_interface: bool,
+    /// Whether environment metadata (`contractenvmetav0`) was compared.
+    pub env_metadata: bool,
+    /// The storage-layout analysis state for this run.
+    pub storage_schema: StorageScopeState,
+    /// Number of distinct `contractspecv0` sections in the old WASM (0 if not parsed).
+    pub old_spec_section_count: usize,
+    /// Number of distinct `contractspecv0` sections in the new WASM (0 if not parsed).
+    pub new_spec_section_count: usize,
+    /// Names of duplicate entries found in the old WASM, sorted for stable output.
+    pub old_duplicate_names: Vec<String>,
+    /// Names of duplicate entries found in the new WASM, sorted for stable output.
+    pub new_duplicate_names: Vec<String>,
+}
+
+impl Default for AnalysisScope {
+    /// The conservative default: exported interface analyzed, environment
+    /// metadata not compared, storage layout not analyzed. Callers that do more
+    /// (the CLI compares env metadata; a schema-backed run analyzes storage)
+    /// widen the scope explicitly, so the report never overstates coverage.
+    fn default() -> Self {
+        Self {
+            exported_interface: true,
+            env_metadata: false,
+            storage_schema: StorageScopeState::NotAnalyzed,
+            old_spec_section_count: 0,
+            new_spec_section_count: 0,
+            old_duplicate_names: Vec::new(),
+            new_duplicate_names: Vec::new(),
+        }
+    }
+}
+
+impl AnalysisScope {
+    /// Whether a storage schema was analyzed for this run.
+    pub fn storage_analyzed(&self) -> bool {
+        matches!(self.storage_schema, StorageScopeState::Analyzed { .. })
+    }
+
+    /// One-sentence bounded claim describing what this verdict certifies. When
+    /// no schema was supplied it reduces to [`SCOPE_SUMMARY_LINE`].
+    pub fn summary_line(&self) -> String {
+        match &self.storage_schema {
+            StorageScopeState::NotAnalyzed => SCOPE_SUMMARY_LINE.to_string(),
+            StorageScopeState::Analyzed {
+                key_types,
+                value_types,
+            } => format!(
+                "Exported interface + environment metadata, plus a declared storage schema \
+                 ({key_types} key type(s), {value_types} value type(s)). Storage coverage is \
+                 limited to the declared types."
+            ),
+        }
+    }
+
+    /// A single line stating the storage-layout coverage explicitly.
+    pub fn storage_status_line(&self) -> String {
+        match &self.storage_schema {
+            StorageScopeState::NotAnalyzed => {
+                "Storage layout: NOT analyzed — no storage schema supplied.".to_string()
+            }
+            StorageScopeState::Analyzed {
+                key_types,
+                value_types,
+            } => format!(
+                "Storage layout: analyzed against the declared schema \
+                 ({key_types} key type(s), {value_types} value type(s))."
+            ),
+        }
+    }
+}
+
+/// A machine-readable view of an [`AnalysisScope`] for `--format json`.
+#[derive(Serialize)]
+pub struct ScopeJson {
+    pub exported_interface_analyzed: bool,
+    pub env_metadata_analyzed: bool,
+    pub storage_layout_analyzed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_key_types: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_value_types: Option<usize>,
+    /// Number of `contractspecv0` sections found in the old WASM.
+    pub old_spec_section_count: usize,
+    /// Number of `contractspecv0` sections found in the new WASM.
+    pub new_spec_section_count: usize,
+    /// Names of duplicate entries detected in the old WASM (empty when clean).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub old_duplicate_names: Vec<String>,
+    /// Names of duplicate entries detected in the new WASM (empty when clean).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub new_duplicate_names: Vec<String>,
+    pub summary: String,
+}
+
+impl AnalysisScope {
+    /// Build the serializable coverage view of this scope.
+    pub fn to_json(&self) -> ScopeJson {
+        let (storage_key_types, storage_value_types) = match &self.storage_schema {
+            StorageScopeState::NotAnalyzed => (None, None),
+            StorageScopeState::Analyzed {
+                key_types,
+                value_types,
+            } => (Some(*key_types), Some(*value_types)),
+        };
+        ScopeJson {
+            exported_interface_analyzed: self.exported_interface,
+            env_metadata_analyzed: self.env_metadata,
+            storage_layout_analyzed: self.storage_analyzed(),
+            storage_key_types,
+            storage_value_types,
+            old_spec_section_count: self.old_spec_section_count,
+            new_spec_section_count: self.new_spec_section_count,
+            old_duplicate_names: self.old_duplicate_names.clone(),
+            new_duplicate_names: self.new_duplicate_names.clone(),
+            summary: self.summary_line(),
+        }
+    }
+}
 
 /// A finding as it appears in the report, augmented with suppression state.
 ///
@@ -16,12 +180,23 @@ pub struct ReportedFinding {
     /// (`severity`, `category`, `message`, `type_name`, `target`).
     #[serde(flatten)]
     pub finding: Finding,
+    /// The SHA-256 fingerprint computed for this finding.
+    pub fingerprint: String,
     /// Whether a suppression rule acknowledged this finding.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub suppressed: bool,
     /// The justification copied from the matching rule, if it provided one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suppression_reason: Option<String>,
+    /// The author copied from the matching rule, if it provided one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppression_author: Option<String>,
+    /// The expiry copied from the matching rule, if it provided one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppression_expiry: Option<String>,
+    /// The fingerprint copied from the matching rule, if it provided one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppression_fingerprint: Option<String>,
     /// Optional remediation/explanation advice for the user.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remediation: Option<String>,
@@ -34,10 +209,24 @@ pub struct SafetyReport {
     pub info_count: usize,
     /// Number of findings (of any severity) acknowledged by a suppression rule.
     pub suppressed_count: usize,
+    pub suppressed_critical_count: usize,
     pub total_findings: usize,
     pub is_safe: bool,
     pub findings_by_category: HashMap<String, Vec<ReportedFinding>>,
     pub strict: bool,
+    /// What this run actually inspected. Drives the scope reporting so a verdict
+    /// is never read as broader than the analysis that produced it.
+    pub scope: AnalysisScope,
+    /// Where the baseline (old) contract was sourced from (e.g. "RPC", "Local File").
+    pub baseline_source: Option<String>,
+    /// Verified SHA-256 hash of the baseline WASM bytecode (hex), if verified.
+    pub verified_code_hash: Option<String>,
+    /// Human-readable summary of the old contract spec (e.g. "3 fns, 2 types").
+    /// Populated by the canonical pipeline so callers don't need to re-extract metadata.
+    pub old_spec_summary: Option<String>,
+    /// Human-readable summary of the new contract spec.
+    /// Populated by the canonical pipeline so callers don't need to re-extract metadata.
+    pub new_spec_summary: Option<String>,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -56,11 +245,18 @@ pub struct SeverityCounts {
 pub struct SafetyReportJson<'a> {
     pub is_safe: bool,
     pub strict: bool,
+    /// One-sentence bounded claim describing what this verdict certifies.
+    /// Machine consumers should not equate `is_safe` with storage compatibility.
+    pub certifies: String,
+    /// Structured coverage: which analysis dimensions actually ran.
+    pub scope: ScopeJson,
     pub counts: SeverityCounts,
     /// Findings (of any severity) acknowledged by the suppression config.
     pub suppressed_count: usize,
     pub total_findings: usize,
     pub recommended_bump: &'static str,
+    pub baseline_source: Option<&'a str>,
+    pub verified_code_hash: Option<&'a str>,
     pub findings_by_category: BTreeMap<&'a str, &'a Vec<ReportedFinding>>,
 }
 
@@ -89,6 +285,7 @@ impl SafetyReport {
         let mut warning_count = 0;
         let mut info_count = 0;
         let mut suppressed_count = 0;
+        let mut suppressed_critical_count = 0;
         let mut failing_critical_count = 0;
         let mut failing_warning_count = 0;
         let mut findings_by_category: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
@@ -104,6 +301,9 @@ impl SafetyReport {
             let suppressed = rule.is_some();
             if suppressed {
                 suppressed_count += 1;
+                if finding.severity == Severity::Critical {
+                    suppressed_critical_count += 1;
+                }
             } else {
                 match finding.severity {
                     Severity::Critical => failing_critical_count += 1,
@@ -118,13 +318,18 @@ impl SafetyReport {
                 None
             };
 
+            let fingerprint = crate::suppression::compute_fingerprint(finding);
             findings_by_category
                 .entry(finding.category.clone())
                 .or_default()
                 .push(ReportedFinding {
                     finding: finding.clone(),
+                    fingerprint,
                     suppressed,
                     suppression_reason: rule.and_then(|r| r.reason.clone()),
+                    suppression_author: rule.and_then(|r| r.author.clone()),
+                    suppression_expiry: rule.and_then(|r| r.expiry.clone()),
+                    suppression_fingerprint: rule.and_then(|r| r.fingerprint.clone()),
                     remediation,
                 });
         }
@@ -140,11 +345,47 @@ impl SafetyReport {
             warning_count,
             info_count,
             suppressed_count,
+            suppressed_critical_count,
             total_findings: diff.findings.len(),
             is_safe,
             findings_by_category,
             strict,
+            scope: AnalysisScope::default(),
+            baseline_source: None,
+            verified_code_hash: None,
+            old_spec_summary: None,
+            new_spec_summary: None,
         }
+    }
+
+    /// The passing status label, widened only as far as the analysis actually
+    /// went. Without a storage schema the claim stays bounded to the exported
+    /// interface; with one it may also speak to the declared storage types.
+    pub fn passed_status_label(&self) -> &'static str {
+        if self.scope.storage_analyzed() {
+            "✅ PASSED (No exported-interface or declared-storage breaks)"
+        } else {
+            "✅ PASSED (No exported-interface breaking changes)"
+        }
+    }
+
+    /// The failing status label, naming the scopes a break could have come from.
+    pub fn failed_status_label(&self) -> &'static str {
+        if self.scope.storage_analyzed() {
+            "❌ FAILED (Breaking changes detected in the exported interface or declared storage)"
+        } else {
+            "❌ FAILED (Exported-interface breaking changes detected)"
+        }
+    }
+
+    /// Attach an [`AnalysisScope`] describing what this run inspected.
+    ///
+    /// Consuming builder so a caller can widen the reported scope (for example
+    /// the CLI, which compares environment metadata, or a schema-backed run that
+    /// analyzed declared storage types) without the report ever overstating it.
+    pub fn with_scope(mut self, scope: AnalysisScope) -> Self {
+        self.scope = scope;
+        self
     }
 
     /// Derive the recommended SemVer bump from safety report findings:
@@ -170,6 +411,8 @@ impl SafetyReport {
         SafetyReportJson {
             is_safe: self.is_safe,
             strict: self.strict,
+            certifies: self.scope.summary_line(),
+            scope: self.scope.to_json(),
             counts: SeverityCounts {
                 critical: self.critical_count,
                 warning: self.warning_count,
@@ -178,6 +421,8 @@ impl SafetyReport {
             suppressed_count: self.suppressed_count,
             total_findings: self.total_findings,
             recommended_bump: self.recommended_bump(),
+            baseline_source: self.baseline_source.as_deref(),
+            verified_code_hash: self.verified_code_hash.as_deref(),
             findings_by_category: self
                 .findings_by_category
                 .iter()
@@ -210,15 +455,54 @@ impl SafetyReport {
         );
 
         let status = if self.is_safe {
-            "✅ PASSED (No breaking changes detected)".green().bold()
+            self.passed_status_label().green().bold()
         } else if self.strict && self.critical_count == 0 {
             "❌ FAILED (Warnings detected in strict mode)".red().bold()
         } else {
-            "❌ FAILED (Critical breaking changes detected)"
-                .red()
-                .bold()
+            self.failed_status_label().red().bold()
         };
         output.push_str(&format!("Status: {}\n", status));
+        output.push_str(&format!("Scope:  {}\n", self.scope.summary_line().dimmed()));
+        let storage_status = self.scope.storage_status_line();
+        let storage_status = if self.scope.storage_analyzed() {
+            storage_status.dimmed()
+        } else {
+            // No schema: make the "not analyzed" gap visible rather than dim.
+            storage_status.yellow()
+        };
+        output.push_str(&format!("        {}\n", storage_status));
+
+        // Spec-section integrity summary (non-zero section count or duplicates).
+        if self.scope.old_spec_section_count > 1 || self.scope.new_spec_section_count > 1 {
+            output.push_str(&format!(
+                "        Spec sections: old={}, new={} (multi-section WASMs detected)\n",
+                self.scope.old_spec_section_count,
+                self.scope.new_spec_section_count,
+            ).yellow().to_string());
+        }
+        let all_dups: Vec<String> = self
+            .scope
+            .old_duplicate_names
+            .iter()
+            .map(|n| format!("old:{n}"))
+            .chain(
+                self.scope
+                    .new_duplicate_names
+                    .iter()
+                    .map(|n| format!("new:{n}")),
+            )
+            .collect();
+        if !all_dups.is_empty() {
+            output.push_str(
+                &format!(
+                    "        Duplicate entries detected: {}\n",
+                    all_dups.join(", ")
+                )
+                .red()
+                .bold()
+                .to_string(),
+            );
+        }
 
         let crit_str = if self.critical_count > 0 {
             self.critical_count.to_string().red().bold()
@@ -249,6 +533,14 @@ impl SafetyReport {
             _ => bump.normal(),
         };
         output.push_str(&format!("Recommended Bump: {}\n", bump_str));
+
+        if let Some(source) = &self.baseline_source {
+            output.push_str(&format!("Baseline Source: {}\n", source));
+        }
+        if let Some(hash) = &self.verified_code_hash {
+            output.push_str(&format!("Verified Code Hash: {}\n", hash.dimmed()));
+        }
+
         output.push_str(
             &"----------------------------------------\n\n"
                 .dimmed()
@@ -256,7 +548,8 @@ impl SafetyReport {
         );
 
         if self.total_findings == 0 {
-            output.push_str(&"No relevant changes detected. The upgrade is identical in its exports and types.\n".green().to_string());
+            output.push_str(&"No relevant changes detected. The exported interface is identical in its exports and types.\n".green().to_string());
+            output.push_str(&format!("\n{}\n", STORAGE_NOT_VERIFIED_NOTE.dimmed()));
             return output;
         }
 
@@ -339,6 +632,56 @@ impl SafetyReport {
             }
         }
 
+        let mut suppressed_list = Vec::new();
+        for group in self.findings_by_category.values() {
+            for reported in group {
+                if reported.suppressed {
+                    suppressed_list.push(reported);
+                }
+            }
+        }
+
+        if !suppressed_list.is_empty() {
+            output.push_str(
+                &"\n========================================\n"
+                    .bold()
+                    .to_string(),
+            );
+            output.push_str(
+                &"🔕 APPLIED SUPPRESSIONS AUDIT LOG\n"
+                    .bold()
+                    .magenta()
+                    .to_string(),
+            );
+            output.push_str(
+                &"========================================\n"
+                    .bold()
+                    .to_string(),
+            );
+            for reported in suppressed_list {
+                let f = &reported.finding;
+                let target_str = f.target.as_deref().unwrap_or("<no target>");
+                output.push_str(&format!(
+                    " - Category:    {}\n   Target:      {}\n",
+                    f.category, target_str
+                ));
+                if let Some(fp) = &reported.suppression_fingerprint {
+                    output.push_str(&format!("   Fingerprint: {}\n", fp));
+                }
+                if let Some(author) = &reported.suppression_author {
+                    let expiry_str = reported.suppression_expiry.as_deref().unwrap_or("never");
+                    output.push_str(&format!(
+                        "   Author:      {} (expires {})\n",
+                        author, expiry_str
+                    ));
+                }
+                if let Some(reason) = &reported.suppression_reason {
+                    output.push_str(&format!("   Reason:      {}\n", reason));
+                }
+                output.push('\n');
+            }
+        }
+
         output
     }
 
@@ -348,11 +691,43 @@ impl SafetyReport {
         output.push_str("# Soroban Upgrade Safety Report\n\n");
 
         let status = if self.is_safe {
-            "✅ PASSED (No breaking changes detected)"
+            self.passed_status_label()
         } else {
-            "❌ FAILED (Critical breaking changes detected)"
+            self.failed_status_label()
         };
         output.push_str(&format!("## Status: {}\n\n", status));
+        output.push_str(&format!("_{}_\n\n", self.scope.summary_line()));
+        output.push_str(&format!(
+            "**Scope:** {}\n\n",
+            self.scope.storage_status_line()
+        ));
+
+        // Spec-section integrity (multi-section or duplicates).
+        if self.scope.old_spec_section_count > 1 || self.scope.new_spec_section_count > 1 {
+            output.push_str(&format!(
+                "> ⚠️ Multi-section WASM detected: old has {} contractspecv0 section(s), new has {}.\n\n",
+                self.scope.old_spec_section_count,
+                self.scope.new_spec_section_count,
+            ));
+        }
+        let all_dups: Vec<String> = self
+            .scope
+            .old_duplicate_names
+            .iter()
+            .map(|n| format!("`old:{n}`"))
+            .chain(
+                self.scope
+                    .new_duplicate_names
+                    .iter()
+                    .map(|n| format!("`new:{n}`")),
+            )
+            .collect();
+        if !all_dups.is_empty() {
+            output.push_str(&format!(
+                "> ❌ Duplicate spec entries detected: {}\n\n",
+                all_dups.join(", ")
+            ));
+        }
 
         output.push_str("### Summary Table\n\n");
         output.push_str("| Finding Severity | Count |\n");
@@ -367,10 +742,19 @@ impl SafetyReport {
             "\n**Recommended SemVer Bump**: `{}`\n\n",
             self.recommended_bump()
         ));
+
+        if let Some(source) = &self.baseline_source {
+            output.push_str(&format!("**Baseline Source**: `{}`\n\n", source));
+        }
+        if let Some(hash) = &self.verified_code_hash {
+            output.push_str(&format!("**Verified Code Hash**: `{}`\n\n", hash));
+        }
+
         output.push_str("---\n\n");
 
         if self.total_findings == 0 {
-            output.push_str("No relevant changes detected. The upgrade is identical in its exports and types.\n");
+            output.push_str("No relevant changes detected. The exported interface is identical in its exports and types.\n\n");
+            output.push_str(&format!("> {}\n", STORAGE_NOT_VERIFIED_NOTE));
             return output;
         }
 
@@ -411,6 +795,35 @@ impl SafetyReport {
             output.push_str("- Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n");
         }
 
+        let mut suppressed_list = Vec::new();
+        for group in self.findings_by_category.values() {
+            for reported in group {
+                if reported.suppressed {
+                    suppressed_list.push(reported);
+                }
+            }
+        }
+
+        if !suppressed_list.is_empty() {
+            output.push_str("### 🔕 Applied Suppressions Audit Log\n\n");
+            output.push_str("| Category | Target | Fingerprint | Author | Expiry | Reason |\n");
+            output.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
+            for reported in suppressed_list {
+                let f = &reported.finding;
+                let category = &f.category;
+                let target = f.target.as_deref().unwrap_or("-");
+                let fingerprint = reported.suppression_fingerprint.as_deref().unwrap_or("-");
+                let author = reported.suppression_author.as_deref().unwrap_or("-");
+                let expiry = reported.suppression_expiry.as_deref().unwrap_or("-");
+                let reason = reported.suppression_reason.as_deref().unwrap_or("-");
+                output.push_str(&format!(
+                    "| {} | `{}` | `{}` | {} | {} | {} |\n",
+                    category, target, fingerprint, author, expiry, reason
+                ));
+            }
+            output.push_str("\n---\n\n");
+        }
+
         output
     }
 }
@@ -437,6 +850,41 @@ pub fn remediation_for(category: &str, class: Option<&TypeClass>) -> Option<Stri
 ///
 /// Use [`remediation_for`] to also account for a finding's classification.
 pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
+    if category == STORAGE_UNRESOLVED_CATEGORY {
+        return Some(
+            "Declare the referenced type in the storage schema, or confirm it is not \
+             serialized into storage. Until it resolves, its layout is not analyzed.",
+        );
+    }
+
+    if let Some(base) = category.strip_prefix(STORAGE_CATEGORY_PREFIX) {
+        return storage_remediation_guidance(base).or_else(|| interface_remediation_guidance(base));
+    }
+
+    interface_remediation_guidance(category)
+}
+
+/// Guidance specific to declared storage types, where the consequence of a
+/// structural change is stored-data corruption rather than a broken caller.
+fn storage_remediation_guidance(base_category: &str) -> Option<&'static str> {
+    match base_category {
+        "Struct Field Reordered" => Some("This corrupts stored data. Soroban serializes struct fields positionally, so reordering makes existing entries decode into the wrong fields. Restore the original field order and append any new field at the end."),
+        "Struct Field Removed" => Some("This corrupts stored data. Existing entries still contain bytes for this field. Restore the field, or perform an explicit migration that rewrites every affected entry before the upgrade."),
+        "Struct Field Type Changed" => Some("This corrupts stored data. Existing entries hold bytes in the old type's encoding. Revert the type, or migrate every affected entry."),
+        "Struct Field Added" => Some("For a storage value this needs a migration or default, because existing entries lack the field. For a storage key it is fatal: the key's bytes change, so every existing entry becomes unreachable."),
+        "Union Case Reordered" => Some("This orphans stored data. Union cases are addressed by positional discriminant, so reordering changes which variant existing bytes decode as. Restore the original case order and append new cases at the end."),
+        "Union Case Removed" => Some("This orphans stored data written under the removed discriminant. Restore the case, or migrate the affected entries before upgrading."),
+        "Union Case Type Changed" => Some("This corrupts stored data. The payload encoding changed under an unchanged discriminant. Revert the payload type, or migrate the affected entries."),
+        "Enum Case Value Changed" => Some("This orphans stored data. The discriminant is what was written to storage, so changing it makes existing entries resolve to a different case or to nothing. Restore the original value."),
+        "Enum Case Removed" => Some("This orphans stored data written under this discriminant. Restore the case, or migrate the affected entries."),
+        "Struct Removed" | "Enum Removed" | "Union Removed" => Some("A declared storage type disappeared while data written with it may still exist on chain. Restore the type, or migrate the affected entries before upgrading."),
+        "Cascading Layout Break" => Some("This type embeds a modified storage type, so its stored bytes are no longer decodable. Resolve the break in the referenced type."),
+        _ => None,
+    }
+}
+
+/// Guidance for exported-interface findings.
+fn interface_remediation_guidance(category: &str) -> Option<&'static str> {
     match category {
         "Environment" => Some("Verify that the target network supports the new protocol version and adjust any SDK/tooling dependencies accordingly."),
         "Function Removed" => Some("This is a breaking change. If the function is no longer needed, deprecate it in client integrations. Otherwise, restore the function signature."),
@@ -454,6 +902,10 @@ pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
         "Struct Field Reordered" => Some("This is a breaking change. Reordering fields breaks positional serialization layouts. Restore the original field order."),
         "Struct Field Type Changed" => Some("This is a breaking change. Changing field types breaks layout serialization. Revert the type change or migrate existing data."),
         "Struct Field Added" => Some("Warning: Ensure existing storage entries are migrated or initialized with correct default values for the new field."),
+        "Event Schema Added" => Some("Warning: Ensure event consumers and indexers handle the new field gracefully, since existing stored or emitted events won't contain it."),
+        "Struct Field Inserted" => Some("This is a breaking change. A field was inserted in the middle of the struct, shifting all subsequent fields. Restore the original field order or perform a state migration."),
+        "Event Field Inserted" => Some("This is a breaking change. A field was inserted in the middle of the event schema, shifting all subsequent fields. Update event indexers and consumers to handle the new positional layout."),
+        "Event Enum Removed" => Some("This is a breaking change. Downstream event consumers or indexers relying on this enum will fail. Restore the enum."),
         "Enum Removed" => Some("This is a breaking change. Stored data or parameters using this enum will be invalid. Restore the enum."),
         "Enum Documentation Changed" => Some("No code changes required. Ensure the updated docs are clear for consumers."),
         "Enum Added" => Some("No action required. Ensure consumers are aware of the new enum type if needed."),
@@ -466,14 +918,27 @@ pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
         "Union Case Reordered" => Some("This is a breaking change. Reordering union cases breaks positional discriminant serialization. Restore the original case order."),
         "Union Case Type Changed" => Some("This is a breaking change. Changing union case payload types breaks layout serialization. Revert the type change or migrate existing data."),
         "Union Case Added" => Some("No action required. Ensure consumers can handle the new union case gracefully."),
+        "Union Case Inserted" => Some("This is a breaking change. A union case was inserted in the middle, shifting all subsequent case discriminants. Restore the original case order or migrate stored data."),
         "Error Enum Removed" => Some("This is a breaking change. Clients matching on these error codes will break. Restore the error enum."),
         "Error Enum Added" => Some("No action required. Inform client integrations about the new error enum if needed."),
         "Error Enum Case Removed" => Some("This is a breaking change. Clients matching on this error code will break. Restore the case."),
         "Error Enum Case Value Changed" => Some("This is a breaking change. Modifying error case values breaks error-code compatibility. Revert the value change."),
         "Error Enum Case Added" => Some("No action required. Ensure clients can handle the new error case gracefully."),
+        "Type Library Changed" => Some("No code changes required. The type's declaring library changed, so its definition is now controlled by a different dependency and can drift independently. Confirm the new source is intended and pin/review that dependency."),
         "Cascading Layout Break" => Some("This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type."),
-        "Type Renamed" => Some("The type was matched to a renamed counterpart with an identical layout, so stored data stays compatible. No migration is needed — update client and SDK type names."),
-        "Type Renamed With Changes" => Some("The type was matched to a renamed counterpart whose layout also changed. Update client type names, then resolve the accompanying field-level findings, which are the actual breaking changes."),
+        "Spec Entry Conflict" => Some(
+            "The WASM contains multiple conflicting definitions for the same entry name. \
+             This means the analysis cannot be trusted: the definition used for comparison \
+             may not be the one the contract actually executes. \
+             Rebuild the contract with a toolchain that produces a single contractspecv0 section \
+             and a unique definition per name. Do not deploy this WASM.",
+        ),
+        "Spec Entry Duplicate" => Some(
+            "The WASM contains identical duplicate definitions for the same entry name. \
+             While the duplicate is safe to deduplicate, the WASM is non-canonical. \
+             Rebuild with a toolchain that produces a single contractspecv0 section \
+             per contract.",
+        ),
         _ => None,
     }
 }
@@ -515,26 +980,81 @@ mod tests {
             .join("diff.rs");
         let content = std::fs::read_to_string(diff_rs_path).expect("Failed to read src/diff.rs");
 
-        // Everything from `ALL_CATEGORIES` down to the start of the emitters;
-        // the inventory itself is a list of bare literals and would otherwise
-        // be scanned as if it were emitting code.
-        let inventory_end = content
-            .find("/// Compare decoded environment metadata")
-            .expect("diff.rs should still define the inventory before the emitters");
-        let emitters = &content[inventory_end..];
+        let mut checked_categories = std::collections::HashSet::new();
 
-        let mut found = std::collections::BTreeSet::new();
-        for line in emitters.lines() {
-            // Category literals appear either on a `category:` line or, for the
-            // rename findings, in the `(Severity::_, "…", "…")` tuple that
-            // feeds one. Scanning any line that mentions `Severity::` or
-            // `category` covers both without matching message text.
-            if !line.contains("category") && !line.contains("Severity::") {
-                continue;
-            }
-            for literal in line.split('"').skip(1).step_by(2) {
-                if crate::diff::ALL_CATEGORIES.contains(&literal) {
-                    found.insert(literal.to_string());
+        for line in content.lines() {
+            if line.contains("category:") {
+                // If it is ENVIRONMENT_CATEGORY
+                if line.contains("ENVIRONMENT_CATEGORY") {
+                    checked_categories.insert("Environment".to_string());
+                    continue;
+                }
+                // Constant-referenced duplicate/conflict categories
+                if line.contains("SPEC_CONFLICT_CATEGORY") {
+                    checked_categories.insert("Spec Entry Conflict".to_string());
+                    continue;
+                }
+                if line.contains("SPEC_DUPLICATE_CATEGORY") {
+                    checked_categories.insert("Spec Entry Duplicate".to_string());
+                    continue;
+                }
+
+                // Find all string literals in the line
+                let mut chars = line.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '"' {
+                        let mut literal = String::new();
+                        while let Some(&nc) = chars.peek() {
+                            if nc == '"' {
+                                chars.next();
+                                break;
+                            }
+                            literal.push(chars.next().unwrap());
+                        }
+                        if !literal.is_empty() {
+                            // If it's a format string like "{} Removed"
+                            if literal.contains("{}") {
+                                let suffixes = vec![
+                                    "Removed",
+                                    "Reordered",
+                                    "Type Changed",
+                                    "Value Changed",
+                                    "Added",
+                                ];
+                                for suffix in suffixes {
+                                    if literal == format!("{{}} {}", suffix) {
+                                        let prefixes = match suffix {
+                                            "Reordered" | "Type Changed" => {
+                                                vec!["Struct Field", "Event Field"]
+                                            }
+                                            "Value Changed" => {
+                                                vec!["Enum Case", "Event Enum Case"]
+                                            }
+                                            "Added" => vec![
+                                                "Struct Field",
+                                                "Event Schema",
+                                                "Enum Case",
+                                                "Event Enum Case",
+                                            ],
+                                            "Removed" => vec![
+                                                "Struct Field",
+                                                "Event Field",
+                                                "Enum Case",
+                                                "Event Enum Case",
+                                            ],
+                                            _ => unreachable!(),
+                                        };
+                                        for prefix in prefixes {
+                                            checked_categories
+                                                .insert(format!("{} {}", prefix, suffix));
+                                        }
+                                    }
+                                }
+                            } else {
+                                checked_categories.insert(literal);
+                            }
+                        }
+                    }
                 }
                 // A literal that *looks* like a category (Title Case words,
                 // no punctuation) but is not in the inventory is a bug.
@@ -566,10 +1086,16 @@ mod tests {
             warning_count: 0,
             info_count: 0,
             suppressed_count: 0,
+            suppressed_critical_count: 0,
             total_findings: 0,
             is_safe: true,
             findings_by_category: std::collections::HashMap::new(),
             strict: false,
+            scope: AnalysisScope::default(),
+            baseline_source: None,
+            verified_code_hash: None,
+            old_spec_summary: None,
+            new_spec_summary: None,
         };
 
         // Identical upgrade -> patch

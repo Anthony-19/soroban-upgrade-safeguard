@@ -37,23 +37,51 @@ fn write_config(name: &str, contents: &str) -> PathBuf {
     path
 }
 
-/// Run the binary in JSON mode comparing `v1 -> v2`, optionally with a config.
-/// Returns (parsed JSON, exit code).
-fn run(config: Option<&PathBuf>) -> (Value, i32) {
+/// Run the binary, optionally with a config.
+/// Returns (stdout, stderr, exit code).
+fn run_raw(config: Option<&PathBuf>, format_json: bool) -> (String, String, i32) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"));
-    cmd.arg(wasm("v1.wasm"))
-        .arg(wasm("v2.wasm"))
-        .args(["--format", "json"]);
+    cmd.arg(wasm("v1.wasm")).arg(wasm("v2.wasm"));
+    if format_json {
+        cmd.args(["--format", "json"]);
+    }
     if let Some(path) = config {
         cmd.args(["--config".as_ref(), path.as_os_str()]);
     }
 
     let output = cmd.output().expect("failed to run binary");
     let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+    (stdout, stderr, code)
+}
+
+/// Run the binary in JSON mode comparing `v1 -> v2`, optionally with a config.
+/// Returns (parsed JSON, exit code).
+fn run(config: Option<&PathBuf>) -> (Value, i32) {
+    let (stdout, _, code) = run_raw(config, true);
     let json: Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("stdout was not valid JSON: {e}\n---stdout---\n{stdout}"));
-    let code = output.status.code().expect("process terminated by signal");
     (json, code)
+}
+
+/// Helper to get all Critical findings and their computed fingerprints.
+fn get_findings_with_fingerprints() -> Vec<(String, Option<String>, String)> {
+    let (json, _) = run(None);
+    json["findings_by_category"]
+        .as_object()
+        .expect("findings_by_category must be an object")
+        .values()
+        .flat_map(|arr| arr.as_array().expect("findings must be an array"))
+        .filter(|f| f["severity"].as_str().unwrap() == "critical")
+        .map(|f| {
+            (
+                f["category"].as_str().unwrap().to_string(),
+                f["target"].as_str().map(str::to_string),
+                f["fingerprint"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
 }
 
 /// Collect every finding across all categories as (category, target, suppressed).
@@ -193,5 +221,153 @@ fn missing_explicit_config_is_an_error() {
     assert!(
         stderr.contains("suppression config"),
         "error should mention the suppression config: {stderr}"
+    );
+}
+
+#[test]
+fn test_new_format_suppression_success() {
+    let findings = get_findings_with_fingerprints();
+    assert_eq!(findings.len(), 3, "sanity check: expect 3 findings");
+
+    let mut toml_str = String::from("allow_targetless = false\n");
+    for (cat, target, fp) in &findings {
+        toml_str.push_str("\n[[suppress]]\n");
+        toml_str.push_str(&format!("category = \"{}\"\n", cat));
+        if let Some(t) = target {
+            toml_str.push_str(&format!("target = \"{}\"\n", t));
+        }
+        toml_str.push_str("author = \"test-author\"\n");
+        toml_str.push_str("expiry = \"2099-12-31\"\n");
+        toml_str.push_str(&format!("fingerprint = \"{}\"\n", fp));
+    }
+
+    let config = write_config("new-format-success", &toml_str);
+    let (stdout, stderr, code) = run_raw(Some(&config), true);
+
+    assert_eq!(code, 0, "all findings suppressed -> must exit 0");
+    assert!(
+        stderr.contains(
+            "SECURITY NOTICE: The gate passed because 3 Critical breaking changes were suppressed"
+        ),
+        "stderr must contain the security notice. Stderr: {}",
+        stderr
+    );
+
+    let json: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["suppressed_count"].as_u64().unwrap(), 3);
+}
+
+#[test]
+fn test_fingerprint_mismatch_fails() {
+    let findings = get_findings_with_fingerprints();
+    let mut toml_str = String::from("allow_targetless = false\n");
+    for (i, (cat, target, fp)) in findings.iter().enumerate() {
+        toml_str.push_str("\n[[suppress]]\n");
+        toml_str.push_str(&format!("category = \"{}\"\n", cat));
+        if let Some(t) = target {
+            toml_str.push_str(&format!("target = \"{}\"\n", t));
+        }
+        toml_str.push_str("author = \"test-author\"\n");
+        toml_str.push_str("expiry = \"2099-12-31\"\n");
+        if i == 0 {
+            toml_str.push_str("fingerprint = \"wrongfingerprint12345\"\n");
+        } else {
+            toml_str.push_str(&format!("fingerprint = \"{}\"\n", fp));
+        }
+    }
+
+    let config = write_config("fingerprint-mismatch", &toml_str);
+    let (_, _, code) = run_raw(Some(&config), true);
+    assert_eq!(code, 1, "mismatched fingerprint must not suppress finding");
+}
+
+#[test]
+fn test_expiry_check_fails() {
+    let findings = get_findings_with_fingerprints();
+    let mut toml_str = String::from("allow_targetless = false\n");
+    for (i, (cat, target, fp)) in findings.iter().enumerate() {
+        toml_str.push_str("\n[[suppress]]\n");
+        toml_str.push_str(&format!("category = \"{}\"\n", cat));
+        if let Some(t) = target {
+            toml_str.push_str(&format!("target = \"{}\"\n", t));
+        }
+        toml_str.push_str("author = \"test-author\"\n");
+        if i == 0 {
+            toml_str.push_str("expiry = \"2020-01-01\"\n"); // expired
+        } else {
+            toml_str.push_str("expiry = \"2099-12-31\"\n");
+        }
+        toml_str.push_str(&format!("fingerprint = \"{}\"\n", fp));
+    }
+
+    let config = write_config("expired-rule", &toml_str);
+    let (_, stderr, code) = run_raw(Some(&config), true);
+    assert_ne!(code, 0, "expired rule must cause validation error");
+    assert!(
+        stderr.contains("expired on 2020-01-01"),
+        "stderr should mention the expiration error: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_max_suppressions_fails() {
+    let findings = get_findings_with_fingerprints();
+    let mut toml_str = String::from("max_suppressions = 2\nallow_targetless = false\n");
+    for (cat, target, fp) in &findings {
+        toml_str.push_str("\n[[suppress]]\n");
+        toml_str.push_str(&format!("category = \"{}\"\n", cat));
+        if let Some(t) = target {
+            toml_str.push_str(&format!("target = \"{}\"\n", t));
+        }
+        toml_str.push_str("author = \"test-author\"\n");
+        toml_str.push_str("expiry = \"2099-12-31\"\n");
+        toml_str.push_str(&format!("fingerprint = \"{}\"\n", fp));
+    }
+
+    let config = write_config("max-suppressions", &toml_str);
+    let (_, stderr, code) = run_raw(Some(&config), true);
+    assert_ne!(code, 0, "exceeding max_suppressions must fail");
+    assert!(
+        stderr.contains("exceed the maximum limit of 2"),
+        "stderr should mention max suppressions: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_allow_targetless_disabled_fails() {
+    let mut toml_str = String::from("allow_targetless = false\n");
+    toml_str.push_str("\n[[suppress]]\n");
+    toml_str.push_str("category = \"Environment\"\n"); // targetless
+
+    let config = write_config("targetless-disabled", &toml_str);
+    let (_, stderr, code) = run_raw(Some(&config), true);
+    assert_ne!(
+        code, 0,
+        "targetless with allow_targetless = false must fail"
+    );
+    assert!(
+        stderr.contains("Targetless wildcard suppressions are disabled"),
+        "stderr should mention targetless disabled: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_old_format_warning_output() {
+    let config = write_config(
+        "old-format-warning",
+        r#"
+        [[suppress]]
+        category = "Struct Field Removed"
+        target   = "ConfigData.threshold"
+        "#,
+    );
+    let (_, stderr, _) = run_raw(Some(&config), true);
+    assert!(
+        stderr.contains("Warning: Deprecated old-format suppression rule detected"),
+        "stderr must warn about old format: {}",
+        stderr
     );
 }
