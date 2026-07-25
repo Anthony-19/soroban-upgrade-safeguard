@@ -67,6 +67,66 @@ to point at another file. See [`.safeguard.example.toml`](.safeguard.example.tom
 for a documented template and the [documentation](docs/documentation.md#suppressing-known-breaking-changes)
 for the full `target` convention.
 
+## GitHub Action
+
+Use the reusable GitHub Action in your CI workflows to automatically check Soroban contract upgrades on pull requests.
+
+### Quick Start
+
+Create `.github/workflows/safeguard.yml`:
+
+```yaml
+name: Check upgrade safety
+
+on:
+  pull_request:
+    paths:
+      - 'wasm/**/*.wasm'
+
+jobs:
+  safeguard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: soroban-upgrade-safeguard/./
+        with:
+          old-wasm: ./wasm/current.wasm
+          new-wasm: ./wasm/next.wasm
+```
+
+### Inputs
+
+| Input | Description | Required | Default |
+| :--- | :--- | :--- | :--- |
+| `old-wasm` | Path to the old (baseline) WASM file | No | — |
+| `new-wasm` | Path to the new (upgrade) WASM file | No | — |
+| `contract-id` | Stellar/Soroban contract ID | No | — |
+| `rpc-url` | Stellar RPC URL | No | — |
+| `format` | Output format (`text`, `json`, `markdown`) | No | `text` |
+| `strict` | Fail on warnings as well as critical findings | No | `false` |
+| `explain` | Print remediation guidance for each finding | No | `false` |
+| `config` | Path to a suppression config file | No | — |
+| `expected-wasm-hash` | Expected SHA-256 hash of on-chain WASM | No | — |
+
+### Outputs
+
+| Output | Description |
+| :--- | :--- |
+| `verdict` | `passed` or `failed` |
+| `critical-count` | Number of critical findings |
+| `warning-count` | Number of warning findings |
+| `info-count` | Number of info findings |
+
+### JSON output in CI
+
+```yaml
+- uses: soroban-upgrade-safeguard/./
+  with:
+    old-wasm: ./wasm/v1.wasm
+    new-wasm: ./wasm/v2.wasm
+    format: json
+```
+
 ### Storage layout analysis
 
 The exported spec describes a contract's callable surface, not what it writes to storage. A contract can keep its public interface byte-identical while reordering the fields of an internal struct or shifting a storage-key discriminant, which corrupts every existing entry on upgrade.
