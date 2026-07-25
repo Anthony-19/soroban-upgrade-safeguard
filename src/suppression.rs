@@ -214,22 +214,22 @@ impl SuppressionConfig {
             if is_new_format {
                 if rule.author.is_none() {
                     anyhow::bail!(
-                        "Missing 'author' for suppression rule under category '{}' (target: '{:?}').",
-                        rule.category,
+                        "Missing 'author' for suppression rule under rule_id '{}' (target: '{:?}').",
+                        rule.rule_id,
                         rule.target
                     );
                 }
                 if rule.expiry.is_none() {
                     anyhow::bail!(
-                        "Missing 'expiry' for suppression rule under category '{}' (target: '{:?}').",
-                        rule.category,
+                        "Missing 'expiry' for suppression rule under rule_id '{}' (target: '{:?}').",
+                        rule.rule_id,
                         rule.target
                     );
                 }
                 if rule.fingerprint.is_none() {
                     anyhow::bail!(
-                        "Missing 'fingerprint' for suppression rule under category '{}' (target: '{:?}').",
-                        rule.category,
+                        "Missing 'fingerprint' for suppression rule under rule_id '{}' (target: '{:?}').",
+                        rule.rule_id,
                         rule.target
                     );
                 }
@@ -238,8 +238,8 @@ impl SuppressionConfig {
             if let Some(expiry_str) = &rule.expiry {
                 if is_expired(expiry_str)? {
                     anyhow::bail!(
-                        "Suppression rule for category '{}' has expired on {}.",
-                        rule.category,
+                        "Suppression rule for rule_id '{}' has expired on {}.",
+                        rule.rule_id,
                         expiry_str
                     );
                 }
@@ -672,6 +672,7 @@ mod tests {
             message: "Struct field threshold of type ConfigData was removed".to_string(),
             type_name: Some("ConfigData".to_string()),
             target: Some("ConfigData.threshold".to_string()),
+            classification: None,
         };
         let fp = compute_fingerprint(&f);
         let expected_input = "category:Struct Field Removed\ntarget:ConfigData.threshold\nmessage:Struct field threshold of type ConfigData was removed";
@@ -747,6 +748,7 @@ mod tests {
             message: "Struct field threshold of type ConfigData was removed".to_string(),
             type_name: Some("ConfigData".to_string()),
             target: Some("ConfigData.threshold".to_string()),
+            classification: None,
         };
         let fp = compute_fingerprint(&f);
 

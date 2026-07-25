@@ -323,8 +323,7 @@ impl SafetyReport {
                 .unwrap_or_else(|| finding.category.as_str())
                 .to_string();
             let remediation = if explain {
-                get_remediation_guidance(&rule_id).map(String::from)
-                remediation_for(&finding.category, finding.classification.as_ref())
+                guidance_for_rule_id(&rule_id).map(String::from)
             } else {
                 None
             };
@@ -367,8 +366,6 @@ impl SafetyReport {
             verified_code_hash: None,
             category_filter: CategoryFilter::default(),
             scope: AnalysisScope::default(),
-            baseline_source: None,
-            verified_code_hash: None,
             old_spec_summary: None,
             new_spec_summary: None,
         }
@@ -1167,8 +1164,6 @@ mod tests {
             verified_code_hash: None,
             category_filter: CategoryFilter::default(),
             scope: AnalysisScope::default(),
-            baseline_source: None,
-            verified_code_hash: None,
             old_spec_summary: None,
             new_spec_summary: None,
         };
