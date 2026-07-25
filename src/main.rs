@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use soroban_upgrade_safeguard::{
     color::should_disable_color,
     diff, loader, parser, report, spec,
+    report::{CategoryFilter, validate_categories},
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
 
@@ -85,10 +86,43 @@ struct Args {
     /// Directory containing the new versions of the contracts for directory comparison
     #[arg(long, value_name = "NEW_DIR", requires = "old_dir")]
     new_dir: Option<PathBuf>,
+
+    /// Only include findings from these categories. Repeatable.
+    #[arg(long, value_name = "CATEGORY", num_args = 0..)]
+    include_category: Vec<String>,
+
+    /// Exclude findings from these categories. Repeatable.
+    #[arg(long, value_name = "CATEGORY", num_args = 0..)]
+    exclude_category: Vec<String>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Validate category filter arguments
+    let all_categories: Vec<String> = args
+        .include_category
+        .iter()
+        .chain(args.exclude_category.iter())
+        .cloned()
+        .collect();
+    if !all_categories.is_empty() {
+        if let Err(unknown) = validate_categories(&all_categories) {
+            anyhow::bail!(
+                "Unknown category name(s): {}. Valid categories are: {}",
+                unknown.join(", "),
+                report::KNOWN_CATEGORIES.join(", ")
+            );
+        }
+    }
+    let category_filter = CategoryFilter {
+        include: if args.include_category.is_empty() {
+            None
+        } else {
+            Some(args.include_category.iter().cloned().collect())
+        },
+        exclude: args.exclude_category.iter().cloned().collect(),
+    };
 
     if should_disable_color(
         args.no_color,
@@ -171,7 +205,7 @@ fn main() -> Result<()> {
             let old_wasm = loader::load_wasm(&pair.old)?;
             let new_wasm = loader::load_wasm(&pair.new)?;
 
-            let report = compare_contracts(
+            let mut report = compare_contracts(
                 &ContractComparison {
                     old_bytes: &old_wasm.bytes,
                     old_path: &old_wasm.path,
@@ -183,6 +217,10 @@ fn main() -> Result<()> {
                 },
                 &progress,
             )?;
+
+            if !all_categories.is_empty() {
+                report.apply_category_filter(&category_filter);
+            }
 
             if !report.is_safe {
                 overall_safe = false;
@@ -373,6 +411,11 @@ fn main() -> Result<()> {
         },
         &progress,
     )?;
+
+    let mut safety_report = safety_report;
+    if !all_categories.is_empty() {
+        safety_report.apply_category_filter(&category_filter);
+    }
 
     match args.format {
         OutputFormat::Json => {

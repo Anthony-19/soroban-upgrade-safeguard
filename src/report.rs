@@ -2,7 +2,7 @@ use crate::diff::{DiffReport, Finding, Severity};
 use crate::suppression::SuppressionConfig;
 use colored::Colorize;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// A finding as it appears in the report, augmented with suppression state.
 ///
@@ -33,10 +33,18 @@ pub struct SafetyReport {
     pub info_count: usize,
     /// Number of findings (of any severity) acknowledged by a suppression rule.
     pub suppressed_count: usize,
+    /// Number of findings hidden by category filtering.
+    pub filtered_count: usize,
     pub total_findings: usize,
     pub is_safe: bool,
     pub findings_by_category: HashMap<String, Vec<ReportedFinding>>,
     pub strict: bool,
+    /// Where the baseline (old) contract was sourced from (e.g. "RPC", "Local File").
+    pub baseline_source: Option<String>,
+    /// Verified SHA-256 hash of the baseline WASM bytecode (hex), if verified.
+    pub verified_code_hash: Option<String>,
+    /// Active category filter, if any.
+    pub category_filter: CategoryFilter,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -58,6 +66,8 @@ pub struct SafetyReportJson<'a> {
     pub counts: SeverityCounts,
     /// Findings (of any severity) acknowledged by the suppression config.
     pub suppressed_count: usize,
+    /// Findings hidden by category filtering.
+    pub filtered_count: usize,
     pub total_findings: usize,
     pub recommended_bump: &'static str,
     pub findings_by_category: BTreeMap<&'a str, &'a Vec<ReportedFinding>>,
@@ -139,10 +149,14 @@ impl SafetyReport {
             warning_count,
             info_count,
             suppressed_count,
+            filtered_count: 0,
             total_findings: diff.findings.len(),
             is_safe,
             findings_by_category,
             strict,
+            baseline_source: None,
+            verified_code_hash: None,
+            category_filter: CategoryFilter::default(),
         }
     }
 
@@ -175,6 +189,7 @@ impl SafetyReport {
                 info: self.info_count,
             },
             suppressed_count: self.suppressed_count,
+            filtered_count: self.filtered_count,
             total_findings: self.total_findings,
             recommended_bump: self.recommended_bump(),
             findings_by_category: self
@@ -238,6 +253,18 @@ impl SafetyReport {
             output.push_str(&format!(
                 "Suppressed: {}\n",
                 self.suppressed_count.to_string().magenta().bold()
+            ));
+        }
+        if self.filtered_count > 0 {
+            output.push_str(&format!(
+                "Filtered:   {}\n",
+                self.filtered_count.to_string().yellow().bold()
+            ));
+            output.push_str(&format!(
+                "{}",
+                "  ↳ Findings were hidden by --include-category/--exclude-category.\n"
+                    .yellow()
+                    .dimmed()
             ));
         }
         let bump = self.recommended_bump();
@@ -362,6 +389,10 @@ impl SafetyReport {
         if self.suppressed_count > 0 {
             output.push_str(&format!("| **Suppressed** | {} |\n", self.suppressed_count));
         }
+        if self.filtered_count > 0 {
+            output.push_str(&format!("| **Filtered** | {} |\n", self.filtered_count));
+            output.push_str("\n> ⚠️  Findings were hidden by `--include-category`/`--exclude-category`. The verdict reflects the remaining visible findings only.\n\n");
+        }
         output.push_str(&format!(
             "\n**Recommended SemVer Bump**: `{}`\n\n",
             self.recommended_bump()
@@ -411,6 +442,138 @@ impl SafetyReport {
         }
 
         output
+    }
+
+    /// Apply a category filter to the report, removing findings from
+    /// excluded / non-included categories. The original `total_findings`
+    /// count is preserved; the difference is reported via `filtered_count`.
+    /// The safety verdict is recalculated based on remaining findings.
+    pub fn apply_category_filter(&mut self, filter: &CategoryFilter) {
+        let mut new_categories: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
+        let mut filtered = 0usize;
+        let mut critical = 0usize;
+        let mut warning = 0usize;
+        let mut info = 0usize;
+        let mut failing_critical = 0usize;
+        let mut failing_warning = 0usize;
+
+        for (category, findings) in &self.findings_by_category {
+            if filter.should_include(category) {
+                for rf in findings {
+                    match rf.finding.severity {
+                        Severity::Critical => critical += 1,
+                        Severity::Warning => warning += 1,
+                        Severity::Info => info += 1,
+                    }
+                    if !rf.suppressed {
+                        match rf.finding.severity {
+                            Severity::Critical => failing_critical += 1,
+                            Severity::Warning => failing_warning += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                new_categories.insert(category.to_string(), findings.clone());
+            } else {
+                filtered += findings.len();
+            }
+        }
+
+        self.filtered_count = filtered;
+        self.critical_count = critical;
+        self.warning_count = warning;
+        self.info_count = info;
+        self.findings_by_category = new_categories;
+        self.is_safe = if self.strict {
+            failing_critical == 0 && failing_warning == 0
+        } else {
+            failing_critical == 0
+        };
+        self.category_filter = filter.clone();
+    }
+}
+
+/// All known finding categories used by the analysis engine.
+pub const KNOWN_CATEGORIES: &[&str] = &[
+    "Environment",
+    "Function Removed",
+    "Function Documentation Changed",
+    "Function Added",
+    "Function Signature Changed",
+    "Parameter Renamed",
+    "Parameter Reordered",
+    "Parameter Type Changed",
+    "Return Type Changed",
+    "Event Definition Removed",
+    "Struct Removed",
+    "Struct Documentation Changed",
+    "Struct Added",
+    "Struct Field Removed",
+    "Event Field Removed",
+    "Struct Field Reordered",
+    "Event Field Reordered",
+    "Struct Field Type Changed",
+    "Event Field Type Changed",
+    "Struct Field Added",
+    "Event Enum Removed",
+    "Enum Removed",
+    "Enum Documentation Changed",
+    "Enum Added",
+    "Enum Case Removed",
+    "Event Enum Case Removed",
+    "Enum Case Value Changed",
+    "Event Enum Case Value Changed",
+    "Enum Case Added",
+    "Event Enum Case Added",
+    "Union Removed",
+    "Union Added",
+    "Union Case Removed",
+    "Union Case Reordered",
+    "Union Case Type Changed",
+    "Union Case Added",
+    "Error Enum Removed",
+    "Error Enum Added",
+    "Error Enum Case Removed",
+    "Error Enum Case Value Changed",
+    "Error Enum Case Added",
+    "Cascading Layout Break",
+];
+
+/// Validate that the given category name is a known category.
+/// Returns an error message listing unknown categories if any are invalid.
+pub fn validate_categories(categories: &[String]) -> Result<(), Vec<String>> {
+    let known: HashSet<&str> = KNOWN_CATEGORIES.iter().copied().collect();
+    let unknown: Vec<String> = categories
+        .iter()
+        .filter(|c| !known.contains(c.as_str()))
+        .cloned()
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(unknown)
+    }
+}
+
+/// A filter that restricts which finding categories are included in the report.
+#[derive(Debug, Clone, Default)]
+pub struct CategoryFilter {
+    /// Only include these categories (empty = no inclusion restriction).
+    pub include: Option<HashSet<String>>,
+    /// Exclude these categories.
+    pub exclude: HashSet<String>,
+}
+
+impl CategoryFilter {
+    /// Returns `true` if the category should be included in the report output.
+    pub fn should_include(&self, category: &str) -> bool {
+        if self.exclude.contains(category) {
+            return false;
+        }
+        if let Some(ref include) = self.include {
+            return include.contains(category);
+        }
+        true
     }
 }
 
@@ -563,10 +726,14 @@ mod tests {
             warning_count: 0,
             info_count: 0,
             suppressed_count: 0,
+            filtered_count: 0,
             total_findings: 0,
             is_safe: true,
             findings_by_category: std::collections::HashMap::new(),
             strict: false,
+            baseline_source: None,
+            verified_code_hash: None,
+            category_filter: CategoryFilter::default(),
         };
 
         // Identical upgrade -> patch
