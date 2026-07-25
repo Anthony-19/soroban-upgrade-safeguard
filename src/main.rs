@@ -1,14 +1,15 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use colored::Colorize;
-use std::io::IsTerminal;
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use soroban_upgrade_safeguard::{
     color::should_disable_color,
-    diff, loader, parser, report, spec,
-    report::{CategoryFilter, validate_categories},
+    diff, loader, parser, report,
+    report::{validate_categories, CategoryFilter},
+    spec,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
 
@@ -560,7 +561,11 @@ fn collect_wasm_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
         let read_dir = match std::fs::read_dir(&dir) {
             Ok(rd) => rd,
             Err(e) => {
-                eprintln!("⚠️  Warning: Cannot read directory '{}': {}", dir.display(), e);
+                eprintln!(
+                    "⚠️  Warning: Cannot read directory '{}': {}",
+                    dir.display(),
+                    e
+                );
                 continue;
             }
         };
@@ -569,7 +574,11 @@ fn collect_wasm_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("⚠️  Warning: Error reading entry in '{}': {}", dir.display(), e);
+                    eprintln!(
+                        "⚠️  Warning: Error reading entry in '{}': {}",
+                        dir.display(),
+                        e
+                    );
                     continue;
                 }
             };
@@ -578,13 +587,8 @@ fn collect_wasm_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
 
             if path.is_dir() {
                 stack.push((path, depth + 1));
-            } else if path.is_file()
-                && path.extension().and_then(|s| s.to_str()) == Some("wasm")
-            {
-                let relative = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_path_buf();
+            } else if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("wasm") {
+                let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
                 files.push((relative, path));
             }
         }
@@ -605,9 +609,8 @@ fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>>
     }
 
     let old_files = collect_wasm_files(old_dir)?;
-    let new_files_map: std::collections::HashMap<PathBuf, PathBuf> = collect_wasm_files(new_dir)?
-        .into_iter()
-        .collect();
+    let new_files_map: std::collections::HashMap<PathBuf, PathBuf> =
+        collect_wasm_files(new_dir)?.into_iter().collect();
 
     let mut pairs = Vec::new();
 

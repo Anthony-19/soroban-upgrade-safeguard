@@ -229,8 +229,16 @@ fn batch_recursive_directory_scanning_pairs_by_relative_path() {
     std::fs::copy(wasm("v1.wasm"), new_dir.join("contracts/core/vault.wasm")).expect("copy");
 
     // contracts/upgrades/migrator.wasm: breaking (v1 -> v2)
-    std::fs::copy(wasm("v1.wasm"), old_dir.join("contracts/upgrades/migrator.wasm")).expect("copy");
-    std::fs::copy(wasm("v2.wasm"), new_dir.join("contracts/upgrades/migrator.wasm")).expect("copy");
+    std::fs::copy(
+        wasm("v1.wasm"),
+        old_dir.join("contracts/upgrades/migrator.wasm"),
+    )
+    .expect("copy");
+    std::fs::copy(
+        wasm("v2.wasm"),
+        new_dir.join("contracts/upgrades/migrator.wasm"),
+    )
+    .expect("copy");
 
     let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
         .arg("--old-dir")

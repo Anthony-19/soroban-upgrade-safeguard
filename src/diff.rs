@@ -984,10 +984,7 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
-        ScEnvMetaEntry, ScSpecTypeUdt, ScSpecUdtErrorEnumCaseV0, ScSpecUdtUnionCaseTupleV0,
-        ScSpecUdtUnionCaseV0, ScSpecUdtUnionCaseVoidV0, StringM, VecM,
-    };
+    use stellar_xdr::curr::{ScEnvMetaEntry, ScSpecTypeUdt, StringM, VecM};
 
     /// Helper: build a minimal ContractSpec with the given structs.
     fn spec_with_structs(structs: Vec<(&str, Vec<(&str, ScSpecTypeDef)>)>) -> ContractSpec {

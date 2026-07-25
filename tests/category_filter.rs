@@ -24,10 +24,9 @@ fn include_category_filters_out_other_categories() {
     // Only Environment findings should remain, so no critical findings
     assert_eq!(code, 0, "Only Environment findings should not be critical");
 
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("output must be valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
     assert_eq!(json["counts"]["critical"], 0);
-    assert_eq!(json["filtered_count"].as_u64().unwrap_or(0) > 0, true);
+    assert!(json["filtered_count"].as_u64().unwrap_or(0) > 0);
 }
 
 #[test]
@@ -46,9 +45,8 @@ fn exclude_category_removes_specified_findings() {
     // Struct Field Removed is excluded, but other critical findings remain
     assert_eq!(code, 1, "Other critical findings should still fail");
 
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("output must be valid JSON");
-    assert_eq!(json["filtered_count"].as_u64().unwrap_or(0) > 0, true);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+    assert!(json["filtered_count"].as_u64().unwrap_or(0) > 0);
 }
 
 #[test]
@@ -68,9 +66,8 @@ fn exclude_multiple_categories() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
 
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("output must be valid JSON");
-    assert_eq!(json["filtered_count"].as_u64().unwrap_or(0) > 0, true);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+    assert!(json["filtered_count"].as_u64().unwrap_or(0) > 0);
 }
 
 #[test]
@@ -114,13 +111,22 @@ fn include_and_exclude_together() {
     // Include + exclude same category = exclude wins, no findings displayed
     assert_eq!(code, 0);
 
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("output must be valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
     // Exclude wins over include, so all findings are filtered out
     // total_findings is the original count; filtered_count reflects what was hidden
     let filtered = json["filtered_count"].as_u64().unwrap_or(0);
-    assert!(filtered > 0, "All findings should be filtered: {}", filtered);
-    assert_eq!(json["findings_by_category"].as_object().map(|o| o.len()).unwrap_or(0), 0);
+    assert!(
+        filtered > 0,
+        "All findings should be filtered: {}",
+        filtered
+    );
+    assert_eq!(
+        json["findings_by_category"]
+            .as_object()
+            .map(|o| o.len())
+            .unwrap_or(0),
+        0
+    );
     assert_eq!(json["counts"]["critical"], 0);
     assert_eq!(json["counts"]["warning"], 0);
     assert_eq!(json["counts"]["info"], 0);

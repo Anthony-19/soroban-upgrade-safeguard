@@ -29,13 +29,16 @@ fn assert_snapshot(name: &str, content: &str) {
         return;
     }
 
-    let expected = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!(
+    let expected = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
             "snapshot '{}' not found at {}.\n\
              Run with `UPDATE_SNAPSHOTS=1 cargo test` to create it.\n\
              Underlying error: {}",
-            name, path.display(), e
-        ));
+            name,
+            path.display(),
+            e
+        )
+    });
 
     if content != expected {
         // Show a diff-like message
@@ -96,7 +99,10 @@ fn snapshot_text_output_with_explain() {
     setup_no_color();
     let report = soroban_upgrade_safeguard::compare_wasm_files(&wasm("v1.wasm"), &wasm("v2.wasm"))
         .expect("comparison should succeed");
-    assert_snapshot("text_output_explain.txt", &report.generate_summary_text(true));
+    assert_snapshot(
+        "text_output_explain.txt",
+        &report.generate_summary_text(true),
+    );
 }
 
 #[test]
@@ -104,7 +110,10 @@ fn snapshot_identical_contracts_empty_report() {
     setup_no_color();
     let report = soroban_upgrade_safeguard::compare_wasm_files(&wasm("v1.wasm"), &wasm("v1.wasm"))
         .expect("comparison should succeed");
-    assert_snapshot("text_output_identical.txt", &report.generate_summary_text(false));
+    assert_snapshot(
+        "text_output_identical.txt",
+        &report.generate_summary_text(false),
+    );
 }
 
 #[test]
@@ -119,15 +128,17 @@ fn snapshot_strict_mode_text_output() {
     let diff_report = soroban_upgrade_safeguard::diff::compare(&old_spec, &new_spec);
 
     use soroban_upgrade_safeguard::suppression::SuppressionConfig;
-    let strict_report =
-        soroban_upgrade_safeguard::report::SafetyReport::with_suppressions(
-            &diff_report,
-            &SuppressionConfig::default(),
-            true,
-            true,
-        );
+    let strict_report = soroban_upgrade_safeguard::report::SafetyReport::with_suppressions(
+        &diff_report,
+        &SuppressionConfig::default(),
+        true,
+        true,
+    );
 
-    assert_snapshot("text_output_strict.txt", &strict_report.generate_summary_text(true));
+    assert_snapshot(
+        "text_output_strict.txt",
+        &strict_report.generate_summary_text(true),
+    );
 }
 
 #[test]
@@ -161,7 +172,10 @@ reason = "Planned storage migration in v2."
         false,
     );
 
-    assert_snapshot("text_output_suppressed.txt", &report.generate_summary_text(true));
+    assert_snapshot(
+        "text_output_suppressed.txt",
+        &report.generate_summary_text(true),
+    );
 }
 
 #[test]
@@ -169,15 +183,13 @@ fn snapshot_batch_mode_markdown() {
     setup_no_color();
 
     // Run batch mode via the CLI binary to exercise the batch rendering path
-    let output = std::process::Command::new(
-        env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"),
-    )
-    .arg(wasm("v1.wasm"))
-    .arg(wasm("v2.wasm"))
-    .args(["--format", "markdown"])
-    .env("NO_COLOR", "1")
-    .output()
-    .expect("failed to run binary");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg(wasm("v1.wasm"))
+        .arg(wasm("v2.wasm"))
+        .args(["--format", "markdown"])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("failed to run binary");
 
     let md = String::from_utf8(output.stdout).expect("stdout not UTF-8");
 
