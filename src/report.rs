@@ -300,8 +300,9 @@ impl SafetyReport {
                     .bold()
                     .to_string(),
             );
-            let group = self.findings_by_category.get(category).unwrap();
-            for reported in group {
+            let mut group = self.findings_by_category.get(category).unwrap().clone();
+            group.sort_by(|a, b| a.finding.message.cmp(&b.finding.message));
+            for reported in &group {
                 let finding = &reported.finding;
 
                 if reported.suppressed {
@@ -413,8 +414,9 @@ impl SafetyReport {
 
         for category in categories {
             output.push_str(&format!("### {}\n\n", category));
-            let group = self.findings_by_category.get(category).unwrap();
-            for reported in group {
+            let mut group = self.findings_by_category.get(category).unwrap().clone();
+            group.sort_by(|a, b| a.finding.message.cmp(&b.finding.message));
+            for reported in &group {
                 let finding = &reported.finding;
 
                 if reported.suppressed {
