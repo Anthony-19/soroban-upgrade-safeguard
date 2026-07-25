@@ -1,8 +1,10 @@
 use crate::classification::{ClassificationConfig, TypeClass};
+use crate::limits::{LimitError, ResourcePolicy};
 use crate::mapper::LayoutMapper;
 use crate::parser::ContractEnvMeta;
 use crate::rename::{match_renames, Rename};
-use crate::spec::ContractSpec;
+use crate::spec::{ContractSpec, DuplicateEntry};
+use crate::storage_schema::ResolvedStorageSchema;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use stellar_xdr::curr::{

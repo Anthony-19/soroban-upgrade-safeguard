@@ -684,6 +684,7 @@ mod tests {
             message: "Struct field threshold of type ConfigData was removed".to_string(),
             type_name: Some("ConfigData".to_string()),
             target: Some("ConfigData.threshold".to_string()),
+            classification: None,
         };
         let fp = compute_fingerprint(&f);
         let expected_input = "category:Struct Field Removed\ntarget:ConfigData.threshold\nmessage:Struct field threshold of type ConfigData was removed";
@@ -759,6 +760,7 @@ mod tests {
             message: "Struct field threshold of type ConfigData was removed".to_string(),
             type_name: Some("ConfigData".to_string()),
             target: Some("ConfigData.threshold".to_string()),
+            classification: None,
         };
         let fp = compute_fingerprint(&f);
 
