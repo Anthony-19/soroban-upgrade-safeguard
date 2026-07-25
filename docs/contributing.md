@@ -70,6 +70,18 @@ The source lives under `src/` and is split into focused modules. Understanding t
 
 Tests and fixtures live under `tests/`.
 
+Snapshot tests live in `tests/snapshot_tests.rs` and cover the Text, Markdown, and JSON output formats. They use a custom snapshot helper that compares rendered output against stored `.txt`, `.md`, and `.json` files in `tests/snapshots/`.
+
+### Updating snapshots
+
+When you intentionally change the output format (e.g., add a new finding category or modify the report layout), the snapshot tests will fail. To update all snapshots:
+
+```bash
+UPDATE_SNAPSHOTS=1 cargo test --test snapshot_tests
+```
+
+Review the changed snapshot files with `git diff tests/snapshots/` to confirm the differences are expected, then commit them alongside your code changes.
+
 For a deeper explanation of how these pieces fit together at runtime, read [documentation.md](documentation.md).
 
 ## Building and Running
