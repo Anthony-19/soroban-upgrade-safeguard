@@ -1,5 +1,8 @@
 # Soroban Upgrade Safeguard 🛡️
 
+[![CI](https://github.com/ShippedLabs/soroban-upgrade-safeguard/actions/workflows/ci.yml/badge.svg)](https://github.com/ShippedLabs/soroban-upgrade-safeguard/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 ![Soroban Upgrade Safeguard Demo](assets/demo.png)
 
 A powerful CLI tool to analyze and validate Soroban smart contract upgrades on the Stellar network. It detects breaking changes in storage layout, function signatures, and event schemas before you deploy.
@@ -12,7 +15,8 @@ A powerful CLI tool to analyze and validate Soroban smart contract upgrades on t
 - **Storage Schema Analysis**: Declare your storage-key types and internal value types in a manifest, and they are diffed with the same engine and severities as exported types, catching layout breaks that are invisible in the public interface.
 - **Storage Layout Protection**: Detects field removals, reorderings, and type changes in structs and enums that would corrupt on-chain data.
 - **Function Signature Validation**: Flags changes in function names, parameters, and return types that break integration with existing clients/contracts.
-- **Event Schema Analysis**: Heuristically identifies event-related types and ensures their structure remains backwards compatible for indexers.
+- **Rename Detection**: Matches types structurally, not just by name, so renaming a type is reported as a rename rather than a spurious delete-plus-add — and an unrelated type reusing an old name is not mistaken for it.
+- **Event Schema Analysis**: Types you declare as events in `[classification]` get indexer-focused findings and remediation. Classification is explicit, never inferred from the name, and never affects suppression keys.
 - **Cascading Break Detection**: Uses dependency graphing to track how a change in a low-level type affects all parent structures.
 - **Rich CLI Output**: Beautiful, color-coded reports with actionable severity levels (Critical, Warning, Info).
 - **CI/CD Friendly**: Exits with a non-zero code if critical breaking changes are detected.
@@ -42,29 +46,86 @@ soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
 ### Suppressing known breaking changes
 
 If a breaking change is deliberate and already accounted for, list it in a
-`.safeguard.toml` so it no longer fails the run. Rules require explicit `author`,
-`reason`, expiry date (`YYYY-MM-DD`), and SHA-256 content `fingerprint` binding.
-Matching is exact (by `category`, `target`, and `fingerprint`), and suppressed
-findings are prominently audited in report outputs:
+`.safeguard.toml` so it no longer fails the run. Matching is exact (by the
+stable `rule_id` and `target`), and suppressed findings are still shown in the
+report, marked `[SUPPRESSED]`:
 
 ```toml
 max_suppressions = 10
 allow_targetless = false
 
 [[suppress]]
-category    = "Struct Field Removed"
-target      = "ConfigData.threshold"
-author      = "Alice <alice@example.com>"
-reason      = "Planned storage migration in v2."
-expiry      = "2026-12-31"
-fingerprint = "8a3f..."  # SHA-256 hex of category + target + normalized message
+rule_id = "struct_field_removed"
+target  = "ConfigData.threshold"
+reason  = "Planned storage migration in v2."
 ```
 
-The tool auto-loads `.safeguard.toml` from the current directory, or use
-`--config <PATH>` to point at another file. See
-[`.safeguard.example.toml`](.safeguard.example.toml) for a documented template
-and the [documentation](docs/documentation.md#suppressing-known-breaking-changes)
+Existing configs that still use `category = "..."` continue to work through a
+compatibility mapping, but `rule_id` is the stable key going forward. The tool
+auto-loads `.safeguard.toml` from the current directory, or use `--config <PATH>`
+to point at another file. See [`.safeguard.example.toml`](.safeguard.example.toml)
+for a documented template and the [documentation](docs/documentation.md#suppressing-known-breaking-changes)
 for the full `target` convention.
+
+## GitHub Action
+
+Use the reusable GitHub Action in your CI workflows to automatically check Soroban contract upgrades on pull requests.
+
+### Quick Start
+
+Create `.github/workflows/safeguard.yml`:
+
+```yaml
+name: Check upgrade safety
+
+on:
+  pull_request:
+    paths:
+      - 'wasm/**/*.wasm'
+
+jobs:
+  safeguard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: soroban-upgrade-safeguard/./
+        with:
+          old-wasm: ./wasm/current.wasm
+          new-wasm: ./wasm/next.wasm
+```
+
+### Inputs
+
+| Input | Description | Required | Default |
+| :--- | :--- | :--- | :--- |
+| `old-wasm` | Path to the old (baseline) WASM file | No | — |
+| `new-wasm` | Path to the new (upgrade) WASM file | No | — |
+| `contract-id` | Stellar/Soroban contract ID | No | — |
+| `rpc-url` | Stellar RPC URL | No | — |
+| `format` | Output format (`text`, `json`, `markdown`) | No | `text` |
+| `strict` | Fail on warnings as well as critical findings | No | `false` |
+| `explain` | Print remediation guidance for each finding | No | `false` |
+| `config` | Path to a suppression config file | No | — |
+| `expected-wasm-hash` | Expected SHA-256 hash of on-chain WASM | No | — |
+
+### Outputs
+
+| Output | Description |
+| :--- | :--- |
+| `verdict` | `passed` or `failed` |
+| `critical-count` | Number of critical findings |
+| `warning-count` | Number of warning findings |
+| `info-count` | Number of info findings |
+
+### JSON output in CI
+
+```yaml
+- uses: soroban-upgrade-safeguard/./
+  with:
+    old-wasm: ./wasm/v1.wasm
+    new-wasm: ./wasm/v2.wasm
+    format: json
+```
 
 ### Storage layout analysis
 

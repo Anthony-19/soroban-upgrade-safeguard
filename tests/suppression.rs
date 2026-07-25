@@ -3,11 +3,19 @@
 //! These drive the compiled binary with `--config` against the checked-in
 //! `v1 -> v2` fixtures, which produce three Critical findings:
 //!
-//! - `Event Enum Case Value Changed` on `StatusEvent.Paused`
-//! - `Function Signature Changed`     on `initialize`
-//! - `Struct Field Removed`           on `ConfigData.threshold`
+//! - `Enum Case Value Changed`    on `StatusEvent.Paused`
+//! - `Function Signature Changed` on `initialize`
+//! - `Struct Field Removed`       on `ConfigData.threshold`
 //!
 //! and assert that suppressions flip the failing set without hiding findings.
+//!
+//! Note the category for `StatusEvent.Paused` is the structural
+//! `Enum Case Value Changed`, not an event-specific key. Categories (and thus
+//! suppression keys) are purely structural; whether a type reads as an "event"
+//! is separate classification metadata that never changes the category. So even
+//! though `StatusEvent` contains the substring "event", with the default
+//! classification (no `[classification]` table, name heuristic off) it is a
+//! plain storage type and its suppression key is the structural one.
 
 use serde_json::Value;
 use std::path::PathBuf;
@@ -94,12 +102,36 @@ fn findings(json: &Value) -> Vec<(String, Option<String>, bool)> {
 }
 
 #[test]
+fn rule_id_based_suppression_matches_stable_identifier() {
+    let config = write_config(
+        "rule-id",
+        r#"
+        [[suppress]]
+        rule_id = "struct_field_removed"
+        target  = "ConfigData.threshold"
+        reason  = "Reviewed storage migration"
+        "#,
+    );
+
+    let (json, code) = run(Some(&config));
+
+    assert_eq!(code, 0, "suppressing by rule_id should pass the run");
+    assert_eq!(json["suppressed_count"].as_u64().unwrap(), 1);
+    assert!(
+        findings(&json).iter().any(|(c, t, s)| c == "Struct Field Removed"
+            && t.as_deref() == Some("ConfigData.threshold")
+            && *s),
+        "the removed field must appear as suppressed when matched by rule_id"
+    );
+}
+
+#[test]
 fn suppressing_all_criticals_passes_but_still_lists_them() {
     let config = write_config(
         "all",
         r#"
         [[suppress]]
-        category = "Event Enum Case Value Changed"
+        category = "Enum Case Value Changed"
         target   = "StatusEvent.Paused"
         reason   = "Reviewed: indexers already updated."
 
@@ -165,7 +197,7 @@ fn partial_suppression_still_fails_on_remaining_critical() {
         "partial",
         r#"
         [[suppress]]
-        category = "Event Enum Case Value Changed"
+        category = "Enum Case Value Changed"
         target   = "StatusEvent.Paused"
 
         [[suppress]]
