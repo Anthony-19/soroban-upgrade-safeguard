@@ -1,7 +1,7 @@
 use crate::diff::Severity;
 
 /// A single registered detection rule.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RuleDefinition {
     pub id: &'static str,
     pub label: &'static str,
