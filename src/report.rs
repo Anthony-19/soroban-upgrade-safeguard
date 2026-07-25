@@ -53,6 +53,14 @@ pub struct AnalysisScope {
     pub env_metadata: bool,
     /// The storage-layout analysis state for this run.
     pub storage_schema: StorageScopeState,
+    /// Number of distinct `contractspecv0` sections in the old WASM (0 if not parsed).
+    pub old_spec_section_count: usize,
+    /// Number of distinct `contractspecv0` sections in the new WASM (0 if not parsed).
+    pub new_spec_section_count: usize,
+    /// Names of duplicate entries found in the old WASM, sorted for stable output.
+    pub old_duplicate_names: Vec<String>,
+    /// Names of duplicate entries found in the new WASM, sorted for stable output.
+    pub new_duplicate_names: Vec<String>,
 }
 
 impl Default for AnalysisScope {
@@ -65,6 +73,10 @@ impl Default for AnalysisScope {
             exported_interface: true,
             env_metadata: false,
             storage_schema: StorageScopeState::NotAnalyzed,
+            old_spec_section_count: 0,
+            new_spec_section_count: 0,
+            old_duplicate_names: Vec::new(),
+            new_duplicate_names: Vec::new(),
         }
     }
 }
@@ -118,6 +130,16 @@ pub struct ScopeJson {
     pub storage_key_types: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_value_types: Option<usize>,
+    /// Number of `contractspecv0` sections found in the old WASM.
+    pub old_spec_section_count: usize,
+    /// Number of `contractspecv0` sections found in the new WASM.
+    pub new_spec_section_count: usize,
+    /// Names of duplicate entries detected in the old WASM (empty when clean).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub old_duplicate_names: Vec<String>,
+    /// Names of duplicate entries detected in the new WASM (empty when clean).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub new_duplicate_names: Vec<String>,
     pub summary: String,
 }
 
@@ -137,6 +159,10 @@ impl AnalysisScope {
             storage_layout_analyzed: self.storage_analyzed(),
             storage_key_types,
             storage_value_types,
+            old_spec_section_count: self.old_spec_section_count,
+            new_spec_section_count: self.new_spec_section_count,
+            old_duplicate_names: self.old_duplicate_names.clone(),
+            new_duplicate_names: self.new_duplicate_names.clone(),
             summary: self.summary_line(),
         }
     }
@@ -445,6 +471,38 @@ impl SafetyReport {
         };
         output.push_str(&format!("        {}\n", storage_status));
 
+        // Spec-section integrity summary (non-zero section count or duplicates).
+        if self.scope.old_spec_section_count > 1 || self.scope.new_spec_section_count > 1 {
+            output.push_str(&format!(
+                "        Spec sections: old={}, new={} (multi-section WASMs detected)\n",
+                self.scope.old_spec_section_count,
+                self.scope.new_spec_section_count,
+            ).yellow().to_string());
+        }
+        let all_dups: Vec<String> = self
+            .scope
+            .old_duplicate_names
+            .iter()
+            .map(|n| format!("old:{n}"))
+            .chain(
+                self.scope
+                    .new_duplicate_names
+                    .iter()
+                    .map(|n| format!("new:{n}")),
+            )
+            .collect();
+        if !all_dups.is_empty() {
+            output.push_str(
+                &format!(
+                    "        Duplicate entries detected: {}\n",
+                    all_dups.join(", ")
+                )
+                .red()
+                .bold()
+                .to_string(),
+            );
+        }
+
         let crit_str = if self.critical_count > 0 {
             self.critical_count.to_string().red().bold()
         } else {
@@ -643,6 +701,33 @@ impl SafetyReport {
             self.scope.storage_status_line()
         ));
 
+        // Spec-section integrity (multi-section or duplicates).
+        if self.scope.old_spec_section_count > 1 || self.scope.new_spec_section_count > 1 {
+            output.push_str(&format!(
+                "> ⚠️ Multi-section WASM detected: old has {} contractspecv0 section(s), new has {}.\n\n",
+                self.scope.old_spec_section_count,
+                self.scope.new_spec_section_count,
+            ));
+        }
+        let all_dups: Vec<String> = self
+            .scope
+            .old_duplicate_names
+            .iter()
+            .map(|n| format!("`old:{n}`"))
+            .chain(
+                self.scope
+                    .new_duplicate_names
+                    .iter()
+                    .map(|n| format!("`new:{n}`")),
+            )
+            .collect();
+        if !all_dups.is_empty() {
+            output.push_str(&format!(
+                "> ❌ Duplicate spec entries detected: {}\n\n",
+                all_dups.join(", ")
+            ));
+        }
+
         output.push_str("### Summary Table\n\n");
         output.push_str("| Finding Severity | Count |\n");
         output.push_str("| :--- | :--- |\n");
@@ -831,6 +916,19 @@ fn interface_remediation_guidance(category: &str) -> Option<&'static str> {
         "Error Enum Case Added" => Some("No action required. Ensure clients can handle the new error case gracefully."),
         "Type Library Changed" => Some("No code changes required. The type's declaring library changed, so its definition is now controlled by a different dependency and can drift independently. Confirm the new source is intended and pin/review that dependency."),
         "Cascading Layout Break" => Some("This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type."),
+        "Spec Entry Conflict" => Some(
+            "The WASM contains multiple conflicting definitions for the same entry name. \
+             This means the analysis cannot be trusted: the definition used for comparison \
+             may not be the one the contract actually executes. \
+             Rebuild the contract with a toolchain that produces a single contractspecv0 section \
+             and a unique definition per name. Do not deploy this WASM.",
+        ),
+        "Spec Entry Duplicate" => Some(
+            "The WASM contains identical duplicate definitions for the same entry name. \
+             While the duplicate is safe to deduplicate, the WASM is non-canonical. \
+             Rebuild with a toolchain that produces a single contractspecv0 section \
+             per contract.",
+        ),
         _ => None,
     }
 }
@@ -853,6 +951,15 @@ mod tests {
                 // If it is ENVIRONMENT_CATEGORY
                 if line.contains("ENVIRONMENT_CATEGORY") {
                     checked_categories.insert("Environment".to_string());
+                    continue;
+                }
+                // Constant-referenced duplicate/conflict categories
+                if line.contains("SPEC_CONFLICT_CATEGORY") {
+                    checked_categories.insert("Spec Entry Conflict".to_string());
+                    continue;
+                }
+                if line.contains("SPEC_DUPLICATE_CATEGORY") {
+                    checked_categories.insert("Spec Entry Duplicate".to_string());
                     continue;
                 }
 

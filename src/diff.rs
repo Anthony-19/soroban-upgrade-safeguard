@@ -1,7 +1,7 @@
 use crate::limits::{LimitError, ResourcePolicy};
 use crate::mapper::{try_type_to_string, LayoutMapper};
 use crate::parser::ContractEnvMeta;
-use crate::spec::ContractSpec;
+use crate::spec::{ContractSpec, DuplicateEntry};
 use crate::storage_schema::{DeclarationRole, ResolvedStorageSchema};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -180,6 +180,95 @@ pub fn report_unresolved_storage_references(names: &[String], report: &mut DiffR
             type_name: Some(name.clone()),
             target: Some(name.clone()),
         });
+    }
+}
+
+/// Category label for duplicate spec-entry findings.
+///
+/// Used in `findings_by_category` in JSON output. Two sub-categories:
+///   - "Spec Entry Conflict"   — conflicting definitions (Critical)
+///   - "Spec Entry Duplicate"  — identical definitions (Info)
+pub const SPEC_CONFLICT_CATEGORY: &str = "Spec Entry Conflict";
+pub const SPEC_DUPLICATE_CATEGORY: &str = "Spec Entry Duplicate";
+
+/// Inject duplicate-spec-entry findings into `report`.
+///
+/// Called once per WASM side (old/new). `side` is `"old"` or `"new"` and is
+/// embedded in every message so the operator knows which binary has the problem.
+///
+/// Policy:
+/// - **Conflicting** duplicates (same name, different definition) → `Critical`.
+///   They mean the analysis model is ambiguous; the run must fail.
+/// - **Identical** duplicates (same name, byte-identical definition) → `Info`
+///   in compat mode, `Warning` otherwise. They are safe to deduplicate but
+///   indicate a non-canonical WASM.
+///
+/// Multi-section WASMs: `spec_section_count` is included in the message so an
+/// operator can tell whether the duplicate spans sections or is within a single
+/// section. A `spec_section_count > 1` combined with a conflict is the attack
+/// vector described in the issue.
+pub fn report_duplicate_spec_entries(
+    side: &str,
+    duplicates: &[DuplicateEntry],
+    spec_section_count: usize,
+    report: &mut DiffReport,
+    compat_duplicates: bool,
+) {
+    for dup in duplicates {
+        let section_note = if spec_section_count > 1 {
+            format!(
+                " ({spec_section_count} contractspecv0 sections present; sections: {})",
+                dup.sections
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else {
+            format!(
+                " (within section {})",
+                dup.sections.first().copied().unwrap_or(0)
+            )
+        };
+
+        if dup.is_identical {
+            // In compat mode: informational (safe to ignore for clean WASMs).
+            // Without compat mode: Warning (non-canonical WASM is suspicious).
+            let severity = if compat_duplicates {
+                Severity::Info
+            } else {
+                Severity::Warning
+            };
+            report.findings.push(Finding {
+                severity,
+                category: SPEC_DUPLICATE_CATEGORY.to_string(),
+                message: format!(
+                    "{side} WASM: {} '{}' appears {} times with an identical definition{section_note}. \
+                     The WASM is non-canonical but the duplicate is safe to deduplicate.",
+                    dup.kind.label(),
+                    dup.name,
+                    dup.sections.len(),
+                ),
+                type_name: Some(dup.name.clone()),
+                target: Some(dup.name.clone()),
+            });
+        } else {
+            report.findings.push(Finding {
+                severity: Severity::Critical,
+                category: SPEC_CONFLICT_CATEGORY.to_string(),
+                message: format!(
+                    "{side} WASM: {} '{}' has {} conflicting definitions{section_note}. \
+                     The analysis model is ambiguous — the definition used for comparison \
+                     may not match the one the contract actually executes. This is a \
+                     soundness failure and the run cannot be trusted.",
+                    dup.kind.label(),
+                    dup.name,
+                    dup.sections.len(),
+                ),
+                type_name: Some(dup.name.clone()),
+                target: Some(dup.name.clone()),
+            });
+        }
     }
 }
 

@@ -15,13 +15,14 @@ This document explains what Soroban Upgrade Safeguard does, how it works interna
 9. [Detection Categories](#detection-categories)
 10. [Severity Levels](#severity-levels)
 11. [Cascading Layout Breaks](#cascading-layout-breaks)
-12. [Reading the Report](#reading-the-report)
-13. [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes)
-14. [Resource Limits and Hardening Against Malicious Input](#resource-limits-and-hardening-against-malicious-input)
-15. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
-16. [Limitations](#limitations)
-17. [Migration Note](#migration-note)
-18. [Frequently Asked Questions](#frequently-asked-questions)
+12. [Spec Entry Integrity and Duplicate Detection](#spec-entry-integrity-and-duplicate-detection)
+13. [Reading the Report](#reading-the-report)
+14. [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes)
+15. [Resource Limits and Hardening Against Malicious Input](#resource-limits-and-hardening-against-malicious-input)
+16. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
+17. [Limitations](#limitations)
+18. [Migration Note](#migration-note)
+19. [Frequently Asked Questions](#frequently-asked-questions)
 
 ## Overview
 
@@ -387,6 +388,57 @@ Every finding carries one of three severity levels.
 The most subtle failures come from shared types. Suppose a small struct named `Money` is used as a field inside `Account`, and `Account` is used inside `Ledger`. If you change `Money`, the stored bytes for every `Account` and every `Ledger` are now wrong, even though you never touched those larger types directly.
 
 To catch this, `mapper.rs` builds a reverse dependency graph: for each user-defined type, it records which other types embed it. After the direct comparison finds the set of types with critical changes, `diff.rs` walks that graph outward and marks every dependent type as broken too, transitively. These appear in the report under the **Cascading Layout Break** category, naming both the affected parent type and the underlying modified type that caused the break. Cyclic type references are handled safely so the walk always terminates.
+
+## Spec Entry Integrity and Duplicate Detection
+
+WASM binaries are permitted to carry more than one custom section with the same name. The Soroban toolchain typically emits a single `contractspecv0` section, but a crafted or malformed build can contain multiple. The parser concatenates entries from all `contractspecv0` sections in order, and then `spec.rs` checks for duplicate names within each kind (function, struct, enum, union, error enum).
+
+### Why duplicates are a soundness problem
+
+If two sections define the same type name differently, the analysis model contains the first definition it encountered. Any subsequent conflicting definition is discarded from the model. This creates a gap: the definition the tool analyzes may not be the one the contract actually uses. An attacker who controls section ordering can steer the tool to analyze a benign definition while the real, breaking one is ignored. The upgrade appears safe; in production it corrupts data.
+
+### Detection policy
+
+The tool compares every pair of definitions that share a name and kind using their serialized XDR bytes:
+
+- **Conflicting duplicates** (same name, different bytes) produce a **`Spec Entry Conflict`** finding at `Critical` severity. The run is marked `is_safe: false` and exits with code 1. This is true regardless of which side carries the duplicate (old or new) and regardless of whether `--compat-duplicates` is set.
+
+- **Identical duplicates** (same name, byte-identical bytes) produce a **`Spec Entry Duplicate`** finding. The severity depends on the mode:
+  - **Default mode**: `Warning`. The WASM is non-canonical and the condition is suspicious.
+  - **Compat mode** (`--compat-duplicates`): `Info`. Legitimate toolchains that historically emit split sections with identical entries can set this flag to suppress the warning without hiding genuine conflicts.
+
+The first encountered definition is always the one used for comparison. The policy is deterministic and independent of `HashMap` iteration order.
+
+### JSON fields
+
+The `scope` object in JSON output always reflects the duplicate status:
+
+```json
+{
+  "scope": {
+    "old_spec_section_count": 2,
+    "new_spec_section_count": 1,
+    "old_duplicate_names": ["Ledger"],
+    "new_duplicate_names": []
+  }
+}
+```
+
+`old_spec_section_count` and `new_spec_section_count` give the raw number of `contractspecv0` sections found in each binary. `old_duplicate_names` and `new_duplicate_names` list every entry name that appeared more than once (across all kinds), sorted for stable output. These fields are always present; the name lists are omitted from JSON when empty.
+
+### Compat mode
+
+Some older SDK versions emit two `contractspecv0` sections with identical entries. To handle those WASMs without failing, pass `--compat-duplicates`:
+
+```bash
+soroban-upgrade-safeguard old.wasm new.wasm --compat-duplicates
+```
+
+In compat mode, identical duplicates become informational and no longer cause a `Warning`. Conflicting duplicates remain `Critical` regardless — a difference in definitions cannot be safely ignored in any mode.
+
+### Coverage
+
+Duplicate detection covers all five spec entry kinds: functions, structs, enums, unions, and error enums. Provenance (which section each entry came from, zero-indexed) is tracked through decoding and reported in every finding message and in the `scope` JSON so an operator can identify exactly which sections are involved.
 
 ## Zero-Trust RPC Baseline Retrieval
 
