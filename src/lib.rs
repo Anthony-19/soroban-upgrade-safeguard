@@ -306,6 +306,7 @@ pub fn compare_wasm_bytes_with_options(
         suppressions,
         options.explain,
         options.strict,
+        policy,
     );
     safety_report.old_spec_summary = Some(old_spec_summary);
     safety_report.new_spec_summary = Some(new_spec_summary);

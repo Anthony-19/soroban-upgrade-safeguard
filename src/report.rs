@@ -232,6 +232,21 @@ pub struct SafetyReport {
     /// Human-readable summary of the new contract spec.
     /// Populated by the canonical pipeline so callers don't need to re-extract metadata.
     pub new_spec_summary: Option<String>,
+    /// Resolved configuration settings recorded in this report.
+    pub settings: ReportSettings,
+}
+
+/// Material configuration settings recorded in the safety report for auditability.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ReportSettings {
+    pub strict: bool,
+    pub explain: bool,
+    pub max_suppressions: Option<usize>,
+    pub allow_targetless: Option<bool>,
+    pub max_xdr_depth: u32,
+    pub max_xdr_len: usize,
+    pub max_entries: usize,
+    pub max_walk_depth: usize,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -268,12 +283,14 @@ pub struct SafetyReportJson<'a> {
 }
 
 impl SafetyReport {
-    /// Compute a safety report from a raw DiffReport, with no suppressions.
-    ///
-    /// Equivalent to [`SafetyReport::with_suppressions`] using an empty config,
-    /// so behavior is identical to before suppression support existed.
     pub fn new(diff: &DiffReport) -> Self {
-        Self::with_suppressions(diff, &SuppressionConfig::default(), false, false)
+        Self::with_suppressions(
+            diff,
+            &SuppressionConfig::default(),
+            false,
+            false,
+            &ResourcePolicy::default(),
+        )
     }
 
     /// Compute a safety report, applying a suppression config.
@@ -287,7 +304,19 @@ impl SafetyReport {
         suppressions: &SuppressionConfig,
         explain: bool,
         strict: bool,
+        policy: &ResourcePolicy,
     ) -> Self {
+        let settings = ReportSettings {
+            strict,
+            explain,
+            max_suppressions: suppressions.max_suppressions,
+            allow_targetless: suppressions.allow_targetless,
+            max_xdr_depth: policy.max_xdr_depth,
+            max_xdr_len: policy.max_xdr_len,
+            max_entries: policy.max_entries,
+            max_walk_depth: policy.max_walk_depth,
+        };
+
         let mut critical_count = 0;
         let mut warning_count = 0;
         let mut info_count = 0;
@@ -371,6 +400,7 @@ impl SafetyReport {
             verified_code_hash: None,
             old_spec_summary: None,
             new_spec_summary: None,
+            settings: settings.clone(),
         }
     }
 
@@ -1171,6 +1201,7 @@ mod tests {
             verified_code_hash: None,
             old_spec_summary: None,
             new_spec_summary: None,
+            settings: ReportSettings::default(),
         };
 
         // Identical upgrade -> patch
