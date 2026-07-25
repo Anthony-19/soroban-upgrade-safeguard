@@ -53,6 +53,12 @@ pub struct SorobanMetadata {
     /// Number of distinct `contractspecv0` custom sections found.
     pub spec_section_count: usize,
     pub env_meta: Option<ContractEnvMeta>,
+    /// Names of functions exported from this WASM binary's export section.
+    ///
+    /// These are the names visible to on-chain callers at runtime, which may
+    /// differ from the names declared in the `contractspecv0` spec. Tracking
+    /// both lets the diff layer catch mismatches and removed exports.
+    pub exported_function_names: std::collections::BTreeSet<String>,
 }
 
 /// Decodes concatenated ScSpecEntry XDR objects from raw bytes using the default
@@ -190,45 +196,63 @@ pub fn extract_metadata_with_policy(
     let mut spec_section_index = 0usize;
 
     for payload in parser.parse_all(bytes) {
-        if let Payload::CustomSection(section) = payload.context("Failed to parse WASM payload")? {
-            match section.name() {
-                "contractspecv0" => {
-                    let section_index = spec_section_index;
-                    spec_section_index += 1;
+        match payload.context("Failed to parse WASM payload")? {
+            Payload::CustomSection(section) => {
+                match section.name() {
+                    "contractspecv0" => {
+                        let section_index = spec_section_index;
+                        spec_section_index += 1;
 
-                    let entries = decode_spec_entries_with_policy(
-                        section.data(),
-                        policy,
-                        metadata.spec.len(),
-                    )
-                    .with_context(|| {
-                        format!(
-                            "Failed to decode contractspecv0 section {} at byte offset {}",
-                            section_index,
-                            section.data_offset()
+                        let entries = decode_spec_entries_with_policy(
+                            section.data(),
+                            policy,
+                            metadata.spec.len(),
                         )
-                    })?;
-                    // Tag each decoded entry with its source section index so
-                    // duplicate detection can report exactly which sections
-                    // carry conflicting definitions.
-                    let tagged = entries
-                        .into_iter()
-                        .map(|e| TaggedSpecEntry::new(e, section_index));
-                    metadata.spec.extend(tagged);
-                    metadata.spec_section_count += 1;
+                        .with_context(|| {
+                            format!(
+                                "Failed to decode contractspecv0 section {} at byte offset {}",
+                                section_index,
+                                section.data_offset()
+                            )
+                        })?;
+                        // Tag each decoded entry with its source section index so
+                        // duplicate detection can report exactly which sections
+                        // carry conflicting definitions.
+                        let tagged = entries
+                            .into_iter()
+                            .map(|e| TaggedSpecEntry::new(e, section_index));
+                        metadata.spec.extend(tagged);
+                        metadata.spec_section_count += 1;
+                    }
+                    "contractenvmetav0" => {
+                        // A malformed env-meta section is tolerated (best-effort, as
+                        // before), but a resource-limit violation is adversarial and
+                        // must not be silently swallowed.
+                        match decode_env_meta_with_policy(section.data(), policy) {
+                            Ok(env_meta) => metadata.env_meta = Some(env_meta),
+                            Err(err) if find_limit_error(&err).is_some() => return Err(err),
+                            Err(_) => {}
+                        }
+                    }
+                    _ => {}
                 }
-                "contractenvmetav0" => {
-                    // A malformed env-meta section is tolerated (best-effort, as
-                    // before), but a resource-limit violation is adversarial and
-                    // must not be silently swallowed.
-                    match decode_env_meta_with_policy(section.data(), policy) {
-                        Ok(env_meta) => metadata.env_meta = Some(env_meta),
-                        Err(err) if find_limit_error(&err).is_some() => return Err(err),
-                        Err(_) => {}
+            }
+            Payload::ExportSection(reader) => {
+                // Collect every exported function name from the binary's export
+                // section. These are the names visible to on-chain callers at
+                // runtime and may differ from the contractspecv0 declarations.
+                // We ignore non-function exports (memories, tables, globals).
+                for export in reader {
+                    if let Ok(export) = export {
+                        if export.kind == wasmparser::ExternalKind::Func {
+                            metadata
+                                .exported_function_names
+                                .insert(export.name.to_string());
+                        }
                     }
                 }
-                _ => {}
             }
+            _ => {}
         }
     }
 

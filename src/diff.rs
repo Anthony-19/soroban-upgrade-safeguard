@@ -117,6 +117,125 @@ pub fn compare_with_classification(
     report
 }
 
+/// Run the full structural diff bounded by `policy`.
+///
+/// This is the function the canonical pipeline ([`crate::lib`]) calls. It
+/// runs the same stages as [`compare_with_classification`] but also enforces
+/// the recursive type-walk depth limit from `policy`, returning a typed
+/// [`crate::limits::LimitError`] when a type graph exceeds the configured
+/// bound rather than overflowing the stack.
+pub fn compare_with_policy(
+    old: &ContractSpec,
+    new: &ContractSpec,
+    policy: &crate::limits::ResourcePolicy,
+) -> Result<DiffReport, crate::limits::LimitError> {
+    let mut report = DiffReport::default();
+
+    compare_functions(old, new, &mut report);
+    compare_structs(old, new, &ClassificationConfig::none(), &mut report);
+    compare_enums(old, new, &ClassificationConfig::none(), &mut report);
+    compare_unions(old, new, &ClassificationConfig::none(), &mut report);
+    compare_error_enums(old, new, &ClassificationConfig::none(), &mut report);
+
+    // Cascade detection uses the LayoutMapper which enforces the walk-depth
+    // limit. If the graph exceeds it we surface a LimitError rather than
+    // overflowing the stack.
+    detect_cascading_layout_breaks_with_policy(old, &mut report, policy)?;
+
+    Ok(report)
+}
+
+/// Category label for duplicate spec entries that are byte-identical across sections.
+pub const SPEC_DUPLICATE_CATEGORY: &str = "Spec Entry Duplicate";
+/// Category label for duplicate spec entries that conflict (different definitions).
+pub const SPEC_CONFLICT_CATEGORY: &str = "Spec Entry Conflict";
+
+/// Inject findings for duplicate spec entries detected during `ContractSpec::from_entries_checked`.
+///
+/// Identical duplicates (same definition in multiple sections) become `Info`
+/// findings unless `compat_duplicates` is `true`, in which case they are
+/// silently dropped. Conflicting duplicates (different definitions) always
+/// become `Critical` findings.
+pub fn report_duplicate_spec_entries(
+    side: &str,
+    duplicates: &[crate::spec::DuplicateEntry],
+    section_count: usize,
+    report: &mut DiffReport,
+    compat_duplicates: bool,
+) {
+    for dup in duplicates {
+        if dup.is_identical {
+            if compat_duplicates {
+                continue;
+            }
+            report.findings.push(Finding {
+                severity: Severity::Info,
+                category: SPEC_DUPLICATE_CATEGORY.to_string(),
+                message: format!(
+                    "{} build: {} '{}' appears in {} of {} contractspecv0 section(s) with an \
+                     identical definition. The WASM is non-canonical but safe to use.",
+                    side,
+                    dup.kind.label(),
+                    dup.name,
+                    dup.sections.len(),
+                    section_count,
+                ),
+                type_name: Some(dup.name.clone()),
+                target: Some(dup.name.clone()),
+                classification: None,
+            });
+        } else {
+            report.findings.push(Finding {
+                severity: Severity::Critical,
+                category: SPEC_CONFLICT_CATEGORY.to_string(),
+                message: format!(
+                    "{} build: {} '{}' has conflicting definitions across contractspecv0 \
+                     sections {:?}. The spec is ambiguous and the build cannot be trusted.",
+                    side,
+                    dup.kind.label(),
+                    dup.name,
+                    dup.sections,
+                ),
+                type_name: Some(dup.name.clone()),
+                target: Some(dup.name.clone()),
+                classification: None,
+            });
+        }
+    }
+}
+
+/// Compare two resolved storage schemas through the same diff engine used for
+/// the exported interface, returning a `DiffReport` with the storage findings.
+pub fn compare_storage_schemas(
+    old: &crate::storage_schema::ResolvedStorageSchema,
+    new: &crate::storage_schema::ResolvedStorageSchema,
+) -> DiffReport {
+    compare_with_classification(&old.spec, &new.spec, &ClassificationConfig::none())
+}
+
+/// Inject `Info` findings for schema references the resolver could not match
+/// against the exported spec. These are not errors — they just cap the coverage
+/// claim so the report cannot overstate what was verified.
+pub fn report_unresolved_storage_references(
+    unresolved: &[String],
+    report: &mut DiffReport,
+) {
+    for name in unresolved {
+        report.findings.push(Finding {
+            severity: Severity::Info,
+            category: ENVIRONMENT_CATEGORY.to_string(),
+            message: format!(
+                "Storage schema references type '{}' which could not be resolved against \
+                 the exported spec. Coverage for this type is not guaranteed.",
+                name
+            ),
+            type_name: Some(name.clone()),
+            target: Some(name.clone()),
+            classification: None,
+        });
+    }
+}
+
 /// Category label for contract environment metadata findings.
 pub const ENVIRONMENT_CATEGORY: &str = "Environment";
 
@@ -180,7 +299,112 @@ pub const ALL_CATEGORIES: &[&str] = &[
     "Error Enum Case Value Changed",
     // Cascades.
     "Cascading Layout Break",
+    // Binary export section vs. declared spec.
+    "Export Removed",
+    "Export Added",
+    "Export Spec Mismatch",
+    // Duplicate / conflicting spec entries.
+    "Spec Entry Duplicate",
+    "Spec Entry Conflict",
 ];
+
+/// Compare the binary export sections of two WASM builds.
+///
+/// A function present in the old binary's export section but absent from the new
+/// one is a breaking change — callers that invoke by name will get a missing
+/// export at runtime. A function present in the new binary but absent from the
+/// old one is informational (new export available).
+///
+/// Additionally, any name that appears in the `contractspecv0` spec but NOT in
+/// the binary's export section (or vice versa) indicates a spec/binary mismatch
+/// that should be visible.
+///
+/// `old_exports` and `new_exports` are the `exported_function_names` sets from
+/// [`crate::parser::SorobanMetadata`]. `old_spec_fns` and `new_spec_fns` are
+/// the function name sets from the respective [`crate::spec::ContractSpec`].
+pub fn compare_exports(
+    old_exports: &std::collections::BTreeSet<String>,
+    new_exports: &std::collections::BTreeSet<String>,
+    old_spec_fns: &std::collections::HashSet<String>,
+    new_spec_fns: &std::collections::HashSet<String>,
+    report: &mut DiffReport,
+) {
+    // 1. Exports present in the old binary but removed in the new binary.
+    for name in old_exports {
+        if !new_exports.contains(name) {
+            report.findings.push(Finding {
+                severity: Severity::Critical,
+                category: "Export Removed".to_string(),
+                message: format!(
+                    "Exported function '{}' is present in the old binary but absent from \
+                     the new binary. On-chain callers will get a missing-export error at runtime.",
+                    name
+                ),
+                type_name: None,
+                target: Some(name.clone()),
+                classification: None,
+            });
+        }
+    }
+
+    // 2. Exports present in the new binary but absent from the old binary.
+    for name in new_exports {
+        if !old_exports.contains(name) {
+            report.findings.push(Finding {
+                severity: Severity::Info,
+                category: "Export Added".to_string(),
+                message: format!(
+                    "New exported function '{}' appeared in the binary export section.",
+                    name
+                ),
+                type_name: None,
+                target: Some(name.clone()),
+                classification: None,
+            });
+        }
+    }
+
+    // 3. Each build's declared spec must agree with the functions the binary
+    // actually exports. Check both sides: an inconsistent baseline is useful
+    // diagnostic information too, and an inconsistent candidate is unsafe.
+    for (side, exports, spec_fns) in [
+        ("old", old_exports, old_spec_fns),
+        ("new", new_exports, new_spec_fns),
+    ] {
+        for name in spec_fns {
+            if !exports.contains(name) {
+                report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category: "Export Spec Mismatch".to_string(),
+                    message: format!(
+                        "Function '{}' is declared in the {} contract spec but is NOT present in \
+                         that binary's export section. Callers following the spec will fail at runtime.",
+                        name, side
+                    ),
+                    type_name: None,
+                    target: Some(name.clone()),
+                    classification: None,
+                });
+            }
+        }
+        for name in exports {
+            if !spec_fns.contains(name) {
+                report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category: "Export Spec Mismatch".to_string(),
+                    message: format!(
+                        "Function '{}' is exported by the {} binary but is NOT declared in \
+                         that contract spec. The spec does not reflect all callable entry-points.",
+                        name, side
+                    ),
+                    type_name: None,
+                    target: Some(name.clone()),
+                    classification: None,
+                });
+            }
+        }
+    }
+}
 
 /// Compare decoded environment metadata between two contract builds.
 pub fn compare_env_metadata(
@@ -1371,10 +1595,105 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
     }
 }
 
+/// Policy-aware variant of [`detect_cascading_layout_breaks`].
+///
+/// Uses [`crate::mapper::LayoutMapper::new_with_policy`] so the walk is bounded
+/// by `policy.max_walk_depth`. Returns a [`crate::limits::LimitError`] if the
+/// type graph is deeper than the configured limit.
+fn detect_cascading_layout_breaks_with_policy(
+    old: &ContractSpec,
+    report: &mut DiffReport,
+    policy: &crate::limits::ResourcePolicy,
+) -> Result<(), crate::limits::LimitError> {
+    let old_mapper = LayoutMapper::new_with_policy(old, policy);
+    let reverse_deps = old_mapper.try_build_reverse_dependencies()?;
+
+    let mut broken_types = std::collections::HashSet::new();
+    for finding in &report.findings {
+        if finding.severity == Severity::Critical {
+            if let Some(ref name) = finding.type_name {
+                broken_types.insert(name.clone());
+            }
+        }
+    }
+
+    let mut queue: Vec<String> = broken_types.into_iter().collect();
+    let mut i = 0;
+    let mut cascaded = std::collections::HashSet::new();
+
+    while i < queue.len() {
+        let current_broken_type = queue[i].clone();
+        i += 1;
+
+        if let Some(dependents) = reverse_deps.get(&current_broken_type) {
+            for dep in dependents {
+                if !cascaded.contains(dep) {
+                    cascaded.insert(dep.clone());
+                    queue.push(dep.clone());
+
+                    report.findings.push(Finding {
+                        severity: Severity::Critical,
+                        category: "Cascading Layout Break".to_string(),
+                        message: format!(
+                            "Type '{}' layout is broken because it embeds modified type '{}'. \
+                             Stored data for '{}' is no longer compatible.",
+                            dep, current_broken_type, dep
+                        ),
+                        type_name: Some(dep.clone()),
+                        target: Some(dep.clone()),
+                        classification: None,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeSet, HashSet};
     use stellar_xdr::curr::{ScEnvMetaEntry, ScSpecTypeUdt, StringM, VecM};
+
+    #[test]
+    fn exported_functions_detect_removals_additions_and_spec_mismatches() {
+        let old_exports = BTreeSet::from(["legacy".to_string(), "old_only".to_string()]);
+        let new_exports = BTreeSet::from(["legacy".to_string(), "new_only".to_string()]);
+        let old_spec = HashSet::from(["legacy".to_string(), "declared_only_old".to_string()]);
+        let new_spec = HashSet::from(["legacy".to_string(), "declared_only_new".to_string()]);
+        let mut report = DiffReport::default();
+
+        compare_exports(
+            &old_exports,
+            &new_exports,
+            &old_spec,
+            &new_spec,
+            &mut report,
+        );
+
+        assert!(report.findings.iter().any(|finding| {
+            finding.category == "Export Removed"
+                && finding.target.as_deref() == Some("old_only")
+                && finding.severity == Severity::Critical
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.category == "Export Added"
+                && finding.target.as_deref() == Some("new_only")
+                && finding.severity == Severity::Info
+        }));
+        for target in [
+            "declared_only_old",
+            "old_only",
+            "declared_only_new",
+            "new_only",
+        ] {
+            assert!(report.findings.iter().any(|finding| {
+                finding.category == "Export Spec Mismatch"
+                    && finding.target.as_deref() == Some(target)
+            }));
+        }
+    }
 
     /// Helper: build a minimal ContractSpec with the given structs.
     fn spec_with_structs(structs: Vec<(&str, Vec<(&str, ScSpecTypeDef)>)>) -> ContractSpec {

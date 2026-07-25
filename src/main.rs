@@ -145,6 +145,15 @@ struct Args {
     /// always Critical regardless of this flag.
     #[arg(long)]
     compat_duplicates: bool,
+
+    /// Write the report to this file instead of stdout.
+    ///
+    /// The file is created (or overwritten) only after the report has been
+    /// successfully rendered, so a failed comparison never leaves a
+    /// partial file behind. Progress output continues to go to its normal
+    /// destination regardless of this flag.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
 }
 
 /// Resolve the effective [`ResourcePolicy`]: built-in defaults, overlaid by the
@@ -205,6 +214,27 @@ fn main() {
     }
 }
 
+/// Write `content` to a file if `output_path` is `Some`, otherwise print it
+/// to stdout. Writing to a file is atomic: the full string is rendered before
+/// any file is opened, so a failed comparison never leaves a partial file.
+///
+/// When a file path is used, a progress message is emitted via `progress` so
+/// the user can see where the report landed.
+fn emit_report_output(
+    content: &str,
+    output_path: Option<&std::path::Path>,
+    progress: &impl Fn(String),
+) -> Result<()> {
+    if let Some(path) = output_path {
+        std::fs::write(path, content)
+            .with_context(|| format!("Failed to write report to '{}'", path.display()))?;
+        progress(format!("✅ Report written to: {}", path.display()));
+    } else {
+        println!("{}", content);
+    }
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let args = Args::parse();
 
@@ -252,9 +282,12 @@ fn run() -> Result<()> {
     };
 
     // In JSON or Markdown mode, decorative progress goes to stderr so stdout
-    // stays a single, pristine document. In text mode it stays on stdout
-    // exactly as before.
-    let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
+    // stays a single, pristine document. An explicit output file also keeps
+    // stdout empty in text mode: the report is in that file and all progress
+    // belongs on stderr rather than alongside it.
+    let clean_stdout = args.output.is_some()
+        || args.format == OutputFormat::Json
+        || args.format == OutputFormat::Markdown;
     let progress = |line: String| {
         if clean_stdout {
             eprintln!("{line}");
@@ -537,7 +570,8 @@ fn run() -> Result<()> {
                     "dependency_findings": infra_findings,
                 });
 
-                println!("{}", serde_json::to_string_pretty(&batch_json)?);
+                let rendered = serde_json::to_string_pretty(&batch_json)?;
+                emit_report_output(&rendered, args.output.as_deref(), &progress)?;
             }
             OutputFormat::Markdown => {
                 let mut markdown = String::new();
@@ -628,50 +662,49 @@ fn run() -> Result<()> {
                     markdown.push_str("\n---\n\n");
                 }
 
-                println!("{}", markdown);
+                emit_report_output(&markdown, args.output.as_deref(), &progress)?;
             }
             OutputFormat::Text => {
-                println!("========================================");
-                println!("    SOROBAN BATCH SAFETY REPORT");
-                println!("========================================");
+                let mut text_output = String::new();
+                text_output.push_str("========================================\n");
+                text_output.push_str("    SOROBAN BATCH SAFETY REPORT\n");
+                text_output.push_str("========================================\n");
 
-                let status = if overall_safe {
-                    "✅ PASSED (All contracts safe)".green().bold()
+                let status_line = if overall_safe {
+                    "Overall Status: ✅ PASSED (All contracts safe)\n"
                 } else {
-                    "❌ FAILED (Some contracts have breaking changes)"
-                        .red()
-                        .bold()
+                    "Overall Status: ❌ FAILED (Some contracts have breaking changes)\n"
                 };
-                println!("Overall Status: {}\n", status);
+                text_output.push_str(status_line);
+                text_output.push('\n');
 
-                println!("Summary of Contracts:");
+                text_output.push_str("Summary of Contracts:\n");
                 for (name, report) in &results {
-                    let status_str = if report.is_safe {
-                        "✅ PASSED".green()
-                    } else {
-                        "❌ FAILED".red().bold()
-                    };
-                    println!(
-                        "  - {}: {} ({} critical, {} warnings, {} info, {} suppressed)",
-                        name.bold(),
+                    let status_str = if report.is_safe { "✅ PASSED" } else { "❌ FAILED" };
+                    text_output.push_str(&format!(
+                        "  - {}: {} ({} critical, {} warnings, {} info, {} suppressed)\n",
+                        name,
                         status_str,
                         report.critical_count,
                         report.warning_count,
                         report.info_count,
                         report.suppressed_count
-                    );
+                    ));
                 }
                 for (name, failure) in &failed {
                     let status_str = if failure.is_limit {
-                        "⛔ ERROR (resource limit)".red().bold()
+                        "⛔ ERROR (resource limit)"
                     } else {
-                        "⛔ ERROR".red().bold()
+                        "⛔ ERROR"
                     };
-                    println!("  - {}: {} — {}", name.bold(), status_str, failure.message);
+                    text_output.push_str(&format!(
+                        "  - {}: {} — {}\n",
+                        name, status_str, failure.message
+                    ));
                 }
 
                 if !cross_findings.is_empty() {
-                    println!("\n🔗 Cross-Contract Dependency Findings:");
+                    text_output.push_str("\n🔗 Cross-Contract Dependency Findings:\n");
                     let mut by_affected: std::collections::BTreeMap<
                         &str,
                         Vec<&CrossContractFinding>,
@@ -683,7 +716,10 @@ fn run() -> Result<()> {
                             .push(cf);
                     }
                     for (affected, cfs) in &by_affected {
-                        println!("  Contract '{}' is affected by changes in:", affected.bold());
+                        text_output.push_str(&format!(
+                            "  Contract '{}' is affected by changes in:\n",
+                            affected
+                        ));
                         for cf in cfs {
                             let sev_icon = match cf.finding.severity {
                                 soroban_upgrade_safeguard::diff::Severity::Critical => "🔴",
@@ -695,39 +731,58 @@ fn run() -> Result<()> {
                             } else {
                                 format!("transitive depth {}", cf.propagation_depth)
                             };
-                            println!(
-                                "    {} [{}] '{}' → {} ({})",
+                            text_output.push_str(&format!(
+                                "    {} [{}] '{}' → {} ({})\n",
                                 sev_icon,
                                 cf.finding.category,
                                 cf.finding.target.as_deref().unwrap_or(""),
-                                cf.changed_contract.bold(),
+                                cf.changed_contract,
                                 depth_label
-                            );
+                            ));
                         }
                     }
                 }
 
                 if !cycle_findings_list.is_empty() {
-                    println!("\n⚠️  Cyclic Dependencies:");
+                    text_output.push_str("\n⚠️  Cyclic Dependencies:\n");
                     for f in &cycle_findings_list {
-                        println!("  🟡 {}", f.message);
+                        text_output.push_str(&format!("  🟡 {}\n", f.message));
                     }
                 }
 
                 if !missing_findings_list.is_empty() {
-                    println!("\n⚠️  Missing Dependency Contracts:");
+                    text_output.push_str("\n⚠️  Missing Dependency Contracts:\n");
                     for f in &missing_findings_list {
-                        println!("  🟡 {}", f.message);
+                        text_output.push_str(&format!("  🟡 {}\n", f.message));
                     }
                 }
 
-                println!("\n========================================\n");
+                text_output.push_str("\n========================================\n\n");
 
                 for (name, report) in &results {
-                    println!("=== Contract: {} ===", name.bold().magenta());
-                    println!("{}", report.generate_summary_text(args.explain));
-                    println!("========================================\n");
+                    text_output.push_str(&format!("=== Contract: {} ===\n", name));
+                    // Strip ANSI codes if writing to file so it stays clean text.
+                    let report_text = report.generate_summary_text(args.explain);
+                    text_output.push_str(&report_text);
+                    text_output.push_str("========================================\n\n");
                 }
+
+                emit_report_output(&text_output, args.output.as_deref(), &progress)?;
+            }
+        }
+
+        // Emit unmatched suppression warnings for all batch reports (stderr only).
+        for (name, report) in &results {
+            for rule in &report.unmatched_suppressions {
+                let target_part = rule
+                    .target
+                    .as_deref()
+                    .map(|t| format!(", target='{}'", t))
+                    .unwrap_or_default();
+                eprintln!(
+                    "⚠️  [{}] Suppression rule never matched: category='{}'{} — possible typo or stale rule.",
+                    name, rule.rule_id, target_part
+                );
             }
         }
 
@@ -866,20 +921,38 @@ fn run() -> Result<()> {
     safety_report.baseline_source = baseline_source.map(|s| s.to_string());
     safety_report.verified_code_hash = verified_hash_hex;
 
-    match args.format {
-        OutputFormat::Json => {
-            // Single JSON document to stdout; no decorative text, no ANSI codes.
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&safety_report.to_json())?
-            );
-        }
-        OutputFormat::Markdown => {
-            println!("{}", safety_report.generate_summary_markdown());
-        }
-        OutputFormat::Text => {
-            println!("{}", safety_report.generate_summary_text(args.explain));
-        }
+    // Render the report to a string first so --output can write it atomically.
+    let rendered = match args.format {
+        OutputFormat::Json => serde_json::to_string_pretty(&safety_report.to_json())?,
+        OutputFormat::Markdown => safety_report.generate_summary_markdown(),
+        OutputFormat::Text => safety_report.generate_summary_text(args.explain),
+    };
+
+    // Write the report — either to a file (--output) or to stdout.
+    if let Some(ref output_path) = args.output {
+        std::fs::write(output_path, &rendered).with_context(|| {
+            format!("Failed to write report to '{}'", output_path.display())
+        })?;
+        progress(format!(
+            "✅ Report written to: {}",
+            output_path.display()
+        ));
+    } else {
+        println!("{}", rendered);
+    }
+
+    // Warn about suppression rules that never matched any finding.
+    // Goes to stderr so it does not pollute the report on stdout.
+    for rule in &safety_report.unmatched_suppressions {
+        let target_part = rule
+            .target
+            .as_deref()
+            .map(|t| format!(", target='{}'", t))
+            .unwrap_or_default();
+        eprintln!(
+            "⚠️  Suppression rule never matched any finding: category='{}'{} — possible typo or stale rule.",
+            rule.rule_id, target_part
+        );
     }
 
     if !safety_report.is_safe {

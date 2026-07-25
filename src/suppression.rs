@@ -215,21 +215,21 @@ impl SuppressionConfig {
                 if rule.author.is_none() {
                     anyhow::bail!(
                         "Missing 'author' for suppression rule under category '{}' (target: '{:?}').",
-                        rule.category,
+                        rule.rule_id,
                         rule.target
                     );
                 }
                 if rule.expiry.is_none() {
                     anyhow::bail!(
                         "Missing 'expiry' for suppression rule under category '{}' (target: '{:?}').",
-                        rule.category,
+                        rule.rule_id,
                         rule.target
                     );
                 }
                 if rule.fingerprint.is_none() {
                     anyhow::bail!(
                         "Missing 'fingerprint' for suppression rule under category '{}' (target: '{:?}').",
-                        rule.category,
+                        rule.rule_id,
                         rule.target
                     );
                 }
@@ -239,7 +239,7 @@ impl SuppressionConfig {
                 if is_expired(expiry_str)? {
                     anyhow::bail!(
                         "Suppression rule for category '{}' has expired on {}.",
-                        rule.category,
+                        rule.rule_id,
                         expiry_str
                     );
                 }
@@ -279,6 +279,18 @@ impl SuppressionConfig {
     /// Return the first rule that matches `finding`, if any.
     pub fn matching_rule(&self, finding: &Finding) -> Option<&SuppressionRule> {
         self.rules.iter().find(|rule| rule.matches(finding))
+    }
+
+    /// Return the first rule that matches `finding` together with its index, if any.
+    /// The index is used by the report layer to track which rules were used.
+    pub fn matching_rule_with_index(
+        &self,
+        finding: &Finding,
+    ) -> Option<(usize, &SuppressionRule)> {
+        self.rules
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| rule.matches(finding))
     }
 
     /// Whether any rule matches `finding`.

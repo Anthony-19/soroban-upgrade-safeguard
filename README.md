@@ -43,6 +43,19 @@ soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>
 soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
 ```
 
+### Saving a report
+
+Use `--output <PATH>` to write only the rendered report to a file. The format is
+selected with `--format text`, `--format json`, or `--format markdown`; progress
+messages are sent to stderr, leaving stdout and the file free of progress text.
+The report is rendered before the file is opened, so a comparison that fails
+before producing a report does not create or truncate the requested output file.
+
+```bash
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
+  --format json --output ./upgrade-report.json
+```
+
 ### Suppressing known breaking changes
 
 If a breaking change is deliberate and already accounted for, list it in a
