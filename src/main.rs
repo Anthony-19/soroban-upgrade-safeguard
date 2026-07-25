@@ -135,6 +135,16 @@ struct Args {
     /// detection). Overrides `[limits]` and the default.
     #[arg(long, value_name = "N")]
     max_walk_depth: Option<usize>,
+
+    /// Treat identical duplicate spec entries (same name, byte-identical
+    /// definition) as informational rather than warnings.
+    ///
+    /// This is a compatibility mode for toolchains that legitimately emit
+    /// split contractspecv0 sections with identical entries (e.g., some
+    /// SDK versions). Conflicting duplicates (different definitions) are
+    /// always Critical regardless of this flag.
+    #[arg(long)]
+    compat_duplicates: bool,
 }
 
 /// Resolve the effective [`ResourcePolicy`]: built-in defaults, overlaid by the
@@ -298,6 +308,18 @@ fn run() -> Result<()> {
         progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
         progress(format!("Loaded {} pair(s) for comparison.\n", pairs.len()));
 
+        // Resolve a stable, unique display name for every pair *before* any
+        // analysis runs. Two rules:
+        //
+        //  1. An explicit `name` that is duplicated across manifest entries is
+        //     an error — the user wrote it deliberately, so a silent rename
+        //     would be more confusing than failing early.
+        //  2. A derived name (taken from the new WASM basename) that collides
+        //     is disambiguated by appending " (2)", " (3)", … so both pairs
+        //     appear in the output rather than one silently overwriting the
+        //     other.
+        let pair_names: Vec<String> = resolve_pair_names(&pairs)?;
+
         let mut results = std::collections::BTreeMap::new();
         let mut failed: std::collections::BTreeMap<String, PairFailure> =
             std::collections::BTreeMap::new();
@@ -305,14 +327,7 @@ fn run() -> Result<()> {
         let mut any_limit_violation = false;
 
         for (i, pair) in pairs.iter().enumerate() {
-            let default_name = format!("pair_{}", i + 1);
-            let contract_name = pair.name.clone().unwrap_or_else(|| {
-                pair.new
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.to_string())
-                    .unwrap_or(default_name)
-            });
+            let contract_name = pair_names[i].clone();
 
             progress(format!(
                 "📦 [{}/{}] Comparing contract pair: {}",
@@ -513,7 +528,7 @@ fn run() -> Result<()> {
                 let batch_json = serde_json::json!({
                     "is_safe": overall_safe,
                     "strict": args.strict,
-                    "total_pairs": pairs.len(),
+                    "total_pairs": results.len() + failed.len(),
                     "limit_violation": any_limit_violation,
                     "recommended_bump": overall_bump,
                     "results": results_json,
@@ -977,6 +992,7 @@ fn compare_contracts(
             suppressions: Some(suppressions),
             explain: args.explain,
             strict: args.strict,
+            compat_duplicates: args.compat_duplicates,
             storage_schemas: *storage_schemas,
         },
     )?;
@@ -997,6 +1013,66 @@ fn compare_contracts(
     }
 
     Ok(safety_report)
+}
+
+/// Assign a stable, unique display name to every pair in the batch.
+///
+/// Two rules govern the assignment:
+///
+/// - **Explicit duplicates are an error.** When two manifest entries carry the
+///   same explicit `name`, the user wrote that name deliberately. Silently
+///   renaming one would hide the mistake; failing early with a clear message is
+///   safer.
+///
+/// - **Derived duplicates are disambiguated.** When two pairs share the same
+///   basename (common with directory scans across sub-directories), the second
+///   occurrence is renamed `name (2)`, the third `name (3)`, and so on. Both
+///   pairs appear in the output instead of the second silently overwriting the
+///   first.
+fn resolve_pair_names(pairs: &[ContractPair]) -> Result<Vec<String>> {
+    use std::collections::HashMap;
+
+    // Validate explicit names first — duplicates are always an error.
+    let mut explicit_seen: HashMap<&str, usize> = HashMap::new();
+    for (i, pair) in pairs.iter().enumerate() {
+        if let Some(ref name) = pair.name {
+            if let Some(first) = explicit_seen.insert(name.as_str(), i) {
+                anyhow::bail!(
+                    "Manifest has two entries with the same explicit name {:?} \
+                     (positions {} and {}). Each entry must have a distinct name.",
+                    name,
+                    first + 1,
+                    i + 1,
+                );
+            }
+        }
+    }
+
+    // Build unique names. For derived names, track how many times each
+    // candidate has been seen and append a counter on collision.
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut names: Vec<String> = Vec::with_capacity(pairs.len());
+
+    for (i, pair) in pairs.iter().enumerate() {
+        let candidate = pair.name.clone().unwrap_or_else(|| {
+            pair.new
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(String::from)
+                .unwrap_or_else(|| format!("pair_{}", i + 1))
+        });
+
+        let count = counts.entry(candidate.clone()).or_insert(0);
+        *count += 1;
+        let unique_name = if *count == 1 {
+            candidate
+        } else {
+            format!("{} ({})", candidate, count)
+        };
+        names.push(unique_name);
+    }
+
+    Ok(names)
 }
 
 fn parse_manifest(path: &Path) -> Result<(Vec<ContractPair>, Vec<ContractDependency>)> {

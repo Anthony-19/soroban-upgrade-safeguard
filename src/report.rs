@@ -1,6 +1,7 @@
 use crate::diff::{DiffReport, Finding, Severity};
 use crate::rules::{canonical_rule_id, display_label_for_rule_id, guidance_for_rule_id};
 use crate::suppression::SuppressionConfig;
+use crate::classification::TypeClass;
 use colored::Colorize;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -52,6 +53,14 @@ pub struct AnalysisScope {
     pub env_metadata: bool,
     /// The storage-layout analysis state for this run.
     pub storage_schema: StorageScopeState,
+    /// Number of distinct `contractspecv0` sections in the old WASM (0 if not parsed).
+    pub old_spec_section_count: usize,
+    /// Number of distinct `contractspecv0` sections in the new WASM (0 if not parsed).
+    pub new_spec_section_count: usize,
+    /// Names of duplicate entries found in the old WASM, sorted for stable output.
+    pub old_duplicate_names: Vec<String>,
+    /// Names of duplicate entries found in the new WASM, sorted for stable output.
+    pub new_duplicate_names: Vec<String>,
 }
 
 impl Default for AnalysisScope {
@@ -64,6 +73,10 @@ impl Default for AnalysisScope {
             exported_interface: true,
             env_metadata: false,
             storage_schema: StorageScopeState::NotAnalyzed,
+            old_spec_section_count: 0,
+            new_spec_section_count: 0,
+            old_duplicate_names: Vec::new(),
+            new_duplicate_names: Vec::new(),
         }
     }
 }
@@ -117,6 +130,16 @@ pub struct ScopeJson {
     pub storage_key_types: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_value_types: Option<usize>,
+    /// Number of `contractspecv0` sections found in the old WASM.
+    pub old_spec_section_count: usize,
+    /// Number of `contractspecv0` sections found in the new WASM.
+    pub new_spec_section_count: usize,
+    /// Names of duplicate entries detected in the old WASM (empty when clean).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub old_duplicate_names: Vec<String>,
+    /// Names of duplicate entries detected in the new WASM (empty when clean).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub new_duplicate_names: Vec<String>,
     pub summary: String,
 }
 
@@ -136,6 +159,10 @@ impl AnalysisScope {
             storage_layout_analyzed: self.storage_analyzed(),
             storage_key_types,
             storage_value_types,
+            old_spec_section_count: self.old_spec_section_count,
+            new_spec_section_count: self.new_spec_section_count,
+            old_duplicate_names: self.old_duplicate_names.clone(),
+            new_duplicate_names: self.new_duplicate_names.clone(),
             summary: self.summary_line(),
         }
     }
@@ -291,6 +318,7 @@ impl SafetyReport {
                 .to_string();
             let remediation = if explain {
                 get_remediation_guidance(&rule_id).map(String::from)
+                remediation_for(&finding.category, finding.classification.as_ref())
             } else {
                 None
             };
@@ -449,6 +477,38 @@ impl SafetyReport {
             storage_status.yellow()
         };
         output.push_str(&format!("        {}\n", storage_status));
+
+        // Spec-section integrity summary (non-zero section count or duplicates).
+        if self.scope.old_spec_section_count > 1 || self.scope.new_spec_section_count > 1 {
+            output.push_str(&format!(
+                "        Spec sections: old={}, new={} (multi-section WASMs detected)\n",
+                self.scope.old_spec_section_count,
+                self.scope.new_spec_section_count,
+            ).yellow().to_string());
+        }
+        let all_dups: Vec<String> = self
+            .scope
+            .old_duplicate_names
+            .iter()
+            .map(|n| format!("old:{n}"))
+            .chain(
+                self.scope
+                    .new_duplicate_names
+                    .iter()
+                    .map(|n| format!("new:{n}")),
+            )
+            .collect();
+        if !all_dups.is_empty() {
+            output.push_str(
+                &format!(
+                    "        Duplicate entries detected: {}\n",
+                    all_dups.join(", ")
+                )
+                .red()
+                .bold()
+                .to_string(),
+            );
+        }
 
         let crit_str = if self.critical_count > 0 {
             self.critical_count.to_string().red().bold()
@@ -648,6 +708,33 @@ impl SafetyReport {
             self.scope.storage_status_line()
         ));
 
+        // Spec-section integrity (multi-section or duplicates).
+        if self.scope.old_spec_section_count > 1 || self.scope.new_spec_section_count > 1 {
+            output.push_str(&format!(
+                "> ⚠️ Multi-section WASM detected: old has {} contractspecv0 section(s), new has {}.\n\n",
+                self.scope.old_spec_section_count,
+                self.scope.new_spec_section_count,
+            ));
+        }
+        let all_dups: Vec<String> = self
+            .scope
+            .old_duplicate_names
+            .iter()
+            .map(|n| format!("`old:{n}`"))
+            .chain(
+                self.scope
+                    .new_duplicate_names
+                    .iter()
+                    .map(|n| format!("`new:{n}`")),
+            )
+            .collect();
+        if !all_dups.is_empty() {
+            output.push_str(&format!(
+                "> ❌ Duplicate spec entries detected: {}\n\n",
+                all_dups.join(", ")
+            ));
+        }
+
         output.push_str("### Summary Table\n\n");
         output.push_str("| Finding Severity | Count |\n");
         output.push_str("| :--- | :--- |\n");
@@ -771,7 +858,33 @@ mod tests {
     }
 
     #[test]
-    fn test_every_emitted_category_has_guidance() {
+    fn every_category_in_the_inventory_has_guidance() {
+        for cat in crate::diff::ALL_CATEGORIES {
+            assert!(
+                get_remediation_guidance(cat).is_some(),
+                "Category '{cat}' does not have remediation guidance!"
+            );
+        }
+    }
+
+    #[test]
+    fn no_category_is_event_flavored() {
+        // Event-ness must live in `classification`, never in the suppression
+        // key, so that reclassifying a type cannot move a finding out from
+        // under an existing suppression rule.
+        for cat in crate::diff::ALL_CATEGORIES {
+            assert!(
+                !cat.contains("Event") || cat.starts_with("Error Enum"),
+                "Category '{cat}' encodes classification in the suppression key"
+            );
+        }
+    }
+
+    /// The inventory is only trustworthy if it actually covers what `diff.rs`
+    /// emits, so scan the source for category literals and require each one to
+    /// be listed. This catches a new category added without guidance.
+    #[test]
+    fn every_emitted_category_is_in_the_inventory() {
         let diff_rs_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("diff.rs");
@@ -784,6 +897,15 @@ mod tests {
                 // If it is ENVIRONMENT_CATEGORY
                 if line.contains("ENVIRONMENT_CATEGORY") {
                     checked_categories.insert("Environment".to_string());
+                    continue;
+                }
+                // Constant-referenced duplicate/conflict categories
+                if line.contains("SPEC_CONFLICT_CATEGORY") {
+                    checked_categories.insert("Spec Entry Conflict".to_string());
+                    continue;
+                }
+                if line.contains("SPEC_DUPLICATE_CATEGORY") {
+                    checked_categories.insert("Spec Entry Duplicate".to_string());
                     continue;
                 }
 
@@ -844,25 +966,27 @@ mod tests {
                         }
                     }
                 }
+                // A literal that *looks* like a category (Title Case words,
+                // no punctuation) but is not in the inventory is a bug.
+                let looks_like_category = literal.len() > 3
+                    && literal.split(' ').count() >= 2
+                    && literal
+                        .split(' ')
+                        .all(|w| w.chars().next().is_some_and(|c| c.is_ascii_uppercase()));
+                assert!(
+                    !looks_like_category
+                        || crate::diff::ALL_CATEGORIES.contains(&literal)
+                        || literal == "TOTALLY CUSTOM CATEGORY",
+                    "'{literal}' looks like a category but is not in diff::ALL_CATEGORIES"
+                );
             }
         }
 
-        // Remove test custom categories
-        checked_categories.remove("TOTALLY CUSTOM CATEGORY");
-
         assert!(
-            !checked_categories.is_empty(),
-            "Sanity check: should have found categories"
+            found.len() > 20,
+            "sanity check: expected to find most categories in the source, found {}",
+            found.len()
         );
-
-        for cat in &checked_categories {
-            let guidance = get_remediation_guidance(cat);
-            assert!(
-                guidance.is_some(),
-                "Category '{}' does not have remediation guidance!",
-                cat
-            );
-        }
     }
 
     #[test]
