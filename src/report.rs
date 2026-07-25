@@ -4,7 +4,7 @@ use crate::suppression::SuppressionConfig;
 use crate::classification::TypeClass;
 use colored::Colorize;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// One-line summary of exactly what a verdict from this tool certifies.
 ///
@@ -295,6 +295,8 @@ pub struct SafetyReport {
     pub info_count: usize,
     /// Number of findings (of any severity) acknowledged by a suppression rule.
     pub suppressed_count: usize,
+    /// Number of findings hidden by category filtering.
+    pub filtered_count: usize,
     pub suppressed_critical_count: usize,
     pub total_findings: usize,
     pub is_safe: bool,
@@ -307,6 +309,8 @@ pub struct SafetyReport {
     pub baseline_source: Option<String>,
     /// Verified SHA-256 hash of the baseline WASM bytecode (hex), if verified.
     pub verified_code_hash: Option<String>,
+    /// Active category filter, if any.
+    pub category_filter: CategoryFilter,
     /// Human-readable summary of the old contract spec (e.g. "3 fns, 2 types").
     /// Populated by the canonical pipeline so callers don't need to re-extract metadata.
     pub old_spec_summary: Option<String>,
@@ -347,6 +351,8 @@ pub struct SafetyReportJson<'a> {
     pub counts: SeverityCounts,
     /// Findings (of any severity) acknowledged by the suppression config.
     pub suppressed_count: usize,
+    /// Findings hidden by category filtering.
+    pub filtered_count: usize,
     pub total_findings: usize,
     pub recommended_bump: &'static str,
     pub baseline_source: Option<&'a str>,
@@ -368,12 +374,14 @@ pub struct UnmatchedSuppressionJson {
 }
 
 impl SafetyReport {
-    /// Compute a safety report from a raw DiffReport, with no suppressions.
-    ///
-    /// Equivalent to [`SafetyReport::with_suppressions`] using an empty config,
-    /// so behavior is identical to before suppression support existed.
     pub fn new(diff: &DiffReport) -> Self {
-        Self::with_suppressions(diff, &SuppressionConfig::default(), false, false)
+        Self::with_suppressions(
+            diff,
+            &SuppressionConfig::default(),
+            false,
+            false,
+            &ResourcePolicy::default(),
+        )
     }
 
     /// Compute a safety report, applying a suppression config.
@@ -387,7 +395,19 @@ impl SafetyReport {
         suppressions: &SuppressionConfig,
         explain: bool,
         strict: bool,
+        policy: &ResourcePolicy,
     ) -> Self {
+        let settings = ReportSettings {
+            strict,
+            explain,
+            max_suppressions: suppressions.max_suppressions,
+            allow_targetless: suppressions.allow_targetless,
+            max_xdr_depth: policy.max_xdr_depth,
+            max_xdr_len: policy.max_xdr_len,
+            max_entries: policy.max_entries,
+            max_walk_depth: policy.max_walk_depth,
+        };
+
         let mut critical_count = 0;
         let mut warning_count = 0;
         let mut info_count = 0;
@@ -476,14 +496,16 @@ impl SafetyReport {
             warning_count,
             info_count,
             suppressed_count,
+            filtered_count: 0,
             suppressed_critical_count,
             total_findings: diff.findings.len(),
             is_safe,
             findings_by_category,
             strict,
-            scope: AnalysisScope::default(),
             baseline_source: None,
             verified_code_hash: None,
+            category_filter: CategoryFilter::default(),
+            scope: AnalysisScope::default(),
             old_spec_summary: None,
             new_spec_summary: None,
             metrics: None,
@@ -560,6 +582,7 @@ impl SafetyReport {
                 info: self.info_count,
             },
             suppressed_count: self.suppressed_count,
+            filtered_count: self.filtered_count,
             total_findings: self.total_findings,
             recommended_bump: self.recommended_bump(),
             baseline_source: self.baseline_source.as_deref(),
@@ -668,6 +691,18 @@ impl SafetyReport {
                 self.suppressed_count.to_string().magenta().bold()
             ));
         }
+        if self.filtered_count > 0 {
+            output.push_str(&format!(
+                "Filtered:   {}\n",
+                self.filtered_count.to_string().yellow().bold()
+            ));
+            output.push_str(&format!(
+                "{}",
+                "  ↳ Findings were hidden by --include-category/--exclude-category.\n"
+                    .yellow()
+                    .dimmed()
+            ));
+        }
         let bump = self.recommended_bump();
         let bump_str = match bump {
             "major" => "major".red().bold(),
@@ -711,8 +746,9 @@ impl SafetyReport {
                     .bold()
                     .to_string(),
             );
-            let group = self.findings_by_category.get(category).unwrap();
-            for reported in group {
+            let mut group = self.findings_by_category.get(category).unwrap().clone();
+            group.sort_by(|a, b| a.finding.message.cmp(&b.finding.message));
+            for reported in &group {
                 let finding = &reported.finding;
 
                 if reported.suppressed {
@@ -932,6 +968,10 @@ impl SafetyReport {
         if self.suppressed_count > 0 {
             output.push_str(&format!("| **Suppressed** | {} |\n", self.suppressed_count));
         }
+        if self.filtered_count > 0 {
+            output.push_str(&format!("| **Filtered** | {} |\n", self.filtered_count));
+            output.push_str("\n> ⚠️  Findings were hidden by `--include-category`/`--exclude-category`. The verdict reflects the remaining visible findings only.\n\n");
+        }
         output.push_str(&format!(
             "\n**Recommended SemVer Bump**: `{}`\n\n",
             self.recommended_bump()
@@ -962,8 +1002,9 @@ impl SafetyReport {
 
         for category in categories {
             output.push_str(&format!("### {}\n\n", category));
-            let group = self.findings_by_category.get(category).unwrap();
-            for reported in group {
+            let mut group = self.findings_by_category.get(category).unwrap().clone();
+            group.sort_by(|a, b| a.finding.message.cmp(&b.finding.message));
+            for reported in &group {
                 let finding = &reported.finding;
 
                 if reported.suppressed {
@@ -1229,14 +1270,16 @@ mod tests {
             warning_count: 0,
             info_count: 0,
             suppressed_count: 0,
+            filtered_count: 0,
             suppressed_critical_count: 0,
             total_findings: 0,
             is_safe: true,
             findings_by_category: std::collections::HashMap::new(),
             strict: false,
-            scope: AnalysisScope::default(),
             baseline_source: None,
             verified_code_hash: None,
+            category_filter: CategoryFilter::default(),
+            scope: AnalysisScope::default(),
             old_spec_summary: None,
             new_spec_summary: None,
             metrics: None,
