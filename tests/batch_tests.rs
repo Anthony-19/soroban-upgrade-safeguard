@@ -212,6 +212,123 @@ fn batch_directory_scanning_fails_on_breaking_contract() {
 }
 
 #[test]
+fn batch_recursive_directory_scanning_pairs_by_relative_path() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("recursive_scan");
+    let old_dir = tmp_dir.join("old");
+    let new_dir = tmp_dir.join("new");
+
+    // Create nested directory structure
+    std::fs::create_dir_all(old_dir.join("contracts/core")).ok();
+    std::fs::create_dir_all(old_dir.join("contracts/upgrades")).ok();
+    std::fs::create_dir_all(new_dir.join("contracts/core")).ok();
+    std::fs::create_dir_all(new_dir.join("contracts/upgrades")).ok();
+
+    // Copy fixtures into nested structure:
+    // contracts/core/vault.wasm: clean (v1 -> v1)
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("contracts/core/vault.wasm")).expect("copy");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join("contracts/core/vault.wasm")).expect("copy");
+
+    // contracts/upgrades/migrator.wasm: breaking (v1 -> v2)
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("contracts/upgrades/migrator.wasm")).expect("copy");
+    std::fs::copy(wasm("v2.wasm"), new_dir.join("contracts/upgrades/migrator.wasm")).expect("copy");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_eq!(code, 1);
+    assert!(stdout.contains("Overall Status: ❌ FAILED"));
+    assert!(stdout.contains("vault: ✅ PASSED"));
+    assert!(stdout.contains("migrator: ❌ FAILED"));
+}
+
+#[test]
+fn batch_recursive_scan_warns_on_unpaired_files() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("recursive_unpaired");
+    let old_dir = tmp_dir.join("old");
+    let new_dir = tmp_dir.join("new");
+
+    std::fs::create_dir_all(old_dir.join("contracts")).ok();
+    std::fs::create_dir_all(new_dir.join("contracts")).ok();
+
+    // old has a.wasm, new has a.wasm and b.wasm (no counterpart)
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("contracts/a.wasm")).expect("copy");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join("contracts/a.wasm")).expect("copy");
+    std::fs::copy(wasm("v2.wasm"), new_dir.join("contracts/b.wasm")).expect("copy");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .output()
+        .expect("failed to run binary");
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_eq!(code, 0);
+    assert!(
+        stderr.contains("No old counterpart found for 'contracts/b.wasm'"),
+        "Should warn about b.wasm having no counterpart. stderr: {}",
+        stderr
+    );
+}
+
+#[test]
+fn batch_recursive_scan_deterministic_ordering() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("recursive_order");
+    let old_dir = tmp_dir.join("old");
+    let new_dir = tmp_dir.join("new");
+
+    std::fs::create_dir_all(old_dir.join("z_deep")).ok();
+    std::fs::create_dir_all(new_dir.join("z_deep")).ok();
+
+    // Create files in reverse alphabetical order to test sorting
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("z_deep/z.wasm")).expect("copy");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join("z_deep/z.wasm")).expect("copy");
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("a.wasm")).expect("copy");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join("a.wasm")).expect("copy");
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("m.wasm")).expect("copy");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join("m.wasm")).expect("copy");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+
+    // Should be in order: a, m, z_deep/z
+    let a_pos = stdout.find("a:").unwrap_or(usize::MAX);
+    let m_pos = stdout.find("m:").unwrap_or(usize::MAX);
+    let z_pos = stdout.find("z:").unwrap_or(usize::MAX);
+
+    assert!(
+        a_pos < m_pos,
+        "a should come before m: a at {}, m at {}",
+        a_pos,
+        m_pos
+    );
+    assert!(
+        m_pos < z_pos,
+        "m should come before z/deep z: m at {}, z at {}",
+        m_pos,
+        z_pos
+    );
+}
+
+#[test]
 fn batch_conflicting_options_exit_with_error() {
     // 1. Both manifest and old-dir/new-dir
     let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))

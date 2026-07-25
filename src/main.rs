@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use colored::Colorize;
 use std::io::IsTerminal;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use soroban_upgrade_safeguard::{
@@ -489,6 +490,69 @@ fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {
     )
 }
 
+/// Collect all `.wasm` files under `root`, returning their relative paths
+/// (relative to `root`). Protects against symlink loops via a visited-path set
+/// and enforces a maximum recursion depth of 32.
+fn collect_wasm_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut stack: Vec<(PathBuf, usize)> = Vec::new();
+    stack.push((root.to_path_buf(), 0));
+
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 32 {
+            eprintln!(
+                "⚠️  Warning: Exceeded maximum recursion depth at '{}', skipping",
+                dir.display()
+            );
+            continue;
+        }
+
+        // Resolve symlinks before tracking visited paths
+        let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if !visited.insert(canonical) {
+            continue;
+        }
+
+        let read_dir = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                eprintln!("⚠️  Warning: Cannot read directory '{}': {}", dir.display(), e);
+                continue;
+            }
+        };
+
+        for entry in read_dir {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("⚠️  Warning: Error reading entry in '{}': {}", dir.display(), e);
+                    continue;
+                }
+            };
+
+            let path = entry.path();
+
+            if path.is_dir() {
+                stack.push((path, depth + 1));
+            } else if path.is_file()
+                && path.extension().and_then(|s| s.to_str()) == Some("wasm")
+            {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_path_buf();
+                files.push((relative, path));
+            }
+        }
+    }
+
+    // Sort by relative path for deterministic ordering
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    Ok(files)
+}
+
 fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>> {
     if !old_dir.is_dir() {
         anyhow::bail!("Old directory '{}' is not a directory", old_dir.display());
@@ -497,27 +561,41 @@ fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>>
         anyhow::bail!("New directory '{}' is not a directory", new_dir.display());
     }
 
+    let old_files = collect_wasm_files(old_dir)?;
+    let new_files_map: std::collections::HashMap<PathBuf, PathBuf> = collect_wasm_files(new_dir)?
+        .into_iter()
+        .collect();
+
     let mut pairs = Vec::new();
-    for entry in std::fs::read_dir(old_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("wasm") {
-            let filename = path.file_name().unwrap();
-            let new_path = new_dir.join(filename);
-            if new_path.exists() {
-                let name = path.file_stem().and_then(|s| s.to_str()).map(String::from);
-                pairs.push(ContractPair {
-                    old: path,
-                    new: new_path,
-                    name,
-                });
-            } else {
-                eprintln!(
-                    "⚠️  Warning: Match not found for '{}' in new directory '{}'",
-                    filename.to_string_lossy(),
-                    new_dir.display()
-                );
-            }
+
+    for (rel_path, old_abs_path) in &old_files {
+        if let Some(new_abs_path) = new_files_map.get(rel_path) {
+            let name = rel_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(String::from);
+            pairs.push(ContractPair {
+                old: old_abs_path.clone(),
+                new: new_abs_path.clone(),
+                name,
+            });
+        } else {
+            eprintln!(
+                "⚠️  Warning: Match not found for '{}' in new directory '{}'",
+                rel_path.display(),
+                new_dir.display()
+            );
+        }
+    }
+
+    // Warn about files in new_dir that have no counterpart in old_dir
+    for (rel_path, _) in &collect_wasm_files(new_dir)? {
+        if !old_files.iter().any(|(r, _)| r == rel_path) {
+            eprintln!(
+                "⚠️  Warning: No old counterpart found for '{}' in old directory '{}'",
+                rel_path.display(),
+                old_dir.display()
+            );
         }
     }
 
