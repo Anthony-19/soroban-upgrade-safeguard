@@ -55,11 +55,17 @@ rustup component add rustfmt clippy
 The source lives under `src/` and is split into focused modules. Understanding this layout makes it much easier to find where a change belongs.
 
 - `main.rs` parses command line arguments with clap and drives the full pipeline.
+- `lib.rs` exposes the reusable library API and the canonical comparison pipeline.
+- `color.rs` decides whether terminal output should use color.
+- `suppression.rs` parses `.safeguard.toml` and matches acknowledged findings.
+- `limits.rs` defines the resource limits that protect decoding and type walks from untrusted input.
 - `loader.rs` reads a WASM file from disk and validates that it is a well formed WASM binary.
 - `parser.rs` extracts the Soroban custom sections and decodes the XDR spec entries.
 - `spec.rs` defines `ContractSpec`, the in-memory model that groups functions and user-defined types by name.
+- `storage_schema.rs` loads optional manifests for checking internal storage layouts.
 - `mapper.rs` turns type definitions into readable signatures and builds the reverse dependency graph used for cascade detection.
 - `diff.rs` holds the comparison logic and the `Finding` and `Severity` types. This is where most detection rules live.
+- `dependency.rs` propagates breaking changes across declared contract dependencies in batch comparisons.
 - `report.rs` aggregates findings into a `SafetyReport` and renders the colored summary.
 
 Tests and fixtures live under `tests/`.
