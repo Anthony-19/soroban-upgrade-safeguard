@@ -15,7 +15,7 @@ pub enum OutputFormat {
     Markdown,
 }
 
-#[derive(clap::Parser, Debug, Clone)]
+#[derive(clap::Parser, Debug, Clone, Default)]
 #[command(
     author,
     version,
@@ -73,6 +73,30 @@ pub struct Args {
     #[arg(long, value_name = "NEW_DIR", requires = "old_dir")]
     pub new_dir: Option<PathBuf>,
 
+    /// Allow HTTP connections for RPC when the host is localhost/127.0.0.1.
+    /// Without this flag only HTTPS URLs are accepted.
+    #[arg(long)]
+    pub allow_http_local: bool,
+
+    /// Expected SHA-256 hash (hex) of the on-chain WASM baseline.
+    /// When provided the tool verifies the hash of the fetched bytecode
+    /// matches this value and fails immediately on mismatch.
+    #[arg(long, value_name = "HEX_HASH")]
+    pub expected_wasm_hash: Option<String>,
+
+    /// Storage-schema manifest describing the OLD build's storage layout.
+    ///
+    /// Declares the storage-key types and internal value types that govern
+    /// on-chain compatibility but need not appear in the exported spec. Must be
+    /// given together with --new-storage-schema: detecting a layout change
+    /// requires both snapshots.
+    #[arg(long, value_name = "PATH", requires = "new_storage_schema")]
+    pub old_storage_schema: Option<PathBuf>,
+
+    /// Storage-schema manifest describing the NEW build's storage layout.
+    #[arg(long, value_name = "PATH", requires = "old_storage_schema")]
+    pub new_storage_schema: Option<PathBuf>,
+
     /// Maximum XDR decode depth per entry. Overrides `[limits]` in the config
     /// file and the built-in default. Guards against stack-overflow inputs.
     #[arg(long, value_name = "N")]
@@ -114,7 +138,7 @@ pub struct FileConfig {
     pub suppress: Vec<SuppressionRule>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ResolvedConfig {
     pub wasm_paths: Vec<PathBuf>,
     pub contract_id: Option<String>,
@@ -129,6 +153,7 @@ pub struct ResolvedConfig {
     pub new_dir: Option<PathBuf>,
     pub policy: ResourcePolicy,
     pub suppressions: SuppressionConfig,
+    pub expected_wasm_hash: Option<String>,
 }
 
 impl ResolvedConfig {
@@ -293,6 +318,7 @@ impl ResolvedConfig {
             new_dir,
             policy,
             suppressions,
+            expected_wasm_hash: args.expected_wasm_hash.clone(),
         })
     }
 

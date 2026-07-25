@@ -46,7 +46,7 @@ use crate::diff::Finding;
 pub const DEFAULT_CONFIG_FILE: &str = ".safeguard.toml";
 
 /// A parsed suppression config: a flat list of reviewed acknowledgements.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 pub struct SuppressionConfig {
     /// Configurable maximum number of suppressions. Enforced globally.
     pub max_suppressions: Option<usize>,
@@ -58,7 +58,7 @@ pub struct SuppressionConfig {
 }
 
 /// A single whitelisted finding, keyed by category and (optionally) target.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct SuppressionRule {
     /// The finding category to match exactly (e.g. `"Struct Field Type Changed"`).
     pub category: String,

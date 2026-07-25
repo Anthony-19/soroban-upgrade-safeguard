@@ -8,12 +8,11 @@ use soroban_upgrade_safeguard::{
     color::should_disable_color,
     config::{Args, OutputFormat, ResolvedConfig, RunMode},
     diff,
-    limits::{find_limit_error, LimitsConfig, ResourcePolicy},
-    loader, report,
-    storage_schema::StorageSchema,
-    suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
-    CompareOptions,
+    limits::{find_limit_error, ResourcePolicy},
+    loader, parser, report, spec,
+    suppression::SuppressionConfig,
 };
+
 /// Exit codes:
 /// - `0`: safe (no breaking changes, or all suppressed).
 /// - `1`: breaking changes detected, or a generic/IO/parse error.
@@ -44,54 +43,23 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+    let config = ResolvedConfig::resolve(args)?;
 
     if should_disable_color(
-        args.no_color,
+        config.no_color,
         std::env::var_os("NO_COLOR").is_some(),
         std::io::stdout().is_terminal(),
     ) {
         colored::control::set_override(false);
     }
 
-    // 1. Identify which mode we are running:
-    //    - Batch Manifest Mode
-    //    - Batch Directory Mode
-    //    - Single Contract Pair Mode
-    let is_batch = args.manifest.is_some() || (args.old_dir.is_some() && args.new_dir.is_some());
-
-    if args.manifest.is_some() && (args.old_dir.is_some() || args.new_dir.is_some()) {
-        anyhow::bail!("Cannot specify both --manifest and --old-dir/--new-dir at the same time");
-    }
-
-    if is_batch && !args.wasm_paths.is_empty() {
-        anyhow::bail!("Cannot specify positional WASM paths when using batch mode (--manifest or --old-dir/--new-dir)");
-    }
-
-    // A storage schema describes one specific contract's layout, so a single
-    // pair of manifests cannot be applied across a batch of different
-    // contracts. Refusing is better than silently analyzing the wrong layout.
-    if is_batch && args.old_storage_schema.is_some() {
-        anyhow::bail!(
-            "--old-storage-schema/--new-storage-schema describe a single contract's storage \
-             layout and cannot be used with batch mode. Run the pair on its own to analyze \
-             storage layout."
-        );
-    }
-
-    // Both manifests are loaded and validated up front so a malformed schema
-    // fails before any comparison work is reported.
-    let storage_schemas = match (&args.old_storage_schema, &args.new_storage_schema) {
-        (Some(old), Some(new)) => Some((
-            StorageSchema::load_from_path(old)?,
-            StorageSchema::load_from_path(new)?,
-        )),
-        _ => None,
-    };
+    let mode = config.validate_and_resolve_mode()?;
+    let is_batch = matches!(mode, RunMode::Manifest | RunMode::DirScan);
 
     // In JSON or Markdown mode, decorative progress goes to stderr so stdout
     // stays a single, pristine document. In text mode it stays on stdout
     // exactly as before.
-    let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
+    let clean_stdout = config.format == OutputFormat::Json || config.format == OutputFormat::Markdown;
     let progress = |line: String| {
         if clean_stdout {
             eprintln!("{line}");
@@ -100,42 +68,16 @@ fn run() -> Result<()> {
         }
     };
 
-    // Load suppression config: an explicit --config must exist; otherwise fall
-    // back to `.safeguard.toml` in the working directory if it happens to be
-    // present. With neither, an empty config preserves today's behavior.
-    //
-    // SECURITY WARNING: Storing a suppression configuration file (`.safeguard.toml`)
-    // in the current working directory is a security risk if the directory is writable
-    // by untrusted actors (e.g. pull request contributors in CI environments). A contributor
-    // could place/edit this file to neutralize Critical breaking change warnings.
-    // Ensure changes to `.safeguard.toml` are strictly reviewed, or use the explicit
-    // `--config` flag pointing to a trusted/read-only location in production pipelines.
-    let suppressions = match &args.config {
-        Some(path) => SuppressionConfig::load_from_path(path)?,
-        None => {
-            SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?.unwrap_or_default()
-        }
-    };
-
-    // The resource-limit policy is read from the same file as the suppression
-    // config (an explicit --config, else `.safeguard.toml` if present), then any
-    // --max-* flags applied on top.
-    let config_path: Option<PathBuf> = match &args.config {
-        Some(path) => Some(path.clone()),
-        None => {
-            let default = Path::new(DEFAULT_CONFIG_FILE);
-            default.exists().then(|| default.to_path_buf())
-        }
-    };
-    let policy = resolve_policy(&args, config_path.as_deref())?;
+    let suppressions = &config.suppressions;
+    let policy = &config.policy;
 
     if is_batch {
-        let pairs = if let Some(manifest_path) = &args.manifest {
+        let pairs = if let Some(manifest_path) = &config.manifest {
             parse_manifest(manifest_path)?
         } else {
             scan_directories(
-                args.old_dir.as_ref().unwrap(),
-                args.new_dir.as_ref().unwrap(),
+                config.old_dir.as_ref().unwrap(),
+                config.new_dir.as_ref().unwrap(),
             )?
         };
 
@@ -153,10 +95,10 @@ fn run() -> Result<()> {
             let default_name = format!("pair_{}", i + 1);
             let contract_name = pair.name.clone().unwrap_or_else(|| {
                 pair.new
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.to_string())
-                    .unwrap_or(default_name)
+                     .file_name()
+                     .and_then(|n| n.to_str())
+                     .map(|n| n.to_string())
+                     .unwrap_or(default_name)
             });
 
             progress(format!(
@@ -178,13 +120,11 @@ fn run() -> Result<()> {
                         old_path: &old_wasm.path,
                         new_bytes: &new_wasm.bytes,
                         new_path: &new_wasm.path,
-                        suppressions: &suppressions,
-                        policy: &policy,
-                        // Storage schemas are contract-specific and rejected in
-                        // batch mode, so no pair carries one.
-                        storage_schemas: None,
+                        suppressions,
+                        explain: config.explain,
+                        strict: config.strict,
+                        policy,
                     },
-                    &args,
                     &progress,
                 )
             })();
@@ -223,7 +163,7 @@ fn run() -> Result<()> {
             progress("\n----------------------------------------\n".to_string());
         }
 
-        match args.format {
+        match config.format {
             OutputFormat::Json => {
                 let mut results_json = serde_json::Map::new();
                 for (name, report) in &results {
@@ -243,7 +183,7 @@ fn run() -> Result<()> {
 
                 let batch_json = serde_json::json!({
                     "is_safe": overall_safe,
-                    "strict": args.strict,
+                    "strict": config.strict,
                     "total_pairs": pairs.len(),
                     "limit_violation": any_limit_violation,
                     "results": results_json,
@@ -290,7 +230,10 @@ fn run() -> Result<()> {
                     } else {
                         "⛔ ERROR"
                     };
-                    markdown.push_str(&format!("| {} | {} | — | — | — | — |\n", name, status_str));
+                    markdown.push_str(&format!(
+                        "| {} | {} | — | — | — | — |\n",
+                        name, status_str
+                    ));
                 }
 
                 markdown.push_str("\n---\n\n");
@@ -357,7 +300,7 @@ fn run() -> Result<()> {
 
                 for (name, report) in &results {
                     println!("=== Contract: {} ===", name.bold().magenta());
-                    println!("{}", report.generate_summary_text(args.explain));
+                    println!("{}", report.generate_summary_text(config.explain));
                     println!("========================================\n");
                 }
             }
@@ -373,8 +316,7 @@ fn run() -> Result<()> {
             std::process::exit(1);
         }
 
-        let total_suppressed_criticals: usize =
-            results.values().map(|r| r.suppressed_critical_count).sum();
+        let total_suppressed_criticals: usize = results.values().map(|r| r.suppressed_critical_count).sum();
         if total_suppressed_criticals > 0 {
             eprintln!(
                 "{}",
@@ -393,9 +335,9 @@ fn run() -> Result<()> {
     // Resolve the two usage modes for single pair:
     //   - 2 positional args => local-vs-local comparison
     //   - 1 positional arg  + --contract-id/--rpc-url => RPC-vs-local comparison
-    let (old_source, new_wasm_path) = match (args.wasm_paths.len(), &args.contract_id) {
-        (2, None) => (None, &args.wasm_paths[1]), // local mode
-        (1, Some(_)) => (args.contract_id.as_deref(), &args.wasm_paths[0]), // RPC mode
+    let (old_source, new_wasm_path) = match (config.wasm_paths.len(), &config.contract_id) {
+        (2, None) => (None, &config.wasm_paths[1]), // local mode
+        (1, Some(_)) => (config.contract_id.as_deref(), &config.wasm_paths[0]), // RPC mode
         (2, Some(_)) => {
             anyhow::bail!(
                 "When using --contract-id, provide only the NEW_WASM path as a positional argument"
@@ -406,20 +348,14 @@ fn run() -> Result<()> {
                 "Missing OLD_WASM path. Provide two WASM files, or use --contract-id and --rpc-url \
                  to fetch the old contract from chain.\n\n\
                  Usage: soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>\n       \
-                 soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>\n\n\
-                 Or use batch mode:\n       \
-                 soroban-upgrade-safeguard --manifest <MANIFEST_PATH>\n       \
-                 soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>"
+                 soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>"
             );
         }
         _ => {
             anyhow::bail!(
                 "Expected 1 or 2 WASM path arguments.\n\n\
                  Usage: soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>\n       \
-                 soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>\n\n\
-                 Or use batch mode:\n       \
-                 soroban-upgrade-safeguard --manifest <MANIFEST_PATH>\n       \
-                 soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>"
+                 soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>"
             );
         }
     };
@@ -435,12 +371,12 @@ fn run() -> Result<()> {
     // Old WASM — from file or from RPC. RPC-fetched bytes are subject to the
     // same resource policy as file input.
     let old = if let Some(contract_id) = old_source {
-        let rpc_url = args.rpc_url.as_ref().unwrap();
-        let module = loader::fetch_wasm_from_rpc_with_policy(contract_id, rpc_url, &policy)?;
+        let rpc_url = config.rpc_url.as_ref().unwrap();
+        let module = loader::fetch_wasm_from_rpc_with_policy(contract_id, rpc_url, policy)?;
 
         // If the caller pinned an expected hash, verify it now against the hash
         // that was verified on-chain during the RPC fetch.
-        if let Some(expected_hex) = &args.expected_wasm_hash {
+        if let Some(expected_hex) = &config.expected_wasm_hash {
             let expected_bytes = hex::decode(expected_hex)
                 .context("--expected-wasm-hash must be a valid hex string")?;
             let actual = module
@@ -462,7 +398,7 @@ fn run() -> Result<()> {
 
         module
     } else {
-        loader::load_wasm(&args.wasm_paths[0])?
+        loader::load_wasm(&config.wasm_paths[0])?
     };
 
     // New WASM
@@ -476,31 +412,21 @@ fn run() -> Result<()> {
     }
 
     // Generate Safety Report using the factored helper
-    let baseline_source: Option<&str> = if old_source.is_some() {
-        Some("RPC")
-    } else {
-        Some("Local File")
-    };
-    let verified_hash_hex = old.verified_hash.as_ref().map(hex::encode);
-    let mut safety_report = compare_contracts(
+    let safety_report = compare_contracts(
         &ContractComparison {
             old_bytes: &old.bytes,
             old_path: &old.path,
             new_bytes: &new.bytes,
             new_path: &new.path,
-            suppressions: &suppressions,
-            policy: &policy,
-            storage_schemas: storage_schemas
-                .as_ref()
-                .map(|(old_schema, new_schema)| (old_schema, new_schema)),
+            suppressions,
+            explain: config.explain,
+            strict: config.strict,
+            policy,
         },
-        &args,
         &progress,
     )?;
-    safety_report.baseline_source = baseline_source.map(|s| s.to_string());
-    safety_report.verified_code_hash = verified_hash_hex;
 
-    match args.format {
+    match config.format {
         OutputFormat::Json => {
             // Single JSON document to stdout; no decorative text, no ANSI codes.
             println!(
@@ -512,7 +438,7 @@ fn run() -> Result<()> {
             println!("{}", safety_report.generate_summary_markdown());
         }
         OutputFormat::Text => {
-            println!("{}", safety_report.generate_summary_text(args.explain));
+            println!("{}", safety_report.generate_summary_text(config.explain));
         }
     }
 
@@ -559,19 +485,14 @@ struct ContractComparison<'a> {
     new_bytes: &'a [u8],
     new_path: &'a str,
     suppressions: &'a SuppressionConfig,
+    explain: bool,
+    strict: bool,
     policy: &'a ResourcePolicy,
-    /// The declared storage layouts of the old and new builds, when supplied.
-    /// Both sides are required: a layout change is only visible as a diff.
-    storage_schemas: Option<(&'a StorageSchema, &'a StorageSchema)>,
 }
 
 /// Helper function to run comparison for a single pair.
-///
-/// Delegates to the canonical library pipeline ([`soroban_upgrade_safeguard::compare_wasm_bytes_with_options`])
-/// so both the CLI and library callers always run exactly the same stages.
 fn compare_contracts(
     comparison: &ContractComparison<'_>,
-    args: &Args,
     progress: &impl Fn(String),
 ) -> Result<report::SafetyReport> {
     let ContractComparison {
@@ -580,70 +501,48 @@ fn compare_contracts(
         new_bytes,
         new_path,
         suppressions,
+        explain,
+        strict,
         policy,
-        storage_schemas,
     } = comparison;
-
-    // Show per-file progress lines before running the pipeline.
-    // spec summaries are recovered from the returned report.
+    let old_meta = parser::extract_metadata_with_policy(old_bytes, policy)?;
+    let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
     progress(format!(
         "  {} {} ({} bytes)",
         "✅ Old:".green().bold(),
         old_path,
         old_bytes.len()
     ));
+    progress(format!("     └─ {}", old_spec.summary().dimmed()));
+
+    let new_meta = parser::extract_metadata_with_policy(new_bytes, policy)?;
+    let new_spec = spec::ContractSpec::from_entries(&new_meta.spec);
     progress(format!(
         "  {} {} ({} bytes)",
         "✅ New:".green().bold(),
         new_path,
         new_bytes.len()
     ));
+    progress(format!("     └─ {}", new_spec.summary().dimmed()));
 
     progress(format!(
         "\n{}",
         "🔬 Analyzing structural compatibility...".cyan().bold()
     ));
+    let mut diff_report = diff::compare_with_policy(&old_spec, &new_spec, policy)?;
+    diff::compare_env_metadata(
+        old_meta.env_meta.as_ref(),
+        new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
 
-    if storage_schemas.is_some() {
-        progress(format!(
-            "\n{}",
-            "🗄️  Analyzing declared storage layout...".cyan().bold()
-        ));
-    }
-
-    // Delegate to the single canonical pipeline. Storage-schema analysis,
-    // reconciliation against the exported spec, and the resulting scope are all
-    // handled inside it, so the CLI and every library caller run the same
-    // stages. Reconciliation failure (a manifest that contradicts its build)
-    // surfaces here as an error and stops the run.
-    let safety_report = soroban_upgrade_safeguard::compare_wasm_bytes_with_options(
-        old_bytes,
-        new_bytes,
-        &CompareOptions {
-            policy: Some(policy),
-            suppressions: Some(suppressions),
-            explain: args.explain,
-            strict: args.strict,
-            storage_schemas: *storage_schemas,
-        },
-    )?;
-
-    // Print spec summaries now that we have them from the report.
-    if let Some(ref summary) = safety_report.old_spec_summary {
-        progress(format!("     └─ {}", summary.dimmed()));
-    }
-    if let Some(ref summary) = safety_report.new_spec_summary {
-        progress(format!("     └─ {}", summary.dimmed()));
-    }
-
-    if safety_report.scope.storage_analyzed() {
-        progress(format!(
-            "     └─ {}",
-            safety_report.scope.storage_status_line().dimmed()
-        ));
-    }
-
-    Ok(safety_report)
+    Ok(report::SafetyReport::with_suppressions(
+        &diff_report,
+        suppressions,
+        *explain,
+        *strict,
+        policy,
+    ))
 }
 
 fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {

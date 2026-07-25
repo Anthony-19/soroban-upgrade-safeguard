@@ -217,3 +217,97 @@ Here are the most common configuration mistakes and how to resolve them:
 * **Reason**: When using the strict new-format suppression, the calculated SHA-256 fingerprint of the diff finding must match the `fingerprint` property of the rule exactly.
 * **Remediation**: Check the JSON output or standard error logs for the actual calculated fingerprint of the finding, and verify that the `fingerprint` field in your `.safeguard.toml` matches it exactly (character-for-character).
 
+---
+
+## Deep Dive: Understanding Resource Limits
+
+Safeguard protects your CI runner systems and memory footprints from malicious, malformed, or pathologically nested contract metadata files. By default, standard resource limits are enforced. However, large enterprise contracts may occasionally exceed these safe defaults.
+
+### Limits Reference & Tuning Strategy
+
+#### 1. `max_xdr_depth` (CLI: `--max-xdr-depth`, Default: `128`)
+* **Purpose**: Prevents stack overflows during deep recursive parsing of contract specs.
+* **Symptom**: Panics or exit code 2 when parsing highly nested custom user-defined types (UDTs).
+* **Remediation**: Increase the limit to `256` or higher if you have deeply nested generic structures.
+
+#### 2. `max_xdr_len` (CLI: `--max-xdr-len`, Default: `1,048,576` bytes)
+* **Purpose**: Restricts the maximum size allocated for a single custom WASM section.
+* **Symptom**: Abort error: `Oversized section length relative to budget`.
+* **Remediation**: Increase this threshold when utilizing contracts that export large metadata structures.
+
+#### 3. `max_entries` (CLI: `--max-entries`, Default: `1,000`)
+* **Purpose**: Caps the total count of exported contract spec entries (functions, structs, unions, enums).
+* **Symptom**: Abort error: `Exceeded spec entries limit`.
+* **Remediation**: Large monorepo-style contracts combining multiple modules might need this limit increased to `2000` or `3000`.
+
+#### 4. `max_walk_depth` (CLI: `--max-walk-depth`, Default: `128`)
+* **Purpose**: Restricts recursive structural comparison, formatting, and rendering algorithms.
+* **Symptom**: Validation fails under complex nested structs check.
+* **Remediation**: Raise this limit only if Safeguard explicitly recommends doing so during validation.
+
+---
+
+## CI/CD Pipeline Integration Patterns
+
+Integrating Safeguard as a PR check is highly recommended to block accidental breaking changes.
+
+### GitHub Actions Workflow Example
+
+The following workflow compares a pull request's compiled WASM build against the on-chain deployed version of the contract:
+
+```yaml
+name: Soroban Upgrade Safeguard Gate
+
+on:
+  pull_request:
+    paths:
+      - 'contracts/**/*.rs'
+      - 'contracts/**/*.wasm'
+
+jobs:
+  safeguard-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Contracts
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Install Safeguard CLI
+        run: cargo install --path .
+
+      - name: Run Upgrade Verification Gate
+        run: |
+          soroban-upgrade-safeguard \
+            --contract-id ${{ secrets.STELLAR_CONTRACT_ID }} \
+            --rpc-url https://soroban-testnet.stellar.org \
+            --expected-wasm-hash ${{ secrets.STELLAR_EXPECTED_WASM_HASH }} \
+            --strict \
+            --explain \
+            target/wasm32-unknown-unknown/release/my_contract.wasm
+```
+
+### GitLab CI/CD Pipeline Example
+
+For GitLab CI, you can configure a similar gate:
+
+```yaml
+stages:
+  - test
+
+safeguard_gate:
+  stage: test
+  image: rust:latest
+  script:
+    - cargo build --target wasm32-unknown-unknown --release
+    - cargo install --path .
+    - soroban-upgrade-safeguard --contract-id $CONTRACT_ID --rpc-url $RPC_URL --strict --explain target/wasm32-unknown-unknown/release/my_contract.wasm
+  only:
+    - merge_requests
+```
+
+

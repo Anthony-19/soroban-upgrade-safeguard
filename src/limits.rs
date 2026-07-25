@@ -50,7 +50,7 @@ pub const DEFAULT_MAX_WALK_DEPTH: usize = 128;
 ///
 /// Every limit is independently configurable. `Copy` so it can be threaded by
 /// value through the pipeline without ceremony.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct ResourcePolicy {
     /// Maximum XDR recursion depth per entry (maps to [`Limits::depth`]).
     pub max_xdr_depth: u32,
