@@ -20,11 +20,13 @@
 //! reason   = "Deprecated initializer dropped after the v2 cutover."
 //! ```
 //!
-//! Matching is **exact**: a rule applies only when both its `category` and its
-//! `target` equal the finding's own [`Finding::category`] and [`Finding::target`].
-//! A rule that omits `target` matches only findings that themselves have no
-//! target (e.g. environment-metadata changes). This deliberate strictness keeps
-//! a suppression from over-applying to sibling fields, cases, or parameters.
+//! Matching is **exact**: a rule applies only when both its stable rule id and
+//! its `target` equal the finding's own rule id and [`Finding::target`]. The
+//! parser still accepts legacy `category = "..."` entries and maps them to the
+//! corresponding rule id for compatibility. A rule that omits `target` matches
+//! only findings that themselves have no target (e.g. environment-metadata
+//! changes). This deliberate strictness keeps a suppression from over-applying
+//! to sibling fields, cases, or parameters.
 //!
 //! The `target` convention mirrors [`Finding::target`]:
 //!
@@ -54,6 +56,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::diff::Finding;
+use crate::rules::canonical_rule_id;
 
 /// The default config file name looked up in the current working directory.
 pub const DEFAULT_CONFIG_FILE: &str = ".safeguard.toml";
@@ -97,8 +100,10 @@ pub struct SuppressionConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SuppressionRule {
-    /// The finding category to match exactly (e.g. `"Struct Field Type Changed"`).
-    pub category: String,
+    /// The stable rule id to match exactly (e.g. `"struct_field_type_changed"`).
+    /// Legacy suppression files may still use `category = "Struct Field Type Changed"`.
+    #[serde(default, alias = "category")]
+    pub rule_id: String,
     /// The exact [`Finding::target`] to match. When omitted, the rule matches
     /// only findings whose target is `None`.
     #[serde(default)]
@@ -143,26 +148,17 @@ pub fn stable_category(category: &str) -> &str {
 }
 
 impl SuppressionRule {
-    /// Whether this rule matches `finding` exactly on category, target, and fingerprint (if present).
+    /// Whether this rule matches `finding` exactly on both rule id and target.
     fn matches(&self, finding: &Finding) -> bool {
-        if self.category != finding.category || self.target.as_deref() != finding.target.as_deref()
-        {
-            return false;
-        }
+        self.canonical_rule_id().is_some_and(|rule_id| {
+            canonical_rule_id(&finding.category)
+                .is_some_and(|finding_rule_id| rule_id == finding_rule_id)
+                && self.target.as_deref() == finding.target.as_deref()
+        })
+    }
 
-        if let Some(rule_fingerprint) = &self.fingerprint {
-            // New format: calculate finding fingerprint and verify.
-            let computed_fingerprint = compute_fingerprint(finding);
-            rule_fingerprint.trim().to_lowercase() == computed_fingerprint
-        } else {
-            // Old format / compatibility mode fallback. Warn on stderr.
-            eprintln!(
-                "⚠️  Warning: Deprecated old-format suppression rule detected (category: \"{}\", target: \"{:?}\"). Please upgrade to the new format with 'author', 'reason', 'expiry', and 'fingerprint'. This will be a hard error in the next release.",
-                self.category,
-                self.target
-            );
-            true
-        }
+    fn canonical_rule_id(&self) -> Option<&'static str> {
+        canonical_rule_id(&self.rule_id)
     }
 }
 

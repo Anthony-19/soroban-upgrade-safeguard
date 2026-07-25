@@ -483,6 +483,57 @@ Earlier versions folded the event guess into the category string itself. Those n
 
 New rules should use the stable names. `Error Enum …` categories are unrelated to events and were never remapped.
 
+## Rule Registry
+
+Every detection rule has a stable `rule_id` that is independent of the human
+readable category label. The table below lists the registered rules, their
+severity, and the guidance used when `--explain` is enabled.
+
+| rule_id | Label | Severity | Guidance |
+| :--- | :--- | :--- | :--- |
+| `environment` | Environment | Info | Verify the target network supports the new protocol version and adjust tooling as needed. |
+| `function_removed` | Function Removed | Critical | Restore the function or deprecate it in client integrations. |
+| `function_documentation_changed` | Function Documentation Changed | Info | Keep downstream consumers aware of the updated docs and behavior. |
+| `function_added` | Function Added | Info | Inform integrations about the new function. |
+| `function_signature_changed` | Function Signature Changed | Critical | Update call sites and tests to match the new parameter structure. |
+| `parameter_renamed` | Parameter Renamed | Warning | Update named-argument integrations to use the new parameter name. |
+| `parameter_reordered` | Parameter Reordered | Critical | Restore the original parameter order. |
+| `parameter_type_changed` | Parameter Type Changed | Critical | Update caller arguments and SDKs to use the new type. |
+| `return_type_changed` | Return Type Changed | Critical | Update caller expectations and SDKs to the new return type. |
+| `event_definition_removed` | Event Definition Removed | Critical | Update or remove downstream event consumers. |
+| `struct_removed` | Struct Removed | Critical | Restore the struct or migrate any stored data that depends on it. |
+| `struct_documentation_changed` | Struct Documentation Changed | Info | Keep documentation aligned with the intended struct usage. |
+| `struct_added` | Struct Added | Info | Inform consumers about the new struct. |
+| `struct_field_removed` | Struct Field Removed | Critical | Restore the field or perform a storage migration. |
+| `event_field_removed` | Event Field Removed | Critical | Update indexers and consumers that expect the removed field. |
+| `struct_field_reordered` | Struct Field Reordered | Critical | Restore the original field order. |
+| `event_field_reordered` | Event Field Reordered | Critical | Update consumers to handle the new field ordering. |
+| `struct_field_type_changed` | Struct Field Type Changed | Critical | Revert the type change or migrate existing data. |
+| `event_field_type_changed` | Event Field Type Changed | Critical | Update event consumers to handle the new field type. |
+| `struct_field_added` | Struct Field Added | Warning | Ensure consumers and storage migrations handle the new field. |
+| `event_enum_removed` | Event Enum Removed | Critical | Restore the enum or update downstream event consumers. |
+| `enum_removed` | Enum Removed | Critical | Restore the enum or migrate any stored data that uses it. |
+| `enum_documentation_changed` | Enum Documentation Changed | Info | Ensure the updated docs are clear for consumers. |
+| `enum_added` | Enum Added | Info | Inform consumers about the new enum type. |
+| `enum_case_removed` | Enum Case Removed | Critical | Restore the case or migrate data that depends on it. |
+| `event_enum_case_removed` | Event Enum Case Removed | Critical | Restore the case or update event consumers. |
+| `enum_case_value_changed` | Enum Case Value Changed | Critical | Revert the value change to preserve serialization compatibility. |
+| `event_enum_case_value_changed` | Event Enum Case Value Changed | Critical | Revert the change or update event consumers. |
+| `enum_case_added` | Enum Case Added | Info | Ensure consumers can handle the new case. |
+| `event_enum_case_added` | Event Enum Case Added | Info | Update consumers to handle the new event enum case. |
+| `union_removed` | Union Removed | Critical | Restore the union or migrate data that uses it. |
+| `union_added` | Union Added | Info | Inform consumers about the new union type. |
+| `union_case_removed` | Union Case Removed | Critical | Restore the case or migrate existing data. |
+| `union_case_reordered` | Union Case Reordered | Critical | Restore the original case order. |
+| `union_case_type_changed` | Union Case Type Changed | Critical | Revert the type change or migrate data. |
+| `union_case_added` | Union Case Added | Info | Ensure consumers can handle the new union case. |
+| `error_enum_removed` | Error Enum Removed | Critical | Restore the error enum or update clients. |
+| `error_enum_added` | Error Enum Added | Info | Inform client integrations about the new error enum. |
+| `error_enum_case_removed` | Error Enum Case Removed | Critical | Restore the case or update client error handling. |
+| `error_enum_case_value_changed` | Error Enum Case Value Changed | Critical | Revert the value change to preserve error-code compatibility. |
+| `error_enum_case_added` | Error Enum Case Added | Info | Ensure clients can handle the new error case. |
+| `cascading_layout_break` | Cascading Layout Break | Critical | Resolve the underlying layout break in the referenced type. |
+
 ## Severity Levels
 
 Every finding carries one of three severity levels.
@@ -644,26 +695,32 @@ suppressed and the tool behaves exactly as it always has. If you pass
 `--config` explicitly and the file is missing or malformed, that is a hard
 error rather than a silent no-op, so a typo never quietly disables suppression.
 
-Each `[[suppress]]` entry acknowledges exactly one finding using the secure, content-bound format:
+Each `[[suppress]]` entry acknowledges exactly one finding. The stable key is
+`rule_id`, and the legacy `category` field is still accepted as a compatibility
+alias for older configs:
 
 ```toml
-max_suppressions = 10
-allow_targetless = false
+[[suppress]]
+rule_id = "struct_field_removed"
+target  = "ConfigData.threshold"
+reason  = "Planned storage migration in v2 drops the unused threshold field."
 
 [[suppress]]
-category    = "Struct Field Removed"
-target      = "ConfigData.threshold"
-author      = "Alice <alice@example.com>"
-reason      = "Planned storage migration in v2 drops the unused threshold field."
-expiry      = "2026-12-31"
-fingerprint = "8a3f..." # SHA-256 hex fingerprint
+rule_id = "function_signature_changed"
+target  = "initialize"
+reason  = "Re-init is intentional and gated behind the migration admin call."
 ```
 
 A ready-to-copy template lives at [`.safeguard.example.toml`](../.safeguard.example.toml).
 
 ### How matching works
 
-Matching is **exact**: a rule applies only when its `category`, `target`, and `fingerprint` equal the finding's values:
+Matching is **exact**: a rule applies only when both its stable `rule_id` and
+its `target` equal the finding's own values. This strictness keeps a suppression
+from over-applying to a sibling field, enum case, or parameter. A rule that
+omits `target` matches only findings that themselves have no target (for
+example `Environment` changes). Legacy configs that still use `category` are
+mapped to the same rule id automatically, so existing suppressions keep working.
 
 - **Category & Target**: matched verbatim.
 - **Fingerprint**: calculated as the SHA-256 hex hash of:

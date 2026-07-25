@@ -1,6 +1,5 @@
-use crate::diff::{
-    DiffReport, Finding, Severity, STORAGE_CATEGORY_PREFIX, STORAGE_UNRESOLVED_CATEGORY,
-};
+use crate::diff::{DiffReport, Finding, Severity};
+use crate::rules::{canonical_rule_id, display_label_for_rule_id, guidance_for_rule_id};
 use crate::suppression::SuppressionConfig;
 use crate::classification::TypeClass;
 use colored::Colorize;
@@ -176,6 +175,8 @@ impl AnalysisScope {
 /// full — it simply does not count toward the failing set.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReportedFinding {
+    /// Stable rule id for this finding.
+    pub rule_id: String,
     /// The underlying finding, flattened so JSON keeps its original shape
     /// (`severity`, `category`, `message`, `type_name`, `target`).
     #[serde(flatten)]
@@ -312,7 +313,11 @@ impl SafetyReport {
                 }
             }
 
+            let rule_id = canonical_rule_id(&finding.category)
+                .unwrap_or_else(|| finding.category.as_str())
+                .to_string();
             let remediation = if explain {
+                get_remediation_guidance(&rule_id).map(String::from)
                 remediation_for(&finding.category, finding.classification.as_ref())
             } else {
                 None
@@ -323,6 +328,7 @@ impl SafetyReport {
                 .entry(finding.category.clone())
                 .or_default()
                 .push(ReportedFinding {
+                    rule_id,
                     finding: finding.clone(),
                     fingerprint,
                     suppressed,
@@ -828,124 +834,28 @@ impl SafetyReport {
     }
 }
 
-/// Remediation guidance for a finding, tailored by how its type is classified.
-///
-/// Categories are purely structural, so the base advice is about layout and
-/// call sites. When the type is classified as an event, off-chain indexers and
-/// subscribers are also affected, so that consequence is appended rather than
-/// baked into a separate `"Event …"` category — which is exactly what used to
-/// couple suppression keys to the classification guess.
-pub fn remediation_for(category: &str, class: Option<&TypeClass>) -> Option<String> {
-    let base = get_remediation_guidance(category)?;
-    match class {
-        Some(c) if c.is_event() => Some(format!(
-            "{base} This type is classified as an event, so off-chain indexers, \
-             subscribers, and monitoring that consume it must be updated too."
-        )),
-        _ => Some(base.to_string()),
-    }
-}
-
-/// Returns structural remediation/explanation guidance for a finding category.
-///
-/// Use [`remediation_for`] to also account for a finding's classification.
-pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
-    if category == STORAGE_UNRESOLVED_CATEGORY {
-        return Some(
-            "Declare the referenced type in the storage schema, or confirm it is not \
-             serialized into storage. Until it resolves, its layout is not analyzed.",
-        );
-    }
-
-    if let Some(base) = category.strip_prefix(STORAGE_CATEGORY_PREFIX) {
-        return storage_remediation_guidance(base).or_else(|| interface_remediation_guidance(base));
-    }
-
-    interface_remediation_guidance(category)
-}
-
-/// Guidance specific to declared storage types, where the consequence of a
-/// structural change is stored-data corruption rather than a broken caller.
-fn storage_remediation_guidance(base_category: &str) -> Option<&'static str> {
-    match base_category {
-        "Struct Field Reordered" => Some("This corrupts stored data. Soroban serializes struct fields positionally, so reordering makes existing entries decode into the wrong fields. Restore the original field order and append any new field at the end."),
-        "Struct Field Removed" => Some("This corrupts stored data. Existing entries still contain bytes for this field. Restore the field, or perform an explicit migration that rewrites every affected entry before the upgrade."),
-        "Struct Field Type Changed" => Some("This corrupts stored data. Existing entries hold bytes in the old type's encoding. Revert the type, or migrate every affected entry."),
-        "Struct Field Added" => Some("For a storage value this needs a migration or default, because existing entries lack the field. For a storage key it is fatal: the key's bytes change, so every existing entry becomes unreachable."),
-        "Union Case Reordered" => Some("This orphans stored data. Union cases are addressed by positional discriminant, so reordering changes which variant existing bytes decode as. Restore the original case order and append new cases at the end."),
-        "Union Case Removed" => Some("This orphans stored data written under the removed discriminant. Restore the case, or migrate the affected entries before upgrading."),
-        "Union Case Type Changed" => Some("This corrupts stored data. The payload encoding changed under an unchanged discriminant. Revert the payload type, or migrate the affected entries."),
-        "Enum Case Value Changed" => Some("This orphans stored data. The discriminant is what was written to storage, so changing it makes existing entries resolve to a different case or to nothing. Restore the original value."),
-        "Enum Case Removed" => Some("This orphans stored data written under this discriminant. Restore the case, or migrate the affected entries."),
-        "Struct Removed" | "Enum Removed" | "Union Removed" => Some("A declared storage type disappeared while data written with it may still exist on chain. Restore the type, or migrate the affected entries before upgrading."),
-        "Cascading Layout Break" => Some("This type embeds a modified storage type, so its stored bytes are no longer decodable. Resolve the break in the referenced type."),
-        _ => None,
-    }
-}
-
-/// Guidance for exported-interface findings.
-fn interface_remediation_guidance(category: &str) -> Option<&'static str> {
-    match category {
-        "Environment" => Some("Verify that the target network supports the new protocol version and adjust any SDK/tooling dependencies accordingly."),
-        "Function Removed" => Some("This is a breaking change. If the function is no longer needed, deprecate it in client integrations. Otherwise, restore the function signature."),
-        "Function Documentation Changed" => Some("No code changes required. Ensure client/consumer integrations are aware of the updated documentation/behavior."),
-        "Function Added" => Some("No action required. Inform client integrations about the availability of the new function."),
-        "Function Signature Changed" => Some("This is a breaking change. Update call sites, SDKs, and tests to match the new parameter structure."),
-        "Parameter Renamed" => Some("This is a breaking change for named-argument RPC systems. Update all client integrations to use the new parameter name."),
-        "Parameter Reordered" => Some("This is a breaking change. Reordering parameters breaks positional RPC invocation. Restore the original parameter order."),
-        "Parameter Type Changed" => Some("This is a breaking change. Update caller arguments and client SDKs to match the new parameter type."),
-        "Return Type Changed" => Some("This is a breaking change. Update caller expectations and client SDKs to match the new return type."),
-        "Struct Removed" => Some("This is a breaking change. Ensure no stored data or active interfaces reference this struct. If they do, restore the struct."),
-        "Struct Documentation Changed" => Some("No code changes required. Ensure documentation changes are aligned with the struct's intended usage."),
-        "Struct Added" => Some("No action required. New structs can be safely integrated into storage layouts or interface parameters."),
-        "Struct Field Removed" => Some("This is a breaking change. Removing fields breaks serialized storage layouts. Restore the field or perform a state migration."),
-        "Struct Field Reordered" => Some("This is a breaking change. Reordering fields breaks positional serialization layouts. Restore the original field order."),
-        "Struct Field Type Changed" => Some("This is a breaking change. Changing field types breaks layout serialization. Revert the type change or migrate existing data."),
-        "Struct Field Added" => Some("Warning: Ensure existing storage entries are migrated or initialized with correct default values for the new field."),
-        "Event Schema Added" => Some("Warning: Ensure event consumers and indexers handle the new field gracefully, since existing stored or emitted events won't contain it."),
-        "Struct Field Inserted" => Some("This is a breaking change. A field was inserted in the middle of the struct, shifting all subsequent fields. Restore the original field order or perform a state migration."),
-        "Event Field Inserted" => Some("This is a breaking change. A field was inserted in the middle of the event schema, shifting all subsequent fields. Update event indexers and consumers to handle the new positional layout."),
-        "Event Enum Removed" => Some("This is a breaking change. Downstream event consumers or indexers relying on this enum will fail. Restore the enum."),
-        "Enum Removed" => Some("This is a breaking change. Stored data or parameters using this enum will be invalid. Restore the enum."),
-        "Enum Documentation Changed" => Some("No code changes required. Ensure the updated docs are clear for consumers."),
-        "Enum Added" => Some("No action required. Ensure consumers are aware of the new enum type if needed."),
-        "Enum Case Removed" => Some("This is a breaking change. On-chain data or parameters using this case will be invalid. Restore the case."),
-        "Enum Case Value Changed" => Some("This is a breaking change. Modifying case values breaks serialization/deserialization. Revert the value change."),
-        "Enum Case Added" => Some("No action required. Ensure consumers can handle the new case gracefully."),
-        "Union Removed" => Some("This is a breaking change. Stored data or parameters using this union will be invalid. Restore the union."),
-        "Union Added" => Some("No action required. Ensure consumers are aware of the new union type if needed."),
-        "Union Case Removed" => Some("This is a breaking change. On-chain data using this union case will be invalid. Restore the case."),
-        "Union Case Reordered" => Some("This is a breaking change. Reordering union cases breaks positional discriminant serialization. Restore the original case order."),
-        "Union Case Type Changed" => Some("This is a breaking change. Changing union case payload types breaks layout serialization. Revert the type change or migrate existing data."),
-        "Union Case Added" => Some("No action required. Ensure consumers can handle the new union case gracefully."),
-        "Union Case Inserted" => Some("This is a breaking change. A union case was inserted in the middle, shifting all subsequent case discriminants. Restore the original case order or migrate stored data."),
-        "Error Enum Removed" => Some("This is a breaking change. Clients matching on these error codes will break. Restore the error enum."),
-        "Error Enum Added" => Some("No action required. Inform client integrations about the new error enum if needed."),
-        "Error Enum Case Removed" => Some("This is a breaking change. Clients matching on this error code will break. Restore the case."),
-        "Error Enum Case Value Changed" => Some("This is a breaking change. Modifying error case values breaks error-code compatibility. Revert the value change."),
-        "Error Enum Case Added" => Some("No action required. Ensure clients can handle the new error case gracefully."),
-        "Type Library Changed" => Some("No code changes required. The type's declaring library changed, so its definition is now controlled by a different dependency and can drift independently. Confirm the new source is intended and pin/review that dependency."),
-        "Cascading Layout Break" => Some("This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type."),
-        "Spec Entry Conflict" => Some(
-            "The WASM contains multiple conflicting definitions for the same entry name. \
-             This means the analysis cannot be trusted: the definition used for comparison \
-             may not be the one the contract actually executes. \
-             Rebuild the contract with a toolchain that produces a single contractspecv0 section \
-             and a unique definition per name. Do not deploy this WASM.",
-        ),
-        "Spec Entry Duplicate" => Some(
-            "The WASM contains identical duplicate definitions for the same entry name. \
-             While the duplicate is safe to deduplicate, the WASM is non-canonical. \
-             Rebuild with a toolchain that produces a single contractspecv0 section \
-             per contract.",
-        ),
-        _ => None,
-    }
+/// Returns remediation/explanation guidance for a given stable rule id.
+pub fn get_remediation_guidance(rule_id: &str) -> Option<&'static str> {
+    guidance_for_rule_id(rule_id)
+        .or_else(|| canonical_rule_id(rule_id).and_then(guidance_for_rule_id))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rules::{all_rules, rule_by_id};
+
+    #[test]
+    fn every_registered_rule_has_unique_id_and_guidance() {
+        let mut ids = std::collections::HashSet::new();
+
+        for rule in all_rules() {
+            assert!(ids.insert(rule.id), "duplicate rule id: {}", rule.id);
+            assert_eq!(rule.label, display_label_for_rule_id(rule.id).unwrap());
+            assert_eq!(rule.guidance, guidance_for_rule_id(rule.id).unwrap());
+            assert_eq!(rule.severity, rule_by_id(rule.id).unwrap().severity);
+        }
+    }
 
     #[test]
     fn every_category_in_the_inventory_has_guidance() {
