@@ -7,7 +7,7 @@ use stellar_xdr::curr::{
     LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
 };
 
-use wasmparser::{Parser, Payload};
+use wasmparser::Parser;
 
 use crate::limits::{LimitError, ResourcePolicy};
 
@@ -51,8 +51,8 @@ impl std::error::Error for IntegrityError {}
 /// Reads a WASM file from disk, validates it is a valid WASM binary,
 /// and returns a `WasmModule` ready for further analysis.
 pub fn load_wasm(path: &Path) -> Result<WasmModule> {
-    if !path.exists() {
-        bail!("File not found: {}", path.display());
+    if path.is_dir() {
+        bail!("'{}' is a directory, not a WASM file", path.display());
     }
 
     let bytes =
@@ -78,23 +78,7 @@ pub fn load_wasm(path: &Path) -> Result<WasmModule> {
 fn validate_wasm_structure(bytes: &[u8]) -> Result<()> {
     let parser = Parser::new(0);
     for payload in parser.parse_all(bytes) {
-        match payload.context("Malformed WASM payload encountered")? {
-            Payload::Version { .. } => {}
-            Payload::TypeSection(_) => {}
-            Payload::FunctionSection(_) => {}
-            Payload::TableSection(_) => {}
-            Payload::MemorySection(_) => {}
-            Payload::GlobalSection(_) => {}
-            Payload::ExportSection(_) => {}
-            Payload::ImportSection(_) => {}
-            Payload::ElementSection(_) => {}
-            Payload::DataSection(_) => {}
-            Payload::CodeSectionStart { .. } => {}
-            Payload::CodeSectionEntry(_) => {}
-            Payload::CustomSection(_) => {}
-            Payload::End(_) => {}
-            _ => {}
-        }
+        payload.context("Malformed WASM payload encountered")?;
     }
     Ok(())
 }
@@ -526,6 +510,28 @@ mod tests {
             "got: {}",
             msg
         );
+    }
+
+    #[test]
+    fn test_load_wasm_rejects_directory() {
+        let dir = std::env::temp_dir().join("soroban-upgrade-safeguard-test-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let err = load_wasm(&dir).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("is a directory"), "got: {}", msg);
+
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_load_wasm_reports_missing_file() {
+        let path = std::env::temp_dir().join("soroban-upgrade-safeguard-does-not-exist.wasm");
+        let _ = std::fs::remove_file(&path);
+
+        let err = load_wasm(&path).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains(&path.display().to_string()), "got: {}", msg);
     }
 
     #[test]

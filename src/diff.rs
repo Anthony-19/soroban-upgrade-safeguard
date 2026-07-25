@@ -51,29 +51,6 @@ pub struct DiffReport {
     pub findings: Vec<Finding>,
 }
 
-#[allow(dead_code)]
-impl DiffReport {
-    pub fn critical_count(&self) -> usize {
-        self.findings
-            .iter()
-            .filter(|f| f.severity == Severity::Critical)
-            .count()
-    }
-
-    pub fn warning_count(&self) -> usize {
-        self.findings
-            .iter()
-            .filter(|f| f.severity == Severity::Warning)
-            .count()
-    }
-
-    pub fn info_count(&self) -> usize {
-        self.findings
-            .iter()
-            .filter(|f| f.severity == Severity::Info)
-            .count()
-    }
-}
 
 /// Compare two contract specs and return a report of all findings.
 ///
@@ -222,8 +199,9 @@ pub const SPEC_DUPLICATE_CATEGORY: &str = "Spec Entry Duplicate";
 /// Policy:
 /// - **Conflicting** duplicates (same name, different definition) → `Critical`.
 ///   They mean the analysis model is ambiguous; the run must fail.
-/// - **Identical** duplicates (same name, byte-identical definition) → `Info`.
-///   They are safe to deduplicate but indicate a non-canonical WASM.
+/// - **Identical** duplicates (same name, byte-identical definition) → `Info`
+///   in compat mode, `Warning` otherwise. They are safe to deduplicate but
+///   indicate a non-canonical WASM.
 ///
 /// Multi-section WASMs: `spec_section_count` is included in the message so an
 /// operator can tell whether the duplicate spans sections or is within a single
@@ -660,6 +638,50 @@ fn types_equal_inner(
     Ok(equal)
 }
 
+/// Compare the declaring library (`lib`) of a user-defined type and, on a
+/// change, record an informational finding.
+///
+/// Every UDT kind (struct, enum, union, error enum) carries a `lib` recording
+/// the crate the type was declared in. A type can move from a local definition
+/// to one imported from a shared crate, or switch which crate it comes from,
+/// while keeping its name and even its layout. The layout comparisons see
+/// nothing, yet control of the definition has moved to a different dependency
+/// that can drift independently in a future release. We surface the change of
+/// origin so a reviewer knows the definition changed hands.
+///
+/// This is informational only: relocating a type does not by itself change the
+/// serialized layout, so it never affects `is_safe`. `type_name` and `target`
+/// are set to the type name so the finding groups and suppresses like the other
+/// type-level findings.
+fn compare_type_lib(name: &str, kind: &str, old_lib: &str, new_lib: &str, report: &mut DiffReport) {
+    if old_lib == new_lib {
+        return;
+    }
+    let message = if old_lib.is_empty() {
+        format!(
+            "{} '{}' is now declared in library '{}' (previously defined locally).",
+            kind, name, new_lib
+        )
+    } else if new_lib.is_empty() {
+        format!(
+            "{} '{}' is now defined locally (previously declared in library '{}').",
+            kind, name, old_lib
+        )
+    } else {
+        format!(
+            "{} '{}' declaring library changed from '{}' to '{}'.",
+            kind, name, old_lib, new_lib
+        )
+    };
+    report.findings.push(Finding {
+        severity: Severity::Info,
+        category: "Type Library Changed".to_string(),
+        message,
+        type_name: Some(name.to_string()),
+        target: Some(name.to_string()),
+    });
+}
+
 /// Compare struct definitions between old and new contract specs.
 fn compare_structs(
     old: &ContractSpec,
@@ -709,6 +731,14 @@ fn compare_structs(
                         target: Some(name.clone()),
                     });
                 }
+                // Compare declaring library (informational only)
+                compare_type_lib(
+                    name,
+                    "Struct",
+                    &old_struct.lib.to_string(),
+                    &new_struct.lib.to_string(),
+                    report,
+                );
             }
         }
     }
@@ -751,7 +781,7 @@ fn compare_structs(
 /// |---|---|---|---|
 /// | Field removed | Critical | `Struct Field Removed` | `Event Schema Removed` |
 /// | Field inserted mid-sequence | Critical | `Struct Field Inserted` | `Event Field Inserted` |
-/// | Field appended at tail | Warning | `Struct Field Added` | `Struct Field Added` |
+/// | Field appended at tail | Warning | `Struct Field Added` | `Event Schema Added` |
 /// | Field moved (position changed) | Critical | `Struct Field Reordered` | `Event Schema Reordered` |
 /// | Field type changed | Critical | `Struct Field Type Changed` | `Event Schema Type Changed` |
 fn check_struct_fields(
@@ -804,11 +834,11 @@ fn check_struct_fields(
                 // Tail append → Warning (existing behaviour)
                 report.findings.push(Finding {
                     severity: Severity::Warning,
-                    category: "Struct Field Added".to_string(),
+                    category: format!("{} Added", category_prefix),
                     message: format!(
-                        "Struct '{}': new field '{}' appended. \
+                        "{} '{}': new field '{}' appended. \
                          Existing storage entries won't have this field — ensure migration handles defaults.",
-                        name, new_name
+                        msg_prefix, name, new_name
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, new_name)),
@@ -919,6 +949,14 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                         target: Some(name.clone()),
                     });
                 }
+                // Compare declaring library (informational only)
+                compare_type_lib(
+                    name,
+                    "Enum",
+                    &old_enum.lib.to_string(),
+                    &new_enum.lib.to_string(),
+                    report,
+                );
             }
         }
     }
@@ -1034,6 +1072,14 @@ fn compare_unions(
             }
             Some(new_union) => {
                 check_union_cases(name, old_union, new_union, report, policy)?;
+                // Compare declaring library (informational only)
+                compare_type_lib(
+                    name,
+                    "Union",
+                    &old_union.lib.to_string(),
+                    &new_union.lib.to_string(),
+                    report,
+                );
             }
         }
     }
@@ -1253,6 +1299,14 @@ fn compare_error_enums(old: &ContractSpec, new: &ContractSpec, report: &mut Diff
             }
             Some(new_error_enum) => {
                 check_error_enum_cases(name, old_error_enum, new_error_enum, report);
+                // Compare declaring library (informational only)
+                compare_type_lib(
+                    name,
+                    "Error enum",
+                    &old_error_enum.lib.to_string(),
+                    &new_error_enum.lib.to_string(),
+                    report,
+                );
             }
         }
     }
@@ -1697,6 +1751,104 @@ mod tests {
         assert!(
             report.findings.is_empty(),
             "Expected no findings when docs identical"
+        );
+    }
+
+    #[test]
+    fn struct_lib_change_produces_info() {
+        let mut old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let mut new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+
+        // The type switches which crate it is declared in.
+        old.structs.get_mut("Data").unwrap().lib = "old_crate".try_into().unwrap();
+        new.structs.get_mut("Data").unwrap().lib = "new_crate".try_into().unwrap();
+
+        let report = compare(&old, &new);
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Type Library Changed")
+            .expect("expected a lib-change finding");
+        assert_eq!(finding.severity, Severity::Info);
+        assert_eq!(finding.type_name.as_deref(), Some("Data"));
+        assert_eq!(finding.target.as_deref(), Some("Data"));
+        // The message names both the old and new value.
+        assert!(finding.message.contains("old_crate"), "{}", finding.message);
+        assert!(finding.message.contains("new_crate"), "{}", finding.message);
+
+        // Info findings must not influence safety.
+        let safety = crate::report::SafetyReport::new(&report);
+        assert!(safety.is_safe);
+        assert_eq!(safety.critical_count, 0);
+    }
+
+    #[test]
+    fn struct_lib_added_produces_info() {
+        let mut old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let mut new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+
+        // Was defined locally (empty lib), now imported from a crate.
+        old.structs.get_mut("Data").unwrap().lib = StringM::default();
+        new.structs.get_mut("Data").unwrap().lib = "shared_types".try_into().unwrap();
+
+        let report = compare(&old, &new);
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Type Library Changed")
+            .expect("expected a lib-change finding");
+        assert_eq!(finding.severity, Severity::Info);
+        assert!(
+            finding.message.contains("shared_types"),
+            "{}",
+            finding.message
+        );
+
+        let safety = crate::report::SafetyReport::new(&report);
+        assert!(safety.is_safe);
+    }
+
+    #[test]
+    fn struct_lib_removed_produces_info() {
+        let mut old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let mut new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+
+        // Was imported from a crate, now defined locally (empty lib).
+        old.structs.get_mut("Data").unwrap().lib = "shared_types".try_into().unwrap();
+        new.structs.get_mut("Data").unwrap().lib = StringM::default();
+
+        let report = compare(&old, &new);
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Type Library Changed")
+            .expect("expected a lib-change finding");
+        assert_eq!(finding.severity, Severity::Info);
+        assert!(
+            finding.message.contains("shared_types"),
+            "{}",
+            finding.message
+        );
+
+        let safety = crate::report::SafetyReport::new(&report);
+        assert!(safety.is_safe);
+    }
+
+    #[test]
+    fn identical_struct_lib_produces_no_finding() {
+        let mut old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let mut new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+
+        old.structs.get_mut("Data").unwrap().lib = "shared_types".try_into().unwrap();
+        new.structs.get_mut("Data").unwrap().lib = "shared_types".try_into().unwrap();
+
+        let report = compare(&old, &new);
+        assert!(
+            report.findings.is_empty(),
+            "Expected no findings when lib is unchanged"
         );
     }
 
@@ -2545,32 +2697,87 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Event struct: mid-sequence insertion → Event Schema Inserted
+    // Event struct: tail append → Event Schema Added (warning)
     // ---------------------------------------------------------------
     #[test]
-    fn event_struct_field_mid_insertion_is_critical() {
-        let old = spec_with_structs(vec![("SomeEvent", vec![("old_field", ScSpecTypeDef::U32)])]);
+    fn event_struct_field_tail_append_uses_event_wording() {
+        // A struct whose name contains "event" must use "Event Schema Added"
+        // as its category (and "Event schema" in the message), consistent with
+        // every other event-struct finding (Removed, Reordered, Type Changed).
+        let old = spec_with_structs(vec![("TransferEvent", vec![("amount", ScSpecTypeDef::U32)])]);
         let new = spec_with_structs(vec![(
-            "SomeEvent",
+            "TransferEvent",
             vec![
-                ("old_field", ScSpecTypeDef::U32),
-                ("new_field", ScSpecTypeDef::U64),
+                ("amount", ScSpecTypeDef::U32),
+                ("memo", ScSpecTypeDef::U64),
             ],
         )]);
 
         let report = compare(&old, &new);
 
-        // Appended at tail, still Struct Field Added (Warning) — event structs
-        // use the same added logic.
+        // Should use event-flavoured category, not the struct one.
         let added = report.findings.iter().find(|f| {
-            f.category == "Struct Field Added" && f.target.as_deref() == Some("SomeEvent.new_field")
+            f.category == "Event Schema Added"
+                && f.target.as_deref() == Some("TransferEvent.memo")
         });
-        assert!(added.is_some(), "Expected Struct Field Added for new_field");
+        assert!(
+            added.is_some(),
+            "Expected 'Event Schema Added' for a tail-appended field on an event struct, \
+             but categories were: {:?}",
+            report.findings.iter().map(|f| &f.category).collect::<Vec<_>>()
+        );
+        assert_eq!(added.unwrap().severity, Severity::Warning);
+
+        // The message must say "Event schema", not "Struct".
+        let msg = &added.unwrap().message;
+        assert!(
+            msg.contains("Event schema"),
+            "Message should use event wording, got: {msg}"
+        );
+        assert!(
+            !msg.contains("Struct '"),
+            "Message must not use struct wording for an event type, got: {msg}"
+        );
+
+        // No finding with struct wording for this type
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.category == "Struct Field Added"
+                    && f.target.as_deref() == Some("TransferEvent.memo")),
+            "Should not emit 'Struct Field Added' for an event type"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Non-event struct: tail append still uses struct wording
+    // ---------------------------------------------------------------
+    #[test]
+    fn non_event_struct_field_tail_append_uses_struct_wording() {
+        let old = spec_with_structs(vec![("Config", vec![("flag", ScSpecTypeDef::Bool)])]);
+        let new = spec_with_structs(vec![(
+            "Config",
+            vec![
+                ("flag", ScSpecTypeDef::Bool),
+                ("timeout", ScSpecTypeDef::U32),
+            ],
+        )]);
+
+        let report = compare(&old, &new);
+
+        let added = report.findings.iter().find(|f| {
+            f.category == "Struct Field Added" && f.target.as_deref() == Some("Config.timeout")
+        });
+        assert!(
+            added.is_some(),
+            "Expected 'Struct Field Added' for a non-event struct"
+        );
         assert_eq!(added.unwrap().severity, Severity::Warning);
     }
 
     // ---------------------------------------------------------------
-    // Union case: mid-sequence insertion → Critical
+    // Event struct: mid-sequence insertion → Event Schema Inserted
     // ---------------------------------------------------------------
     #[test]
     fn union_case_mid_insertion_is_critical() {

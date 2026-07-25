@@ -889,6 +889,7 @@ fn interface_remediation_guidance(category: &str) -> Option<&'static str> {
         "Struct Field Type Changed" => Some("This is a breaking change. Changing field types breaks layout serialization. Revert the type change or migrate existing data."),
         "Event Field Type Changed" => Some("This is a breaking change. Update event indexers and consumers to handle the new field type."),
         "Struct Field Added" => Some("Warning: Ensure existing storage entries are migrated or initialized with correct default values for the new field."),
+        "Event Schema Added" => Some("Warning: Ensure event consumers and indexers handle the new field gracefully, since existing stored or emitted events won't contain it."),
         "Struct Field Inserted" => Some("This is a breaking change. A field was inserted in the middle of the struct, shifting all subsequent fields. Restore the original field order or perform a state migration."),
         "Event Field Inserted" => Some("This is a breaking change. A field was inserted in the middle of the event schema, shifting all subsequent fields. Update event indexers and consumers to handle the new positional layout."),
         "Event Enum Removed" => Some("This is a breaking change. Downstream event consumers or indexers relying on this enum will fail. Restore the enum."),
@@ -913,6 +914,7 @@ fn interface_remediation_guidance(category: &str) -> Option<&'static str> {
         "Error Enum Case Removed" => Some("This is a breaking change. Clients matching on this error code will break. Restore the case."),
         "Error Enum Case Value Changed" => Some("This is a breaking change. Modifying error case values breaks error-code compatibility. Revert the value change."),
         "Error Enum Case Added" => Some("No action required. Ensure clients can handle the new error case gracefully."),
+        "Type Library Changed" => Some("No code changes required. The type's declaring library changed, so its definition is now controlled by a different dependency and can drift independently. Confirm the new source is intended and pin/review that dependency."),
         "Cascading Layout Break" => Some("This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type."),
         "Spec Entry Conflict" => Some(
             "The WASM contains multiple conflicting definitions for the same entry name. \
@@ -989,9 +991,15 @@ mod tests {
                                             "Reordered" | "Type Changed" => {
                                                 vec!["Struct Field", "Event Field"]
                                             }
-                                            "Value Changed" | "Added" => {
+                                            "Value Changed" => {
                                                 vec!["Enum Case", "Event Enum Case"]
                                             }
+                                            "Added" => vec![
+                                                "Struct Field",
+                                                "Event Schema",
+                                                "Enum Case",
+                                                "Event Enum Case",
+                                            ],
                                             "Removed" => vec![
                                                 "Struct Field",
                                                 "Event Field",

@@ -42,6 +42,7 @@
 //! ```
 
 pub mod color;
+pub mod dependency;
 pub mod diff;
 pub mod limits;
 pub mod loader;
