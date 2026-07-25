@@ -54,6 +54,66 @@ The tool auto-loads `.safeguard.toml` from the current directory, or use
 and the [documentation](docs/documentation.md#suppressing-known-breaking-changes)
 for the full `target` convention.
 
+## GitHub Action
+
+Use the reusable GitHub Action in your CI workflows to automatically check Soroban contract upgrades on pull requests.
+
+### Quick Start
+
+Create `.github/workflows/safeguard.yml`:
+
+```yaml
+name: Check upgrade safety
+
+on:
+  pull_request:
+    paths:
+      - 'wasm/**/*.wasm'
+
+jobs:
+  safeguard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: soroban-upgrade-safeguard/./
+        with:
+          old-wasm: ./wasm/current.wasm
+          new-wasm: ./wasm/next.wasm
+```
+
+### Inputs
+
+| Input | Description | Required | Default |
+| :--- | :--- | :--- | :--- |
+| `old-wasm` | Path to the old (baseline) WASM file | No | — |
+| `new-wasm` | Path to the new (upgrade) WASM file | No | — |
+| `contract-id` | Stellar/Soroban contract ID | No | — |
+| `rpc-url` | Stellar RPC URL | No | — |
+| `format` | Output format (`text`, `json`, `markdown`) | No | `text` |
+| `strict` | Fail on warnings as well as critical findings | No | `false` |
+| `explain` | Print remediation guidance for each finding | No | `false` |
+| `config` | Path to a suppression config file | No | — |
+| `expected-wasm-hash` | Expected SHA-256 hash of on-chain WASM | No | — |
+
+### Outputs
+
+| Output | Description |
+| :--- | :--- |
+| `verdict` | `passed` or `failed` |
+| `critical-count` | Number of critical findings |
+| `warning-count` | Number of warning findings |
+| `info-count` | Number of info findings |
+
+### JSON output in CI
+
+```yaml
+- uses: soroban-upgrade-safeguard/./
+  with:
+    old-wasm: ./wasm/v1.wasm
+    new-wasm: ./wasm/v2.wasm
+    format: json
+```
+
 ## How it Works
 
 The tool parses the `contractspecv0` custom sections from both WASM files, decodes the XDR representations of the contract's interface, and performs a deep structural comparison. It builds a type dependency map to identify when a simple change in a shared struct might cascade into breaking multiple storage entries.
