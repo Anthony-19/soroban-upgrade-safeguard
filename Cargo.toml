@@ -30,3 +30,6 @@ colored = "2.1"
 indicatif = "0.17"
 hex = "0.4"
 ureq = { version = "2.9", features = ["json"] }
+
+[dev-dependencies]
+proptest = "1.11.0"

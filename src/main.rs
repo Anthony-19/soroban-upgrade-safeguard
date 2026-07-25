@@ -456,7 +456,8 @@ fn compare_contracts(
         "\n{}",
         "🔬 Analyzing structural compatibility...".cyan().bold()
     ));
-    let mut diff_report = diff::compare(&old_spec, &new_spec);
+    let mut diff_report =
+        diff::compare_with_classification(&old_spec, &new_spec, &suppressions.classification);
     diff::compare_env_metadata(
         old_meta.env_meta.as_ref(),
         new_meta.env_meta.as_ref(),

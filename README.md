@@ -8,7 +8,8 @@ A powerful CLI tool to analyze and validate Soroban smart contract upgrades on t
 
 - **Storage Layout Protection**: Detects field removals, reorderings, and type changes in structs and enums that would corrupt on-chain data.
 - **Function Signature Validation**: Flags changes in function names, parameters, and return types that break integration with existing clients/contracts.
-- **Event Schema Analysis**: Heuristically identifies event-related types and ensures their structure remains backwards compatible for indexers.
+- **Rename Detection**: Matches types structurally, not just by name, so renaming a type is reported as a rename rather than a spurious delete-plus-add — and an unrelated type reusing an old name is not mistaken for it.
+- **Event Schema Analysis**: Types you declare as events in `[classification]` get indexer-focused findings and remediation. Classification is explicit, never inferred from the name, and never affects suppression keys.
 - **Cascading Break Detection**: Uses dependency graphing to track how a change in a low-level type affects all parent structures.
 - **Rich CLI Output**: Beautiful, color-coded reports with actionable severity levels (Critical, Warning, Info).
 - **CI/CD Friendly**: Exits with a non-zero code if critical breaking changes are detected.

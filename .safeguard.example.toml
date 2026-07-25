@@ -18,6 +18,13 @@
 #   - enum cases ........... "Enum.case"              e.g. "StatusEvent.Paused"
 #
 # Omit `target` to match only findings that have no target (e.g. "Environment").
+#
+# `category` is always STRUCTURAL — "Enum Case Value Changed", never
+# "Event Enum Case Value Changed". Whether a type is an event is reported
+# separately (see [classification] below) and never affects the suppression
+# key, so reclassifying a type cannot silently change what a rule matches.
+# Pre-1.0 event-flavored category names still work and are mapped onto their
+# structural equivalents.
 
 [[suppress]]
 category = "Struct Field Removed"
@@ -28,3 +35,33 @@ reason   = "Planned storage migration in v2 drops the unused threshold field."
 category = "Function Signature Changed"
 target   = "initialize"
 reason   = "Re-init is intentional and gated behind the migration admin call."
+
+
+# ---------------------------------------------------------------------------
+# Type classification (optional)
+# ---------------------------------------------------------------------------
+#
+# Soroban's `contractspecv0` carries no marker saying "this type is an event",
+# so the tool cannot infer it. Declare it here instead. Classification changes
+# only the WORDING and remediation of a finding — never its `category` — so
+# editing this section can never move a finding out from under a suppression
+# rule above.
+#
+# With no [classification] section, nothing is treated as an event and no
+# event-specific advice is emitted. That is the safe default: a name that
+# merely contains "event" (e.g. `PreventList`, `EventCounterCache`) is not
+# evidence of anything.
+
+# [classification]
+#
+# # Genuine events, by exact type name. Names need not contain "event".
+# events = ["Transfer", "LedgerEvent", "PriceUpdate"]
+#
+# # Types to keep as ordinary storage even if a rule below would catch them.
+# # Takes precedence over both `events` and the name heuristic.
+# storage = ["PreventList", "EventCounterCache"]
+#
+# # Opt-in fallback: treat any type whose name contains "event"
+# # (case-insensitive) as an event. Findings produced this way are explicitly
+# # labeled as a heuristic guess in the report. Off by default.
+# name_heuristic = false

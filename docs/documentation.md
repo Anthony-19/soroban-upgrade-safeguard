@@ -11,13 +11,15 @@ This document explains what Soroban Upgrade Safeguard does, how it works interna
 5. [Command Line Usage](#command-line-usage)
 6. [How the Analysis Works](#how-the-analysis-works)
 7. [Detection Categories](#detection-categories)
-8. [Severity Levels](#severity-levels)
-9. [Cascading Layout Breaks](#cascading-layout-breaks)
-10. [Reading the Report](#reading-the-report)
-11. [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes)
-12. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
-13. [Limitations](#limitations)
-14. [Frequently Asked Questions](#frequently-asked-questions)
+8. [Type Identity](#type-identity)
+9. [Type Classification](#type-classification)
+10. [Severity Levels](#severity-levels)
+11. [Cascading Layout Breaks](#cascading-layout-breaks)
+12. [Reading the Report](#reading-the-report)
+13. [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes)
+14. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
+15. [Limitations](#limitations)
+16. [Frequently Asked Questions](#frequently-asked-questions)
 
 ## Overview
 
@@ -177,9 +179,117 @@ The comparison stage looks for the following classes of change.
 - **Enum Case Value Changed.** A variant kept its name but its integer value changed, which breaks serialization. Critical.
 - **Enum Case Added.** A new variant. Informational.
 
+### Type Renames
+
+Types are compared by structure, not only by name, so renaming a type is recognized as a rename instead of being reported as an unrelated removal plus addition. See [Type Identity](#type-identity) for how the matching works and what it deliberately refuses to match.
+
+- **Type Renamed.** The old type was matched to a new one with an identical layout. Stored data stays compatible; only client-side type names need updating. Informational.
+- **Type Renamed With Changes.** The old type was matched to a new one whose layout also changed. The rename itself is a warning, and the actual breaking changes are reported alongside it as ordinary field- or case-level findings.
+
 ### Events
 
-Soroban does not mark event types explicitly in the spec, so the tool uses a naming heuristic: any user-defined type whose name contains the word `event` (case insensitive) is treated as an event type. When such a type changes, the same struct and enum checks apply but the findings are labeled with event-specific categories such as **Event Schema Removed** or **Event Enum Case Value Changed**. This matters because off-chain indexers and subscribers depend on a stable event shape, and a change that is merely awkward for storage can be fully breaking for an indexer.
+Soroban's `contractspecv0` carries no marker that says "this type is an event", so the tool cannot infer it from the spec. Instead you declare it, in the `[classification]` table of `.safeguard.toml`. See [Type Classification](#type-classification).
+
+Classification affects only the **wording** of a finding and the remediation advice attached to it — a type classified as an event gets guidance about off-chain indexers and subscribers, because a change that is merely awkward for storage can be fully breaking for an indexer. It never affects the finding's `category`.
+
+## Type Identity
+
+A contract spec identifies every user-defined type by name, but a name is not an identity. Two questions have to be kept apart:
+
+- **Is this the same type as before?** — a *structural* question.
+- **What kind of thing is it?** — a *semantic* question, covered in [Type Classification](#type-classification).
+
+### Why name matching alone is not enough
+
+Matching purely on name gets two cases wrong, in opposite directions.
+
+- **Renames are false breaks.** Renaming `Config` to `Settings` without touching a single field produces "Struct Removed" plus "Struct Added" — two findings, one of them critical, for a change that is byte-for-byte compatible on chain.
+- **Swaps are false matches.** If `Config` is deleted and an unrelated new type happens to be called `Config`, name matching reports only the field-level differences between two types that have nothing to do with each other, quietly treating a full replacement as an edit.
+
+### How matching actually works
+
+Types that exist under the same name in both specs are compared in place, exactly as before. The types left over — present only in the old spec, or only in the new one — are then matched against each other structurally, per kind (structs to structs, enums to enums, and so on; a struct is never matched to an enum).
+
+Each type gets a **fingerprint**: a canonical string built from its members and their types, with the type's own name excluded. Matching then proceeds in two tiers:
+
+1. **Identical fingerprint.** The layouts are the same, so this is a pure rename. Reported as **Type Renamed** (Info) — no migration needed.
+2. **Similar member sets.** Otherwise the candidates are scored by [Jaccard similarity](https://en.wikipedia.org/wiki/Jaccard_index) over their member keys (name and type together). A pair must score at least `0.5` — more than half their members in common — to be considered a rename at all. Reported as **Type Renamed With Changes** (Warning), followed by the ordinary field- or case-level findings describing what actually changed.
+
+Anything not matched under those rules is reported as a plain removal and a plain addition, which is the conservative outcome: an unmatched removal stays critical.
+
+The matching is **deterministic** — candidates are iterated in sorted order and ties are broken by the lexicographically smaller new name, so the same pair of specs always produces the same output — and **bounded**, at one comparison per (removed, added) pair within a kind.
+
+### What it deliberately does not do
+
+- A removed type and an added type that share fewer than half their members are **not** matched. A rewrite is a rewrite.
+- Each type participates in at most one rename. When several candidates are plausible, the best-scoring one wins and the rest fall back to removal/addition.
+- Two unrelated types with coincidentally identical layouts (say, two distinct `struct Wrapper { value: u32 }`) can be matched. This is unavoidable — they are indistinguishable in the spec — and harmless: the finding is informational and the layouts really are compatible.
+- Names are compared case-sensitively. `Config` and `config` are different names; if both exist, they are separate types.
+
+## Type Classification
+
+Classification answers the second question: what kind of thing a type is. Today that means one distinction — is it an **event**, consumed by off-chain indexers and subscribers, or an ordinary **storage/interface** type?
+
+Nothing in `contractspecv0` records this. The tool used to guess from the name, treating any type whose name contained `event` as an event type. That guess is wrong in both directions: `PreventList` and `EventCounterCache` are not events, and a genuine `Transfer` event is not caught.
+
+So it is configured explicitly, in `.safeguard.toml`:
+
+```toml
+[classification]
+# Genuine events, by exact type name. Names need not contain "event".
+events = ["Transfer", "LedgerEvent", "PriceUpdate"]
+
+# Types to keep as ordinary storage. Takes precedence over everything below.
+storage = ["PreventList", "EventCounterCache"]
+
+# Opt-in fallback: treat any name containing "event" (case-insensitive) as an
+# event. Off by default.
+name_heuristic = false
+```
+
+Resolution precedence, first match wins:
+
+1. listed in `storage` → storage
+2. listed in `events` → event (declared)
+3. `name_heuristic = true` and the name contains `event` → event (heuristic)
+4. otherwise → storage
+
+With no `[classification]` section, **nothing is treated as an event**. The tool makes no claim it cannot back up.
+
+### Classification never affects the suppression key
+
+This is the important property. A finding's `category` describes structure only — `Struct Field Removed`, `Enum Case Value Changed` — and never encodes classification. Event-ness is reported separately, in the finding's `classification` field:
+
+```json
+{
+  "severity": "critical",
+  "category": "Enum Case Value Changed",
+  "target": "StatusEvent.Paused",
+  "type_name": "StatusEvent",
+  "classification": { "class": "event", "heuristic": false }
+}
+```
+
+Because the suppression key (`category` + `target`) contains no classification, editing `[classification]` cannot move a finding out from under an existing suppression rule, and cannot pull an unrelated one under it. Reclassifying a type changes how a finding reads, never whether it fails the run.
+
+When a classification came from the opt-in heuristic rather than a declaration, the report says so in the finding message and sets `"heuristic": true`, so a reviewer can always tell a guess from a fact.
+
+### Category compatibility
+
+Earlier versions folded the event guess into the category string itself. Those names are no longer emitted, but suppression configs that use them keep working — each is mapped onto its structural replacement:
+
+| Pre-1.0 category | Stable category |
+| :--- | :--- |
+| `Event Definition Removed` | `Struct Removed` |
+| `Event Field Removed` | `Struct Field Removed` |
+| `Event Field Reordered` | `Struct Field Reordered` |
+| `Event Field Type Changed` | `Struct Field Type Changed` |
+| `Event Enum Removed` | `Enum Removed` |
+| `Event Enum Case Removed` | `Enum Case Removed` |
+| `Event Enum Case Value Changed` | `Enum Case Value Changed` |
+| `Event Enum Case Added` | `Enum Case Added` |
+
+New rules should use the stable names. `Error Enum …` categories are unrelated to events and were never remapped.
 
 ## Severity Levels
 
@@ -263,6 +373,12 @@ is about, independent of the human-readable message:
 The easiest way to find the right `category` and `target` for a finding is to
 run with `--format json`; every finding carries both fields verbatim.
 
+`category` is always **structural** — it describes what changed in the shape of
+the contract and nothing else. In particular it never encodes whether a type is
+an event, so editing `[classification]` can never change which findings a rule
+matches. Configs written against the older event-flavored category names still
+work; see [Category compatibility](#category-compatibility) for the mapping.
+
 ### What suppression does and does not change
 
 A suppressed finding is **not hidden**. It is still listed in the report, marked
@@ -289,10 +405,10 @@ If that command fails, the pipeline stops before the upgrade is published.
 
 ## Limitations
 
-- Event detection relies on a name heuristic. A type that represents an event but does not contain `event` in its name will be analyzed as an ordinary struct or enum.
+- Event classification is configuration, not detection. A type is treated as an event only if you list it under `[classification]` (or opt into the name heuristic). The spec carries no signal the tool could use instead. See [Type Classification](#type-classification).
 - The tool reasons about the declared interface in the spec sections. It does not analyze the function bodies, so a change in internal logic that keeps the same interface is invisible to it.
 - Appended struct fields are reported as warnings rather than errors. Whether they are truly safe depends on having a migration or default in place, which the tool cannot verify.
-- Comparison is by name. Renaming a type is seen as removing the old name and adding a new one, not as a rename.
+- Rename detection is structural and conservative. A type that is renamed *and* substantially rewritten in the same change falls below the similarity threshold and is reported as a removal plus an addition. See [Type Identity](#type-identity).
 
 ## Frequently Asked Questions
 
