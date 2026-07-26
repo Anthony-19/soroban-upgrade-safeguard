@@ -534,6 +534,7 @@ fn run() -> Result<()> {
                     );
                 }
             }
+        } // end match args.format
 
         // Exit precedence: a resource-limit violation (2) dominates ordinary
         // breaking changes / failures (1), so CI can special-case adversarial
