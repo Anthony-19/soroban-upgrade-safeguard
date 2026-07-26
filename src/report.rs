@@ -738,7 +738,15 @@ impl SafetyReport {
             output.push_str("\n---\n\n");
         }
 
+        self.append_metrics_markdown(&mut output);
+
         output
+    }
+
+    /// Append the informational build-metrics table to Markdown output.
+    /// Full implementation comes from the upstream main branch (BuildMetrics).
+    fn append_metrics_markdown(&self, _output: &mut String) {
+        // Populated by main's BuildMetrics feature; no-op on this branch.
     }
 
     /// Generate GitHub Actions workflow command output.
