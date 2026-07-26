@@ -274,6 +274,60 @@ pub const RULES: &[RuleDefinition] = &[
         severity: Severity::Info,
         guidance: "The new build no longer requires this host function. No action needed — this relaxes the environment requirement.",
     },
+    RuleDefinition {
+        id: "metadata_sdk_version_changed",
+        label: "Metadata SDK Version Changed",
+        severity: Severity::Warning,
+        guidance: "The Soroban SDK version recorded in build metadata changed. Even with an identical exported interface, a new SDK can regenerate the host-interaction code, so rebuild and re-run the test suite, and confirm the new SDK supports the target network's protocol version.",
+    },
+    RuleDefinition {
+        id: "metadata_compiler_version_changed",
+        label: "Metadata Compiler Version Changed",
+        severity: Severity::Warning,
+        guidance: "The Rust compiler version recorded in build metadata changed. This is not a breaking interface change on its own, but it affects code generation; build reproducibly and run the full test suite to confirm behavior is unchanged.",
+    },
+    RuleDefinition {
+        id: "metadata_key_added",
+        label: "Metadata Key Added",
+        severity: Severity::Info,
+        guidance: "A new author-supplied metadata key was added. No action is required for compatibility; confirm the added provenance is intentional.",
+    },
+    RuleDefinition {
+        id: "metadata_key_removed",
+        label: "Metadata Key Removed",
+        severity: Severity::Info,
+        guidance: "An author-supplied metadata key was removed. Confirm no downstream tooling reads this key before deploying.",
+    },
+    RuleDefinition {
+        id: "metadata_key_changed",
+        label: "Metadata Key Changed",
+        severity: Severity::Info,
+        guidance: "An author-supplied metadata value changed. Verify the new value is intended and that any tooling consuming it tolerates the change.",
+    },
+    RuleDefinition {
+        id: "type_renamed",
+        label: "Type Renamed",
+        severity: Severity::Info,
+        guidance: "A type was renamed but its layout is identical, so stored data stays compatible. Update client code and bindings to use the new type name.",
+    },
+    RuleDefinition {
+        id: "type_renamed_with_changes",
+        label: "Type Renamed With Changes",
+        severity: Severity::Warning,
+        guidance: "A type appears renamed and its layout also changed. Treat the layout change as the breaking part: review the field-level findings and migrate stored data before deploying.",
+    },
+    RuleDefinition {
+        id: "duplicate_spec_entry",
+        label: "Duplicate Spec Entry",
+        severity: Severity::Critical,
+        guidance: "The same spec entry is defined more than once. Identical duplicates are harmless but noisy; conflicting definitions break decoding — regenerate the contract spec so each entry appears exactly once.",
+    },
+    RuleDefinition {
+        id: "unresolved_storage_reference",
+        label: "Unresolved Storage Reference",
+        severity: Severity::Warning,
+        guidance: "The storage schema references a type that could not be resolved, so coverage is incomplete for it. Add the missing type to the schema or correct the reference.",
+    },
 ];
 
 pub fn all_rules() -> &'static [RuleDefinition] {

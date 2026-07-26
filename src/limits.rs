@@ -97,6 +97,8 @@ pub enum EntryKind {
     Spec,
     /// `contractenvmetav0` entries.
     EnvMeta,
+    /// `contractmetav0` entries.
+    Meta,
 }
 
 impl EntryKind {
@@ -104,6 +106,7 @@ impl EntryKind {
         match self {
             EntryKind::Spec => "contractspecv0",
             EntryKind::EnvMeta => "contractenvmetav0",
+            EntryKind::Meta => "contractmetav0",
         }
     }
 }

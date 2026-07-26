@@ -1,7 +1,7 @@
 use crate::classification::{ClassificationConfig, TypeClass};
 use crate::limits::{LimitError, ResourcePolicy};
 use crate::mapper::LayoutMapper;
-use crate::parser::ContractEnvMeta;
+use crate::parser::{ContractEnvMeta, ContractMeta, RUST_VERSION_KEY, SDK_VERSION_KEY};
 use crate::rename::{match_renames, Rename};
 use crate::spec::{ContractSpec, DuplicateEntry};
 use crate::storage_schema::ResolvedStorageSchema;
@@ -185,6 +185,15 @@ pub const ALL_CATEGORIES: &[&str] = &[
     // WASM host function imports.
     "Host Import Added",
     "Host Import Removed",
+    // Contract metadata (`contractmetav0`) provenance and author keys.
+    "Metadata SDK Version Changed",
+    "Metadata Compiler Version Changed",
+    "Metadata Key Added",
+    "Metadata Key Removed",
+    "Metadata Key Changed",
+    // Spec-section integrity and storage-schema coverage.
+    "Duplicate Spec Entry",
+    "Unresolved Storage Reference",
 ];
 
 /// Compare decoded environment metadata between two contract builds.
@@ -261,6 +270,114 @@ fn format_env_metadata_change(
         }
         (None, None) => unreachable!("compare_env_metadata filters identical/absent pairs"),
     }
+}
+
+/// Compare decoded contract metadata (`contractmetav0`) between two builds.
+///
+/// The Soroban SDK records build provenance here — its own version
+/// ([`SDK_VERSION_KEY`]) and the Rust compiler version ([`RUST_VERSION_KEY`]) —
+/// and authors may add their own keys via `contractmeta!`. Provenance changes
+/// are reported as distinct, higher-signal findings (`Warning`) than arbitrary
+/// author-key changes (`Info`). Neither is a storage/interface layout break, so
+/// nothing here is `Critical`: that severity stays reserved for breaks that
+/// actually orphan data or callers.
+pub fn compare_contract_metadata(
+    old: Option<&ContractMeta>,
+    new: Option<&ContractMeta>,
+    report: &mut DiffReport,
+) {
+    let old_pairs = old.map(ContractMeta::pairs).unwrap_or_default();
+    let new_pairs = new.map(ContractMeta::pairs).unwrap_or_default();
+
+    // Reserved provenance keys, reported as dedicated version findings.
+    compare_meta_version(
+        "Metadata SDK Version Changed",
+        "Soroban SDK version",
+        old_pairs.get(SDK_VERSION_KEY),
+        new_pairs.get(SDK_VERSION_KEY),
+        report,
+    );
+    compare_meta_version(
+        "Metadata Compiler Version Changed",
+        "Rust compiler version",
+        old_pairs.get(RUST_VERSION_KEY),
+        new_pairs.get(RUST_VERSION_KEY),
+        report,
+    );
+
+    // Generic author-supplied keys: everything that is not a reserved key. The
+    // union is sorted (BTreeSet) so findings are emitted in a stable order.
+    let keys: BTreeSet<&str> = old_pairs
+        .keys()
+        .chain(new_pairs.keys())
+        .map(String::as_str)
+        .filter(|k| *k != SDK_VERSION_KEY && *k != RUST_VERSION_KEY)
+        .collect();
+
+    for key in keys {
+        match (old_pairs.get(key), new_pairs.get(key)) {
+            (Some(old_val), Some(new_val)) if old_val != new_val => push_meta_key_finding(
+                report,
+                "Metadata Key Changed",
+                format!("Metadata key '{key}' changed from '{old_val}' to '{new_val}'."),
+                key,
+            ),
+            (Some(_), Some(_)) => {}
+            (None, Some(new_val)) => push_meta_key_finding(
+                report,
+                "Metadata Key Added",
+                format!("Metadata key '{key}' was added with value '{new_val}'."),
+                key,
+            ),
+            (Some(old_val), None) => push_meta_key_finding(
+                report,
+                "Metadata Key Removed",
+                format!("Metadata key '{key}' was removed (was '{old_val}')."),
+                key,
+            ),
+            (None, None) => {}
+        }
+    }
+}
+
+/// Emit a provenance-version finding (`Warning`) when a reserved metadata key's
+/// value changed, appeared, or disappeared. `label` is the human noun (e.g.
+/// "Soroban SDK version").
+fn compare_meta_version(
+    category: &str,
+    label: &str,
+    old: Option<&String>,
+    new: Option<&String>,
+    report: &mut DiffReport,
+) {
+    let message = match (old, new) {
+        (Some(o), Some(n)) if o == n => return,
+        (Some(o), Some(n)) => format!("{label} changed from '{o}' to '{n}'."),
+        (None, Some(n)) => format!("{label} is now recorded as '{n}' (previously absent)."),
+        (Some(o), None) => format!("{label} is no longer recorded (was '{o}')."),
+        (None, None) => return,
+    };
+    report.findings.push(Finding {
+        severity: Severity::Warning,
+        category: category.to_string(),
+        message,
+        type_name: None,
+        target: None,
+        classification: None,
+    });
+}
+
+/// Push a generic author-supplied metadata-key finding (`Info`), keyed on the
+/// metadata key so a suppression rule can target it precisely.
+fn push_meta_key_finding(report: &mut DiffReport, category: &str, message: String, key: &str) {
+    report.findings.push(Finding {
+        severity: Severity::Info,
+        category: category.to_string(),
+        message,
+        type_name: None,
+        target: Some(key.to_string()),
+        classification: None,
+    });
 }
 
 /// The human-facing noun used in a message for a type of the given class.
@@ -1385,7 +1502,11 @@ pub fn compare_with_policy(
     policy: &ResourcePolicy,
 ) -> Result<DiffReport, LimitError> {
     let _ = policy; // limit enforcement lives in the mapper walk; nothing to enforce here
-    Ok(compare_with_classification(old, new, &ClassificationConfig::none()))
+    Ok(compare_with_classification(
+        old,
+        new,
+        &ClassificationConfig::none(),
+    ))
 }
 
 /// Inject duplicate-spec-entry findings into `report`.
@@ -1417,7 +1538,11 @@ pub fn report_duplicate_spec_entries(
                 dup.name,
                 dup.sections.len(),
                 sections.join(", "),
-                if dup.is_identical { " — identical definitions" } else { " — CONFLICTING definitions" }
+                if dup.is_identical {
+                    " — identical definitions"
+                } else {
+                    " — CONFLICTING definitions"
+                }
             ),
             type_name: Some(dup.name.clone()),
             target: Some(dup.name.clone()),
@@ -1436,10 +1561,7 @@ pub fn compare_storage_schemas(
 }
 
 /// Report unresolved storage-schema type references as `Warning` findings.
-pub fn report_unresolved_storage_references(
-    unresolved: &[String],
-    report: &mut DiffReport,
-) {
+pub fn report_unresolved_storage_references(unresolved: &[String], report: &mut DiffReport) {
     for name in unresolved {
         report.findings.push(Finding {
             severity: Severity::Warning,
@@ -1468,8 +1590,14 @@ pub fn compare_wasm_imports(
 ) {
     use std::collections::BTreeSet;
 
-    let old_set: BTreeSet<(&str, &str)> = old_imports.iter().map(|(m, n)| (m.as_str(), n.as_str())).collect();
-    let new_set: BTreeSet<(&str, &str)> = new_imports.iter().map(|(m, n)| (m.as_str(), n.as_str())).collect();
+    let old_set: BTreeSet<(&str, &str)> = old_imports
+        .iter()
+        .map(|(m, n)| (m.as_str(), n.as_str()))
+        .collect();
+    let new_set: BTreeSet<(&str, &str)> = new_imports
+        .iter()
+        .map(|(m, n)| (m.as_str(), n.as_str()))
+        .collect();
 
     // Newly required host functions (in new, not in old)
     for (module, name) in &new_set {
@@ -1512,7 +1640,7 @@ pub fn compare_wasm_imports(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{ScEnvMetaEntry, ScSpecTypeUdt, StringM, VecM};
+    use stellar_xdr::curr::{ScEnvMetaEntry, ScMetaEntry, ScMetaV0, ScSpecTypeUdt, StringM, VecM};
 
     /// Helper: build a minimal ContractSpec with the given structs.
     fn spec_with_structs(structs: Vec<(&str, Vec<(&str, ScSpecTypeDef)>)>) -> ContractSpec {
@@ -1854,6 +1982,136 @@ mod tests {
         let new = env_meta(22, 0);
         let mut report = DiffReport::default();
         compare_env_metadata(Some(&old), Some(&new), &mut report);
+
+        let safety = crate::report::SafetyReport::new(&report);
+        assert!(safety.is_safe);
+        assert_eq!(safety.critical_count, 0);
+    }
+
+    fn contract_meta(pairs: &[(&str, &str)]) -> ContractMeta {
+        ContractMeta {
+            entries: pairs
+                .iter()
+                .map(|&(k, v)| {
+                    ScMetaEntry::ScMetaV0(ScMetaV0 {
+                        key: k.try_into().unwrap(),
+                        val: v.try_into().unwrap(),
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn meta_sdk_version_change_is_warning() {
+        let old = contract_meta(&[("rssdkver", "21.6.0"), ("rsver", "1.79.0")]);
+        let new = contract_meta(&[("rssdkver", "22.0.0"), ("rsver", "1.79.0")]);
+        let mut report = DiffReport::default();
+        compare_contract_metadata(Some(&old), Some(&new), &mut report);
+
+        assert_eq!(report.findings.len(), 1);
+        let f = &report.findings[0];
+        assert_eq!(f.severity, Severity::Warning);
+        assert_eq!(f.category, "Metadata SDK Version Changed");
+        assert!(f.message.contains("Soroban SDK version"));
+    }
+
+    #[test]
+    fn meta_compiler_version_change_is_warning() {
+        let old = contract_meta(&[("rsver", "1.79.0")]);
+        let new = contract_meta(&[("rsver", "1.80.0")]);
+        let mut report = DiffReport::default();
+        compare_contract_metadata(Some(&old), Some(&new), &mut report);
+
+        assert_eq!(report.findings.len(), 1);
+        let f = &report.findings[0];
+        assert_eq!(f.severity, Severity::Warning);
+        assert_eq!(f.category, "Metadata Compiler Version Changed");
+        assert!(f.message.contains("Rust compiler version"));
+    }
+
+    #[test]
+    fn meta_generic_key_added_is_info() {
+        let old = contract_meta(&[]);
+        let new = contract_meta(&[("author", "acme")]);
+        let mut report = DiffReport::default();
+        compare_contract_metadata(Some(&old), Some(&new), &mut report);
+
+        assert_eq!(report.findings.len(), 1);
+        let f = &report.findings[0];
+        assert_eq!(f.severity, Severity::Info);
+        assert_eq!(f.category, "Metadata Key Added");
+        assert_eq!(f.target.as_deref(), Some("author"));
+    }
+
+    #[test]
+    fn meta_generic_key_removed_is_info() {
+        let old = contract_meta(&[("author", "acme")]);
+        let new = contract_meta(&[]);
+        let mut report = DiffReport::default();
+        compare_contract_metadata(Some(&old), Some(&new), &mut report);
+
+        assert_eq!(report.findings.len(), 1);
+        let f = &report.findings[0];
+        assert_eq!(f.severity, Severity::Info);
+        assert_eq!(f.category, "Metadata Key Removed");
+        assert_eq!(f.target.as_deref(), Some("author"));
+    }
+
+    #[test]
+    fn meta_generic_key_changed_is_info() {
+        let old = contract_meta(&[("author", "acme")]);
+        let new = contract_meta(&[("author", "globex")]);
+        let mut report = DiffReport::default();
+        compare_contract_metadata(Some(&old), Some(&new), &mut report);
+
+        assert_eq!(report.findings.len(), 1);
+        let f = &report.findings[0];
+        assert_eq!(f.severity, Severity::Info);
+        assert_eq!(f.category, "Metadata Key Changed");
+        assert!(f.message.contains("globex"));
+    }
+
+    #[test]
+    fn meta_version_and_generic_are_distinct_findings() {
+        // Version bumps and author-key changes are graded differently and must
+        // not collapse into one finding.
+        let old = contract_meta(&[("rssdkver", "21.6.0"), ("author", "acme")]);
+        let new = contract_meta(&[("rssdkver", "22.0.0"), ("author", "globex")]);
+        let mut report = DiffReport::default();
+        compare_contract_metadata(Some(&old), Some(&new), &mut report);
+
+        assert_eq!(report.findings.len(), 2);
+        assert!(report.findings.iter().any(
+            |f| f.category == "Metadata SDK Version Changed" && f.severity == Severity::Warning
+        ));
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.category == "Metadata Key Changed" && f.severity == Severity::Info));
+    }
+
+    #[test]
+    fn meta_absent_in_both_produces_no_finding() {
+        let mut report = DiffReport::default();
+        compare_contract_metadata(None, None, &mut report);
+        assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn meta_identical_produces_no_finding() {
+        let meta = contract_meta(&[("rssdkver", "21.6.0"), ("author", "acme")]);
+        let mut report = DiffReport::default();
+        compare_contract_metadata(Some(&meta), Some(&meta), &mut report);
+        assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn meta_findings_do_not_affect_is_safe() {
+        let old = contract_meta(&[("rssdkver", "21.6.0")]);
+        let new = contract_meta(&[("rssdkver", "22.0.0")]);
+        let mut report = DiffReport::default();
+        compare_contract_metadata(Some(&old), Some(&new), &mut report);
 
         let safety = crate::report::SafetyReport::new(&report);
         assert!(safety.is_safe);
