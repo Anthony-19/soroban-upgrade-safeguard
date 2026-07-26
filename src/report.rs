@@ -203,6 +203,91 @@ pub struct ReportedFinding {
     pub remediation: Option<String>,
 }
 
+/// Per-build size and interface-count metrics, carried in the report for all
+/// three output formats. These are purely informational and never affect
+/// `is_safe`, the exit code, or the recommended bump.
+#[derive(Debug, Clone, Serialize)]
+pub struct BuildMetrics {
+    /// Total WASM binary size in bytes for the old build.
+    pub old_size_bytes: usize,
+    /// Total WASM binary size in bytes for the new build.
+    pub new_size_bytes: usize,
+    /// Byte delta: `new_size_bytes as i64 - old_size_bytes as i64`.
+    pub size_delta_bytes: i64,
+    /// Number of exported functions in the old spec.
+    pub old_function_count: usize,
+    /// Number of exported functions in the new spec.
+    pub new_function_count: usize,
+    /// Number of structs in the old spec.
+    pub old_struct_count: usize,
+    /// Number of structs in the new spec.
+    pub new_struct_count: usize,
+    /// Number of enums in the old spec.
+    pub old_enum_count: usize,
+    /// Number of enums in the new spec.
+    pub new_enum_count: usize,
+    /// Number of unions in the old spec.
+    pub old_union_count: usize,
+    /// Number of unions in the new spec.
+    pub new_union_count: usize,
+    /// Number of error enums in the old spec.
+    pub old_error_enum_count: usize,
+    /// Number of error enums in the new spec.
+    pub new_error_enum_count: usize,
+}
+
+impl BuildMetrics {
+    /// Construct metrics from raw byte lengths and spec counts.
+    pub fn new(
+        old_size_bytes: usize,
+        new_size_bytes: usize,
+        old_fn: usize,
+        new_fn: usize,
+        old_struct: usize,
+        new_struct: usize,
+        old_enum: usize,
+        new_enum: usize,
+        old_union: usize,
+        new_union: usize,
+        old_err: usize,
+        new_err: usize,
+    ) -> Self {
+        Self {
+            old_size_bytes,
+            new_size_bytes,
+            size_delta_bytes: new_size_bytes as i64 - old_size_bytes as i64,
+            old_function_count: old_fn,
+            new_function_count: new_fn,
+            old_struct_count: old_struct,
+            new_struct_count: new_struct,
+            old_enum_count: old_enum,
+            new_enum_count: new_enum,
+            old_union_count: old_union,
+            new_union_count: new_union,
+            old_error_enum_count: old_err,
+            new_error_enum_count: new_err,
+        }
+    }
+
+    /// Format byte size as a human-readable string (bytes / KB / MB).
+    pub fn format_bytes(n: usize) -> String {
+        if n >= 1_048_576 {
+            format!("{:.2} MB", n as f64 / 1_048_576.0)
+        } else if n >= 1024 {
+            format!("{:.2} KB", n as f64 / 1024.0)
+        } else {
+            format!("{} B", n)
+        }
+    }
+
+    /// Format a signed byte delta as "+X KB" / "-X KB" etc.
+    pub fn format_delta(d: i64) -> String {
+        let abs = d.unsigned_abs() as usize;
+        let sign = if d >= 0 { "+" } else { "-" };
+        format!("{}{}", sign, Self::format_bytes(abs))
+    }
+}
+
 /// A structured container for aggregated comparison findings.
 pub struct SafetyReport {
     pub critical_count: usize,
@@ -232,21 +317,14 @@ pub struct SafetyReport {
     /// Human-readable summary of the new contract spec.
     /// Populated by the canonical pipeline so callers don't need to re-extract metadata.
     pub new_spec_summary: Option<String>,
-    /// Resolved configuration settings recorded in this report.
-    pub settings: ReportSettings,
-}
-
-/// Material configuration settings recorded in the safety report for auditability.
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct ReportSettings {
-    pub strict: bool,
-    pub explain: bool,
-    pub max_suppressions: Option<usize>,
-    pub allow_targetless: Option<bool>,
-    pub max_xdr_depth: u32,
-    pub max_xdr_len: usize,
-    pub max_entries: usize,
-    pub max_walk_depth: usize,
+    /// Build size and interface-count metrics. `None` when the pipeline did not
+    /// supply byte sizes (e.g. in some library callers that use `compare_wasm_bytes`
+    /// without access to the original slices' lengths — though in practice the
+    /// canonical pipeline always populates this).
+    pub metrics: Option<BuildMetrics>,
+    /// Suppression rules from the config that matched no finding during this run.
+    /// Non-empty indicates a potential typo or a stale rule, surfaced to stderr.
+    pub unmatched_suppressions: Vec<crate::suppression::SuppressionRule>,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -280,6 +358,19 @@ pub struct SafetyReportJson<'a> {
     pub baseline_source: Option<&'a str>,
     pub verified_code_hash: Option<&'a str>,
     pub findings_by_category: BTreeMap<&'a str, &'a Vec<ReportedFinding>>,
+    /// Build size and interface-count metrics (always present in CLI output).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<&'a BuildMetrics>,
+    /// Suppression rules from the config that matched no finding.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unmatched_suppressions: Vec<UnmatchedSuppressionJson>,
+}
+
+/// JSON representation of a suppression rule that matched no finding.
+#[derive(Serialize)]
+pub struct UnmatchedSuppressionJson {
+    pub category: String,
+    pub target: Option<String>,
 }
 
 impl SafetyReport {
@@ -326,6 +417,10 @@ impl SafetyReport {
         let mut failing_warning_count = 0;
         let mut findings_by_category: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
 
+        // Track which rule indices actually matched at least one finding.
+        let mut matched_rule_indices: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+
         for finding in &diff.findings {
             match finding.severity {
                 Severity::Critical => critical_count += 1,
@@ -333,7 +428,7 @@ impl SafetyReport {
                 Severity::Info => info_count += 1,
             }
 
-            let rule = suppressions.matching_rule(finding);
+            let rule = suppressions.matching_rule_with_index(finding);
             let suppressed = rule.is_some();
             if suppressed {
                 suppressed_count += 1;
@@ -348,11 +443,18 @@ impl SafetyReport {
                 }
             }
 
+            // Record which rule index matched (if any).
+            if let Some((idx, _)) = rule {
+                matched_rule_indices.insert(idx);
+            }
+
+            let rule_ref = rule.map(|(_, r)| r);
+
             let rule_id = canonical_rule_id(&finding.category)
                 .unwrap_or_else(|| finding.category.as_str())
                 .to_string();
             let remediation = if explain {
-                guidance_for_rule_id(&rule_id).map(String::from)
+                get_remediation_guidance(&rule_id).map(String::from)
             } else {
                 None
             };
@@ -366,13 +468,22 @@ impl SafetyReport {
                     finding: finding.clone(),
                     fingerprint,
                     suppressed,
-                    suppression_reason: rule.and_then(|r| r.reason.clone()),
-                    suppression_author: rule.and_then(|r| r.author.clone()),
-                    suppression_expiry: rule.and_then(|r| r.expiry.clone()),
-                    suppression_fingerprint: rule.and_then(|r| r.fingerprint.clone()),
+                    suppression_reason: rule_ref.and_then(|r| r.reason.clone()),
+                    suppression_author: rule_ref.and_then(|r| r.author.clone()),
+                    suppression_expiry: rule_ref.and_then(|r| r.expiry.clone()),
+                    suppression_fingerprint: rule_ref.and_then(|r| r.fingerprint.clone()),
                     remediation,
                 });
         }
+
+        // Build the list of suppression rules that never matched any finding.
+        let unmatched_suppressions: Vec<crate::suppression::SuppressionRule> = suppressions
+            .rules
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !matched_rule_indices.contains(idx))
+            .map(|(_, r)| r.clone())
+            .collect();
 
         let is_safe = if strict {
             failing_critical_count == 0 && failing_warning_count == 0
@@ -397,7 +508,8 @@ impl SafetyReport {
             scope: AnalysisScope::default(),
             old_spec_summary: None,
             new_spec_summary: None,
-            settings: settings.clone(),
+            metrics: None,
+            unmatched_suppressions,
         }
     }
 
@@ -451,6 +563,14 @@ impl SafetyReport {
 
     /// Build a serializable, machine-readable view of this report.
     pub fn to_json(&self) -> SafetyReportJson<'_> {
+        let unmatched_suppressions = self
+            .unmatched_suppressions
+            .iter()
+            .map(|r| UnmatchedSuppressionJson {
+                category: r.rule_id.clone(),
+                target: r.target.clone(),
+            })
+            .collect();
         SafetyReportJson {
             is_safe: self.is_safe,
             strict: self.strict,
@@ -472,6 +592,8 @@ impl SafetyReport {
                 .iter()
                 .map(|(k, v)| (k.as_str(), v))
                 .collect(),
+            metrics: self.metrics.as_ref(),
+            unmatched_suppressions,
         }
     }
 
@@ -606,6 +728,7 @@ impl SafetyReport {
         if self.total_findings == 0 {
             output.push_str(&"No relevant changes detected. The exported interface is identical in its exports and types.\n".green().to_string());
             output.push_str(&format!("\n{}\n", STORAGE_NOT_VERIFIED_NOTE.dimmed()));
+            self.append_metrics_text(&mut output);
             return output;
         }
 
@@ -739,7 +862,57 @@ impl SafetyReport {
             }
         }
 
+        self.append_metrics_text(&mut output);
+
         output
+    }
+
+    /// Append the informational build-metrics block to text output.
+    fn append_metrics_text(&self, output: &mut String) {
+        if let Some(ref m) = self.metrics {
+            output.push_str(
+                &"\n========================================\n"
+                    .bold()
+                    .to_string(),
+            );
+            output.push_str(
+                &"📊 BUILD METRICS\n"
+                    .bold()
+                    .cyan()
+                    .to_string(),
+            );
+            output.push_str(
+                &"========================================\n"
+                    .bold()
+                    .to_string(),
+            );
+            output.push_str(&format!(
+                "WASM size:  {} → {} ({})\n",
+                BuildMetrics::format_bytes(m.old_size_bytes),
+                BuildMetrics::format_bytes(m.new_size_bytes),
+                BuildMetrics::format_delta(m.size_delta_bytes),
+            ));
+            output.push_str(&format!(
+                "Functions:  {} → {}\n",
+                m.old_function_count, m.new_function_count
+            ));
+            output.push_str(&format!(
+                "Structs:    {} → {}\n",
+                m.old_struct_count, m.new_struct_count
+            ));
+            output.push_str(&format!(
+                "Enums:      {} → {}\n",
+                m.old_enum_count, m.new_enum_count
+            ));
+            output.push_str(&format!(
+                "Unions:     {} → {}\n",
+                m.old_union_count, m.new_union_count
+            ));
+            output.push_str(&format!(
+                "Error Enums:{} → {}\n",
+                m.old_error_enum_count, m.new_error_enum_count
+            ));
+        }
     }
 
     /// Generate a structured Markdown output.
@@ -816,6 +989,7 @@ impl SafetyReport {
         if self.total_findings == 0 {
             output.push_str("No relevant changes detected. The exported interface is identical in its exports and types.\n\n");
             output.push_str(&format!("> {}\n", STORAGE_NOT_VERIFIED_NOTE));
+            self.append_metrics_markdown(&mut output);
             return output;
         }
 
@@ -886,139 +1060,51 @@ impl SafetyReport {
             output.push_str("\n---\n\n");
         }
 
+        self.append_metrics_markdown(&mut output);
+
         output
     }
 
-    /// Apply a category filter to the report, removing findings from
-    /// excluded / non-included categories. The original `total_findings`
-    /// count is preserved; the difference is reported via `filtered_count`.
-    /// The safety verdict is recalculated based on remaining findings.
-    pub fn apply_category_filter(&mut self, filter: &CategoryFilter) {
-        let mut new_categories: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
-        let mut filtered = 0usize;
-        let mut critical = 0usize;
-        let mut warning = 0usize;
-        let mut info = 0usize;
-        let mut failing_critical = 0usize;
-        let mut failing_warning = 0usize;
-
-        for (category, findings) in &self.findings_by_category {
-            if filter.should_include(category) {
-                for rf in findings {
-                    match rf.finding.severity {
-                        Severity::Critical => critical += 1,
-                        Severity::Warning => warning += 1,
-                        Severity::Info => info += 1,
-                    }
-                    if !rf.suppressed {
-                        match rf.finding.severity {
-                            Severity::Critical => failing_critical += 1,
-                            Severity::Warning => failing_warning += 1,
-                            _ => {}
-                        }
-                    }
-                }
-                new_categories.insert(category.to_string(), findings.clone());
-            } else {
-                filtered += findings.len();
-            }
+    /// Append the informational build-metrics table to Markdown output.
+    fn append_metrics_markdown(&self, output: &mut String) {
+        if let Some(ref m) = self.metrics {
+            output.push_str("## 📊 Build Metrics\n\n");
+            output.push_str("| Metric | Old | New | Delta |\n");
+            output.push_str("| :--- | ---: | ---: | ---: |\n");
+            output.push_str(&format!(
+                "| **WASM size** | {} | {} | {} |\n",
+                BuildMetrics::format_bytes(m.old_size_bytes),
+                BuildMetrics::format_bytes(m.new_size_bytes),
+                BuildMetrics::format_delta(m.size_delta_bytes),
+            ));
+            let delta_fn = m.new_function_count as i64 - m.old_function_count as i64;
+            let delta_struct = m.new_struct_count as i64 - m.old_struct_count as i64;
+            let delta_enum = m.new_enum_count as i64 - m.old_enum_count as i64;
+            let delta_union = m.new_union_count as i64 - m.old_union_count as i64;
+            let delta_err = m.new_error_enum_count as i64 - m.old_error_enum_count as i64;
+            let fmt_count = |d: i64| if d >= 0 { format!("+{}", d) } else { format!("{}", d) };
+            output.push_str(&format!(
+                "| **Functions** | {} | {} | {} |\n",
+                m.old_function_count, m.new_function_count, fmt_count(delta_fn)
+            ));
+            output.push_str(&format!(
+                "| **Structs** | {} | {} | {} |\n",
+                m.old_struct_count, m.new_struct_count, fmt_count(delta_struct)
+            ));
+            output.push_str(&format!(
+                "| **Enums** | {} | {} | {} |\n",
+                m.old_enum_count, m.new_enum_count, fmt_count(delta_enum)
+            ));
+            output.push_str(&format!(
+                "| **Unions** | {} | {} | {} |\n",
+                m.old_union_count, m.new_union_count, fmt_count(delta_union)
+            ));
+            output.push_str(&format!(
+                "| **Error Enums** | {} | {} | {} |\n",
+                m.old_error_enum_count, m.new_error_enum_count, fmt_count(delta_err)
+            ));
+            output.push('\n');
         }
-
-        self.filtered_count = filtered;
-        self.critical_count = critical;
-        self.warning_count = warning;
-        self.info_count = info;
-        self.findings_by_category = new_categories;
-        self.is_safe = if self.strict {
-            failing_critical == 0 && failing_warning == 0
-        } else {
-            failing_critical == 0
-        };
-        self.category_filter = filter.clone();
-    }
-}
-
-/// All known finding categories used by the analysis engine.
-pub const KNOWN_CATEGORIES: &[&str] = &[
-    "Environment",
-    "Function Removed",
-    "Function Documentation Changed",
-    "Function Added",
-    "Function Signature Changed",
-    "Parameter Renamed",
-    "Parameter Reordered",
-    "Parameter Type Changed",
-    "Return Type Changed",
-    "Event Definition Removed",
-    "Struct Removed",
-    "Struct Documentation Changed",
-    "Struct Added",
-    "Struct Field Removed",
-    "Event Field Removed",
-    "Struct Field Reordered",
-    "Event Field Reordered",
-    "Struct Field Type Changed",
-    "Event Field Type Changed",
-    "Struct Field Added",
-    "Event Enum Removed",
-    "Enum Removed",
-    "Enum Documentation Changed",
-    "Enum Added",
-    "Enum Case Removed",
-    "Event Enum Case Removed",
-    "Enum Case Value Changed",
-    "Event Enum Case Value Changed",
-    "Enum Case Added",
-    "Event Enum Case Added",
-    "Union Removed",
-    "Union Added",
-    "Union Case Removed",
-    "Union Case Reordered",
-    "Union Case Type Changed",
-    "Union Case Added",
-    "Error Enum Removed",
-    "Error Enum Added",
-    "Error Enum Case Removed",
-    "Error Enum Case Value Changed",
-    "Error Enum Case Added",
-    "Cascading Layout Break",
-];
-
-/// Validate that the given category name is a known category.
-/// Returns an error message listing unknown categories if any are invalid.
-pub fn validate_categories(categories: &[String]) -> Result<(), Vec<String>> {
-    let known: HashSet<&str> = KNOWN_CATEGORIES.iter().copied().collect();
-    let unknown: Vec<String> = categories
-        .iter()
-        .filter(|c| !known.contains(c.as_str()))
-        .cloned()
-        .collect();
-    if unknown.is_empty() {
-        Ok(())
-    } else {
-        Err(unknown)
-    }
-}
-
-/// A filter that restricts which finding categories are included in the report.
-#[derive(Debug, Clone, Default)]
-pub struct CategoryFilter {
-    /// Only include these categories (empty = no inclusion restriction).
-    pub include: Option<HashSet<String>>,
-    /// Exclude these categories.
-    pub exclude: HashSet<String>,
-}
-
-impl CategoryFilter {
-    /// Returns `true` if the category should be included in the report output.
-    pub fn should_include(&self, category: &str) -> bool {
-        if self.exclude.contains(category) {
-            return false;
-        }
-        if let Some(ref include) = self.include {
-            return include.contains(category);
-        }
-        true
     }
 }
 
@@ -1196,7 +1282,8 @@ mod tests {
             scope: AnalysisScope::default(),
             old_spec_summary: None,
             new_spec_summary: None,
-            settings: ReportSettings::default(),
+            metrics: None,
+            unmatched_suppressions: Vec::new(),
         };
 
         // Identical upgrade -> patch

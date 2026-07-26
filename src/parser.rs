@@ -53,9 +53,12 @@ pub struct SorobanMetadata {
     /// Number of distinct `contractspecv0` custom sections found.
     pub spec_section_count: usize,
     pub env_meta: Option<ContractEnvMeta>,
-    /// WASM import section: the host functions this module requires.
-    /// Each entry is `(module, name)`.
-    pub imports: Vec<(String, String)>,
+    /// Names of functions exported from this WASM binary's export section.
+    ///
+    /// These are the names visible to on-chain callers at runtime, which may
+    /// differ from the names declared in the `contractspecv0` spec. Tracking
+    /// both lets the diff layer catch mismatches and removed exports.
+    pub exported_function_names: std::collections::BTreeSet<String>,
 }
 
 /// Decodes concatenated ScSpecEntry XDR objects from raw bytes using the default
@@ -212,6 +215,9 @@ pub fn extract_metadata_with_policy(
                                 section.data_offset()
                             )
                         })?;
+                        // Tag each decoded entry with its source section index so
+                        // duplicate detection can report exactly which sections
+                        // carry conflicting definitions.
                         let tagged = entries
                             .into_iter()
                             .map(|e| TaggedSpecEntry::new(e, section_index));
@@ -219,6 +225,9 @@ pub fn extract_metadata_with_policy(
                         metadata.spec_section_count += 1;
                     }
                     "contractenvmetav0" => {
+                        // A malformed env-meta section is tolerated (best-effort, as
+                        // before), but a resource-limit violation is adversarial and
+                        // must not be silently swallowed.
                         match decode_env_meta_with_policy(section.data(), policy) {
                             Ok(env_meta) => metadata.env_meta = Some(env_meta),
                             Err(err) if find_limit_error(&err).is_some() => return Err(err),
@@ -228,14 +237,18 @@ pub fn extract_metadata_with_policy(
                     _ => {}
                 }
             }
-            Payload::ImportSection(reader) => {
-                for import in reader {
-                    let import = import.context("Failed to parse WASM import")?;
-                    if matches!(import.ty, wasmparser::TypeRef::Func(_)) {
-                        metadata.imports.push((
-                            import.module.to_string(),
-                            import.name.to_string(),
-                        ));
+            Payload::ExportSection(reader) => {
+                // Collect every exported function name from the binary's export
+                // section. These are the names visible to on-chain callers at
+                // runtime and may differ from the contractspecv0 declarations.
+                // We ignore non-function exports (memories, tables, globals).
+                for export in reader {
+                    if let Ok(export) = export {
+                        if export.kind == wasmparser::ExternalKind::Func {
+                            metadata
+                                .exported_function_names
+                                .insert(export.name.to_string());
+                        }
                     }
                 }
             }

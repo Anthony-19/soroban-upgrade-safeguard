@@ -249,9 +249,14 @@ pub fn compare_wasm_bytes_with_options(
         &mut diff_report,
     );
 
-    diff::compare_wasm_imports(
-        &old_meta.imports,
-        &new_meta.imports,
+    // Compare exported function names from the binary export sections.
+    // This catches a removed export that callers depend on, and also any
+    // mismatch between what the binary actually exports and what its spec claims.
+    diff::compare_exports(
+        &old_meta.exported_function_names,
+        &new_meta.exported_function_names,
+        &old_spec.functions.keys().cloned().collect(),
+        &new_spec.functions.keys().cloned().collect(),
         &mut diff_report,
     );
 
@@ -317,6 +322,23 @@ pub fn compare_wasm_bytes_with_options(
     safety_report.old_spec_summary = Some(old_spec_summary);
     safety_report.new_spec_summary = Some(new_spec_summary);
     safety_report.scope = scope;
+
+    // Populate build metrics so all output formats can report size and
+    // interface-count deltas without the caller needing to extract them.
+    safety_report.metrics = Some(report::BuildMetrics::new(
+        old_wasm.len(),
+        new_wasm.len(),
+        old_spec.functions.len(),
+        new_spec.functions.len(),
+        old_spec.structs.len(),
+        new_spec.structs.len(),
+        old_spec.enums.len(),
+        new_spec.enums.len(),
+        old_spec.unions.len(),
+        new_spec.unions.len(),
+        old_spec.error_enums.len(),
+        new_spec.error_enums.len(),
+    ));
 
     Ok(safety_report)
 }

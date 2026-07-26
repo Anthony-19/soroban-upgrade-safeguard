@@ -395,3 +395,71 @@ fn test_old_format_warning_output() {
         stderr
     );
 }
+
+#[test]
+fn unmatched_suppression_rule_is_reported_to_stderr() {
+    // One rule that WILL match (Struct Field Removed / ConfigData.threshold)
+    // and one rule with a deliberate typo in the target that will NOT match.
+    // The mismatched rule must appear in stderr; the matching one must not.
+    let config = write_config(
+        "unmatched-rule",
+        r#"
+        [[suppress]]
+        category = "Struct Field Removed"
+        target   = "ConfigData.threshold"
+        reason   = "Reviewed"
+
+        [[suppress]]
+        category = "Function Removed"
+        target   = "does_not_exist_typo"
+        reason   = "Stale rule"
+        "#,
+    );
+
+    let (_, stderr, _code) = run_raw(Some(&config), false);
+
+    // The unmatched rule (typo target) must be reported on stderr.
+    assert!(
+        stderr.contains("does_not_exist_typo") || stderr.contains("never matched"),
+        "stderr should mention the unmatched suppression rule: {stderr}"
+    );
+
+    // The matched rule (ConfigData.threshold) must NOT generate a notice.
+    assert!(
+        !stderr.contains("ConfigData.threshold"),
+        "stderr must not warn about a rule that did match: {stderr}"
+    );
+}
+
+#[test]
+fn matched_suppression_produces_no_unmatched_notice() {
+    // All three critical findings are suppressed; no rule is unused,
+    // so no unmatched-rule notice should appear on stderr.
+    let config = write_config(
+        "all-matched",
+        r#"
+        [[suppress]]
+        category = "Enum Case Value Changed"
+        target   = "StatusEvent.Paused"
+        reason   = "Reviewed"
+
+        [[suppress]]
+        category = "Function Signature Changed"
+        target   = "initialize"
+        reason   = "Reviewed"
+
+        [[suppress]]
+        category = "Struct Field Removed"
+        target   = "ConfigData.threshold"
+        reason   = "Reviewed"
+        "#,
+    );
+
+    let (_, stderr, code) = run_raw(Some(&config), false);
+
+    assert_eq!(code, 0, "all criticals suppressed -> must exit 0");
+    assert!(
+        !stderr.contains("never matched"),
+        "stderr must not warn about matched rules, got: {stderr}"
+    );
+}

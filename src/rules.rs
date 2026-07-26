@@ -263,16 +263,22 @@ pub const RULES: &[RuleDefinition] = &[
         guidance: "This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type.",
     },
     RuleDefinition {
-        id: "host_import_added",
-        label: "Host Import Added",
-        severity: Severity::Warning,
-        guidance: "The new build requires a host function that the old one did not. Verify that the target network's protocol version provides this function. Deploying to an older protocol will cause a runtime trap.",
+        id: "export_removed",
+        label: "Export Removed",
+        severity: Severity::Critical,
+        guidance: "This is a breaking change. The function is no longer exported by the binary. On-chain callers will receive a missing-export error. Restore the export or update all callers before upgrading.",
     },
     RuleDefinition {
-        id: "host_import_removed",
-        label: "Host Import Removed",
+        id: "export_added",
+        label: "Export Added",
         severity: Severity::Info,
-        guidance: "The new build no longer requires this host function. No action needed — this relaxes the environment requirement.",
+        guidance: "No action required. A new entry-point is now exported by the binary. Ensure the spec is updated to reflect this if the function is intended to be part of the public interface.",
+    },
+    RuleDefinition {
+        id: "export_spec_mismatch",
+        label: "Export Spec Mismatch",
+        severity: Severity::Critical,
+        guidance: "A function appears in the spec but not the binary (or vice versa). The spec and binary must agree on the callable surface. Align the spec and the export list before deploying.",
     },
 ];
 
