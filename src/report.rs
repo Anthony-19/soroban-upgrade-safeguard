@@ -3,6 +3,7 @@ use crate::limits::ResourcePolicy;
 use crate::rules::{canonical_rule_id, guidance_for_rule_id};
 use crate::suppression::SuppressionConfig;
 use colored::Colorize;
+use schemars::JsonSchema;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -121,7 +122,7 @@ impl AnalysisScope {
 }
 
 /// A machine-readable view of an [`AnalysisScope`] for `--format json`.
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub struct ScopeJson {
     pub exported_interface_analyzed: bool,
     pub env_metadata_analyzed: bool,
@@ -135,10 +136,10 @@ pub struct ScopeJson {
     /// Number of `contractspecv0` sections found in the new WASM.
     pub new_spec_section_count: usize,
     /// Names of duplicate entries detected in the old WASM (empty when clean).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub old_duplicate_names: Vec<String>,
     /// Names of duplicate entries detected in the new WASM (empty when clean).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub new_duplicate_names: Vec<String>,
     pub summary: String,
 }
@@ -173,7 +174,7 @@ impl AnalysisScope {
 /// The raw [`Finding`] from the diff layer is left untouched; suppression is a
 /// report-time concern layered on top. A suppressed finding is still listed in
 /// full — it simply does not count toward the failing set.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ReportedFinding {
     /// Stable rule id for this finding.
     pub rule_id: String,
@@ -184,7 +185,7 @@ pub struct ReportedFinding {
     /// The SHA-256 fingerprint computed for this finding.
     pub fingerprint: String,
     /// Whether a suppression rule acknowledged this finding.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suppressed: bool,
     /// The justification copied from the matching rule, if it provided one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -250,7 +251,7 @@ pub struct ReportSettings {
 }
 
 /// Severity counts, serialized as a nested `counts` object.
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub struct SeverityCounts {
     pub critical: usize,
     pub warning: usize,
@@ -261,7 +262,7 @@ pub struct SeverityCounts {
 ///
 /// Borrows from the owning report. Categories are stored in a [`BTreeMap`]
 /// so the emitted JSON has a stable, diffable key order.
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub struct SafetyReportJson<'a> {
     pub is_safe: bool,
     pub strict: bool,

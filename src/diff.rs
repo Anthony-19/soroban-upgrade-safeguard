@@ -5,6 +5,7 @@ use crate::parser::{ContractEnvMeta, ContractMeta, RUST_VERSION_KEY, SDK_VERSION
 use crate::rename::{match_renames, Rename};
 use crate::spec::{ContractSpec, DuplicateEntry};
 use crate::storage_schema::ResolvedStorageSchema;
+use schemars::JsonSchema;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use stellar_xdr::curr::{
@@ -14,7 +15,7 @@ use stellar_xdr::curr::{
 };
 
 /// Severity of a detected issue.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Critical,
@@ -23,7 +24,7 @@ pub enum Severity {
 }
 
 /// A single finding from the comparison analysis.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Finding {
     pub severity: Severity,
     pub category: String,
