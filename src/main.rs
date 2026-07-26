@@ -240,10 +240,12 @@ fn run() -> Result<()> {
         _ => None,
     };
 
-    // In JSON or Markdown mode, decorative progress goes to stderr so stdout
-    // stays a single, pristine document. In text mode it stays on stdout
-    // exactly as before.
-    let clean_stdout = args.format == OutputFormat::Json
+    // In JSON, Markdown, or github-actions mode, decorative progress goes to
+    // stderr so stdout stays a single, pristine document. An explicit output
+    // file also keeps stdout empty in text mode: the report is in that file
+    // and all progress belongs on stderr rather than alongside it.
+    let clean_stdout = args.output.is_some()
+        || args.format == OutputFormat::Json
         || args.format == OutputFormat::Markdown
         || args.format == OutputFormat::GithubActions;
     let progress = |line: String| {
@@ -670,25 +672,22 @@ fn run() -> Result<()> {
     safety_report.baseline_source = baseline_source.map(|s| s.to_string());
     safety_report.verified_code_hash = verified_hash_hex;
 
-    match args.format {
-        OutputFormat::Json => {
-            // Single JSON document to stdout; no decorative text, no ANSI codes.
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&safety_report.to_json())?
-            );
-        }
-        OutputFormat::Markdown => {
-            println!("{}", safety_report.generate_summary_markdown());
-        }
-        OutputFormat::Text => {
-            println!("{}", safety_report.generate_summary_text(args.explain));
-        }
-        OutputFormat::GithubActions => {
-            // No group title in single-pair mode; annotations appear at the
-            // top level of the run summary.
-            print!("{}", safety_report.generate_summary_github_actions(None));
-        }
+    // Render the report to a string first so --output can write it atomically.
+    let rendered = match args.format {
+        OutputFormat::Json => serde_json::to_string_pretty(&safety_report.to_json())?,
+        OutputFormat::Markdown => safety_report.generate_summary_markdown(),
+        OutputFormat::Text => safety_report.generate_summary_text(args.explain),
+        OutputFormat::GithubActions => safety_report.generate_summary_github_actions(None),
+    };
+
+    // Write the report — either to a file (--output) or to stdout.
+    if let Some(ref output_path) = args.output {
+        std::fs::write(output_path, &rendered).with_context(|| {
+            format!("Failed to write report to '{}'", output_path.display())
+        })?;
+        progress(format!("✅ Report written to: {}", output_path.display()));
+    } else {
+        print!("{}", rendered);
     }
 
     if !safety_report.is_safe {
