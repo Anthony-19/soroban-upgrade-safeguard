@@ -129,10 +129,11 @@ pub struct SorobanMetadata {
 }
 
 /// Decodes concatenated ScSpecEntry XDR objects from raw bytes using the default
-/// [`ResourcePolicy`]. Test-only convenience; production paths call
-/// [`decode_spec_entries_with_policy`] so limits can be configured.
-#[cfg(test)]
-fn decode_spec_entries(data: &[u8]) -> Result<Vec<ScSpecEntry>> {
+/// [`ResourcePolicy`]. Production paths call [`decode_spec_entries_with_policy`]
+/// so limits can be configured; this convenience wrapper exists for tests and
+/// for the `decode_spec_entries` fuzz target, which drives the XDR cursor loop
+/// directly on arbitrary bytes without first building a valid WASM wrapper.
+pub fn decode_spec_entries(data: &[u8]) -> Result<Vec<ScSpecEntry>> {
     decode_spec_entries_with_policy(data, &ResourcePolicy::default(), 0)
 }
 
