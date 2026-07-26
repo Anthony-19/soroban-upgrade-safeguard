@@ -10,11 +10,12 @@ Thank you for your interest in improving Soroban Upgrade Safeguard. This guide e
 4. [Building and Running](#building-and-running)
 5. [Testing](#testing)
 6. [Test Fixtures](#test-fixtures)
-7. [Coding Guidelines](#coding-guidelines)
-8. [Adding a New Detection Rule](#adding-a-new-detection-rule)
-9. [Commit and Pull Request Process](#commit-and-pull-request-process)
-10. [Reporting Bugs](#reporting-bugs)
-11. [Code of Conduct](#code-of-conduct)
+7. [Fuzzing](#fuzzing)
+8. [Coding Guidelines](#coding-guidelines)
+9. [Adding a New Detection Rule](#adding-a-new-detection-rule)
+10. [Commit and Pull Request Process](#commit-and-pull-request-process)
+11. [Reporting Bugs](#reporting-bugs)
+12. [Code of Conduct](#code-of-conduct)
 
 ## Ways to Contribute
 
@@ -119,6 +120,62 @@ Every behavior change should come with a test that fails before your change and 
 Integration tests compare real compiled contracts. The `tests/` directory contains a `build_fixtures.sh` helper and a `fixtures` directory with paired contract sources, along with a `wasm` directory for the compiled outputs.
 
 When you add a fixture, keep each pair minimal and focused on a single kind of change so the resulting test reads clearly. A fixture that mixes many unrelated changes makes failures hard to diagnose. Document briefly what the pair is meant to demonstrate, either in a short comment or in the test that consumes it.
+
+## Fuzzing
+
+The parsing path decodes input the tool does not control — a WASM binary, in RPC
+mode fetched from a remote endpoint — so it is exercised by coverage-guided
+fuzzing with [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz). The targets
+live in `fuzz/` and are **not** part of `cargo test`: they need a nightly
+toolchain and libFuzzer, so they are run on demand rather than in the normal
+suite.
+
+### One-time setup
+
+`cargo-fuzz` builds with libFuzzer, which requires a nightly toolchain:
+
+```bash
+rustup toolchain install nightly
+cargo install cargo-fuzz
+```
+
+### Targets
+
+- `extract_metadata` — feeds arbitrary bytes through the full WASM parse and
+  custom-section XDR decode (`parser::extract_metadata`).
+- `decode_spec_entries` — feeds arbitrary bytes straight into the concatenated
+  `ScSpecEntry` XDR cursor loop (`parser::decode_spec_entries`), bypassing the
+  WASM wrapper so the loop is reached without first building a valid module.
+
+Both assert the same property: the function returns `Ok` or `Err` on any input
+and never panics or hangs. Loop termination depends on the XDR cursor position
+strictly advancing each iteration; libFuzzer's timeout enforces the no-hang half
+of the property.
+
+### Running
+
+```bash
+# Run a target until stopped (Ctrl-C). Seeds come from fuzz/corpus/<target>/.
+cargo +nightly fuzz run extract_metadata
+cargo +nightly fuzz run decode_spec_entries
+
+# Time-boxed run, e.g. a quick smoke check or a CI budget:
+cargo +nightly fuzz run extract_metadata -- -max_total_time=60
+cargo +nightly fuzz run decode_spec_entries -- -max_total_time=60
+```
+
+A seed corpus derived from the `tests/wasm` fixtures is committed under
+`fuzz/corpus/<target>/` — the full modules for `extract_metadata`, and the
+extracted `contractspecv0` section bytes for `decode_spec_entries`. Any crash or
+hang is written to `fuzz/artifacts/<target>/`; reproduce it with:
+
+```bash
+cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<crash-file>
+```
+
+`stellar-xdr`'s `arbitrary` feature is declared in `fuzz/Cargo.toml` rather than
+in the crate's release dependencies, so structure-aware targets can use it
+without pulling it into the shipped binary (see issue #79).
 
 ## Coding Guidelines
 

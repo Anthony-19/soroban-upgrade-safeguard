@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use colored::Colorize;
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
@@ -12,6 +13,7 @@ use soroban_upgrade_safeguard::{
     },
     limits::{find_limit_error, LimitsConfig, ResourcePolicy},
     loader, report,
+    report::{validate_categories, CategoryFilter},
     storage_schema::StorageSchema,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
     CompareOptions,
@@ -103,6 +105,13 @@ struct Args {
     #[arg(long, value_name = "NEW_DIR", requires = "old_dir")]
     new_dir: Option<PathBuf>,
 
+    /// Only include findings from these categories. Repeatable.
+    #[arg(long, value_name = "CATEGORY", num_args = 0..)]
+    include_category: Vec<String>,
+
+    /// Exclude findings from these categories. Repeatable.
+    #[arg(long, value_name = "CATEGORY", num_args = 0..)]
+    exclude_category: Vec<String>,
     /// Storage-schema manifest describing the OLD build's storage layout.
     ///
     /// Declares the storage-key types and internal value types that govern
@@ -214,6 +223,34 @@ fn main() {
     }
 }
 
+fn run() -> Result<()> {
+    let args = Args::parse();
+
+    // Validate category filter arguments
+    let all_categories: Vec<String> = args
+        .include_category
+        .iter()
+        .chain(args.exclude_category.iter())
+        .cloned()
+        .collect();
+    if !all_categories.is_empty() {
+        if let Err(unknown) = validate_categories(&all_categories) {
+            anyhow::bail!(
+                "Unknown category name(s): {}. Valid categories are: {}",
+                unknown.join(", "),
+                report::KNOWN_CATEGORIES.join(", ")
+            );
+        }
+    }
+    let category_filter = CategoryFilter {
+        include: if args.include_category.is_empty() {
+            None
+        } else {
+            Some(args.include_category.iter().cloned().collect())
+        },
+        exclude: args.exclude_category.iter().cloned().collect(),
+    };
+
 /// Write `content` to a file if `output_path` is `Some`, otherwise print it
 /// to stdout. Writing to a file is atomic: the full string is rendered before
 /// any file is opened, so a failed comparison never leaves a partial file.
@@ -282,6 +319,9 @@ fn run() -> Result<()> {
     };
 
     // In JSON or Markdown mode, decorative progress goes to stderr so stdout
+    // stays a single, pristine document. In text mode it stays on stdout
+    // exactly as before.
+    let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
     // stays a single, pristine document. An explicit output file also keeps
     // stdout empty in text mode: the report is in that file and all progress
     // belongs on stderr rather than alongside it.
@@ -393,6 +433,10 @@ fn run() -> Result<()> {
             })();
 
             match outcome {
+                Ok(mut report) => {
+                    if !all_categories.is_empty() {
+                        report.apply_category_filter(&category_filter);
+                    }
                 Ok(report) => {
                     if !report.is_safe {
                         overall_safe = false;
@@ -570,6 +614,7 @@ fn run() -> Result<()> {
                     "dependency_findings": infra_findings,
                 });
 
+                println!("{}", serde_json::to_string_pretty(&batch_json)?);
                 let rendered = serde_json::to_string_pretty(&batch_json)?;
                 emit_report_output(&rendered, args.output.as_deref(), &progress)?;
             }
@@ -589,7 +634,11 @@ fn run() -> Result<()> {
                 markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
 
                 for (name, report) in &results {
-                    let status_str = if report.is_safe { "✅ PASSED" } else { "❌ FAILED" };
+                    let status_str = if report.is_safe {
+                        "✅ PASSED"
+                    } else {
+                        "❌ FAILED"
+                    };
                     markdown.push_str(&format!(
                         "| {} | {} | {} | {} | {} | {} |\n",
                         name,
@@ -602,10 +651,12 @@ fn run() -> Result<()> {
                 }
 
                 for (name, failure) in &failed {
-                    let status_str =
-                        if failure.is_limit { "⛔ ERROR (limit)" } else { "⛔ ERROR" };
-                    markdown
-                        .push_str(&format!("| {} | {} | — | — | — | — |\n", name, status_str));
+                    let status_str = if failure.is_limit {
+                        "⛔ ERROR (limit)"
+                    } else {
+                        "⛔ ERROR"
+                    };
+                    markdown.push_str(&format!("| {} | {} | — | — | — | — |\n", name, status_str));
                 }
 
                 markdown.push_str("\n---\n\n");
@@ -621,8 +672,7 @@ fn run() -> Result<()> {
                 for (name, report) in &results {
                     markdown.push_str(&format!("## Details: {}\n\n", name));
                     let report_md = report.generate_summary_markdown();
-                    let stripped_md =
-                        report_md.replace("# Soroban Upgrade Safety Report\n\n", "");
+                    let stripped_md = report_md.replace("# Soroban Upgrade Safety Report\n\n", "");
                     markdown.push_str(&stripped_md);
                     markdown.push_str("\n---\n\n");
                 }
@@ -652,7 +702,10 @@ fn run() -> Result<()> {
 
                 if !cycle_findings_list.is_empty() || !missing_findings_list.is_empty() {
                     markdown.push_str("## Dependency Graph Findings\n\n");
-                    for f in cycle_findings_list.iter().chain(missing_findings_list.iter()) {
+                    for f in cycle_findings_list
+                        .iter()
+                        .chain(missing_findings_list.iter())
+                    {
                         let emoji = match f.severity {
                             soroban_upgrade_safeguard::diff::Severity::Warning => "🟡",
                             _ => "🔵",
@@ -662,49 +715,50 @@ fn run() -> Result<()> {
                     markdown.push_str("\n---\n\n");
                 }
 
-                emit_report_output(&markdown, args.output.as_deref(), &progress)?;
+                println!("{}", markdown);
             }
             OutputFormat::Text => {
-                let mut text_output = String::new();
-                text_output.push_str("========================================\n");
-                text_output.push_str("    SOROBAN BATCH SAFETY REPORT\n");
-                text_output.push_str("========================================\n");
+                println!("========================================");
+                println!("    SOROBAN BATCH SAFETY REPORT");
+                println!("========================================");
 
-                let status_line = if overall_safe {
-                    "Overall Status: ✅ PASSED (All contracts safe)\n"
+                let status = if overall_safe {
+                    "✅ PASSED (All contracts safe)".green().bold()
                 } else {
-                    "Overall Status: ❌ FAILED (Some contracts have breaking changes)\n"
+                    "❌ FAILED (Some contracts have breaking changes)"
+                        .red()
+                        .bold()
                 };
-                text_output.push_str(status_line);
-                text_output.push('\n');
+                println!("Overall Status: {}\n", status);
 
-                text_output.push_str("Summary of Contracts:\n");
+                println!("Summary of Contracts:");
                 for (name, report) in &results {
-                    let status_str = if report.is_safe { "✅ PASSED" } else { "❌ FAILED" };
-                    text_output.push_str(&format!(
-                        "  - {}: {} ({} critical, {} warnings, {} info, {} suppressed)\n",
-                        name,
+                    let status_str = if report.is_safe {
+                        "✅ PASSED".green()
+                    } else {
+                        "❌ FAILED".red().bold()
+                    };
+                    println!(
+                        "  - {}: {} ({} critical, {} warnings, {} info, {} suppressed)",
+                        name.bold(),
                         status_str,
                         report.critical_count,
                         report.warning_count,
                         report.info_count,
                         report.suppressed_count
-                    ));
+                    );
                 }
                 for (name, failure) in &failed {
                     let status_str = if failure.is_limit {
-                        "⛔ ERROR (resource limit)"
+                        "⛔ ERROR (resource limit)".red().bold()
                     } else {
-                        "⛔ ERROR"
+                        "⛔ ERROR".red().bold()
                     };
-                    text_output.push_str(&format!(
-                        "  - {}: {} — {}\n",
-                        name, status_str, failure.message
-                    ));
+                    println!("  - {}: {} — {}", name.bold(), status_str, failure.message);
                 }
 
                 if !cross_findings.is_empty() {
-                    text_output.push_str("\n🔗 Cross-Contract Dependency Findings:\n");
+                    println!("\n🔗 Cross-Contract Dependency Findings:");
                     let mut by_affected: std::collections::BTreeMap<
                         &str,
                         Vec<&CrossContractFinding>,
@@ -716,10 +770,10 @@ fn run() -> Result<()> {
                             .push(cf);
                     }
                     for (affected, cfs) in &by_affected {
-                        text_output.push_str(&format!(
-                            "  Contract '{}' is affected by changes in:\n",
-                            affected
-                        ));
+                        println!(
+                            "  Contract '{}' is affected by changes in:",
+                            affected.bold()
+                        );
                         for cf in cfs {
                             let sev_icon = match cf.finding.severity {
                                 soroban_upgrade_safeguard::diff::Severity::Critical => "🔴",
@@ -731,58 +785,39 @@ fn run() -> Result<()> {
                             } else {
                                 format!("transitive depth {}", cf.propagation_depth)
                             };
-                            text_output.push_str(&format!(
-                                "    {} [{}] '{}' → {} ({})\n",
+                            println!(
+                                "    {} [{}] '{}' → {} ({})",
                                 sev_icon,
                                 cf.finding.category,
                                 cf.finding.target.as_deref().unwrap_or(""),
-                                cf.changed_contract,
+                                cf.changed_contract.bold(),
                                 depth_label
-                            ));
+                            );
                         }
                     }
                 }
 
                 if !cycle_findings_list.is_empty() {
-                    text_output.push_str("\n⚠️  Cyclic Dependencies:\n");
+                    println!("\n⚠️  Cyclic Dependencies:");
                     for f in &cycle_findings_list {
-                        text_output.push_str(&format!("  🟡 {}\n", f.message));
+                        println!("  🟡 {}", f.message);
                     }
                 }
 
                 if !missing_findings_list.is_empty() {
-                    text_output.push_str("\n⚠️  Missing Dependency Contracts:\n");
+                    println!("\n⚠️  Missing Dependency Contracts:");
                     for f in &missing_findings_list {
-                        text_output.push_str(&format!("  🟡 {}\n", f.message));
+                        println!("  🟡 {}", f.message);
                     }
                 }
 
-                text_output.push_str("\n========================================\n\n");
+                println!("\n========================================\n");
 
                 for (name, report) in &results {
-                    text_output.push_str(&format!("=== Contract: {} ===\n", name));
-                    // Strip ANSI codes if writing to file so it stays clean text.
-                    let report_text = report.generate_summary_text(args.explain);
-                    text_output.push_str(&report_text);
-                    text_output.push_str("========================================\n\n");
+                    println!("=== Contract: {} ===", name.bold().magenta());
+                    println!("{}", report.generate_summary_text(args.explain));
+                    println!("========================================\n");
                 }
-
-                emit_report_output(&text_output, args.output.as_deref(), &progress)?;
-            }
-        }
-
-        // Emit unmatched suppression warnings for all batch reports (stderr only).
-        for (name, report) in &results {
-            for rule in &report.unmatched_suppressions {
-                let target_part = rule
-                    .target
-                    .as_deref()
-                    .map(|t| format!(", target='{}'", t))
-                    .unwrap_or_default();
-                eprintln!(
-                    "⚠️  [{}] Suppression rule never matched: category='{}'{} — possible typo or stale rule.",
-                    name, rule.rule_id, target_part
-                );
             }
         }
 
@@ -921,6 +956,24 @@ fn run() -> Result<()> {
     safety_report.baseline_source = baseline_source.map(|s| s.to_string());
     safety_report.verified_code_hash = verified_hash_hex;
 
+    if !all_categories.is_empty() {
+        safety_report.apply_category_filter(&category_filter);
+    }
+
+    match args.format {
+        OutputFormat::Json => {
+            // Single JSON document to stdout; no decorative text, no ANSI codes.
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&safety_report.to_json())?
+            );
+        }
+        OutputFormat::Markdown => {
+            println!("{}", safety_report.generate_summary_markdown());
+        }
+        OutputFormat::Text => {
+            println!("{}", safety_report.generate_summary_text(args.explain));
+        }
     // Render the report to a string first so --output can write it atomically.
     let rendered = match args.format {
         OutputFormat::Json => serde_json::to_string_pretty(&safety_report.to_json())?,
@@ -1170,12 +1223,10 @@ fn parse_manifest(path: &Path) -> Result<(Vec<ContractPair>, Vec<ContractDepende
         .map(str::to_lowercase);
 
     match ext.as_deref() {
-        Some("toml") => Err(toml_err).with_context(|| {
-            format!("Failed to parse TOML manifest '{}'", path.display())
-        }),
-        Some("json") => Err(json_err).with_context(|| {
-            format!("Failed to parse JSON manifest '{}'", path.display())
-        }),
+        Some("toml") => Err(toml_err)
+            .with_context(|| format!("Failed to parse TOML manifest '{}'", path.display())),
+        Some("json") => Err(json_err)
+            .with_context(|| format!("Failed to parse JSON manifest '{}'", path.display())),
         _ => Err(anyhow::anyhow!(
             "Failed to parse manifest '{}' as either TOML or JSON.\n\
              TOML error: {}\n\
@@ -1187,6 +1238,72 @@ fn parse_manifest(path: &Path) -> Result<(Vec<ContractPair>, Vec<ContractDepende
     }
 }
 
+/// Collect all `.wasm` files under `root`, returning their relative paths
+/// (relative to `root`). Protects against symlink loops via a visited-path set
+/// and enforces a maximum recursion depth of 32.
+fn collect_wasm_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut stack: Vec<(PathBuf, usize)> = Vec::new();
+    stack.push((root.to_path_buf(), 0));
+
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 32 {
+            eprintln!(
+                "⚠️  Warning: Exceeded maximum recursion depth at '{}', skipping",
+                dir.display()
+            );
+            continue;
+        }
+
+        // Resolve symlinks before tracking visited paths
+        let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if !visited.insert(canonical) {
+            continue;
+        }
+
+        let read_dir = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                eprintln!(
+                    "⚠️  Warning: Cannot read directory '{}': {}",
+                    dir.display(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        for entry in read_dir {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!(
+                        "⚠️  Warning: Error reading entry in '{}': {}",
+                        dir.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let path = entry.path();
+
+            if path.is_dir() {
+                stack.push((path, depth + 1));
+            } else if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("wasm") {
+                let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                files.push((relative, path));
+            }
+        }
+    }
+
+    // Sort by relative path for deterministic ordering
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    Ok(files)
+}
+
 fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>> {
     if !old_dir.is_dir() {
         anyhow::bail!("Old directory '{}' is not a directory", old_dir.display());
@@ -1195,27 +1312,40 @@ fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>>
         anyhow::bail!("New directory '{}' is not a directory", new_dir.display());
     }
 
+    let old_files = collect_wasm_files(old_dir)?;
+    let new_files_map: std::collections::HashMap<PathBuf, PathBuf> =
+        collect_wasm_files(new_dir)?.into_iter().collect();
+
     let mut pairs = Vec::new();
-    for entry in std::fs::read_dir(old_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("wasm") {
-            let filename = path.file_name().unwrap();
-            let new_path = new_dir.join(filename);
-            if new_path.exists() {
-                let name = path.file_stem().and_then(|s| s.to_str()).map(String::from);
-                pairs.push(ContractPair {
-                    old: path,
-                    new: new_path,
-                    name,
-                });
-            } else {
-                eprintln!(
-                    "⚠️  Warning: Match not found for '{}' in new directory '{}'",
-                    filename.to_string_lossy(),
-                    new_dir.display()
-                );
-            }
+
+    for (rel_path, old_abs_path) in &old_files {
+        if let Some(new_abs_path) = new_files_map.get(rel_path) {
+            let name = rel_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(String::from);
+            pairs.push(ContractPair {
+                old: old_abs_path.clone(),
+                new: new_abs_path.clone(),
+                name,
+            });
+        } else {
+            eprintln!(
+                "⚠️  Warning: Match not found for '{}' in new directory '{}'",
+                rel_path.display(),
+                new_dir.display()
+            );
+        }
+    }
+
+    // Warn about files in new_dir that have no counterpart in old_dir
+    for (rel_path, _) in &collect_wasm_files(new_dir)? {
+        if !old_files.iter().any(|(r, _)| r == rel_path) {
+            eprintln!(
+                "⚠️  Warning: No old counterpart found for '{}' in old directory '{}'",
+                rel_path.display(),
+                old_dir.display()
+            );
         }
     }
 

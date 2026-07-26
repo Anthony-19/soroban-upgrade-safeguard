@@ -665,6 +665,44 @@ Example JSON excerpt:
 }
 ```
 
+## JSON Schema
+
+The JSON output is the integration surface for dashboards, bots, and other
+tooling, so its shape is published as a JSON Schema (Draft 2020-12) under
+[`schema/`](../schema):
+
+- [`schema/report.schema.json`](../schema/report.schema.json) — the single-pair
+  document (`--format json` on a contract pair).
+- [`schema/batch-report.schema.json`](../schema/batch-report.schema.json) — the
+  batch document (`--manifest` or `--old-dir`/`--new-dir` with `--format json`),
+  whose top level differs from the single-pair shape and embeds a single-pair
+  report per contract under `results`.
+
+Both schemas are **derived from the Rust output types**, not hand-written, so
+they cannot silently drift from what the tool emits: `tests/schema_validation.rs`
+regenerates them from the types and validates real emitted output — including a
+run with suppressed findings and one produced with `--explain` — against the
+committed files, failing if they diverge. Conditionally omitted fields
+(`suppressed`, `suppression_reason`, `remediation`, the duplicate-name lists, …)
+are marked optional, and the enumerated fields (the `counts` severities and
+`recommended_bump`) are constrained to their allowed values.
+
+To regenerate the committed schema after intentionally changing an output type:
+
+```bash
+UPDATE_SCHEMA=1 cargo test --test schema_validation schemas_match_the_types
+```
+
+### Stability
+
+The crate is pre-1.0 (`0.x`). While it remains pre-1.0 the JSON shape may still
+change between minor versions, but such changes will be **additive wherever
+possible** — new optional fields rather than renamed or removed ones — and any
+breaking change to the shape will be called out in the release notes. Consumers
+should ignore unknown fields so additive changes do not break them. A firmer
+"additive changes only within a major version" guarantee is intended once the
+crate reaches 1.0.
+
 ## Reading the Report
 
 A run prints a header for each loaded contract with a one line summary of how many functions, structs, enums, unions, and error enums it contains. It then prints the safety report.

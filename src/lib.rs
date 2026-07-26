@@ -249,6 +249,9 @@ pub fn compare_wasm_bytes_with_options(
         &mut diff_report,
     );
 
+    diff::compare_contract_metadata(
+        old_meta.meta.as_ref(),
+        new_meta.meta.as_ref(),
     // Compare exported function names from the binary export sections.
     // This catches a removed export that callers depend on, and also any
     // mismatch between what the binary actually exports and what its spec claims.
@@ -259,6 +262,8 @@ pub fn compare_wasm_bytes_with_options(
         &new_spec.functions.keys().cloned().collect(),
         &mut diff_report,
     );
+
+    diff::compare_wasm_imports(&old_meta.imports, &new_meta.imports, &mut diff_report);
 
     // The pipeline always compares the exported interface and environment
     // metadata; storage layout is analyzed only when a schema is supplied for
@@ -271,15 +276,13 @@ pub fn compare_wasm_bytes_with_options(
         old_spec_section_count: old_meta.spec_section_count,
         new_spec_section_count: new_meta.spec_section_count,
         old_duplicate_names: {
-            let mut names: Vec<String> =
-                old_dups.iter().map(|d| d.name.clone()).collect();
+            let mut names: Vec<String> = old_dups.iter().map(|d| d.name.clone()).collect();
             names.sort();
             names.dedup();
             names
         },
         new_duplicate_names: {
-            let mut names: Vec<String> =
-                new_dups.iter().map(|d| d.name.clone()).collect();
+            let mut names: Vec<String> = new_dups.iter().map(|d| d.name.clone()).collect();
             names.sort();
             names.dedup();
             names

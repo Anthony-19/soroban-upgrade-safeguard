@@ -1,8 +1,9 @@
 use crate::diff::{DiffReport, Finding, Severity};
-use crate::rules::{canonical_rule_id, display_label_for_rule_id, guidance_for_rule_id};
+use crate::limits::ResourcePolicy;
+use crate::rules::{canonical_rule_id, guidance_for_rule_id};
 use crate::suppression::SuppressionConfig;
-use crate::classification::TypeClass;
 use colored::Colorize;
+use schemars::JsonSchema;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -121,7 +122,7 @@ impl AnalysisScope {
 }
 
 /// A machine-readable view of an [`AnalysisScope`] for `--format json`.
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub struct ScopeJson {
     pub exported_interface_analyzed: bool,
     pub env_metadata_analyzed: bool,
@@ -135,10 +136,10 @@ pub struct ScopeJson {
     /// Number of `contractspecv0` sections found in the new WASM.
     pub new_spec_section_count: usize,
     /// Names of duplicate entries detected in the old WASM (empty when clean).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub old_duplicate_names: Vec<String>,
     /// Names of duplicate entries detected in the new WASM (empty when clean).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub new_duplicate_names: Vec<String>,
     pub summary: String,
 }
@@ -173,7 +174,7 @@ impl AnalysisScope {
 /// The raw [`Finding`] from the diff layer is left untouched; suppression is a
 /// report-time concern layered on top. A suppressed finding is still listed in
 /// full — it simply does not count toward the failing set.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ReportedFinding {
     /// Stable rule id for this finding.
     pub rule_id: String,
@@ -184,7 +185,7 @@ pub struct ReportedFinding {
     /// The SHA-256 fingerprint computed for this finding.
     pub fingerprint: String,
     /// Whether a suppression rule acknowledged this finding.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suppressed: bool,
     /// The justification copied from the matching rule, if it provided one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -328,7 +329,7 @@ pub struct SafetyReport {
 }
 
 /// Severity counts, serialized as a nested `counts` object.
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub struct SeverityCounts {
     pub critical: usize,
     pub warning: usize,
@@ -339,7 +340,7 @@ pub struct SeverityCounts {
 ///
 /// Borrows from the owning report. Categories are stored in a [`BTreeMap`]
 /// so the emitted JSON has a stable, diffable key order.
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub struct SafetyReportJson<'a> {
     pub is_safe: bool,
     pub strict: bool,
@@ -451,7 +452,7 @@ impl SafetyReport {
             let rule_ref = rule.map(|(_, r)| r);
 
             let rule_id = canonical_rule_id(&finding.category)
-                .unwrap_or_else(|| finding.category.as_str())
+                .unwrap_or(finding.category.as_str())
                 .to_string();
             let remediation = if explain {
                 get_remediation_guidance(&rule_id).map(String::from)
@@ -640,11 +641,14 @@ impl SafetyReport {
 
         // Spec-section integrity summary (non-zero section count or duplicates).
         if self.scope.old_spec_section_count > 1 || self.scope.new_spec_section_count > 1 {
-            output.push_str(&format!(
-                "        Spec sections: old={}, new={} (multi-section WASMs detected)\n",
-                self.scope.old_spec_section_count,
-                self.scope.new_spec_section_count,
-            ).yellow().to_string());
+            output.push_str(
+                &format!(
+                    "        Spec sections: old={}, new={} (multi-section WASMs detected)\n",
+                    self.scope.old_spec_section_count, self.scope.new_spec_section_count,
+                )
+                .yellow()
+                .to_string(),
+            );
         }
         let all_dups: Vec<String> = self
             .scope
@@ -1117,7 +1121,7 @@ pub fn get_remediation_guidance(rule_id: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::{all_rules, rule_by_id};
+    use crate::rules::{all_rules, display_label_for_rule_id, rule_by_id};
 
     #[test]
     fn every_registered_rule_has_unique_id_and_guidance() {
@@ -1183,7 +1187,7 @@ mod tests {
                     continue;
                 }
 
-                // Find all string literals in the line
+                // Find all string literals in the line and check each one.
                 let mut chars = line.chars().peekable();
                 while let Some(c) = chars.next() {
                     if c == '"' {
@@ -1195,71 +1199,75 @@ mod tests {
                             }
                             literal.push(chars.next().unwrap());
                         }
-                        if !literal.is_empty() {
-                            // If it's a format string like "{} Removed"
-                            if literal.contains("{}") {
-                                let suffixes = vec![
-                                    "Removed",
-                                    "Reordered",
-                                    "Type Changed",
-                                    "Value Changed",
-                                    "Added",
-                                ];
-                                for suffix in suffixes {
-                                    if literal == format!("{{}} {}", suffix) {
-                                        let prefixes = match suffix {
-                                            "Reordered" | "Type Changed" => {
-                                                vec!["Struct Field", "Event Field"]
-                                            }
-                                            "Value Changed" => {
-                                                vec!["Enum Case", "Event Enum Case"]
-                                            }
-                                            "Added" => vec![
-                                                "Struct Field",
-                                                "Event Schema",
-                                                "Enum Case",
-                                                "Event Enum Case",
-                                            ],
-                                            "Removed" => vec![
-                                                "Struct Field",
-                                                "Event Field",
-                                                "Enum Case",
-                                                "Event Enum Case",
-                                            ],
-                                            _ => unreachable!(),
-                                        };
-                                        for prefix in prefixes {
-                                            checked_categories
-                                                .insert(format!("{} {}", prefix, suffix));
+                        if literal.is_empty() {
+                            continue;
+                        }
+
+                        // A literal that *looks* like a category (Title Case
+                        // words, no punctuation) but is not in the inventory is
+                        // a bug.
+                        let looks_like_category = literal.len() > 3
+                            && literal.split(' ').count() >= 2
+                            && literal
+                                .split(' ')
+                                .all(|w| w.chars().next().is_some_and(|c| c.is_ascii_uppercase()));
+                        assert!(
+                            !looks_like_category
+                                || crate::diff::ALL_CATEGORIES.contains(&literal.as_str())
+                                || literal == "TOTALLY CUSTOM CATEGORY",
+                            "'{literal}' looks like a category but is not in diff::ALL_CATEGORIES"
+                        );
+
+                        // If it's a format string like "{} Removed", expand it
+                        // into the concrete categories the code can emit.
+                        if literal.contains("{}") {
+                            let suffixes = vec![
+                                "Removed",
+                                "Reordered",
+                                "Type Changed",
+                                "Value Changed",
+                                "Added",
+                            ];
+                            for suffix in suffixes {
+                                if literal == format!("{{}} {}", suffix) {
+                                    let prefixes = match suffix {
+                                        "Reordered" | "Type Changed" => {
+                                            vec!["Struct Field", "Event Field"]
                                         }
+                                        "Value Changed" => {
+                                            vec!["Enum Case", "Event Enum Case"]
+                                        }
+                                        "Added" => vec![
+                                            "Struct Field",
+                                            "Event Schema",
+                                            "Enum Case",
+                                            "Event Enum Case",
+                                        ],
+                                        "Removed" => vec![
+                                            "Struct Field",
+                                            "Event Field",
+                                            "Enum Case",
+                                            "Event Enum Case",
+                                        ],
+                                        _ => unreachable!(),
+                                    };
+                                    for prefix in prefixes {
+                                        checked_categories.insert(format!("{} {}", prefix, suffix));
                                     }
                                 }
-                            } else {
-                                checked_categories.insert(literal);
                             }
+                        } else {
+                            checked_categories.insert(literal);
                         }
                     }
                 }
-                // A literal that *looks* like a category (Title Case words,
-                // no punctuation) but is not in the inventory is a bug.
-                let looks_like_category = literal.len() > 3
-                    && literal.split(' ').count() >= 2
-                    && literal
-                        .split(' ')
-                        .all(|w| w.chars().next().is_some_and(|c| c.is_ascii_uppercase()));
-                assert!(
-                    !looks_like_category
-                        || crate::diff::ALL_CATEGORIES.contains(&literal)
-                        || literal == "TOTALLY CUSTOM CATEGORY",
-                    "'{literal}' looks like a category but is not in diff::ALL_CATEGORIES"
-                );
             }
         }
 
         assert!(
-            found.len() > 20,
+            checked_categories.len() > 20,
             "sanity check: expected to find most categories in the source, found {}",
-            found.len()
+            checked_categories.len()
         );
     }
 

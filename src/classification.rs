@@ -39,13 +39,14 @@
 
 use std::collections::BTreeSet;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// How a user-defined type is classified for reporting purposes.
 ///
 /// This is metadata attached to a [`crate::diff::Finding`]; it never affects
 /// the structural category used for suppression matching.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "class", rename_all = "lowercase")]
 pub enum TypeClass {
     /// An ordinary storage or interface type.
