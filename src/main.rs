@@ -154,6 +154,15 @@ struct Args {
     /// always Critical regardless of this flag.
     #[arg(long)]
     compat_duplicates: bool,
+
+    /// Write the report to this file instead of stdout.
+    ///
+    /// The file is created (or overwritten) only after the report has been
+    /// successfully rendered, so a failed comparison never leaves a
+    /// partial file behind. Progress output continues to go to its normal
+    /// destination regardless of this flag.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
 }
 
 /// Resolve the effective [`ResourcePolicy`]: built-in defaults, overlaid by the
@@ -242,6 +251,30 @@ fn run() -> Result<()> {
         exclude: args.exclude_category.iter().cloned().collect(),
     };
 
+/// Write `content` to a file if `output_path` is `Some`, otherwise print it
+/// to stdout. Writing to a file is atomic: the full string is rendered before
+/// any file is opened, so a failed comparison never leaves a partial file.
+///
+/// When a file path is used, a progress message is emitted via `progress` so
+/// the user can see where the report landed.
+fn emit_report_output(
+    content: &str,
+    output_path: Option<&std::path::Path>,
+    progress: &impl Fn(String),
+) -> Result<()> {
+    if let Some(path) = output_path {
+        std::fs::write(path, content)
+            .with_context(|| format!("Failed to write report to '{}'", path.display()))?;
+        progress(format!("✅ Report written to: {}", path.display()));
+    } else {
+        println!("{}", content);
+    }
+    Ok(())
+}
+
+fn run() -> Result<()> {
+    let args = Args::parse();
+
     if should_disable_color(
         args.no_color,
         std::env::var_os("NO_COLOR").is_some(),
@@ -289,6 +322,12 @@ fn run() -> Result<()> {
     // stays a single, pristine document. In text mode it stays on stdout
     // exactly as before.
     let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
+    // stays a single, pristine document. An explicit output file also keeps
+    // stdout empty in text mode: the report is in that file and all progress
+    // belongs on stderr rather than alongside it.
+    let clean_stdout = args.output.is_some()
+        || args.format == OutputFormat::Json
+        || args.format == OutputFormat::Markdown;
     let progress = |line: String| {
         if clean_stdout {
             eprintln!("{line}");
@@ -398,6 +437,7 @@ fn run() -> Result<()> {
                     if !all_categories.is_empty() {
                         report.apply_category_filter(&category_filter);
                     }
+                Ok(report) => {
                     if !report.is_safe {
                         overall_safe = false;
                     }
@@ -453,7 +493,8 @@ fn run() -> Result<()> {
         }
 
         // Detect dependencies on contracts absent from this batch.
-        let known_contracts: std::collections::HashSet<String> = results.keys().cloned().collect();
+        let known_contracts: std::collections::HashSet<String> =
+            results.keys().cloned().collect();
         let missing = dep_graph.missing_contracts(&known_contracts);
         let missing_findings_list = missing_contract_findings(&missing);
         if !missing_findings_list.is_empty() {
@@ -481,16 +522,21 @@ fn run() -> Result<()> {
             per_contract_findings.insert(name.clone(), all);
         }
 
-        let cross_findings: Vec<CrossContractFinding> = dep_graph.propagate(&per_contract_findings);
+        let cross_findings: Vec<CrossContractFinding> =
+            dep_graph.propagate(&per_contract_findings);
 
         // Cross-contract criticals always fail; warnings only fail under --strict.
         let cross_critical_count = cross_findings
             .iter()
-            .filter(|f| f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Critical)
+            .filter(|f| {
+                f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Critical
+            })
             .count();
         let cross_warning_count = cross_findings
             .iter()
-            .filter(|f| f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Warning)
+            .filter(|f| {
+                f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Warning
+            })
             .count();
         if cross_critical_count > 0 {
             overall_safe = false;
@@ -539,7 +585,7 @@ fn run() -> Result<()> {
                 let infra_findings: Vec<serde_json::Value> = cycle_findings_list
                     .iter()
                     .chain(missing_findings_list.iter())
-                    .map(serde_json::to_value)
+                    .map(|f| serde_json::to_value(f))
                     .collect::<Result<_, _>>()?;
 
                 // Overall recommended bump: the most severe bump across all
@@ -569,6 +615,8 @@ fn run() -> Result<()> {
                 });
 
                 println!("{}", serde_json::to_string_pretty(&batch_json)?);
+                let rendered = serde_json::to_string_pretty(&batch_json)?;
+                emit_report_output(&rendered, args.output.as_deref(), &progress)?;
             }
             OutputFormat::Markdown => {
                 let mut markdown = String::new();
@@ -926,6 +974,38 @@ fn run() -> Result<()> {
         OutputFormat::Text => {
             println!("{}", safety_report.generate_summary_text(args.explain));
         }
+    // Render the report to a string first so --output can write it atomically.
+    let rendered = match args.format {
+        OutputFormat::Json => serde_json::to_string_pretty(&safety_report.to_json())?,
+        OutputFormat::Markdown => safety_report.generate_summary_markdown(),
+        OutputFormat::Text => safety_report.generate_summary_text(args.explain),
+    };
+
+    // Write the report — either to a file (--output) or to stdout.
+    if let Some(ref output_path) = args.output {
+        std::fs::write(output_path, &rendered).with_context(|| {
+            format!("Failed to write report to '{}'", output_path.display())
+        })?;
+        progress(format!(
+            "✅ Report written to: {}",
+            output_path.display()
+        ));
+    } else {
+        println!("{}", rendered);
+    }
+
+    // Warn about suppression rules that never matched any finding.
+    // Goes to stderr so it does not pollute the report on stdout.
+    for rule in &safety_report.unmatched_suppressions {
+        let target_part = rule
+            .target
+            .as_deref()
+            .map(|t| format!(", target='{}'", t))
+            .unwrap_or_default();
+        eprintln!(
+            "⚠️  Suppression rule never matched any finding: category='{}'{} — possible typo or stale rule.",
+            rule.rule_id, target_part
+        );
     }
 
     if !safety_report.is_safe {
