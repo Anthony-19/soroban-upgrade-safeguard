@@ -50,7 +50,7 @@ pub const DEFAULT_MAX_WALK_DEPTH: usize = 128;
 ///
 /// Every limit is independently configurable. `Copy` so it can be threaded by
 /// value through the pipeline without ceremony.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct ResourcePolicy {
     /// Maximum XDR recursion depth per entry (maps to [`Limits::depth`]).
     pub max_xdr_depth: u32,
@@ -97,6 +97,8 @@ pub enum EntryKind {
     Spec,
     /// `contractenvmetav0` entries.
     EnvMeta,
+    /// `contractmetav0` entries.
+    Meta,
 }
 
 impl EntryKind {
@@ -104,6 +106,7 @@ impl EntryKind {
         match self {
             EntryKind::Spec => "contractspecv0",
             EntryKind::EnvMeta => "contractenvmetav0",
+            EntryKind::Meta => "contractmetav0",
         }
     }
 }
@@ -191,6 +194,7 @@ impl LimitError {
 /// mirrors [`crate::suppression::SuppressionConfig`] so a repo can commit both a
 /// suppression policy and a resource policy in the same file.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
     /// Overrides [`ResourcePolicy::max_xdr_depth`].
     #[serde(default)]

@@ -1,10 +1,11 @@
-use crate::diff::{
-    DiffReport, Finding, Severity, STORAGE_CATEGORY_PREFIX, STORAGE_UNRESOLVED_CATEGORY,
-};
+use crate::diff::{DiffReport, Finding, Severity};
+use crate::limits::ResourcePolicy;
+use crate::rules::{canonical_rule_id, guidance_for_rule_id};
 use crate::suppression::SuppressionConfig;
 use colored::Colorize;
+use schemars::JsonSchema;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// One-line summary of exactly what a verdict from this tool certifies.
 ///
@@ -53,6 +54,14 @@ pub struct AnalysisScope {
     pub env_metadata: bool,
     /// The storage-layout analysis state for this run.
     pub storage_schema: StorageScopeState,
+    /// Number of distinct `contractspecv0` sections in the old WASM (0 if not parsed).
+    pub old_spec_section_count: usize,
+    /// Number of distinct `contractspecv0` sections in the new WASM (0 if not parsed).
+    pub new_spec_section_count: usize,
+    /// Names of duplicate entries found in the old WASM, sorted for stable output.
+    pub old_duplicate_names: Vec<String>,
+    /// Names of duplicate entries found in the new WASM, sorted for stable output.
+    pub new_duplicate_names: Vec<String>,
 }
 
 impl Default for AnalysisScope {
@@ -65,6 +74,10 @@ impl Default for AnalysisScope {
             exported_interface: true,
             env_metadata: false,
             storage_schema: StorageScopeState::NotAnalyzed,
+            old_spec_section_count: 0,
+            new_spec_section_count: 0,
+            old_duplicate_names: Vec::new(),
+            new_duplicate_names: Vec::new(),
         }
     }
 }
@@ -109,7 +122,7 @@ impl AnalysisScope {
 }
 
 /// A machine-readable view of an [`AnalysisScope`] for `--format json`.
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub struct ScopeJson {
     pub exported_interface_analyzed: bool,
     pub env_metadata_analyzed: bool,
@@ -118,6 +131,16 @@ pub struct ScopeJson {
     pub storage_key_types: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_value_types: Option<usize>,
+    /// Number of `contractspecv0` sections found in the old WASM.
+    pub old_spec_section_count: usize,
+    /// Number of `contractspecv0` sections found in the new WASM.
+    pub new_spec_section_count: usize,
+    /// Names of duplicate entries detected in the old WASM (empty when clean).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub old_duplicate_names: Vec<String>,
+    /// Names of duplicate entries detected in the new WASM (empty when clean).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_duplicate_names: Vec<String>,
     pub summary: String,
 }
 
@@ -137,6 +160,10 @@ impl AnalysisScope {
             storage_layout_analyzed: self.storage_analyzed(),
             storage_key_types,
             storage_value_types,
+            old_spec_section_count: self.old_spec_section_count,
+            new_spec_section_count: self.new_spec_section_count,
+            old_duplicate_names: self.old_duplicate_names.clone(),
+            new_duplicate_names: self.new_duplicate_names.clone(),
             summary: self.summary_line(),
         }
     }
@@ -147,8 +174,10 @@ impl AnalysisScope {
 /// The raw [`Finding`] from the diff layer is left untouched; suppression is a
 /// report-time concern layered on top. A suppressed finding is still listed in
 /// full — it simply does not count toward the failing set.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ReportedFinding {
+    /// Stable rule id for this finding.
+    pub rule_id: String,
     /// The underlying finding, flattened so JSON keeps its original shape
     /// (`severity`, `category`, `message`, `type_name`, `target`).
     #[serde(flatten)]
@@ -156,7 +185,7 @@ pub struct ReportedFinding {
     /// The SHA-256 fingerprint computed for this finding.
     pub fingerprint: String,
     /// Whether a suppression rule acknowledged this finding.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suppressed: bool,
     /// The justification copied from the matching rule, if it provided one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -175,6 +204,91 @@ pub struct ReportedFinding {
     pub remediation: Option<String>,
 }
 
+/// Per-build size and interface-count metrics, carried in the report for all
+/// three output formats. These are purely informational and never affect
+/// `is_safe`, the exit code, or the recommended bump.
+#[derive(Debug, Clone, Serialize)]
+pub struct BuildMetrics {
+    /// Total WASM binary size in bytes for the old build.
+    pub old_size_bytes: usize,
+    /// Total WASM binary size in bytes for the new build.
+    pub new_size_bytes: usize,
+    /// Byte delta: `new_size_bytes as i64 - old_size_bytes as i64`.
+    pub size_delta_bytes: i64,
+    /// Number of exported functions in the old spec.
+    pub old_function_count: usize,
+    /// Number of exported functions in the new spec.
+    pub new_function_count: usize,
+    /// Number of structs in the old spec.
+    pub old_struct_count: usize,
+    /// Number of structs in the new spec.
+    pub new_struct_count: usize,
+    /// Number of enums in the old spec.
+    pub old_enum_count: usize,
+    /// Number of enums in the new spec.
+    pub new_enum_count: usize,
+    /// Number of unions in the old spec.
+    pub old_union_count: usize,
+    /// Number of unions in the new spec.
+    pub new_union_count: usize,
+    /// Number of error enums in the old spec.
+    pub old_error_enum_count: usize,
+    /// Number of error enums in the new spec.
+    pub new_error_enum_count: usize,
+}
+
+impl BuildMetrics {
+    /// Construct metrics from raw byte lengths and spec counts.
+    pub fn new(
+        old_size_bytes: usize,
+        new_size_bytes: usize,
+        old_fn: usize,
+        new_fn: usize,
+        old_struct: usize,
+        new_struct: usize,
+        old_enum: usize,
+        new_enum: usize,
+        old_union: usize,
+        new_union: usize,
+        old_err: usize,
+        new_err: usize,
+    ) -> Self {
+        Self {
+            old_size_bytes,
+            new_size_bytes,
+            size_delta_bytes: new_size_bytes as i64 - old_size_bytes as i64,
+            old_function_count: old_fn,
+            new_function_count: new_fn,
+            old_struct_count: old_struct,
+            new_struct_count: new_struct,
+            old_enum_count: old_enum,
+            new_enum_count: new_enum,
+            old_union_count: old_union,
+            new_union_count: new_union,
+            old_error_enum_count: old_err,
+            new_error_enum_count: new_err,
+        }
+    }
+
+    /// Format byte size as a human-readable string (bytes / KB / MB).
+    pub fn format_bytes(n: usize) -> String {
+        if n >= 1_048_576 {
+            format!("{:.2} MB", n as f64 / 1_048_576.0)
+        } else if n >= 1024 {
+            format!("{:.2} KB", n as f64 / 1024.0)
+        } else {
+            format!("{} B", n)
+        }
+    }
+
+    /// Format a signed byte delta as "+X KB" / "-X KB" etc.
+    pub fn format_delta(d: i64) -> String {
+        let abs = d.unsigned_abs() as usize;
+        let sign = if d >= 0 { "+" } else { "-" };
+        format!("{}{}", sign, Self::format_bytes(abs))
+    }
+}
+
 /// A structured container for aggregated comparison findings.
 pub struct SafetyReport {
     pub critical_count: usize,
@@ -182,6 +296,8 @@ pub struct SafetyReport {
     pub info_count: usize,
     /// Number of findings (of any severity) acknowledged by a suppression rule.
     pub suppressed_count: usize,
+    /// Number of findings hidden by category filtering.
+    pub filtered_count: usize,
     pub suppressed_critical_count: usize,
     pub total_findings: usize,
     pub is_safe: bool,
@@ -194,16 +310,26 @@ pub struct SafetyReport {
     pub baseline_source: Option<String>,
     /// Verified SHA-256 hash of the baseline WASM bytecode (hex), if verified.
     pub verified_code_hash: Option<String>,
+    /// Active category filter, if any.
+    pub category_filter: CategoryFilter,
     /// Human-readable summary of the old contract spec (e.g. "3 fns, 2 types").
     /// Populated by the canonical pipeline so callers don't need to re-extract metadata.
     pub old_spec_summary: Option<String>,
     /// Human-readable summary of the new contract spec.
     /// Populated by the canonical pipeline so callers don't need to re-extract metadata.
     pub new_spec_summary: Option<String>,
+    /// Build size and interface-count metrics. `None` when the pipeline did not
+    /// supply byte sizes (e.g. in some library callers that use `compare_wasm_bytes`
+    /// without access to the original slices' lengths — though in practice the
+    /// canonical pipeline always populates this).
+    pub metrics: Option<BuildMetrics>,
+    /// Suppression rules from the config that matched no finding during this run.
+    /// Non-empty indicates a potential typo or a stale rule, surfaced to stderr.
+    pub unmatched_suppressions: Vec<crate::suppression::SuppressionRule>,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub struct SeverityCounts {
     pub critical: usize,
     pub warning: usize,
@@ -214,7 +340,7 @@ pub struct SeverityCounts {
 ///
 /// Borrows from the owning report. Categories are stored in a [`BTreeMap`]
 /// so the emitted JSON has a stable, diffable key order.
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub struct SafetyReportJson<'a> {
     pub is_safe: bool,
     pub strict: bool,
@@ -226,20 +352,37 @@ pub struct SafetyReportJson<'a> {
     pub counts: SeverityCounts,
     /// Findings (of any severity) acknowledged by the suppression config.
     pub suppressed_count: usize,
+    /// Findings hidden by category filtering.
+    pub filtered_count: usize,
     pub total_findings: usize,
     pub recommended_bump: &'static str,
     pub baseline_source: Option<&'a str>,
     pub verified_code_hash: Option<&'a str>,
     pub findings_by_category: BTreeMap<&'a str, &'a Vec<ReportedFinding>>,
+    /// Build size and interface-count metrics (always present in CLI output).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<&'a BuildMetrics>,
+    /// Suppression rules from the config that matched no finding.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unmatched_suppressions: Vec<UnmatchedSuppressionJson>,
+}
+
+/// JSON representation of a suppression rule that matched no finding.
+#[derive(Serialize)]
+pub struct UnmatchedSuppressionJson {
+    pub category: String,
+    pub target: Option<String>,
 }
 
 impl SafetyReport {
-    /// Compute a safety report from a raw DiffReport, with no suppressions.
-    ///
-    /// Equivalent to [`SafetyReport::with_suppressions`] using an empty config,
-    /// so behavior is identical to before suppression support existed.
     pub fn new(diff: &DiffReport) -> Self {
-        Self::with_suppressions(diff, &SuppressionConfig::default(), false, false)
+        Self::with_suppressions(
+            diff,
+            &SuppressionConfig::default(),
+            false,
+            false,
+            &ResourcePolicy::default(),
+        )
     }
 
     /// Compute a safety report, applying a suppression config.
@@ -253,7 +396,19 @@ impl SafetyReport {
         suppressions: &SuppressionConfig,
         explain: bool,
         strict: bool,
+        policy: &ResourcePolicy,
     ) -> Self {
+        let settings = ReportSettings {
+            strict,
+            explain,
+            max_suppressions: suppressions.max_suppressions,
+            allow_targetless: suppressions.allow_targetless,
+            max_xdr_depth: policy.max_xdr_depth,
+            max_xdr_len: policy.max_xdr_len,
+            max_entries: policy.max_entries,
+            max_walk_depth: policy.max_walk_depth,
+        };
+
         let mut critical_count = 0;
         let mut warning_count = 0;
         let mut info_count = 0;
@@ -263,6 +418,10 @@ impl SafetyReport {
         let mut failing_warning_count = 0;
         let mut findings_by_category: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
 
+        // Track which rule indices actually matched at least one finding.
+        let mut matched_rule_indices: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+
         for finding in &diff.findings {
             match finding.severity {
                 Severity::Critical => critical_count += 1,
@@ -270,7 +429,7 @@ impl SafetyReport {
                 Severity::Info => info_count += 1,
             }
 
-            let rule = suppressions.matching_rule(finding);
+            let rule = suppressions.matching_rule_with_index(finding);
             let suppressed = rule.is_some();
             if suppressed {
                 suppressed_count += 1;
@@ -285,8 +444,18 @@ impl SafetyReport {
                 }
             }
 
+            // Record which rule index matched (if any).
+            if let Some((idx, _)) = rule {
+                matched_rule_indices.insert(idx);
+            }
+
+            let rule_ref = rule.map(|(_, r)| r);
+
+            let rule_id = canonical_rule_id(&finding.category)
+                .unwrap_or(finding.category.as_str())
+                .to_string();
             let remediation = if explain {
-                get_remediation_guidance(&finding.category).map(String::from)
+                get_remediation_guidance(&rule_id).map(String::from)
             } else {
                 None
             };
@@ -296,16 +465,26 @@ impl SafetyReport {
                 .entry(finding.category.clone())
                 .or_default()
                 .push(ReportedFinding {
+                    rule_id,
                     finding: finding.clone(),
                     fingerprint,
                     suppressed,
-                    suppression_reason: rule.and_then(|r| r.reason.clone()),
-                    suppression_author: rule.and_then(|r| r.author.clone()),
-                    suppression_expiry: rule.and_then(|r| r.expiry.clone()),
-                    suppression_fingerprint: rule.and_then(|r| r.fingerprint.clone()),
+                    suppression_reason: rule_ref.and_then(|r| r.reason.clone()),
+                    suppression_author: rule_ref.and_then(|r| r.author.clone()),
+                    suppression_expiry: rule_ref.and_then(|r| r.expiry.clone()),
+                    suppression_fingerprint: rule_ref.and_then(|r| r.fingerprint.clone()),
                     remediation,
                 });
         }
+
+        // Build the list of suppression rules that never matched any finding.
+        let unmatched_suppressions: Vec<crate::suppression::SuppressionRule> = suppressions
+            .rules
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !matched_rule_indices.contains(idx))
+            .map(|(_, r)| r.clone())
+            .collect();
 
         let is_safe = if strict {
             failing_critical_count == 0 && failing_warning_count == 0
@@ -318,16 +497,20 @@ impl SafetyReport {
             warning_count,
             info_count,
             suppressed_count,
+            filtered_count: 0,
             suppressed_critical_count,
             total_findings: diff.findings.len(),
             is_safe,
             findings_by_category,
             strict,
-            scope: AnalysisScope::default(),
             baseline_source: None,
             verified_code_hash: None,
+            category_filter: CategoryFilter::default(),
+            scope: AnalysisScope::default(),
             old_spec_summary: None,
             new_spec_summary: None,
+            metrics: None,
+            unmatched_suppressions,
         }
     }
 
@@ -381,6 +564,14 @@ impl SafetyReport {
 
     /// Build a serializable, machine-readable view of this report.
     pub fn to_json(&self) -> SafetyReportJson<'_> {
+        let unmatched_suppressions = self
+            .unmatched_suppressions
+            .iter()
+            .map(|r| UnmatchedSuppressionJson {
+                category: r.rule_id.clone(),
+                target: r.target.clone(),
+            })
+            .collect();
         SafetyReportJson {
             is_safe: self.is_safe,
             strict: self.strict,
@@ -392,6 +583,7 @@ impl SafetyReport {
                 info: self.info_count,
             },
             suppressed_count: self.suppressed_count,
+            filtered_count: self.filtered_count,
             total_findings: self.total_findings,
             recommended_bump: self.recommended_bump(),
             baseline_source: self.baseline_source.as_deref(),
@@ -401,6 +593,8 @@ impl SafetyReport {
                 .iter()
                 .map(|(k, v)| (k.as_str(), v))
                 .collect(),
+            metrics: self.metrics.as_ref(),
+            unmatched_suppressions,
         }
     }
 
@@ -445,6 +639,41 @@ impl SafetyReport {
         };
         output.push_str(&format!("        {}\n", storage_status));
 
+        // Spec-section integrity summary (non-zero section count or duplicates).
+        if self.scope.old_spec_section_count > 1 || self.scope.new_spec_section_count > 1 {
+            output.push_str(
+                &format!(
+                    "        Spec sections: old={}, new={} (multi-section WASMs detected)\n",
+                    self.scope.old_spec_section_count, self.scope.new_spec_section_count,
+                )
+                .yellow()
+                .to_string(),
+            );
+        }
+        let all_dups: Vec<String> = self
+            .scope
+            .old_duplicate_names
+            .iter()
+            .map(|n| format!("old:{n}"))
+            .chain(
+                self.scope
+                    .new_duplicate_names
+                    .iter()
+                    .map(|n| format!("new:{n}")),
+            )
+            .collect();
+        if !all_dups.is_empty() {
+            output.push_str(
+                &format!(
+                    "        Duplicate entries detected: {}\n",
+                    all_dups.join(", ")
+                )
+                .red()
+                .bold()
+                .to_string(),
+            );
+        }
+
         let crit_str = if self.critical_count > 0 {
             self.critical_count.to_string().red().bold()
         } else {
@@ -464,6 +693,18 @@ impl SafetyReport {
             output.push_str(&format!(
                 "Suppressed: {}\n",
                 self.suppressed_count.to_string().magenta().bold()
+            ));
+        }
+        if self.filtered_count > 0 {
+            output.push_str(&format!(
+                "Filtered:   {}\n",
+                self.filtered_count.to_string().yellow().bold()
+            ));
+            output.push_str(&format!(
+                "{}",
+                "  ↳ Findings were hidden by --include-category/--exclude-category.\n"
+                    .yellow()
+                    .dimmed()
             ));
         }
         let bump = self.recommended_bump();
@@ -491,6 +732,7 @@ impl SafetyReport {
         if self.total_findings == 0 {
             output.push_str(&"No relevant changes detected. The exported interface is identical in its exports and types.\n".green().to_string());
             output.push_str(&format!("\n{}\n", STORAGE_NOT_VERIFIED_NOTE.dimmed()));
+            self.append_metrics_text(&mut output);
             return output;
         }
 
@@ -508,8 +750,9 @@ impl SafetyReport {
                     .bold()
                     .to_string(),
             );
-            let group = self.findings_by_category.get(category).unwrap();
-            for reported in group {
+            let mut group = self.findings_by_category.get(category).unwrap().clone();
+            group.sort_by(|a, b| a.finding.message.cmp(&b.finding.message));
+            for reported in &group {
                 let finding = &reported.finding;
 
                 if reported.suppressed {
@@ -623,7 +866,57 @@ impl SafetyReport {
             }
         }
 
+        self.append_metrics_text(&mut output);
+
         output
+    }
+
+    /// Append the informational build-metrics block to text output.
+    fn append_metrics_text(&self, output: &mut String) {
+        if let Some(ref m) = self.metrics {
+            output.push_str(
+                &"\n========================================\n"
+                    .bold()
+                    .to_string(),
+            );
+            output.push_str(
+                &"📊 BUILD METRICS\n"
+                    .bold()
+                    .cyan()
+                    .to_string(),
+            );
+            output.push_str(
+                &"========================================\n"
+                    .bold()
+                    .to_string(),
+            );
+            output.push_str(&format!(
+                "WASM size:  {} → {} ({})\n",
+                BuildMetrics::format_bytes(m.old_size_bytes),
+                BuildMetrics::format_bytes(m.new_size_bytes),
+                BuildMetrics::format_delta(m.size_delta_bytes),
+            ));
+            output.push_str(&format!(
+                "Functions:  {} → {}\n",
+                m.old_function_count, m.new_function_count
+            ));
+            output.push_str(&format!(
+                "Structs:    {} → {}\n",
+                m.old_struct_count, m.new_struct_count
+            ));
+            output.push_str(&format!(
+                "Enums:      {} → {}\n",
+                m.old_enum_count, m.new_enum_count
+            ));
+            output.push_str(&format!(
+                "Unions:     {} → {}\n",
+                m.old_union_count, m.new_union_count
+            ));
+            output.push_str(&format!(
+                "Error Enums:{} → {}\n",
+                m.old_error_enum_count, m.new_error_enum_count
+            ));
+        }
     }
 
     /// Generate a structured Markdown output.
@@ -643,6 +936,33 @@ impl SafetyReport {
             self.scope.storage_status_line()
         ));
 
+        // Spec-section integrity (multi-section or duplicates).
+        if self.scope.old_spec_section_count > 1 || self.scope.new_spec_section_count > 1 {
+            output.push_str(&format!(
+                "> ⚠️ Multi-section WASM detected: old has {} contractspecv0 section(s), new has {}.\n\n",
+                self.scope.old_spec_section_count,
+                self.scope.new_spec_section_count,
+            ));
+        }
+        let all_dups: Vec<String> = self
+            .scope
+            .old_duplicate_names
+            .iter()
+            .map(|n| format!("`old:{n}`"))
+            .chain(
+                self.scope
+                    .new_duplicate_names
+                    .iter()
+                    .map(|n| format!("`new:{n}`")),
+            )
+            .collect();
+        if !all_dups.is_empty() {
+            output.push_str(&format!(
+                "> ❌ Duplicate spec entries detected: {}\n\n",
+                all_dups.join(", ")
+            ));
+        }
+
         output.push_str("### Summary Table\n\n");
         output.push_str("| Finding Severity | Count |\n");
         output.push_str("| :--- | :--- |\n");
@@ -651,6 +971,10 @@ impl SafetyReport {
         output.push_str(&format!("| **Info** | {} |\n", self.info_count));
         if self.suppressed_count > 0 {
             output.push_str(&format!("| **Suppressed** | {} |\n", self.suppressed_count));
+        }
+        if self.filtered_count > 0 {
+            output.push_str(&format!("| **Filtered** | {} |\n", self.filtered_count));
+            output.push_str("\n> ⚠️  Findings were hidden by `--include-category`/`--exclude-category`. The verdict reflects the remaining visible findings only.\n\n");
         }
         output.push_str(&format!(
             "\n**Recommended SemVer Bump**: `{}`\n\n",
@@ -669,6 +993,7 @@ impl SafetyReport {
         if self.total_findings == 0 {
             output.push_str("No relevant changes detected. The exported interface is identical in its exports and types.\n\n");
             output.push_str(&format!("> {}\n", STORAGE_NOT_VERIFIED_NOTE));
+            self.append_metrics_markdown(&mut output);
             return output;
         }
 
@@ -681,8 +1006,9 @@ impl SafetyReport {
 
         for category in categories {
             output.push_str(&format!("### {}\n\n", category));
-            let group = self.findings_by_category.get(category).unwrap();
-            for reported in group {
+            let mut group = self.findings_by_category.get(category).unwrap().clone();
+            group.sort_by(|a, b| a.finding.message.cmp(&b.finding.message));
+            for reported in &group {
                 let finding = &reported.finding;
 
                 if reported.suppressed {
@@ -817,103 +1143,103 @@ impl SafetyReport {
     }
 }
 
-/// Returns remediation/explanation guidance for a given finding category.
-///
-/// Storage-schema findings reuse the exported-interface categories behind a
-/// [`STORAGE_CATEGORY_PREFIX`], so guidance is looked up storage-first and then
-/// falls back to the shared advice for the underlying structural change.
-pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
-    if category == STORAGE_UNRESOLVED_CATEGORY {
-        return Some(
-            "Declare the referenced type in the storage schema, or confirm it is not \
-             serialized into storage. Until it resolves, its layout is not analyzed.",
-        );
+        output
     }
 
-    if let Some(base) = category.strip_prefix(STORAGE_CATEGORY_PREFIX) {
-        return storage_remediation_guidance(base).or_else(|| interface_remediation_guidance(base));
+    /// Append the informational build-metrics table to Markdown output.
+    fn append_metrics_markdown(&self, output: &mut String) {
+        if let Some(ref m) = self.metrics {
+            output.push_str("## 📊 Build Metrics\n\n");
+            output.push_str("| Metric | Old | New | Delta |\n");
+            output.push_str("| :--- | ---: | ---: | ---: |\n");
+            output.push_str(&format!(
+                "| **WASM size** | {} | {} | {} |\n",
+                BuildMetrics::format_bytes(m.old_size_bytes),
+                BuildMetrics::format_bytes(m.new_size_bytes),
+                BuildMetrics::format_delta(m.size_delta_bytes),
+            ));
+            let delta_fn = m.new_function_count as i64 - m.old_function_count as i64;
+            let delta_struct = m.new_struct_count as i64 - m.old_struct_count as i64;
+            let delta_enum = m.new_enum_count as i64 - m.old_enum_count as i64;
+            let delta_union = m.new_union_count as i64 - m.old_union_count as i64;
+            let delta_err = m.new_error_enum_count as i64 - m.old_error_enum_count as i64;
+            let fmt_count = |d: i64| if d >= 0 { format!("+{}", d) } else { format!("{}", d) };
+            output.push_str(&format!(
+                "| **Functions** | {} | {} | {} |\n",
+                m.old_function_count, m.new_function_count, fmt_count(delta_fn)
+            ));
+            output.push_str(&format!(
+                "| **Structs** | {} | {} | {} |\n",
+                m.old_struct_count, m.new_struct_count, fmt_count(delta_struct)
+            ));
+            output.push_str(&format!(
+                "| **Enums** | {} | {} | {} |\n",
+                m.old_enum_count, m.new_enum_count, fmt_count(delta_enum)
+            ));
+            output.push_str(&format!(
+                "| **Unions** | {} | {} | {} |\n",
+                m.old_union_count, m.new_union_count, fmt_count(delta_union)
+            ));
+            output.push_str(&format!(
+                "| **Error Enums** | {} | {} | {} |\n",
+                m.old_error_enum_count, m.new_error_enum_count, fmt_count(delta_err)
+            ));
+            output.push('\n');
+        }
     }
-
-    interface_remediation_guidance(category)
 }
 
-/// Guidance specific to declared storage types, where the consequence of a
-/// structural change is stored-data corruption rather than a broken caller.
-fn storage_remediation_guidance(base_category: &str) -> Option<&'static str> {
-    match base_category {
-        "Struct Field Reordered" => Some("This corrupts stored data. Soroban serializes struct fields positionally, so reordering makes existing entries decode into the wrong fields. Restore the original field order and append any new field at the end."),
-        "Struct Field Removed" => Some("This corrupts stored data. Existing entries still contain bytes for this field. Restore the field, or perform an explicit migration that rewrites every affected entry before the upgrade."),
-        "Struct Field Type Changed" => Some("This corrupts stored data. Existing entries hold bytes in the old type's encoding. Revert the type, or migrate every affected entry."),
-        "Struct Field Added" => Some("For a storage value this needs a migration or default, because existing entries lack the field. For a storage key it is fatal: the key's bytes change, so every existing entry becomes unreachable."),
-        "Union Case Reordered" => Some("This orphans stored data. Union cases are addressed by positional discriminant, so reordering changes which variant existing bytes decode as. Restore the original case order and append new cases at the end."),
-        "Union Case Removed" => Some("This orphans stored data written under the removed discriminant. Restore the case, or migrate the affected entries before upgrading."),
-        "Union Case Type Changed" => Some("This corrupts stored data. The payload encoding changed under an unchanged discriminant. Revert the payload type, or migrate the affected entries."),
-        "Enum Case Value Changed" => Some("This orphans stored data. The discriminant is what was written to storage, so changing it makes existing entries resolve to a different case or to nothing. Restore the original value."),
-        "Enum Case Removed" => Some("This orphans stored data written under this discriminant. Restore the case, or migrate the affected entries."),
-        "Struct Removed" | "Enum Removed" | "Union Removed" => Some("A declared storage type disappeared while data written with it may still exist on chain. Restore the type, or migrate the affected entries before upgrading."),
-        "Cascading Layout Break" => Some("This type embeds a modified storage type, so its stored bytes are no longer decodable. Resolve the break in the referenced type."),
-        _ => None,
-    }
-}
-
-/// Guidance for exported-interface findings.
-fn interface_remediation_guidance(category: &str) -> Option<&'static str> {
-    match category {
-        "Environment" => Some("Verify that the target network supports the new protocol version and adjust any SDK/tooling dependencies accordingly."),
-        "Function Removed" => Some("This is a breaking change. If the function is no longer needed, deprecate it in client integrations. Otherwise, restore the function signature."),
-        "Function Documentation Changed" => Some("No code changes required. Ensure client/consumer integrations are aware of the updated documentation/behavior."),
-        "Function Added" => Some("No action required. Inform client integrations about the availability of the new function."),
-        "Function Signature Changed" => Some("This is a breaking change. Update call sites, SDKs, and tests to match the new parameter structure."),
-        "Parameter Renamed" => Some("This is a breaking change for named-argument RPC systems. Update all client integrations to use the new parameter name."),
-        "Parameter Reordered" => Some("This is a breaking change. Reordering parameters breaks positional RPC invocation. Restore the original parameter order."),
-        "Parameter Type Changed" => Some("This is a breaking change. Update caller arguments and client SDKs to match the new parameter type."),
-        "Return Type Changed" => Some("This is a breaking change. Update caller expectations and client SDKs to match the new return type."),
-        "Event Definition Removed" => Some("This is a breaking change. Update or remove downstream event indexing or monitoring systems that consume this event."),
-        "Struct Removed" => Some("This is a breaking change. Ensure no stored data or active interfaces reference this struct. If they do, restore the struct."),
-        "Struct Documentation Changed" => Some("No code changes required. Ensure documentation changes are aligned with the struct's intended usage."),
-        "Struct Added" => Some("No action required. New structs can be safely integrated into storage layouts or interface parameters."),
-        "Struct Field Removed" => Some("This is a breaking change. Removing fields breaks serialized storage layouts. Restore the field or perform a state migration."),
-        "Event Field Removed" => Some("This is a breaking change. Update event indexers and consumers that expect this field to be present."),
-        "Struct Field Reordered" => Some("This is a breaking change. Reordering fields breaks positional serialization layouts. Restore the original field order."),
-        "Event Field Reordered" => Some("This is a breaking change. Update event indexers and consumers to handle the new positional field order."),
-        "Struct Field Type Changed" => Some("This is a breaking change. Changing field types breaks layout serialization. Revert the type change or migrate existing data."),
-        "Event Field Type Changed" => Some("This is a breaking change. Update event indexers and consumers to handle the new field type."),
-        "Struct Field Added" => Some("Warning: Ensure existing storage entries are migrated or initialized with correct default values for the new field."),
-        "Struct Field Inserted" => Some("This is a breaking change. A field was inserted in the middle of the struct, shifting all subsequent fields. Restore the original field order or perform a state migration."),
-        "Event Field Inserted" => Some("This is a breaking change. A field was inserted in the middle of the event schema, shifting all subsequent fields. Update event indexers and consumers to handle the new positional layout."),
-        "Event Enum Removed" => Some("This is a breaking change. Downstream event consumers or indexers relying on this enum will fail. Restore the enum."),
-        "Enum Removed" => Some("This is a breaking change. Stored data or parameters using this enum will be invalid. Restore the enum."),
-        "Enum Documentation Changed" => Some("No code changes required. Ensure the updated docs are clear for consumers."),
-        "Enum Added" => Some("No action required. Ensure consumers are aware of the new enum type if needed."),
-        "Enum Case Removed" => Some("This is a breaking change. On-chain data or parameters using this case will be invalid. Restore the case."),
-        "Event Enum Case Removed" => Some("This is a breaking change. Downstream event indexers or consumers relying on this case will fail. Restore the case."),
-        "Enum Case Value Changed" => Some("This is a breaking change. Modifying case values breaks serialization/deserialization. Revert the value change."),
-        "Event Enum Case Value Changed" => Some("This is a breaking change. Downstream event indexers or consumers relying on these values will fail. Revert the value change."),
-        "Enum Case Added" => Some("No action required. Ensure consumers can handle the new case gracefully."),
-        "Event Enum Case Added" => Some("No action required. Update event indexers and consumers to handle the new event enum case if necessary."),
-        "Union Removed" => Some("This is a breaking change. Stored data or parameters using this union will be invalid. Restore the union."),
-        "Union Added" => Some("No action required. Ensure consumers are aware of the new union type if needed."),
-        "Union Case Removed" => Some("This is a breaking change. On-chain data using this union case will be invalid. Restore the case."),
-        "Union Case Reordered" => Some("This is a breaking change. Reordering union cases breaks positional discriminant serialization. Restore the original case order."),
-        "Union Case Type Changed" => Some("This is a breaking change. Changing union case payload types breaks layout serialization. Revert the type change or migrate existing data."),
-        "Union Case Added" => Some("No action required. Ensure consumers can handle the new union case gracefully."),
-        "Union Case Inserted" => Some("This is a breaking change. A union case was inserted in the middle, shifting all subsequent case discriminants. Restore the original case order or migrate stored data."),
-        "Error Enum Removed" => Some("This is a breaking change. Clients matching on these error codes will break. Restore the error enum."),
-        "Error Enum Added" => Some("No action required. Inform client integrations about the new error enum if needed."),
-        "Error Enum Case Removed" => Some("This is a breaking change. Clients matching on this error code will break. Restore the case."),
-        "Error Enum Case Value Changed" => Some("This is a breaking change. Modifying error case values breaks error-code compatibility. Revert the value change."),
-        "Error Enum Case Added" => Some("No action required. Ensure clients can handle the new error case gracefully."),
-        "Cascading Layout Break" => Some("This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type."),
-        _ => None,
-    }
+/// Returns remediation/explanation guidance for a given stable rule id.
+pub fn get_remediation_guidance(rule_id: &str) -> Option<&'static str> {
+    guidance_for_rule_id(rule_id)
+        .or_else(|| canonical_rule_id(rule_id).and_then(guidance_for_rule_id))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rules::{all_rules, display_label_for_rule_id, rule_by_id};
 
     #[test]
-    fn test_every_emitted_category_has_guidance() {
+    fn every_registered_rule_has_unique_id_and_guidance() {
+        let mut ids = std::collections::HashSet::new();
+
+        for rule in all_rules() {
+            assert!(ids.insert(rule.id), "duplicate rule id: {}", rule.id);
+            assert_eq!(rule.label, display_label_for_rule_id(rule.id).unwrap());
+            assert_eq!(rule.guidance, guidance_for_rule_id(rule.id).unwrap());
+            assert_eq!(rule.severity, rule_by_id(rule.id).unwrap().severity);
+        }
+    }
+
+    #[test]
+    fn every_category_in_the_inventory_has_guidance() {
+        for cat in crate::diff::ALL_CATEGORIES {
+            assert!(
+                get_remediation_guidance(cat).is_some(),
+                "Category '{cat}' does not have remediation guidance!"
+            );
+        }
+    }
+
+    #[test]
+    fn no_category_is_event_flavored() {
+        // Event-ness must live in `classification`, never in the suppression
+        // key, so that reclassifying a type cannot move a finding out from
+        // under an existing suppression rule.
+        for cat in crate::diff::ALL_CATEGORIES {
+            assert!(
+                !cat.contains("Event") || cat.starts_with("Error Enum"),
+                "Category '{cat}' encodes classification in the suppression key"
+            );
+        }
+    }
+
+    /// The inventory is only trustworthy if it actually covers what `diff.rs`
+    /// emits, so scan the source for category literals and require each one to
+    /// be listed. This catches a new category added without guidance.
+    #[test]
+    fn every_emitted_category_is_in_the_inventory() {
         let diff_rs_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("diff.rs");
@@ -928,8 +1254,17 @@ mod tests {
                     checked_categories.insert("Environment".to_string());
                     continue;
                 }
+                // Constant-referenced duplicate/conflict categories
+                if line.contains("SPEC_CONFLICT_CATEGORY") {
+                    checked_categories.insert("Spec Entry Conflict".to_string());
+                    continue;
+                }
+                if line.contains("SPEC_DUPLICATE_CATEGORY") {
+                    checked_categories.insert("Spec Entry Duplicate".to_string());
+                    continue;
+                }
 
-                // Find all string literals in the line
+                // Find all string literals in the line and check each one.
                 let mut chars = line.chars().peekable();
                 while let Some(c) = chars.next() {
                     if c == '"' {
@@ -941,64 +1276,76 @@ mod tests {
                             }
                             literal.push(chars.next().unwrap());
                         }
-                        if !literal.is_empty() {
-                            // If it's a format string like "{} Removed"
-                            if literal.contains("{}") {
-                                let suffixes = vec![
-                                    "Removed",
-                                    "Reordered",
-                                    "Type Changed",
-                                    "Value Changed",
-                                    "Added",
-                                ];
-                                for suffix in suffixes {
-                                    if literal == format!("{{}} {}", suffix) {
-                                        let prefixes = match suffix {
-                                            "Reordered" | "Type Changed" => {
-                                                vec!["Struct Field", "Event Field"]
-                                            }
-                                            "Value Changed" | "Added" => {
-                                                vec!["Enum Case", "Event Enum Case"]
-                                            }
-                                            "Removed" => vec![
-                                                "Struct Field",
-                                                "Event Field",
-                                                "Enum Case",
-                                                "Event Enum Case",
-                                            ],
-                                            _ => unreachable!(),
-                                        };
-                                        for prefix in prefixes {
-                                            checked_categories
-                                                .insert(format!("{} {}", prefix, suffix));
+                        if literal.is_empty() {
+                            continue;
+                        }
+
+                        // A literal that *looks* like a category (Title Case
+                        // words, no punctuation) but is not in the inventory is
+                        // a bug.
+                        let looks_like_category = literal.len() > 3
+                            && literal.split(' ').count() >= 2
+                            && literal
+                                .split(' ')
+                                .all(|w| w.chars().next().is_some_and(|c| c.is_ascii_uppercase()));
+                        assert!(
+                            !looks_like_category
+                                || crate::diff::ALL_CATEGORIES.contains(&literal.as_str())
+                                || literal == "TOTALLY CUSTOM CATEGORY",
+                            "'{literal}' looks like a category but is not in diff::ALL_CATEGORIES"
+                        );
+
+                        // If it's a format string like "{} Removed", expand it
+                        // into the concrete categories the code can emit.
+                        if literal.contains("{}") {
+                            let suffixes = vec![
+                                "Removed",
+                                "Reordered",
+                                "Type Changed",
+                                "Value Changed",
+                                "Added",
+                            ];
+                            for suffix in suffixes {
+                                if literal == format!("{{}} {}", suffix) {
+                                    let prefixes = match suffix {
+                                        "Reordered" | "Type Changed" => {
+                                            vec!["Struct Field", "Event Field"]
                                         }
+                                        "Value Changed" => {
+                                            vec!["Enum Case", "Event Enum Case"]
+                                        }
+                                        "Added" => vec![
+                                            "Struct Field",
+                                            "Event Schema",
+                                            "Enum Case",
+                                            "Event Enum Case",
+                                        ],
+                                        "Removed" => vec![
+                                            "Struct Field",
+                                            "Event Field",
+                                            "Enum Case",
+                                            "Event Enum Case",
+                                        ],
+                                        _ => unreachable!(),
+                                    };
+                                    for prefix in prefixes {
+                                        checked_categories.insert(format!("{} {}", prefix, suffix));
                                     }
                                 }
-                            } else {
-                                checked_categories.insert(literal);
                             }
+                        } else {
+                            checked_categories.insert(literal);
                         }
                     }
                 }
             }
         }
 
-        // Remove test custom categories
-        checked_categories.remove("TOTALLY CUSTOM CATEGORY");
-
         assert!(
-            !checked_categories.is_empty(),
-            "Sanity check: should have found categories"
+            checked_categories.len() > 20,
+            "sanity check: expected to find most categories in the source, found {}",
+            checked_categories.len()
         );
-
-        for cat in &checked_categories {
-            let guidance = get_remediation_guidance(cat);
-            assert!(
-                guidance.is_some(),
-                "Category '{}' does not have remediation guidance!",
-                cat
-            );
-        }
     }
 
     #[test]
@@ -1008,16 +1355,20 @@ mod tests {
             warning_count: 0,
             info_count: 0,
             suppressed_count: 0,
+            filtered_count: 0,
             suppressed_critical_count: 0,
             total_findings: 0,
             is_safe: true,
             findings_by_category: std::collections::HashMap::new(),
             strict: false,
-            scope: AnalysisScope::default(),
             baseline_source: None,
             verified_code_hash: None,
+            category_filter: CategoryFilter::default(),
+            scope: AnalysisScope::default(),
             old_spec_summary: None,
             new_spec_summary: None,
+            metrics: None,
+            unmatched_suppressions: Vec::new(),
         };
 
         // Identical upgrade -> patch

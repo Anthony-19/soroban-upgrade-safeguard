@@ -20,11 +20,13 @@
 //! reason   = "Deprecated initializer dropped after the v2 cutover."
 //! ```
 //!
-//! Matching is **exact**: a rule applies only when both its `category` and its
-//! `target` equal the finding's own [`Finding::category`] and [`Finding::target`].
-//! A rule that omits `target` matches only findings that themselves have no
-//! target (e.g. environment-metadata changes). This deliberate strictness keeps
-//! a suppression from over-applying to sibling fields, cases, or parameters.
+//! Matching is **exact**: a rule applies only when both its stable rule id and
+//! its `target` equal the finding's own rule id and [`Finding::target`]. The
+//! parser still accepts legacy `category = "..."` entries and maps them to the
+//! corresponding rule id for compatibility. A rule that omits `target` matches
+//! only findings that themselves have no target (e.g. environment-metadata
+//! changes). This deliberate strictness keeps a suppression from over-applying
+//! to sibling fields, cases, or parameters.
 //!
 //! The `target` convention mirrors [`Finding::target`]:
 //!
@@ -33,6 +35,19 @@
 //! - types: the type name (e.g. `Data`)
 //! - struct fields: `Type.field` (e.g. `Data.amount`)
 //! - enum cases: `Enum.case` (e.g. `Status.Active`)
+//!
+//! ## Stable category keys
+//!
+//! Categories describe **structure only** — `"Enum Case Value Changed"`, never
+//! `"Event Enum Case Value Changed"`. Whether a type is an event is reported
+//! separately in the finding's `classification` field and affects only wording
+//! and remediation. That separation is deliberate: a suppression key can never
+//! shift because the event classification changed, so a reclassification cannot
+//! silently un-suppress (or newly suppress) a real breaking change.
+//!
+//! Configs written against the older event-flavored names keep working —
+//! [`stable_category`] maps each one onto its structural replacement — but new
+//! rules should use the structural keys.
 
 use std::fs;
 use std::path::Path;
@@ -41,12 +56,18 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::diff::Finding;
+use crate::rules::canonical_rule_id;
 
 /// The default config file name looked up in the current working directory.
 pub const DEFAULT_CONFIG_FILE: &str = ".safeguard.toml";
 
 /// A parsed suppression config: a flat list of reviewed acknowledgements.
+///
+/// `deny_unknown_fields` is deliberate: this is the one config file that can
+/// turn the safety gate off, so a mistyped key (`targets`, `[[suppression]]`)
+/// must be a loud parse error rather than a silently dropped rule.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SuppressionConfig {
     /// Configurable maximum number of suppressions. Enforced globally.
     pub max_suppressions: Option<usize>,
@@ -55,13 +76,34 @@ pub struct SuppressionConfig {
     /// The acknowledged findings, one `[[suppress]]` table per entry.
     #[serde(default, rename = "suppress")]
     pub rules: Vec<SuppressionRule>,
+    /// Explicit event/storage classification (the `[classification]` table).
+    ///
+    /// Classification only affects a finding's wording, remediation, and
+    /// `classification` metadata — never the structural `category` used for
+    /// suppression matching — so changing it can never silently move a finding
+    /// out from under an existing suppression rule.
+    #[serde(default)]
+    pub classification: crate::classification::ClassificationConfig,
+    /// The `[limits]` table is parsed independently by [`crate::limits`]. We
+    /// still declare it here so `deny_unknown_fields` accepts a combined config
+    /// carrying both `[[suppress]]` rules and `[limits]`; its contents are
+    /// ignored by this parser.
+    #[serde(default)]
+    #[allow(dead_code)] // Present only so deny_unknown_fields accepts `[limits]`.
+    limits: Option<toml::Value>,
 }
 
 /// A single whitelisted finding, keyed by category and (optionally) target.
+///
+/// `deny_unknown_fields` guards against a typo (e.g. `targets` for `target`)
+/// silently changing what the rule matches.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SuppressionRule {
-    /// The finding category to match exactly (e.g. `"Struct Field Type Changed"`).
-    pub category: String,
+    /// The stable rule id to match exactly (e.g. `"struct_field_type_changed"`).
+    /// Legacy suppression files may still use `category = "Struct Field Type Changed"`.
+    #[serde(default, alias = "category")]
+    pub rule_id: String,
     /// The exact [`Finding::target`] to match. When omitted, the rule matches
     /// only findings whose target is `None`.
     #[serde(default)]
@@ -80,27 +122,43 @@ pub struct SuppressionRule {
     pub fingerprint: Option<String>,
 }
 
-impl SuppressionRule {
-    /// Whether this rule matches `finding` exactly on category, target, and fingerprint (if present).
-    fn matches(&self, finding: &Finding) -> bool {
-        if self.category != finding.category || self.target.as_deref() != finding.target.as_deref()
-        {
-            return false;
-        }
+/// Map a pre-1.0 event-flavored category onto the structural category that
+/// replaced it.
+///
+/// Categories used to encode the event/storage guess in the string itself
+/// (`"Event Enum Case Value Changed"`), which meant a change to the
+/// classification heuristic silently moved a finding out from under an
+/// existing suppression. Categories are now purely structural and event-ness
+/// lives in the separate `classification` field, so these names are no longer
+/// emitted — but configs in the wild still reference them. Translating them
+/// here keeps those configs working; the docs list the mapping so teams can
+/// migrate to the stable keys at their own pace.
+pub fn stable_category(category: &str) -> &str {
+    match category {
+        "Event Definition Removed" => "Struct Removed",
+        "Event Field Removed" => "Struct Field Removed",
+        "Event Field Reordered" => "Struct Field Reordered",
+        "Event Field Type Changed" => "Struct Field Type Changed",
+        "Event Enum Removed" => "Enum Removed",
+        "Event Enum Case Removed" => "Enum Case Removed",
+        "Event Enum Case Value Changed" => "Enum Case Value Changed",
+        "Event Enum Case Added" => "Enum Case Added",
+        other => other,
+    }
+}
 
-        if let Some(rule_fingerprint) = &self.fingerprint {
-            // New format: calculate finding fingerprint and verify.
-            let computed_fingerprint = compute_fingerprint(finding);
-            rule_fingerprint.trim().to_lowercase() == computed_fingerprint
-        } else {
-            // Old format / compatibility mode fallback. Warn on stderr.
-            eprintln!(
-                "⚠️  Warning: Deprecated old-format suppression rule detected (category: \"{}\", target: \"{:?}\"). Please upgrade to the new format with 'author', 'reason', 'expiry', and 'fingerprint'. This will be a hard error in the next release.",
-                self.category,
-                self.target
-            );
-            true
-        }
+impl SuppressionRule {
+    /// Whether this rule matches `finding` exactly on both rule id and target.
+    fn matches(&self, finding: &Finding) -> bool {
+        self.canonical_rule_id().is_some_and(|rule_id| {
+            canonical_rule_id(&finding.category)
+                .is_some_and(|finding_rule_id| rule_id == finding_rule_id)
+                && self.target.as_deref() == finding.target.as_deref()
+        })
+    }
+
+    fn canonical_rule_id(&self) -> Option<&'static str> {
+        canonical_rule_id(&self.rule_id)
     }
 }
 
@@ -157,21 +215,21 @@ impl SuppressionConfig {
                 if rule.author.is_none() {
                     anyhow::bail!(
                         "Missing 'author' for suppression rule under category '{}' (target: '{:?}').",
-                        rule.category,
+                        rule.rule_id,
                         rule.target
                     );
                 }
                 if rule.expiry.is_none() {
                     anyhow::bail!(
                         "Missing 'expiry' for suppression rule under category '{}' (target: '{:?}').",
-                        rule.category,
+                        rule.rule_id,
                         rule.target
                     );
                 }
                 if rule.fingerprint.is_none() {
                     anyhow::bail!(
                         "Missing 'fingerprint' for suppression rule under category '{}' (target: '{:?}').",
-                        rule.category,
+                        rule.rule_id,
                         rule.target
                     );
                 }
@@ -181,7 +239,7 @@ impl SuppressionConfig {
                 if is_expired(expiry_str)? {
                     anyhow::bail!(
                         "Suppression rule for category '{}' has expired on {}.",
-                        rule.category,
+                        rule.rule_id,
                         expiry_str
                     );
                 }
@@ -221,6 +279,18 @@ impl SuppressionConfig {
     /// Return the first rule that matches `finding`, if any.
     pub fn matching_rule(&self, finding: &Finding) -> Option<&SuppressionRule> {
         self.rules.iter().find(|rule| rule.matches(finding))
+    }
+
+    /// Return the first rule that matches `finding` together with its index, if any.
+    /// The index is used by the report layer to track which rules were used.
+    pub fn matching_rule_with_index(
+        &self,
+        finding: &Finding,
+    ) -> Option<(usize, &SuppressionRule)> {
+        self.rules
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| rule.matches(finding))
     }
 
     /// Whether any rule matches `finding`.
@@ -394,6 +464,7 @@ mod tests {
             message: "irrelevant to matching".to_string(),
             type_name: target.map(|t| t.split('.').next().unwrap().to_string()),
             target: target.map(|t| t.to_string()),
+            classification: None,
         }
     }
 
@@ -418,6 +489,91 @@ mod tests {
         let f = finding("Struct Field Type Changed", Some("Data.amount"));
         let rule = config.matching_rule(&f).expect("should match exactly");
         assert_eq!(rule.reason.as_deref(), Some("Planned migration"));
+    }
+
+    #[test]
+    fn unknown_key_in_suppress_entry_is_rejected() {
+        // `targets` is a typo for `target`; without deny_unknown_fields it would
+        // silently load as a targetless rule and change what it matches.
+        let err = SuppressionConfig::from_toml_str(
+            r#"
+            [[suppress]]
+            category = "Struct Field Type Changed"
+            targets  = "Data.amount"
+            reason   = "Planned migration"
+            "#,
+        )
+        .expect_err("an unknown key in a suppress entry must be a parse error");
+
+        // The error, including the anyhow context added by load_from_path, must
+        // name the offending key so the user can find it.
+        let full = format!("{:#}", err);
+        assert!(
+            full.contains("targets"),
+            "error should name the unknown key `targets`, got: {}",
+            full
+        );
+    }
+
+    #[test]
+    fn unknown_top_level_key_is_rejected() {
+        // `[[suppression]]` (wrong table name) plus a stray scalar: both are
+        // unknown top-level keys and must fail rather than parse to zero rules.
+        let err = SuppressionConfig::from_toml_str(
+            r#"
+            max_supressions = 10
+
+            [[suppression]]
+            category = "Struct Field Type Changed"
+            target   = "Data.amount"
+            "#,
+        )
+        .expect_err("an unknown top-level key must be a parse error");
+
+        let full = format!("{:#}", err);
+        assert!(
+            full.contains("max_supressions") || full.contains("suppression"),
+            "error should name the unknown top-level key, got: {}",
+            full
+        );
+    }
+
+    #[test]
+    fn limits_table_still_parses_alongside_suppressions() {
+        // `[limits]` is parsed independently by crate::limits, but the same file
+        // flows through SuppressionConfig too, so the stricter rules must still
+        // accept it.
+        let config = SuppressionConfig::from_toml_str(
+            r#"
+            max_suppressions = 10
+            allow_targetless = false
+
+            [[suppress]]
+            category    = "Struct Field Removed"
+            target      = "ConfigData.threshold"
+            author      = "Alice <alice@example.com>"
+            reason      = "Planned migration."
+            expiry      = "2026-12-31"
+            fingerprint = "8a3f..."
+
+            [limits]
+            max_xdr_depth = 64
+            "#,
+        )
+        .expect("a config carrying both [[suppress]] and [limits] must parse");
+        assert_eq!(config.rules.len(), 1);
+    }
+
+    #[test]
+    fn example_config_still_parses() {
+        // Acceptance: the shipped example must keep parsing under the stricter rules.
+        let contents = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/.safeguard.example.toml"
+        ))
+        .expect("failed to read .safeguard.example.toml");
+        SuppressionConfig::from_toml_str(&contents)
+            .expect(".safeguard.example.toml must parse under deny_unknown_fields");
     }
 
     #[test]
@@ -468,6 +624,43 @@ mod tests {
     }
 
     #[test]
+    fn legacy_event_category_still_matches_its_structural_replacement() {
+        // A config written before categories became purely structural must keep
+        // suppressing the same finding, not silently stop applying.
+        let config = SuppressionConfig::from_toml_str(
+            r#"
+            [[suppress]]
+            category = "Event Enum Case Value Changed"
+            target   = "StatusEvent.Paused"
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.is_suppressed(&finding(
+            "Enum Case Value Changed",
+            Some("StatusEvent.Paused")
+        )));
+        // Aliasing must not widen the target match.
+        assert!(!config.is_suppressed(&finding(
+            "Enum Case Value Changed",
+            Some("StatusEvent.Active")
+        )));
+    }
+
+    #[test]
+    fn stable_categories_are_passed_through_unchanged() {
+        for cat in [
+            "Struct Field Removed",
+            "Enum Case Value Changed",
+            "Function Signature Changed",
+            "Type Renamed",
+            "Environment",
+        ] {
+            assert_eq!(stable_category(cat), cat);
+        }
+    }
+
+    #[test]
     fn function_target_matches_bare_name() {
         let config = SuppressionConfig::from_toml_str(
             r#"
@@ -491,6 +684,7 @@ mod tests {
             message: "Struct field threshold of type ConfigData was removed".to_string(),
             type_name: Some("ConfigData".to_string()),
             target: Some("ConfigData.threshold".to_string()),
+            classification: None,
         };
         let fp = compute_fingerprint(&f);
         let expected_input = "category:Struct Field Removed\ntarget:ConfigData.threshold\nmessage:Struct field threshold of type ConfigData was removed";
@@ -566,6 +760,7 @@ mod tests {
             message: "Struct field threshold of type ConfigData was removed".to_string(),
             type_name: Some("ConfigData".to_string()),
             target: Some("ConfigData.threshold".to_string()),
+            classification: None,
         };
         let fp = compute_fingerprint(&f);
 

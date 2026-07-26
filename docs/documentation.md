@@ -15,13 +15,14 @@ This document explains what Soroban Upgrade Safeguard does, how it works interna
 9. [Detection Categories](#detection-categories)
 10. [Severity Levels](#severity-levels)
 11. [Cascading Layout Breaks](#cascading-layout-breaks)
-12. [Reading the Report](#reading-the-report)
-13. [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes)
-14. [Resource Limits and Hardening Against Malicious Input](#resource-limits-and-hardening-against-malicious-input)
-15. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
-16. [Limitations](#limitations)
-17. [Migration Note](#migration-note)
-18. [Frequently Asked Questions](#frequently-asked-questions)
+12. [Spec Entry Integrity and Duplicate Detection](#spec-entry-integrity-and-duplicate-detection)
+13. [Reading the Report](#reading-the-report)
+14. [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes)
+15. [Resource Limits and Hardening Against Malicious Input](#resource-limits-and-hardening-against-malicious-input)
+16. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
+17. [Limitations](#limitations)
+18. [Migration Note](#migration-note)
+19. [Frequently Asked Questions](#frequently-asked-questions)
 
 ## Overview
 
@@ -370,9 +371,168 @@ The comparison stage looks for the following classes of change.
 - **Enum Case Value Changed.** A variant kept its name but its integer value changed, which breaks serialization. Critical.
 - **Enum Case Added.** A new variant. Informational.
 
+### Type Renames
+
+Types are compared by structure, not only by name, so renaming a type is recognized as a rename instead of being reported as an unrelated removal plus addition. See [Type Identity](#type-identity) for how the matching works and what it deliberately refuses to match.
+
+- **Type Renamed.** The old type was matched to a new one with an identical layout. Stored data stays compatible; only client-side type names need updating. Informational.
+- **Type Renamed With Changes.** The old type was matched to a new one whose layout also changed. The rename itself is a warning, and the actual breaking changes are reported alongside it as ordinary field- or case-level findings.
+
 ### Events
 
-Soroban does not mark event types explicitly in the spec, so the tool uses a naming heuristic: any user-defined type whose name contains the word `event` (case insensitive) is treated as an event type. When such a type changes, the same struct and enum checks apply but the findings are labeled with event-specific categories such as **Event Schema Removed** or **Event Enum Case Value Changed**. This matters because off-chain indexers and subscribers depend on a stable event shape, and a change that is merely awkward for storage can be fully breaking for an indexer.
+Soroban's `contractspecv0` carries no marker that says "this type is an event", so the tool cannot infer it from the spec. Instead you declare it, in the `[classification]` table of `.safeguard.toml`. See [Type Classification](#type-classification).
+
+Classification affects only the **wording** of a finding and the remediation advice attached to it — a type classified as an event gets guidance about off-chain indexers and subscribers, because a change that is merely awkward for storage can be fully breaking for an indexer. It never affects the finding's `category`.
+
+## Type Identity
+
+A contract spec identifies every user-defined type by name, but a name is not an identity. Two questions have to be kept apart:
+
+- **Is this the same type as before?** — a *structural* question.
+- **What kind of thing is it?** — a *semantic* question, covered in [Type Classification](#type-classification).
+
+### Why name matching alone is not enough
+
+Matching purely on name gets two cases wrong, in opposite directions.
+
+- **Renames are false breaks.** Renaming `Config` to `Settings` without touching a single field produces "Struct Removed" plus "Struct Added" — two findings, one of them critical, for a change that is byte-for-byte compatible on chain.
+- **Swaps are false matches.** If `Config` is deleted and an unrelated new type happens to be called `Config`, name matching reports only the field-level differences between two types that have nothing to do with each other, quietly treating a full replacement as an edit.
+
+### How matching actually works
+
+Types that exist under the same name in both specs are compared in place, exactly as before. The types left over — present only in the old spec, or only in the new one — are then matched against each other structurally, per kind (structs to structs, enums to enums, and so on; a struct is never matched to an enum).
+
+Each type gets a **fingerprint**: a canonical string built from its members and their types, with the type's own name excluded. Matching then proceeds in two tiers:
+
+1. **Identical fingerprint.** The layouts are the same, so this is a pure rename. Reported as **Type Renamed** (Info) — no migration needed.
+2. **Similar member sets.** Otherwise the candidates are scored by [Jaccard similarity](https://en.wikipedia.org/wiki/Jaccard_index) over their member keys (name and type together). A pair must score at least `0.5` — more than half their members in common — to be considered a rename at all. Reported as **Type Renamed With Changes** (Warning), followed by the ordinary field- or case-level findings describing what actually changed.
+
+Anything not matched under those rules is reported as a plain removal and a plain addition, which is the conservative outcome: an unmatched removal stays critical.
+
+The matching is **deterministic** — candidates are iterated in sorted order and ties are broken by the lexicographically smaller new name, so the same pair of specs always produces the same output — and **bounded**, at one comparison per (removed, added) pair within a kind.
+
+### What it deliberately does not do
+
+- A removed type and an added type that share fewer than half their members are **not** matched. A rewrite is a rewrite.
+- Each type participates in at most one rename. When several candidates are plausible, the best-scoring one wins and the rest fall back to removal/addition.
+- Two unrelated types with coincidentally identical layouts (say, two distinct `struct Wrapper { value: u32 }`) can be matched. This is unavoidable — they are indistinguishable in the spec — and harmless: the finding is informational and the layouts really are compatible.
+- Names are compared case-sensitively. `Config` and `config` are different names; if both exist, they are separate types.
+
+## Type Classification
+
+Classification answers the second question: what kind of thing a type is. Today that means one distinction — is it an **event**, consumed by off-chain indexers and subscribers, or an ordinary **storage/interface** type?
+
+Nothing in `contractspecv0` records this. The tool used to guess from the name, treating any type whose name contained `event` as an event type. That guess is wrong in both directions: `PreventList` and `EventCounterCache` are not events, and a genuine `Transfer` event is not caught.
+
+So it is configured explicitly, in `.safeguard.toml`:
+
+```toml
+[classification]
+# Genuine events, by exact type name. Names need not contain "event".
+events = ["Transfer", "LedgerEvent", "PriceUpdate"]
+
+# Types to keep as ordinary storage. Takes precedence over everything below.
+storage = ["PreventList", "EventCounterCache"]
+
+# Opt-in fallback: treat any name containing "event" (case-insensitive) as an
+# event. Off by default.
+name_heuristic = false
+```
+
+Resolution precedence, first match wins:
+
+1. listed in `storage` → storage
+2. listed in `events` → event (declared)
+3. `name_heuristic = true` and the name contains `event` → event (heuristic)
+4. otherwise → storage
+
+With no `[classification]` section, **nothing is treated as an event**. The tool makes no claim it cannot back up.
+
+### Classification never affects the suppression key
+
+This is the important property. A finding's `category` describes structure only — `Struct Field Removed`, `Enum Case Value Changed` — and never encodes classification. Event-ness is reported separately, in the finding's `classification` field:
+
+```json
+{
+  "severity": "critical",
+  "category": "Enum Case Value Changed",
+  "target": "StatusEvent.Paused",
+  "type_name": "StatusEvent",
+  "classification": { "class": "event", "heuristic": false }
+}
+```
+
+Because the suppression key (`category` + `target`) contains no classification, editing `[classification]` cannot move a finding out from under an existing suppression rule, and cannot pull an unrelated one under it. Reclassifying a type changes how a finding reads, never whether it fails the run.
+
+When a classification came from the opt-in heuristic rather than a declaration, the report says so in the finding message and sets `"heuristic": true`, so a reviewer can always tell a guess from a fact.
+
+### Category compatibility
+
+Earlier versions folded the event guess into the category string itself. Those names are no longer emitted, but suppression configs that use them keep working — each is mapped onto its structural replacement:
+
+| Pre-1.0 category | Stable category |
+| :--- | :--- |
+| `Event Definition Removed` | `Struct Removed` |
+| `Event Field Removed` | `Struct Field Removed` |
+| `Event Field Reordered` | `Struct Field Reordered` |
+| `Event Field Type Changed` | `Struct Field Type Changed` |
+| `Event Enum Removed` | `Enum Removed` |
+| `Event Enum Case Removed` | `Enum Case Removed` |
+| `Event Enum Case Value Changed` | `Enum Case Value Changed` |
+| `Event Enum Case Added` | `Enum Case Added` |
+
+New rules should use the stable names. `Error Enum …` categories are unrelated to events and were never remapped.
+
+## Rule Registry
+
+Every detection rule has a stable `rule_id` that is independent of the human
+readable category label. The table below lists the registered rules, their
+severity, and the guidance used when `--explain` is enabled.
+
+| rule_id | Label | Severity | Guidance |
+| :--- | :--- | :--- | :--- |
+| `environment` | Environment | Info | Verify the target network supports the new protocol version and adjust tooling as needed. |
+| `function_removed` | Function Removed | Critical | Restore the function or deprecate it in client integrations. |
+| `function_documentation_changed` | Function Documentation Changed | Info | Keep downstream consumers aware of the updated docs and behavior. |
+| `function_added` | Function Added | Info | Inform integrations about the new function. |
+| `function_signature_changed` | Function Signature Changed | Critical | Update call sites and tests to match the new parameter structure. |
+| `parameter_renamed` | Parameter Renamed | Warning | Update named-argument integrations to use the new parameter name. |
+| `parameter_reordered` | Parameter Reordered | Critical | Restore the original parameter order. |
+| `parameter_type_changed` | Parameter Type Changed | Critical | Update caller arguments and SDKs to use the new type. |
+| `return_type_changed` | Return Type Changed | Critical | Update caller expectations and SDKs to the new return type. |
+| `event_definition_removed` | Event Definition Removed | Critical | Update or remove downstream event consumers. |
+| `struct_removed` | Struct Removed | Critical | Restore the struct or migrate any stored data that depends on it. |
+| `struct_documentation_changed` | Struct Documentation Changed | Info | Keep documentation aligned with the intended struct usage. |
+| `struct_added` | Struct Added | Info | Inform consumers about the new struct. |
+| `struct_field_removed` | Struct Field Removed | Critical | Restore the field or perform a storage migration. |
+| `event_field_removed` | Event Field Removed | Critical | Update indexers and consumers that expect the removed field. |
+| `struct_field_reordered` | Struct Field Reordered | Critical | Restore the original field order. |
+| `event_field_reordered` | Event Field Reordered | Critical | Update consumers to handle the new field ordering. |
+| `struct_field_type_changed` | Struct Field Type Changed | Critical | Revert the type change or migrate existing data. |
+| `event_field_type_changed` | Event Field Type Changed | Critical | Update event consumers to handle the new field type. |
+| `struct_field_added` | Struct Field Added | Warning | Ensure consumers and storage migrations handle the new field. |
+| `event_enum_removed` | Event Enum Removed | Critical | Restore the enum or update downstream event consumers. |
+| `enum_removed` | Enum Removed | Critical | Restore the enum or migrate any stored data that uses it. |
+| `enum_documentation_changed` | Enum Documentation Changed | Info | Ensure the updated docs are clear for consumers. |
+| `enum_added` | Enum Added | Info | Inform consumers about the new enum type. |
+| `enum_case_removed` | Enum Case Removed | Critical | Restore the case or migrate data that depends on it. |
+| `event_enum_case_removed` | Event Enum Case Removed | Critical | Restore the case or update event consumers. |
+| `enum_case_value_changed` | Enum Case Value Changed | Critical | Revert the value change to preserve serialization compatibility. |
+| `event_enum_case_value_changed` | Event Enum Case Value Changed | Critical | Revert the change or update event consumers. |
+| `enum_case_added` | Enum Case Added | Info | Ensure consumers can handle the new case. |
+| `event_enum_case_added` | Event Enum Case Added | Info | Update consumers to handle the new event enum case. |
+| `union_removed` | Union Removed | Critical | Restore the union or migrate data that uses it. |
+| `union_added` | Union Added | Info | Inform consumers about the new union type. |
+| `union_case_removed` | Union Case Removed | Critical | Restore the case or migrate existing data. |
+| `union_case_reordered` | Union Case Reordered | Critical | Restore the original case order. |
+| `union_case_type_changed` | Union Case Type Changed | Critical | Revert the type change or migrate data. |
+| `union_case_added` | Union Case Added | Info | Ensure consumers can handle the new union case. |
+| `error_enum_removed` | Error Enum Removed | Critical | Restore the error enum or update clients. |
+| `error_enum_added` | Error Enum Added | Info | Inform client integrations about the new error enum. |
+| `error_enum_case_removed` | Error Enum Case Removed | Critical | Restore the case or update client error handling. |
+| `error_enum_case_value_changed` | Error Enum Case Value Changed | Critical | Revert the value change to preserve error-code compatibility. |
+| `error_enum_case_added` | Error Enum Case Added | Info | Ensure clients can handle the new error case. |
+| `cascading_layout_break` | Cascading Layout Break | Critical | Resolve the underlying layout break in the referenced type. |
 
 ## Severity Levels
 
@@ -387,6 +547,57 @@ Every finding carries one of three severity levels.
 The most subtle failures come from shared types. Suppose a small struct named `Money` is used as a field inside `Account`, and `Account` is used inside `Ledger`. If you change `Money`, the stored bytes for every `Account` and every `Ledger` are now wrong, even though you never touched those larger types directly.
 
 To catch this, `mapper.rs` builds a reverse dependency graph: for each user-defined type, it records which other types embed it. After the direct comparison finds the set of types with critical changes, `diff.rs` walks that graph outward and marks every dependent type as broken too, transitively. These appear in the report under the **Cascading Layout Break** category, naming both the affected parent type and the underlying modified type that caused the break. Cyclic type references are handled safely so the walk always terminates.
+
+## Spec Entry Integrity and Duplicate Detection
+
+WASM binaries are permitted to carry more than one custom section with the same name. The Soroban toolchain typically emits a single `contractspecv0` section, but a crafted or malformed build can contain multiple. The parser concatenates entries from all `contractspecv0` sections in order, and then `spec.rs` checks for duplicate names within each kind (function, struct, enum, union, error enum).
+
+### Why duplicates are a soundness problem
+
+If two sections define the same type name differently, the analysis model contains the first definition it encountered. Any subsequent conflicting definition is discarded from the model. This creates a gap: the definition the tool analyzes may not be the one the contract actually uses. An attacker who controls section ordering can steer the tool to analyze a benign definition while the real, breaking one is ignored. The upgrade appears safe; in production it corrupts data.
+
+### Detection policy
+
+The tool compares every pair of definitions that share a name and kind using their serialized XDR bytes:
+
+- **Conflicting duplicates** (same name, different bytes) produce a **`Spec Entry Conflict`** finding at `Critical` severity. The run is marked `is_safe: false` and exits with code 1. This is true regardless of which side carries the duplicate (old or new) and regardless of whether `--compat-duplicates` is set.
+
+- **Identical duplicates** (same name, byte-identical bytes) produce a **`Spec Entry Duplicate`** finding. The severity depends on the mode:
+  - **Default mode**: `Warning`. The WASM is non-canonical and the condition is suspicious.
+  - **Compat mode** (`--compat-duplicates`): `Info`. Legitimate toolchains that historically emit split sections with identical entries can set this flag to suppress the warning without hiding genuine conflicts.
+
+The first encountered definition is always the one used for comparison. The policy is deterministic and independent of `HashMap` iteration order.
+
+### JSON fields
+
+The `scope` object in JSON output always reflects the duplicate status:
+
+```json
+{
+  "scope": {
+    "old_spec_section_count": 2,
+    "new_spec_section_count": 1,
+    "old_duplicate_names": ["Ledger"],
+    "new_duplicate_names": []
+  }
+}
+```
+
+`old_spec_section_count` and `new_spec_section_count` give the raw number of `contractspecv0` sections found in each binary. `old_duplicate_names` and `new_duplicate_names` list every entry name that appeared more than once (across all kinds), sorted for stable output. These fields are always present; the name lists are omitted from JSON when empty.
+
+### Compat mode
+
+Some older SDK versions emit two `contractspecv0` sections with identical entries. To handle those WASMs without failing, pass `--compat-duplicates`:
+
+```bash
+soroban-upgrade-safeguard old.wasm new.wasm --compat-duplicates
+```
+
+In compat mode, identical duplicates become informational and no longer cause a `Warning`. Conflicting duplicates remain `Critical` regardless — a difference in definitions cannot be safely ignored in any mode.
+
+### Coverage
+
+Duplicate detection covers all five spec entry kinds: functions, structs, enums, unions, and error enums. Provenance (which section each entry came from, zero-indexed) is tracked through decoding and reported in every finding message and in the `scope` JSON so an operator can identify exactly which sections are involved.
 
 ## Zero-Trust RPC Baseline Retrieval
 
@@ -454,6 +665,44 @@ Example JSON excerpt:
 }
 ```
 
+## JSON Schema
+
+The JSON output is the integration surface for dashboards, bots, and other
+tooling, so its shape is published as a JSON Schema (Draft 2020-12) under
+[`schema/`](../schema):
+
+- [`schema/report.schema.json`](../schema/report.schema.json) — the single-pair
+  document (`--format json` on a contract pair).
+- [`schema/batch-report.schema.json`](../schema/batch-report.schema.json) — the
+  batch document (`--manifest` or `--old-dir`/`--new-dir` with `--format json`),
+  whose top level differs from the single-pair shape and embeds a single-pair
+  report per contract under `results`.
+
+Both schemas are **derived from the Rust output types**, not hand-written, so
+they cannot silently drift from what the tool emits: `tests/schema_validation.rs`
+regenerates them from the types and validates real emitted output — including a
+run with suppressed findings and one produced with `--explain` — against the
+committed files, failing if they diverge. Conditionally omitted fields
+(`suppressed`, `suppression_reason`, `remediation`, the duplicate-name lists, …)
+are marked optional, and the enumerated fields (the `counts` severities and
+`recommended_bump`) are constrained to their allowed values.
+
+To regenerate the committed schema after intentionally changing an output type:
+
+```bash
+UPDATE_SCHEMA=1 cargo test --test schema_validation schemas_match_the_types
+```
+
+### Stability
+
+The crate is pre-1.0 (`0.x`). While it remains pre-1.0 the JSON shape may still
+change between minor versions, but such changes will be **additive wherever
+possible** — new optional fields rather than renamed or removed ones — and any
+breaking change to the shape will be called out in the release notes. Consumers
+should ignore unknown fields so additive changes do not break them. A firmer
+"additive changes only within a major version" guarantee is intended once the
+crate reaches 1.0.
+
 ## Reading the Report
 
 A run prints a header for each loaded contract with a one line summary of how many functions, structs, enums, unions, and error enums it contains. It then prints the safety report.
@@ -484,26 +733,32 @@ suppressed and the tool behaves exactly as it always has. If you pass
 `--config` explicitly and the file is missing or malformed, that is a hard
 error rather than a silent no-op, so a typo never quietly disables suppression.
 
-Each `[[suppress]]` entry acknowledges exactly one finding using the secure, content-bound format:
+Each `[[suppress]]` entry acknowledges exactly one finding. The stable key is
+`rule_id`, and the legacy `category` field is still accepted as a compatibility
+alias for older configs:
 
 ```toml
-max_suppressions = 10
-allow_targetless = false
+[[suppress]]
+rule_id = "struct_field_removed"
+target  = "ConfigData.threshold"
+reason  = "Planned storage migration in v2 drops the unused threshold field."
 
 [[suppress]]
-category    = "Struct Field Removed"
-target      = "ConfigData.threshold"
-author      = "Alice <alice@example.com>"
-reason      = "Planned storage migration in v2 drops the unused threshold field."
-expiry      = "2026-12-31"
-fingerprint = "8a3f..." # SHA-256 hex fingerprint
+rule_id = "function_signature_changed"
+target  = "initialize"
+reason  = "Re-init is intentional and gated behind the migration admin call."
 ```
 
 A ready-to-copy template lives at [`.safeguard.example.toml`](../.safeguard.example.toml).
 
 ### How matching works
 
-Matching is **exact**: a rule applies only when its `category`, `target`, and `fingerprint` equal the finding's values:
+Matching is **exact**: a rule applies only when both its stable `rule_id` and
+its `target` equal the finding's own values. This strictness keeps a suppression
+from over-applying to a sibling field, enum case, or parameter. A rule that
+omits `target` matches only findings that themselves have no target (for
+example `Environment` changes). Legacy configs that still use `category` are
+mapped to the same rule id automatically, so existing suppressions keep working.
 
 - **Category & Target**: matched verbatim.
 - **Fingerprint**: calculated as the SHA-256 hex hash of:
@@ -518,6 +773,12 @@ For backwards compatibility, old-format rules (lacking `author`, `expiry`, or `f
 1. Run `soroban-upgrade-safeguard` with `--format json`.
 2. Copy the finding's `category` and `target`.
 3. Add `author`, `reason`, `expiry` (`YYYY-MM-DD`), and compute or copy the `fingerprint`.
+
+`category` is always **structural** — it describes what changed in the shape of
+the contract and nothing else. In particular it never encodes whether a type is
+an event, so editing `[classification]` can never change which findings a rule
+matches. Configs written against the older event-flavored category names still
+work; see [Category compatibility](#category-compatibility) for the mapping.
 
 ### What suppression does and does not change
 

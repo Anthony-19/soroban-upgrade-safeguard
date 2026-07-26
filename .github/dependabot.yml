@@ -1,0 +1,42 @@
+# Dependabot keeps the project's pinned dependencies current so that pinning
+# (see the base image pinning policy in the Dockerfile) buys reproducibility
+# without the pins quietly rotting into stale, unpatched versions.
+#
+# The `docker` ecosystem watches the `FROM … @sha256:…` lines in the Dockerfile
+# and opens a PR — updating both the version tag and the digest — whenever a new
+# base image is published, so a toolchain bump is a reviewable change rather than
+# an invisible drift.
+version: 2
+updates:
+  # Base images pinned in the Dockerfile (builder: rust, runtime: debian).
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "chore"
+
+  # Rust crate dependencies (Cargo.toml / Cargo.lock).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "rust"
+    commit-message:
+      prefix: "chore"
+
+  # GitHub Actions pinned in .github/workflows.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "chore"

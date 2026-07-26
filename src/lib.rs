@@ -41,13 +41,17 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+pub mod classification;
 pub mod color;
+pub mod dependency;
 pub mod diff;
 pub mod limits;
 pub mod loader;
 pub mod mapper;
 pub mod parser;
+pub mod rename;
 pub mod report;
+pub mod rules;
 pub mod spec;
 pub mod storage_schema;
 pub mod suppression;
@@ -105,6 +109,12 @@ pub struct CompareOptions<'a> {
     pub explain: bool,
     /// Treat `Warning`-severity findings as failures (strict mode).
     pub strict: bool,
+    /// When `true`, identical duplicate spec entries (same name, byte-identical
+    /// definition) are downgraded to `Info` instead of failing the run.
+    /// Conflicting duplicates (different definitions) always remain `Critical`
+    /// even in compat mode — the analysis cannot be trusted when two definitions
+    /// disagree, regardless of this flag.
+    pub compat_duplicates: bool,
     /// Declared storage layouts of the old and new builds. When supplied, the
     /// pipeline additionally diffs these internal storage types through the same
     /// engine and records that storage was analyzed in the report's scope.
@@ -205,18 +215,55 @@ pub fn compare_wasm_bytes_with_options(
     let new_meta = parser::extract_metadata_with_policy(new_wasm, policy)
         .context("Failed to extract metadata from the new WASM")?;
 
-    let old_spec = ContractSpec::from_entries(&old_meta.spec);
-    let new_spec = ContractSpec::from_entries(&new_meta.spec);
+    // Build specs with duplicate detection. Conflicting duplicates are wired
+    // into the diff report as Critical findings so they affect the exit code
+    // and appear in JSON output; identical duplicates become Info findings.
+    let (old_spec, old_dups) = ContractSpec::from_entries_checked(&old_meta.spec);
+    let (new_spec, new_dups) = ContractSpec::from_entries_checked(&new_meta.spec);
 
     let old_spec_summary = old_spec.summary();
     let new_spec_summary = new_spec.summary();
 
     let mut diff_report = diff::compare_with_policy(&old_spec, &new_spec, policy)?;
+
+    // Inject duplicate findings before the structural diff so that the report
+    // presents them alongside the regular findings in JSON/text/markdown.
+    diff::report_duplicate_spec_entries(
+        "old",
+        &old_dups,
+        old_meta.spec_section_count,
+        &mut diff_report,
+        options.compat_duplicates,
+    );
+    diff::report_duplicate_spec_entries(
+        "new",
+        &new_dups,
+        new_meta.spec_section_count,
+        &mut diff_report,
+        options.compat_duplicates,
+    );
+
     diff::compare_env_metadata(
         old_meta.env_meta.as_ref(),
         new_meta.env_meta.as_ref(),
         &mut diff_report,
     );
+
+    diff::compare_contract_metadata(
+        old_meta.meta.as_ref(),
+        new_meta.meta.as_ref(),
+    // Compare exported function names from the binary export sections.
+    // This catches a removed export that callers depend on, and also any
+    // mismatch between what the binary actually exports and what its spec claims.
+    diff::compare_exports(
+        &old_meta.exported_function_names,
+        &new_meta.exported_function_names,
+        &old_spec.functions.keys().cloned().collect(),
+        &new_spec.functions.keys().cloned().collect(),
+        &mut diff_report,
+    );
+
+    diff::compare_wasm_imports(&old_meta.imports, &new_meta.imports, &mut diff_report);
 
     // The pipeline always compares the exported interface and environment
     // metadata; storage layout is analyzed only when a schema is supplied for
@@ -226,6 +273,20 @@ pub fn compare_wasm_bytes_with_options(
         exported_interface: true,
         env_metadata: true,
         storage_schema: report::StorageScopeState::NotAnalyzed,
+        old_spec_section_count: old_meta.spec_section_count,
+        new_spec_section_count: new_meta.spec_section_count,
+        old_duplicate_names: {
+            let mut names: Vec<String> = old_dups.iter().map(|d| d.name.clone()).collect();
+            names.sort();
+            names.dedup();
+            names
+        },
+        new_duplicate_names: {
+            let mut names: Vec<String> = new_dups.iter().map(|d| d.name.clone()).collect();
+            names.sort();
+            names.dedup();
+            names
+        },
     };
 
     if let Some((old_schema, new_schema)) = options.storage_schemas {
@@ -259,10 +320,28 @@ pub fn compare_wasm_bytes_with_options(
         suppressions,
         options.explain,
         options.strict,
+        policy,
     );
     safety_report.old_spec_summary = Some(old_spec_summary);
     safety_report.new_spec_summary = Some(new_spec_summary);
     safety_report.scope = scope;
+
+    // Populate build metrics so all output formats can report size and
+    // interface-count deltas without the caller needing to extract them.
+    safety_report.metrics = Some(report::BuildMetrics::new(
+        old_wasm.len(),
+        new_wasm.len(),
+        old_spec.functions.len(),
+        new_spec.functions.len(),
+        old_spec.structs.len(),
+        new_spec.structs.len(),
+        old_spec.enums.len(),
+        new_spec.enums.len(),
+        old_spec.unions.len(),
+        new_spec.unions.len(),
+        old_spec.error_enums.len(),
+        new_spec.error_enums.len(),
+    ));
 
     Ok(safety_report)
 }

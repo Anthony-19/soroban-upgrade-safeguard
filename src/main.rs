@@ -1,13 +1,19 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use colored::Colorize;
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use soroban_upgrade_safeguard::{
     color::should_disable_color,
+    dependency::{
+        cycle_findings, missing_contract_findings, ContractDependency, CrossContractFinding,
+        DependencyGraph,
+    },
     limits::{find_limit_error, LimitsConfig, ResourcePolicy},
     loader, report,
+    report::{validate_categories, CategoryFilter},
     storage_schema::StorageSchema,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
     CompareOptions,
@@ -102,6 +108,13 @@ struct Args {
     #[arg(long, value_name = "NEW_DIR", requires = "old_dir")]
     new_dir: Option<PathBuf>,
 
+    /// Only include findings from these categories. Repeatable.
+    #[arg(long, value_name = "CATEGORY", num_args = 0..)]
+    include_category: Vec<String>,
+
+    /// Exclude findings from these categories. Repeatable.
+    #[arg(long, value_name = "CATEGORY", num_args = 0..)]
+    exclude_category: Vec<String>,
     /// Storage-schema manifest describing the OLD build's storage layout.
     ///
     /// Declares the storage-key types and internal value types that govern
@@ -134,6 +147,25 @@ struct Args {
     /// detection). Overrides `[limits]` and the default.
     #[arg(long, value_name = "N")]
     max_walk_depth: Option<usize>,
+
+    /// Treat identical duplicate spec entries (same name, byte-identical
+    /// definition) as informational rather than warnings.
+    ///
+    /// This is a compatibility mode for toolchains that legitimately emit
+    /// split contractspecv0 sections with identical entries (e.g., some
+    /// SDK versions). Conflicting duplicates (different definitions) are
+    /// always Critical regardless of this flag.
+    #[arg(long)]
+    compat_duplicates: bool,
+
+    /// Write the report to this file instead of stdout.
+    ///
+    /// The file is created (or overwritten) only after the report has been
+    /// successfully rendered, so a failed comparison never leaves a
+    /// partial file behind. Progress output continues to go to its normal
+    /// destination regardless of this flag.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
 }
 
 /// Resolve the effective [`ResourcePolicy`]: built-in defaults, overlaid by the
@@ -192,6 +224,55 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn run() -> Result<()> {
+    let args = Args::parse();
+
+    // Validate category filter arguments
+    let all_categories: Vec<String> = args
+        .include_category
+        .iter()
+        .chain(args.exclude_category.iter())
+        .cloned()
+        .collect();
+    if !all_categories.is_empty() {
+        if let Err(unknown) = validate_categories(&all_categories) {
+            anyhow::bail!(
+                "Unknown category name(s): {}. Valid categories are: {}",
+                unknown.join(", "),
+                report::KNOWN_CATEGORIES.join(", ")
+            );
+        }
+    }
+    let category_filter = CategoryFilter {
+        include: if args.include_category.is_empty() {
+            None
+        } else {
+            Some(args.include_category.iter().cloned().collect())
+        },
+        exclude: args.exclude_category.iter().cloned().collect(),
+    };
+
+/// Write `content` to a file if `output_path` is `Some`, otherwise print it
+/// to stdout. Writing to a file is atomic: the full string is rendered before
+/// any file is opened, so a failed comparison never leaves a partial file.
+///
+/// When a file path is used, a progress message is emitted via `progress` so
+/// the user can see where the report landed.
+fn emit_report_output(
+    content: &str,
+    output_path: Option<&std::path::Path>,
+    progress: &impl Fn(String),
+) -> Result<()> {
+    if let Some(path) = output_path {
+        std::fs::write(path, content)
+            .with_context(|| format!("Failed to write report to '{}'", path.display()))?;
+        progress(format!("✅ Report written to: {}", path.display()));
+    } else {
+        println!("{}", content);
+    }
+    Ok(())
 }
 
 fn run() -> Result<()> {
@@ -265,14 +346,16 @@ fn run() -> Result<()> {
         _ => None,
     };
 
-    // In JSON, Markdown, or github-actions mode, decorative progress goes to
-    // stderr so stdout stays a single, pristine document. An explicit output
-    // file also keeps stdout empty in text mode: the report is in that file
-    // and all progress belongs on stderr rather than alongside it.
+    // In JSON or Markdown mode, decorative progress goes to stderr so stdout
+    // stays a single, pristine document. In text mode it stays on stdout
+    // exactly as before.
+    let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
+    // stays a single, pristine document. An explicit output file also keeps
+    // stdout empty in text mode: the report is in that file and all progress
+    // belongs on stderr rather than alongside it.
     let clean_stdout = args.output.is_some()
         || args.format == OutputFormat::Json
-        || args.format == OutputFormat::Markdown
-        || args.format == OutputFormat::GithubActions;
+        || args.format == OutputFormat::Markdown;
     let progress = |line: String| {
         if clean_stdout {
             eprintln!("{line}");
@@ -311,18 +394,32 @@ fn run() -> Result<()> {
     let policy = resolve_policy(&args, config_path.as_deref())?;
 
     if is_batch {
-        let pairs = if let Some(manifest_path) = &args.manifest {
+        let (pairs, dep_declarations) = if let Some(manifest_path) = &args.manifest {
             parse_manifest(manifest_path)?
         } else {
-            scan_directories(
+            // Directory scan mode has no dependency declaration mechanism.
+            let pairs = scan_directories(
                 args.old_dir.as_ref().unwrap(),
                 args.new_dir.as_ref().unwrap(),
-            )?
+            )?;
+            (pairs, vec![])
         };
 
         progress("🔍 Soroban Upgrade Safeguard (Batch Mode)".to_string());
         progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
         progress(format!("Loaded {} pair(s) for comparison.\n", pairs.len()));
+
+        // Resolve a stable, unique display name for every pair *before* any
+        // analysis runs. Two rules:
+        //
+        //  1. An explicit `name` that is duplicated across manifest entries is
+        //     an error — the user wrote it deliberately, so a silent rename
+        //     would be more confusing than failing early.
+        //  2. A derived name (taken from the new WASM basename) that collides
+        //     is disambiguated by appending " (2)", " (3)", … so both pairs
+        //     appear in the output rather than one silently overwriting the
+        //     other.
+        let pair_names: Vec<String> = resolve_pair_names(&pairs)?;
 
         let mut results = std::collections::BTreeMap::new();
         let mut failed: std::collections::BTreeMap<String, PairFailure> =
@@ -331,14 +428,7 @@ fn run() -> Result<()> {
         let mut any_limit_violation = false;
 
         for (i, pair) in pairs.iter().enumerate() {
-            let default_name = format!("pair_{}", i + 1);
-            let contract_name = pair.name.clone().unwrap_or_else(|| {
-                pair.new
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.to_string())
-                    .unwrap_or(default_name)
-            });
+            let contract_name = pair_names[i].clone();
 
             progress(format!(
                 "📦 [{}/{}] Comparing contract pair: {}",
@@ -375,6 +465,7 @@ fn run() -> Result<()> {
                     if !all_categories.is_empty() {
                         report.apply_category_filter(&category_filter);
                     }
+                Ok(report) => {
                     if !report.is_safe {
                         overall_safe = false;
                     }
@@ -407,6 +498,88 @@ fn run() -> Result<()> {
             progress("\n----------------------------------------\n".to_string());
         }
 
+        // ── Cross-contract dependency propagation ──────────────────────────
+        // After all individual pairs have been analyzed, build the dependency
+        // graph and propagate caller-visible breaking changes from callees to
+        // every contract that depends on them.
+        let dep_graph = DependencyGraph::from_declarations(&dep_declarations);
+
+        // Detect and report cycles.
+        let cycles = dep_graph.detect_cycles();
+        let cycle_findings_list = cycle_findings(&cycles);
+        if !cycle_findings_list.is_empty() {
+            progress(format!(
+                "\n⚠️  {} cyclic dependency/ies detected in the declared graph.",
+                cycles.len()
+            ));
+            for f in &cycle_findings_list {
+                progress(format!("   {}", f.message));
+            }
+            if args.strict {
+                overall_safe = false;
+            }
+        }
+
+        // Detect dependencies on contracts absent from this batch.
+        let known_contracts: std::collections::HashSet<String> =
+            results.keys().cloned().collect();
+        let missing = dep_graph.missing_contracts(&known_contracts);
+        let missing_findings_list = missing_contract_findings(&missing);
+        if !missing_findings_list.is_empty() {
+            progress(format!(
+                "\n⚠️  {} dependency contract(s) not present in this batch:",
+                missing.len()
+            ));
+            for name in &missing {
+                progress(format!("   - {}", name));
+            }
+            overall_safe = false;
+        }
+
+        // Collect per-contract raw findings for propagation.
+        let mut per_contract_findings: std::collections::HashMap<
+            String,
+            Vec<soroban_upgrade_safeguard::diff::Finding>,
+        > = std::collections::HashMap::new();
+        for (name, report) in &results {
+            let all: Vec<_> = report
+                .findings_by_category
+                .values()
+                .flat_map(|v| v.iter().map(|rf| rf.finding.clone()))
+                .collect();
+            per_contract_findings.insert(name.clone(), all);
+        }
+
+        let cross_findings: Vec<CrossContractFinding> =
+            dep_graph.propagate(&per_contract_findings);
+
+        // Cross-contract criticals always fail; warnings only fail under --strict.
+        let cross_critical_count = cross_findings
+            .iter()
+            .filter(|f| {
+                f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Critical
+            })
+            .count();
+        let cross_warning_count = cross_findings
+            .iter()
+            .filter(|f| {
+                f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Warning
+            })
+            .count();
+        if cross_critical_count > 0 {
+            overall_safe = false;
+        }
+        if args.strict && cross_warning_count > 0 {
+            overall_safe = false;
+        }
+
+        if !cross_findings.is_empty() {
+            progress(format!(
+                "\n🔗 {} cross-contract finding(s) propagated from dependency analysis.",
+                cross_findings.len()
+            ));
+        }
+
         match args.format {
             OutputFormat::Json => {
                 let mut results_json = serde_json::Map::new();
@@ -425,16 +598,53 @@ fn run() -> Result<()> {
                     );
                 }
 
+                // Cross-contract findings grouped by affected contract.
+                let mut cross_by_contract: serde_json::Map<String, serde_json::Value> =
+                    serde_json::Map::new();
+                for cf in &cross_findings {
+                    cross_by_contract
+                        .entry(cf.affected_contract.clone())
+                        .or_insert_with(|| serde_json::json!([]))
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::to_value(cf)?);
+                }
+
+                let infra_findings: Vec<serde_json::Value> = cycle_findings_list
+                    .iter()
+                    .chain(missing_findings_list.iter())
+                    .map(|f| serde_json::to_value(f))
+                    .collect::<Result<_, _>>()?;
+
+                // Overall recommended bump: the most severe bump across all
+                // pairs in the batch, since batch mode compares a whole set
+                // of contracts that ship together.
+                let bump_rank = |bump: &str| match bump {
+                    "major" => 2,
+                    "minor" => 1,
+                    _ => 0,
+                };
+                let overall_bump = results
+                    .values()
+                    .map(|report| report.recommended_bump())
+                    .max_by_key(|bump| bump_rank(bump))
+                    .unwrap_or("patch");
+
                 let batch_json = serde_json::json!({
                     "is_safe": overall_safe,
                     "strict": args.strict,
-                    "total_pairs": pairs.len(),
+                    "total_pairs": results.len() + failed.len(),
                     "limit_violation": any_limit_violation,
+                    "recommended_bump": overall_bump,
                     "results": results_json,
                     "failed": failed_json,
+                    "cross_contract_findings": cross_by_contract,
+                    "dependency_findings": infra_findings,
                 });
 
                 println!("{}", serde_json::to_string_pretty(&batch_json)?);
+                let rendered = serde_json::to_string_pretty(&batch_json)?;
+                emit_report_output(&rendered, args.output.as_deref(), &progress)?;
             }
             OutputFormat::Markdown => {
                 let mut markdown = String::new();
@@ -495,6 +705,44 @@ fn run() -> Result<()> {
                     markdown.push_str("\n---\n\n");
                 }
 
+                if !cross_findings.is_empty() {
+                    markdown.push_str("## Cross-Contract Dependency Findings\n\n");
+                    markdown.push_str("| Affected Contract | Changed Contract | Depth | Severity | Category | Target |\n");
+                    markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
+                    for cf in &cross_findings {
+                        let sev = match cf.finding.severity {
+                            soroban_upgrade_safeguard::diff::Severity::Critical => "🔴 Critical",
+                            soroban_upgrade_safeguard::diff::Severity::Warning => "🟡 Warning",
+                            soroban_upgrade_safeguard::diff::Severity::Info => "🔵 Info",
+                        };
+                        markdown.push_str(&format!(
+                            "| {} | {} | {} | {} | {} | {} |\n",
+                            cf.affected_contract,
+                            cf.changed_contract,
+                            cf.propagation_depth,
+                            sev,
+                            cf.finding.category,
+                            cf.finding.target.as_deref().unwrap_or("-")
+                        ));
+                    }
+                    markdown.push_str("\n---\n\n");
+                }
+
+                if !cycle_findings_list.is_empty() || !missing_findings_list.is_empty() {
+                    markdown.push_str("## Dependency Graph Findings\n\n");
+                    for f in cycle_findings_list
+                        .iter()
+                        .chain(missing_findings_list.iter())
+                    {
+                        let emoji = match f.severity {
+                            soroban_upgrade_safeguard::diff::Severity::Warning => "🟡",
+                            _ => "🔵",
+                        };
+                        markdown.push_str(&format!("- {} {}\n", emoji, f.message));
+                    }
+                    markdown.push_str("\n---\n\n");
+                }
+
                 println!("{}", markdown);
             }
             OutputFormat::Text => {
@@ -537,6 +785,60 @@ fn run() -> Result<()> {
                     println!("  - {}: {} — {}", name.bold(), status_str, failure.message);
                 }
 
+                if !cross_findings.is_empty() {
+                    println!("\n🔗 Cross-Contract Dependency Findings:");
+                    let mut by_affected: std::collections::BTreeMap<
+                        &str,
+                        Vec<&CrossContractFinding>,
+                    > = std::collections::BTreeMap::new();
+                    for cf in &cross_findings {
+                        by_affected
+                            .entry(cf.affected_contract.as_str())
+                            .or_default()
+                            .push(cf);
+                    }
+                    for (affected, cfs) in &by_affected {
+                        println!(
+                            "  Contract '{}' is affected by changes in:",
+                            affected.bold()
+                        );
+                        for cf in cfs {
+                            let sev_icon = match cf.finding.severity {
+                                soroban_upgrade_safeguard::diff::Severity::Critical => "🔴",
+                                soroban_upgrade_safeguard::diff::Severity::Warning => "🟡",
+                                soroban_upgrade_safeguard::diff::Severity::Info => "🔵",
+                            };
+                            let depth_label = if cf.propagation_depth == 1 {
+                                "direct".to_string()
+                            } else {
+                                format!("transitive depth {}", cf.propagation_depth)
+                            };
+                            println!(
+                                "    {} [{}] '{}' → {} ({})",
+                                sev_icon,
+                                cf.finding.category,
+                                cf.finding.target.as_deref().unwrap_or(""),
+                                cf.changed_contract.bold(),
+                                depth_label
+                            );
+                        }
+                    }
+                }
+
+                if !cycle_findings_list.is_empty() {
+                    println!("\n⚠️  Cyclic Dependencies:");
+                    for f in &cycle_findings_list {
+                        println!("  🟡 {}", f.message);
+                    }
+                }
+
+                if !missing_findings_list.is_empty() {
+                    println!("\n⚠️  Missing Dependency Contracts:");
+                    for f in &missing_findings_list {
+                        println!("  🟡 {}", f.message);
+                    }
+                }
+
                 println!("\n========================================\n");
 
                 for (name, report) in &results {
@@ -564,9 +866,7 @@ fn run() -> Result<()> {
             }
         } // end match args.format
 
-        // Exit precedence: a resource-limit violation (2) dominates ordinary
-        // breaking changes / failures (1), so CI can special-case adversarial
-        // input. All safe and no errors → success (0).
+        // Exit precedence: resource-limit violation (2) > breaking changes (1) > safe (0).
         if any_limit_violation {
             std::process::exit(2);
         }
@@ -705,6 +1005,20 @@ fn run() -> Result<()> {
         safety_report.apply_category_filter(&category_filter);
     }
 
+    match args.format {
+        OutputFormat::Json => {
+            // Single JSON document to stdout; no decorative text, no ANSI codes.
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&safety_report.to_json())?
+            );
+        }
+        OutputFormat::Markdown => {
+            println!("{}", safety_report.generate_summary_markdown());
+        }
+        OutputFormat::Text => {
+            println!("{}", safety_report.generate_summary_text(args.explain));
+        }
     // Render the report to a string first so --output can write it atomically.
     let rendered = match args.format {
         OutputFormat::Json => serde_json::to_string_pretty(&safety_report.to_json())?,
@@ -718,7 +1032,10 @@ fn run() -> Result<()> {
         std::fs::write(output_path, &rendered).with_context(|| {
             format!("Failed to write report to '{}'", output_path.display())
         })?;
-        progress(format!("✅ Report written to: {}", output_path.display()));
+        progress(format!(
+            "✅ Report written to: {}",
+            output_path.display()
+        ));
     } else {
         println!("{}", rendered);
     }
@@ -847,6 +1164,7 @@ fn compare_contracts(
             suppressions: Some(suppressions),
             explain: args.explain,
             strict: args.strict,
+            compat_duplicates: args.compat_duplicates,
             storage_schemas: *storage_schemas,
         },
     )?;
@@ -869,22 +1187,167 @@ fn compare_contracts(
     Ok(safety_report)
 }
 
-fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {
+/// Assign a stable, unique display name to every pair in the batch.
+///
+/// Two rules govern the assignment:
+///
+/// - **Explicit duplicates are an error.** When two manifest entries carry the
+///   same explicit `name`, the user wrote that name deliberately. Silently
+///   renaming one would hide the mistake; failing early with a clear message is
+///   safer.
+///
+/// - **Derived duplicates are disambiguated.** When two pairs share the same
+///   basename (common with directory scans across sub-directories), the second
+///   occurrence is renamed `name (2)`, the third `name (3)`, and so on. Both
+///   pairs appear in the output instead of the second silently overwriting the
+///   first.
+fn resolve_pair_names(pairs: &[ContractPair]) -> Result<Vec<String>> {
+    use std::collections::HashMap;
+
+    // Validate explicit names first — duplicates are always an error.
+    let mut explicit_seen: HashMap<&str, usize> = HashMap::new();
+    for (i, pair) in pairs.iter().enumerate() {
+        if let Some(ref name) = pair.name {
+            if let Some(first) = explicit_seen.insert(name.as_str(), i) {
+                anyhow::bail!(
+                    "Manifest has two entries with the same explicit name {:?} \
+                     (positions {} and {}). Each entry must have a distinct name.",
+                    name,
+                    first + 1,
+                    i + 1,
+                );
+            }
+        }
+    }
+
+    // Build unique names. For derived names, track how many times each
+    // candidate has been seen and append a counter on collision.
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut names: Vec<String> = Vec::with_capacity(pairs.len());
+
+    for (i, pair) in pairs.iter().enumerate() {
+        let candidate = pair.name.clone().unwrap_or_else(|| {
+            pair.new
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(String::from)
+                .unwrap_or_else(|| format!("pair_{}", i + 1))
+        });
+
+        let count = counts.entry(candidate.clone()).or_insert(0);
+        *count += 1;
+        let unique_name = if *count == 1 {
+            candidate
+        } else {
+            format!("{} ({})", candidate, count)
+        };
+        names.push(unique_name);
+    }
+
+    Ok(names)
+}
+
+fn parse_manifest(path: &Path) -> Result<(Vec<ContractPair>, Vec<ContractDependency>)> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read manifest file: {}", path.display()))?;
 
-    // Try TOML, then JSON
-    if let Ok(manifest) = toml::from_str::<Manifest>(&content) {
-        return Ok(manifest.pairs);
+    // Capture both errors before deciding which to surface.
+    let toml_err = match toml::from_str::<Manifest>(&content) {
+        Ok(manifest) => return Ok((manifest.pairs, manifest.dependencies)),
+        Err(e) => e,
+    };
+    let json_err = match serde_json::from_str::<Manifest>(&content) {
+        Ok(manifest) => return Ok((manifest.pairs, manifest.dependencies)),
+        Err(e) => e,
+    };
+
+    // Use the file extension to pick the most relevant error; fall back to
+    // showing both when the extension is absent or unrecognised.
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_lowercase);
+
+    match ext.as_deref() {
+        Some("toml") => Err(toml_err)
+            .with_context(|| format!("Failed to parse TOML manifest '{}'", path.display())),
+        Some("json") => Err(json_err)
+            .with_context(|| format!("Failed to parse JSON manifest '{}'", path.display())),
+        _ => Err(anyhow::anyhow!(
+            "Failed to parse manifest '{}' as either TOML or JSON.\n\
+             TOML error: {}\n\
+             JSON error: {}",
+            path.display(),
+            toml_err,
+            json_err,
+        )),
     }
-    if let Ok(manifest) = serde_json::from_str::<Manifest>(&content) {
-        return Ok(manifest.pairs);
+}
+
+/// Collect all `.wasm` files under `root`, returning their relative paths
+/// (relative to `root`). Protects against symlink loops via a visited-path set
+/// and enforces a maximum recursion depth of 32.
+fn collect_wasm_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut stack: Vec<(PathBuf, usize)> = Vec::new();
+    stack.push((root.to_path_buf(), 0));
+
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 32 {
+            eprintln!(
+                "⚠️  Warning: Exceeded maximum recursion depth at '{}', skipping",
+                dir.display()
+            );
+            continue;
+        }
+
+        // Resolve symlinks before tracking visited paths
+        let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if !visited.insert(canonical) {
+            continue;
+        }
+
+        let read_dir = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                eprintln!(
+                    "⚠️  Warning: Cannot read directory '{}': {}",
+                    dir.display(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        for entry in read_dir {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!(
+                        "⚠️  Warning: Error reading entry in '{}': {}",
+                        dir.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let path = entry.path();
+
+            if path.is_dir() {
+                stack.push((path, depth + 1));
+            } else if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("wasm") {
+                let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                files.push((relative, path));
+            }
+        }
     }
 
-    anyhow::bail!(
-        "Failed to parse manifest '{}' as either TOML or JSON.",
-        path.display()
-    )
+    // Sort by relative path for deterministic ordering
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    Ok(files)
 }
 
 fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>> {
@@ -895,27 +1358,40 @@ fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>>
         anyhow::bail!("New directory '{}' is not a directory", new_dir.display());
     }
 
+    let old_files = collect_wasm_files(old_dir)?;
+    let new_files_map: std::collections::HashMap<PathBuf, PathBuf> =
+        collect_wasm_files(new_dir)?.into_iter().collect();
+
     let mut pairs = Vec::new();
-    for entry in std::fs::read_dir(old_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("wasm") {
-            let filename = path.file_name().unwrap();
-            let new_path = new_dir.join(filename);
-            if new_path.exists() {
-                let name = path.file_stem().and_then(|s| s.to_str()).map(String::from);
-                pairs.push(ContractPair {
-                    old: path,
-                    new: new_path,
-                    name,
-                });
-            } else {
-                eprintln!(
-                    "⚠️  Warning: Match not found for '{}' in new directory '{}'",
-                    filename.to_string_lossy(),
-                    new_dir.display()
-                );
-            }
+
+    for (rel_path, old_abs_path) in &old_files {
+        if let Some(new_abs_path) = new_files_map.get(rel_path) {
+            let name = rel_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(String::from);
+            pairs.push(ContractPair {
+                old: old_abs_path.clone(),
+                new: new_abs_path.clone(),
+                name,
+            });
+        } else {
+            eprintln!(
+                "⚠️  Warning: Match not found for '{}' in new directory '{}'",
+                rel_path.display(),
+                new_dir.display()
+            );
+        }
+    }
+
+    // Warn about files in new_dir that have no counterpart in old_dir
+    for (rel_path, _) in &collect_wasm_files(new_dir)? {
+        if !old_files.iter().any(|(r, _)| r == rel_path) {
+            eprintln!(
+                "⚠️  Warning: No old counterpart found for '{}' in old directory '{}'",
+                rel_path.display(),
+                old_dir.display()
+            );
         }
     }
 
