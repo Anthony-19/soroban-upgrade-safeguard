@@ -205,6 +205,31 @@ fn run() -> Result<()> {
         colored::control::set_override(false);
     }
 
+    // Validate category filter arguments before doing any real work.
+    let all_categories: Vec<String> = args
+        .include_category
+        .iter()
+        .chain(args.exclude_category.iter())
+        .cloned()
+        .collect();
+    if !all_categories.is_empty() {
+        if let Err(unknown) = validate_categories(&all_categories) {
+            anyhow::bail!(
+                "Unknown category name(s): {}. Valid categories are: {}",
+                unknown.join(", "),
+                report::KNOWN_CATEGORIES.join(", ")
+            );
+        }
+    }
+    let category_filter = CategoryFilter {
+        include: if args.include_category.is_empty() {
+            None
+        } else {
+            Some(args.include_category.iter().cloned().collect())
+        },
+        exclude: args.exclude_category.iter().cloned().collect(),
+    };
+
     // 1. Identify which mode we are running:
     //    - Batch Manifest Mode
     //    - Batch Directory Mode
@@ -346,7 +371,10 @@ fn run() -> Result<()> {
             })();
 
             match outcome {
-                Ok(report) => {
+                Ok(mut report) => {
+                    if !all_categories.is_empty() {
+                        report.apply_category_filter(&category_filter);
+                    }
                     if !report.is_safe {
                         overall_safe = false;
                     }
@@ -673,6 +701,10 @@ fn run() -> Result<()> {
     safety_report.baseline_source = baseline_source.map(|s| s.to_string());
     safety_report.verified_code_hash = verified_hash_hex;
 
+    if !all_categories.is_empty() {
+        safety_report.apply_category_filter(&category_filter);
+    }
+
     // Render the report to a string first so --output can write it atomically.
     let rendered = match args.format {
         OutputFormat::Json => serde_json::to_string_pretty(&safety_report.to_json())?,
@@ -688,7 +720,21 @@ fn run() -> Result<()> {
         })?;
         progress(format!("✅ Report written to: {}", output_path.display()));
     } else {
-        print!("{}", rendered);
+        println!("{}", rendered);
+    }
+
+    // Warn about suppression rules that never matched any finding.
+    // Goes to stderr so it does not pollute the report on stdout.
+    for rule in &safety_report.unmatched_suppressions {
+        let target_part = rule
+            .target
+            .as_deref()
+            .map(|t| format!(", target='{}'", t))
+            .unwrap_or_default();
+        eprintln!(
+            "⚠️  Suppression rule never matched any finding: category='{}'{} — possible typo or stale rule.",
+            rule.rule_id, target_part
+        );
     }
 
     if !safety_report.is_safe {
@@ -726,6 +772,8 @@ struct PairFailure {
 #[derive(serde::Deserialize, Clone, Debug)]
 struct Manifest {
     pairs: Vec<ContractPair>,
+    #[serde(default)]
+    dependencies: Vec<ContractDependency>,
 }
 
 struct ContractComparison<'a> {
