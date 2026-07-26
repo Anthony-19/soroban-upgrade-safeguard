@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "A safety tool to check for breaking changes in Soroban contract upgrades."
 license = "MIT"
+repository = "https://github.com/ShippedLabs/soroban-upgrade-safeguard"
+readme = "README.md"
+keywords = ["soroban", "stellar", "smart-contracts", "wasm", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "soroban_upgrade_safeguard"
