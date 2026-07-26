@@ -29,6 +29,9 @@ enum OutputFormat {
     Json,
     /// Markdown document suitable for PR descriptions and comments.
     Markdown,
+    /// GitHub Actions workflow commands so findings appear as annotations in
+    /// the run summary and pull-request checks.
+    GithubActions,
 }
 
 #[derive(Parser, Debug)]
@@ -282,6 +285,31 @@ fn run() -> Result<()> {
     ) {
         colored::control::set_override(false);
     }
+
+    // Validate category filter arguments before doing any real work.
+    let all_categories: Vec<String> = args
+        .include_category
+        .iter()
+        .chain(args.exclude_category.iter())
+        .cloned()
+        .collect();
+    if !all_categories.is_empty() {
+        if let Err(unknown) = validate_categories(&all_categories) {
+            anyhow::bail!(
+                "Unknown category name(s): {}. Valid categories are: {}",
+                unknown.join(", "),
+                report::KNOWN_CATEGORIES.join(", ")
+            );
+        }
+    }
+    let category_filter = CategoryFilter {
+        include: if args.include_category.is_empty() {
+            None
+        } else {
+            Some(args.include_category.iter().cloned().collect())
+        },
+        exclude: args.exclude_category.iter().cloned().collect(),
+    };
 
     // 1. Identify which mode we are running:
     //    - Batch Manifest Mode
@@ -819,7 +847,24 @@ fn run() -> Result<()> {
                     println!("========================================\n");
                 }
             }
-        }
+            OutputFormat::GithubActions => {
+                // Each contract pair is wrapped in a log group so the run
+                // summary stays readable when many pairs are compared.
+                for (name, report) in &results {
+                    print!(
+                        "{}",
+                        report.generate_summary_github_actions(Some(name.as_str()))
+                    );
+                }
+                // Errored pairs get a plain error annotation.
+                for (name, failure) in &failed {
+                    println!(
+                        "::error::Contract '{}' could not be analyzed: {}",
+                        name, failure.message
+                    );
+                }
+            }
+        } // end match args.format
 
         // Exit precedence: resource-limit violation (2) > breaking changes (1) > safe (0).
         if any_limit_violation {
@@ -979,6 +1024,7 @@ fn run() -> Result<()> {
         OutputFormat::Json => serde_json::to_string_pretty(&safety_report.to_json())?,
         OutputFormat::Markdown => safety_report.generate_summary_markdown(),
         OutputFormat::Text => safety_report.generate_summary_text(args.explain),
+        OutputFormat::GithubActions => safety_report.generate_summary_github_actions(None),
     };
 
     // Write the report — either to a file (--output) or to stdout.
