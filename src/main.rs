@@ -7,15 +7,13 @@ use std::path::{Path, PathBuf};
 
 use soroban_upgrade_safeguard::{
     color::should_disable_color,
-    diff, loader, parser, report,
-    report::{validate_categories, CategoryFilter},
-    spec,
     dependency::{
         cycle_findings, missing_contract_findings, ContractDependency, CrossContractFinding,
         DependencyGraph,
     },
     limits::{find_limit_error, LimitsConfig, ResourcePolicy},
     loader, report,
+    report::{validate_categories, CategoryFilter},
     storage_schema::StorageSchema,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
     CompareOptions,
@@ -372,27 +370,6 @@ fn run() -> Result<()> {
                 contract_name.bold()
             ));
 
-            let old_wasm = loader::load_wasm(&pair.old)?;
-            let new_wasm = loader::load_wasm(&pair.new)?;
-
-            let mut report = compare_contracts(
-                &ContractComparison {
-                    old_bytes: &old_wasm.bytes,
-                    old_path: &old_wasm.path,
-                    new_bytes: &new_wasm.bytes,
-                    new_path: &new_wasm.path,
-                    suppressions: &suppressions,
-                    explain: args.explain,
-                    strict: args.strict,
-                },
-                &progress,
-            )?;
-
-            if !all_categories.is_empty() {
-                report.apply_category_filter(&category_filter);
-            }
-
-            if !report.is_safe {
             // Per-pair policy: a pair that trips a resource limit (or otherwise
             // errors) fails only that pair — it must not abort the whole batch,
             // so its result is recorded and the loop continues.
@@ -417,7 +394,10 @@ fn run() -> Result<()> {
             })();
 
             match outcome {
-                Ok(report) => {
+                Ok(mut report) => {
+                    if !all_categories.is_empty() {
+                        report.apply_category_filter(&category_filter);
+                    }
                     if !report.is_safe {
                         overall_safe = false;
                     }
@@ -473,8 +453,7 @@ fn run() -> Result<()> {
         }
 
         // Detect dependencies on contracts absent from this batch.
-        let known_contracts: std::collections::HashSet<String> =
-            results.keys().cloned().collect();
+        let known_contracts: std::collections::HashSet<String> = results.keys().cloned().collect();
         let missing = dep_graph.missing_contracts(&known_contracts);
         let missing_findings_list = missing_contract_findings(&missing);
         if !missing_findings_list.is_empty() {
@@ -502,21 +481,16 @@ fn run() -> Result<()> {
             per_contract_findings.insert(name.clone(), all);
         }
 
-        let cross_findings: Vec<CrossContractFinding> =
-            dep_graph.propagate(&per_contract_findings);
+        let cross_findings: Vec<CrossContractFinding> = dep_graph.propagate(&per_contract_findings);
 
         // Cross-contract criticals always fail; warnings only fail under --strict.
         let cross_critical_count = cross_findings
             .iter()
-            .filter(|f| {
-                f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Critical
-            })
+            .filter(|f| f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Critical)
             .count();
         let cross_warning_count = cross_findings
             .iter()
-            .filter(|f| {
-                f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Warning
-            })
+            .filter(|f| f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Warning)
             .count();
         if cross_critical_count > 0 {
             overall_safe = false;
@@ -565,7 +539,7 @@ fn run() -> Result<()> {
                 let infra_findings: Vec<serde_json::Value> = cycle_findings_list
                     .iter()
                     .chain(missing_findings_list.iter())
-                    .map(|f| serde_json::to_value(f))
+                    .map(serde_json::to_value)
                     .collect::<Result<_, _>>()?;
 
                 // Overall recommended bump: the most severe bump across all
@@ -612,7 +586,11 @@ fn run() -> Result<()> {
                 markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
 
                 for (name, report) in &results {
-                    let status_str = if report.is_safe { "✅ PASSED" } else { "❌ FAILED" };
+                    let status_str = if report.is_safe {
+                        "✅ PASSED"
+                    } else {
+                        "❌ FAILED"
+                    };
                     markdown.push_str(&format!(
                         "| {} | {} | {} | {} | {} | {} |\n",
                         name,
@@ -625,10 +603,12 @@ fn run() -> Result<()> {
                 }
 
                 for (name, failure) in &failed {
-                    let status_str =
-                        if failure.is_limit { "⛔ ERROR (limit)" } else { "⛔ ERROR" };
-                    markdown
-                        .push_str(&format!("| {} | {} | — | — | — | — |\n", name, status_str));
+                    let status_str = if failure.is_limit {
+                        "⛔ ERROR (limit)"
+                    } else {
+                        "⛔ ERROR"
+                    };
+                    markdown.push_str(&format!("| {} | {} | — | — | — | — |\n", name, status_str));
                 }
 
                 markdown.push_str("\n---\n\n");
@@ -644,8 +624,7 @@ fn run() -> Result<()> {
                 for (name, report) in &results {
                     markdown.push_str(&format!("## Details: {}\n\n", name));
                     let report_md = report.generate_summary_markdown();
-                    let stripped_md =
-                        report_md.replace("# Soroban Upgrade Safety Report\n\n", "");
+                    let stripped_md = report_md.replace("# Soroban Upgrade Safety Report\n\n", "");
                     markdown.push_str(&stripped_md);
                     markdown.push_str("\n---\n\n");
                 }
@@ -675,7 +654,10 @@ fn run() -> Result<()> {
 
                 if !cycle_findings_list.is_empty() || !missing_findings_list.is_empty() {
                     markdown.push_str("## Dependency Graph Findings\n\n");
-                    for f in cycle_findings_list.iter().chain(missing_findings_list.iter()) {
+                    for f in cycle_findings_list
+                        .iter()
+                        .chain(missing_findings_list.iter())
+                    {
                         let emoji = match f.severity {
                             soroban_upgrade_safeguard::diff::Severity::Warning => "🟡",
                             _ => "🔵",
@@ -740,7 +722,10 @@ fn run() -> Result<()> {
                             .push(cf);
                     }
                     for (affected, cfs) in &by_affected {
-                        println!("  Contract '{}' is affected by changes in:", affected.bold());
+                        println!(
+                            "  Contract '{}' is affected by changes in:",
+                            affected.bold()
+                        );
                         for cf in cfs {
                             let sev_icon = match cf.finding.severity {
                                 soroban_upgrade_safeguard::diff::Severity::Critical => "🔴",
@@ -923,7 +908,6 @@ fn run() -> Result<()> {
     safety_report.baseline_source = baseline_source.map(|s| s.to_string());
     safety_report.verified_code_hash = verified_hash_hex;
 
-    let mut safety_report = safety_report;
     if !all_categories.is_empty() {
         safety_report.apply_category_filter(&category_filter);
     }
@@ -1159,12 +1143,10 @@ fn parse_manifest(path: &Path) -> Result<(Vec<ContractPair>, Vec<ContractDepende
         .map(str::to_lowercase);
 
     match ext.as_deref() {
-        Some("toml") => Err(toml_err).with_context(|| {
-            format!("Failed to parse TOML manifest '{}'", path.display())
-        }),
-        Some("json") => Err(json_err).with_context(|| {
-            format!("Failed to parse JSON manifest '{}'", path.display())
-        }),
+        Some("toml") => Err(toml_err)
+            .with_context(|| format!("Failed to parse TOML manifest '{}'", path.display())),
+        Some("json") => Err(json_err)
+            .with_context(|| format!("Failed to parse JSON manifest '{}'", path.display())),
         _ => Err(anyhow::anyhow!(
             "Failed to parse manifest '{}' as either TOML or JSON.\n\
              TOML error: {}\n\
