@@ -23,6 +23,9 @@ enum OutputFormat {
     Json,
     /// Markdown document suitable for PR descriptions and comments.
     Markdown,
+    /// GitHub Actions workflow commands so findings appear as annotations in
+    /// the run summary and pull-request checks.
+    GithubActions,
 }
 
 #[derive(Parser, Debug)]
@@ -240,7 +243,9 @@ fn run() -> Result<()> {
     // In JSON or Markdown mode, decorative progress goes to stderr so stdout
     // stays a single, pristine document. In text mode it stays on stdout
     // exactly as before.
-    let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
+    let clean_stdout = args.format == OutputFormat::Json
+        || args.format == OutputFormat::Markdown
+        || args.format == OutputFormat::GithubActions;
     let progress = |line: String| {
         if clean_stdout {
             eprintln!("{line}");
@@ -510,7 +515,23 @@ fn run() -> Result<()> {
                     println!("========================================\n");
                 }
             }
-        }
+            OutputFormat::GithubActions => {
+                // Each contract pair is wrapped in a log group so the run
+                // summary stays readable when many pairs are compared.
+                for (name, report) in &results {
+                    print!(
+                        "{}",
+                        report.generate_summary_github_actions(Some(name.as_str()))
+                    );
+                }
+                // Errored pairs get a plain error annotation.
+                for (name, failure) in &failed {
+                    println!(
+                        "::error::Contract '{}' could not be analyzed: {}",
+                        name, failure.message
+                    );
+                }
+            }
 
         // Exit precedence: a resource-limit violation (2) dominates ordinary
         // breaking changes / failures (1), so CI can special-case adversarial
@@ -662,6 +683,11 @@ fn run() -> Result<()> {
         }
         OutputFormat::Text => {
             println!("{}", safety_report.generate_summary_text(args.explain));
+        }
+        OutputFormat::GithubActions => {
+            // No group title in single-pair mode; annotations appear at the
+            // top level of the run summary.
+            print!("{}", safety_report.generate_summary_github_actions(None));
         }
     }
 

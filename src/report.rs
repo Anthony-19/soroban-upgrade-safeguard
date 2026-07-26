@@ -740,6 +740,73 @@ impl SafetyReport {
 
         output
     }
+
+    /// Generate GitHub Actions workflow command output.
+    ///
+    /// Emits one [workflow command] per non-suppressed finding, levelled to
+    /// match the finding's severity:
+    ///
+    /// - `Critical` → `::error`
+    /// - `Warning`  → `::warning`
+    /// - `Info`     → `::notice`
+    ///
+    /// Suppressed findings are emitted as `::notice` (not at their original
+    /// severity) so they appear in the log without blocking the run.
+    ///
+    /// A short human-readable summary follows the annotations so the log is
+    /// still useful when read directly.
+    ///
+    /// [workflow command]: https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions
+    pub fn generate_summary_github_actions(&self, group_title: Option<&str>) -> String {
+        let mut output = String::new();
+
+        // Optional log grouping (used in batch mode to separate contract pairs).
+        if let Some(title) = group_title {
+            output.push_str(&format!("::group::{}\n", title));
+        }
+
+        // Sort categories for deterministic output.
+        let mut categories: Vec<&String> = self.findings_by_category.keys().collect();
+        categories.sort();
+
+        for category in categories {
+            let group = self.findings_by_category.get(category).unwrap();
+            for reported in group {
+                let finding = &reported.finding;
+                let text = format!("[{}] {}", finding.category, finding.message);
+
+                if reported.suppressed {
+                    // Suppressed findings are demoted to notice so they are
+                    // visible in the run summary without failing the check.
+                    output.push_str(&format!("::notice::{}\n", text));
+                } else {
+                    let level = match finding.severity {
+                        Severity::Critical => "error",
+                        Severity::Warning => "warning",
+                        Severity::Info => "notice",
+                    };
+                    output.push_str(&format!("::{level}::{text}\n"));
+                }
+            }
+        }
+
+        // Human-readable summary after the annotations.
+        let status = if self.is_safe { "PASSED" } else { "FAILED" };
+        output.push_str(&format!(
+            "\nSoroban Upgrade Safeguard: {} — {} critical, {} warning(s), {} info ({} suppressed)\n",
+            status,
+            self.critical_count,
+            self.warning_count,
+            self.info_count,
+            self.suppressed_count,
+        ));
+
+        if group_title.is_some() {
+            output.push_str("::endgroup::\n");
+        }
+
+        output
+    }
 }
 
 /// Returns remediation/explanation guidance for a given finding category.
