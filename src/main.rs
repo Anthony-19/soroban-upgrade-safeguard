@@ -425,6 +425,28 @@ fn run() -> Result<()> {
         //     other.
         let pair_names: Vec<String> = resolve_pair_names(&pairs)?;
 
+        // Open the WASM cache once for the whole batch.  A batch is exactly
+        // where refetching the same deployed contract repeatedly is most
+        // expensive, so caching pays off most here.  The cache is shared
+        // across rayon threads via a reference; `WasmCache` is `Send + Sync`
+        // because it performs only independent, hash-keyed file operations.
+        let no_cache_batch = args.no_cache
+            || std::env::var("SAFEGUARD_NO_CACHE")
+                .ok()
+                .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true"))
+                .unwrap_or(false);
+        let batch_cache: Option<WasmCache> = if no_cache_batch {
+            None
+        } else {
+            match WasmCache::open() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("⚠️  Could not open WASM cache, proceeding without it: {e:#}");
+                    None
+                }
+            }
+        };
+
         let mut results = std::collections::BTreeMap::new();
         let mut failed: std::collections::BTreeMap<String, PairFailure> =
             std::collections::BTreeMap::new();
@@ -469,8 +491,18 @@ fn run() -> Result<()> {
                 // runs to completion.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                     || -> Result<report::SafetyReport> {
-                        let old_wasm = loader::load_wasm(&pair.old)?;
-                        let new_wasm = loader::load_wasm(&pair.new)?;
+                        let old_wasm = resolve_contract_source(
+                            &pair.old,
+                            &policy,
+                            batch_cache.as_ref(),
+                            args.allow_http_local,
+                        )?;
+                        let new_wasm = resolve_contract_source(
+                            &pair.new,
+                            &policy,
+                            batch_cache.as_ref(),
+                            args.allow_http_local,
+                        )?;
                         compare_contracts(
                             &ContractComparison {
                                 old_bytes: &old_wasm.bytes,
@@ -1135,10 +1167,119 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+/// One side of a manifest contract pair — either a local file or an on-chain
+/// contract fetched via RPC.
+///
+/// # Manifest syntax
+///
+/// **Local file** — a plain string (backward-compatible with existing manifests):
+///
+/// ```toml
+/// [[pairs]]
+/// old = "path/to/old.wasm"
+/// new = "path/to/new.wasm"
+/// ```
+///
+/// **On-chain contract** — an inline table with `contract_id` and `rpc_url`:
+///
+/// ```toml
+/// [[pairs]]
+/// old = { contract_id = "CCONTRACT...", rpc_url = "https://soroban-testnet.stellar.org" }
+/// new = "path/to/new.wasm"
+/// ```
+///
+/// Either or both sides may be on-chain. WASM fetched via RPC is cached by
+/// code hash (see `--no-cache`) so a repeated contract in a large batch only
+/// hits the network once.
+#[derive(Clone, Debug)]
+enum ContractSource {
+    /// A WASM binary on the local filesystem.
+    File(PathBuf),
+    /// A deployed Soroban contract, fetched from Stellar RPC.
+    OnChain {
+        contract_id: String,
+        rpc_url: String,
+    },
+}
+
+impl<'de> serde::Deserialize<'de> for ContractSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+        use std::fmt;
+
+        struct ContractSourceVisitor;
+
+        impl<'de> Visitor<'de> for ContractSourceVisitor {
+            type Value = ContractSource;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(
+                    f,
+                    "a file path string or an on-chain table \
+                     {{ contract_id = \"C...\", rpc_url = \"https://...\" }}"
+                )
+            }
+
+            // Plain string → local file path (backward-compatible).
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<ContractSource, E> {
+                Ok(ContractSource::File(PathBuf::from(v)))
+            }
+
+            fn visit_string<E: de::Error>(self, v: String) -> Result<ContractSource, E> {
+                Ok(ContractSource::File(PathBuf::from(v)))
+            }
+
+            // Inline table → on-chain contract.
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<ContractSource, M::Error> {
+                let mut contract_id: Option<String> = None;
+                let mut rpc_url: Option<String> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "contract_id" => {
+                            if contract_id.is_some() {
+                                return Err(de::Error::duplicate_field("contract_id"));
+                            }
+                            contract_id = Some(map.next_value()?);
+                        }
+                        "rpc_url" => {
+                            if rpc_url.is_some() {
+                                return Err(de::Error::duplicate_field("rpc_url"));
+                            }
+                            rpc_url = Some(map.next_value()?);
+                        }
+                        other => {
+                            return Err(de::Error::unknown_field(
+                                other,
+                                &["contract_id", "rpc_url"],
+                            ))
+                        }
+                    }
+                }
+
+                let contract_id = contract_id
+                    .ok_or_else(|| de::Error::missing_field("contract_id"))?;
+                let rpc_url =
+                    rpc_url.ok_or_else(|| de::Error::missing_field("rpc_url"))?;
+
+                Ok(ContractSource::OnChain {
+                    contract_id,
+                    rpc_url,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(ContractSourceVisitor)
+    }
+}
+
 #[derive(serde::Deserialize, Clone, Debug)]
 struct ContractPair {
-    old: PathBuf,
-    new: PathBuf,
+    old: ContractSource,
+    new: ContractSource,
     name: Option<String>,
 }
 
@@ -1251,6 +1392,35 @@ fn compare_contracts(
     Ok(safety_report)
 }
 
+/// Load a [`loader::WasmModule`] from either a local file or an on-chain
+/// contract, applying `policy`, optional `cache`, and URL-security settings.
+///
+/// This is the single entry-point for source resolution used by both the
+/// single-pair path and the batch loop, so on-chain and file sources behave
+/// consistently regardless of the calling context.
+fn resolve_contract_source(
+    source: &ContractSource,
+    policy: &ResourcePolicy,
+    cache: Option<&WasmCache>,
+    allow_http_local: bool,
+) -> Result<loader::WasmModule> {
+    match source {
+        ContractSource::File(path) => loader::load_wasm(path),
+        ContractSource::OnChain {
+            contract_id,
+            rpc_url,
+        } => {
+            loader::validate_rpc_url(rpc_url, allow_http_local)?;
+            loader::fetch_wasm_from_rpc_with_policy_and_cache(
+                contract_id,
+                rpc_url,
+                policy,
+                cache,
+            )
+        }
+    }
+}
+
 /// Assign a stable, unique display name to every pair in the batch.
 ///
 /// Two rules govern the assignment:
@@ -1291,11 +1461,14 @@ fn resolve_pair_names(pairs: &[ContractPair]) -> Result<Vec<String>> {
 
     for (i, pair) in pairs.iter().enumerate() {
         let candidate = pair.name.clone().unwrap_or_else(|| {
-            pair.new
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(String::from)
-                .unwrap_or_else(|| format!("pair_{}", i + 1))
+            match &pair.new {
+                ContractSource::File(path) => path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("pair_{}", i + 1)),
+                ContractSource::OnChain { contract_id, .. } => contract_id.clone(),
+            }
         });
 
         let count = counts.entry(candidate.clone()).or_insert(0);
@@ -1435,8 +1608,8 @@ fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>>
                 .and_then(|s| s.to_str())
                 .map(String::from);
             pairs.push(ContractPair {
-                old: old_abs_path.clone(),
-                new: new_abs_path.clone(),
+                old: ContractSource::File(old_abs_path.clone()),
+                new: ContractSource::File(new_abs_path.clone()),
                 name,
             });
         } else {

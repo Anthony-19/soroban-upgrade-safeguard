@@ -80,6 +80,7 @@ Each CLI flag and configuration parameter has a corresponding environment variab
 | (Positional) | `wasm_paths` | `SAFEGUARD_WASM_PATHS` | Comma-separated paths |
 | `--contract-id`| `contract_id`| `SAFEGUARD_CONTRACT_ID` | String |
 | `--rpc-url` | `rpc_url` | `SAFEGUARD_RPC_URL` | String (URL) |
+| `--no-cache` | — | `SAFEGUARD_NO_CACHE` | Boolean (`true`/`1` or `false`/`0`) |
 | (TOML-only) | `max_suppressions`| `SAFEGUARD_MAX_SUPPRESSIONS` | Unsigned Integer |
 | (TOML-only) | `allow_targetless`| `SAFEGUARD_ALLOW_TARGETLESS` | Boolean (`true`/`1` or `false`/`0`) |
 | `--max-xdr-depth`| `limits.max_xdr_depth`| `SAFEGUARD_MAX_XDR_DEPTH`| Unsigned 32-bit Integer |
@@ -144,6 +145,14 @@ Safeguard provides the following command line options. You can view them by runn
   The target contract ID deployed on the Stellar network (RPC mode only).
 * **`--rpc-url <URL>`**
   The Stellar RPC server URL used to query and fetch the on-chain contract code (RPC mode only).
+* **`--allow-http-local`**
+  Allow plain `http://` RPC URLs when the host is `localhost` or `127.0.0.1`. Without this flag only `https://` URLs are accepted. Applies to both single-pair RPC mode and on-chain pairs declared in a manifest.
+* **`--no-cache`** / `SAFEGUARD_NO_CACHE=1`
+  Skip both reading from and writing to the local WASM cache for this run. By default, WASM fetched from RPC is cached on disk keyed by its code hash so repeat fetches of the same deployed code are served locally. Use this flag (or the environment variable) to force a fresh network fetch.
+
+  To clear the cache entirely without disabling it, delete the platform cache directory:
+  - **Linux / macOS**: `~/.cache/soroban-upgrade-safeguard/wasm/`
+  - **Windows**: `%LOCALAPPDATA%\soroban-upgrade-safeguard\wasm\`
 * **`--manifest <PATH>`**
   Path to a batch manifest configuration TOML file containing multiple contract pairs to compare (Manifest mode).
 * **`--old-dir <PATH>`**
@@ -178,6 +187,71 @@ Safeguard resolves its operation mode dynamically based on the set of provided a
 * **Trigger**: `--manifest <PATH>` is specified.
 * **Behavior**: Safeguard reads the manifest file (which lists pairs of contracts) and runs comparisons on all of them in batch.
 * **Restrictions**: No positional arguments are allowed.
+
+#### Manifest pair sources
+
+Each side of a pair can be a **local file path** (string) or an **on-chain contract** (inline table with `contract_id` and `rpc_url`). The two forms can be mixed freely within the same manifest and across pairs.
+
+**File-only pair** — backward-compatible, unchanged from previous versions:
+
+```toml
+[[pairs]]
+old = "wasm/old/my_contract.wasm"
+new = "wasm/new/my_contract.wasm"
+name = "my_contract"
+```
+
+**Old side from RPC, new side from local file** — the primary upgrade-check workflow:
+
+```toml
+[[pairs]]
+old = { contract_id = "CCONTRACT_ID_HERE", rpc_url = "https://soroban-testnet.stellar.org" }
+new  = "target/wasm32-unknown-unknown/release/my_contract.wasm"
+name = "my_contract"
+```
+
+**Both sides from RPC** — compare two deployed versions directly:
+
+```toml
+[[pairs]]
+old = { contract_id = "COLD_CONTRACT_ID", rpc_url = "https://soroban-mainnet.stellar.org" }
+new  = { contract_id = "CNEW_CONTRACT_ID", rpc_url = "https://soroban-mainnet.stellar.org" }
+name = "my_contract"
+```
+
+**Mixed batch** — file and on-chain pairs in a single run:
+
+```toml
+[[pairs]]
+old = "wasm/old/token.wasm"
+new  = "wasm/new/token.wasm"
+name = "token"
+
+[[pairs]]
+old = { contract_id = "CPOOL_CONTRACT_ID", rpc_url = "https://soroban-testnet.stellar.org" }
+new  = "wasm/new/pool.wasm"
+name = "pool"
+```
+
+**JSON manifest** — same syntax, just written as JSON objects:
+
+```json
+{
+  "pairs": [
+    {
+      "old": { "contract_id": "CCONTRACT_ID_HERE", "rpc_url": "https://soroban-testnet.stellar.org" },
+      "new": "target/wasm32-unknown-unknown/release/my_contract.wasm",
+      "name": "my_contract"
+    }
+  ]
+}
+```
+
+> **Derived names for on-chain pairs.** When a pair has no explicit `name`, the name is derived from the `new` side: the WASM file stem for a local file, or the full `contract_id` string for an on-chain source. Provide an explicit `name` to keep reports readable when contract IDs are long.
+
+> **Caching.** WASM fetched from RPC is cached on disk keyed by code hash (see `--no-cache`). A batch is exactly where the cache matters most: if the same deployed contract appears in several pairs, it is fetched only once for the whole run.
+
+> **URL security.** Each on-chain pair's `rpc_url` is validated independently. `https://` is always accepted. Plain `http://` is only permitted for `localhost` / `127.0.0.1` when `--allow-http-local` is passed.
 
 ### 4. Directory Scan Mode
 * **Trigger**: Both `--old-dir <PATH>` and `--new-dir <PATH>` are specified.
