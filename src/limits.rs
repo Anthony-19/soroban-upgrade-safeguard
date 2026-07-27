@@ -55,6 +55,15 @@ pub const DEFAULT_MAX_WALK_DEPTH: usize = 128;
 /// inputs while accepting any real contract.
 pub const DEFAULT_MAX_WASM_SIZE: usize = 25 * 1024 * 1024;
 
+/// Default RPC request timeout in seconds (30 s).
+///
+/// Applied as an **overall** per-request budget via
+/// `ureq::AgentBuilder::timeout`: it covers TCP connect, TLS handshake,
+/// sending the request body, and reading the full response.  30 seconds is
+/// generous enough for slow-but-live endpoints while still ensuring a hung
+/// connection fails before a typical CI job times out.
+pub const DEFAULT_RPC_TIMEOUT_SECS: u64 = 30;
+
 /// A single, reusable policy bounding how much work untrusted input may cause.
 ///
 /// Every limit is independently configurable. `Copy` so it can be threaded by
@@ -77,6 +86,14 @@ pub struct ResourcePolicy {
     /// against `wasm_bytes.len()` for bytes received over RPC. Violations
     /// surface as [`LimitError::WasmSizeExceeded`].
     pub max_wasm_size: usize,
+    /// Overall per-request timeout for RPC calls, in seconds.
+    ///
+    /// Covers TCP connect, TLS handshake, sending the request body, and
+    /// reading the full response.  The same budget is applied to every
+    /// `getLedgerEntries` call made during a fetch (there are at most two per
+    /// contract).  Set to `0` to disable the timeout entirely (not
+    /// recommended in CI).
+    pub rpc_timeout_secs: u64,
 }
 
 impl Default for ResourcePolicy {
@@ -87,6 +104,7 @@ impl Default for ResourcePolicy {
             max_entries: DEFAULT_MAX_ENTRIES,
             max_walk_depth: DEFAULT_MAX_WALK_DEPTH,
             max_wasm_size: DEFAULT_MAX_WASM_SIZE,
+            rpc_timeout_secs: DEFAULT_RPC_TIMEOUT_SECS,
         }
     }
 }
@@ -237,6 +255,11 @@ pub struct LimitsConfig {
     /// Overrides [`ResourcePolicy::max_wasm_size`].
     #[serde(default)]
     pub max_wasm_size: Option<usize>,
+    /// Overrides [`ResourcePolicy::rpc_timeout_secs`].
+    ///
+    /// Set to `0` to disable the RPC timeout entirely (not recommended in CI).
+    #[serde(default)]
+    pub rpc_timeout_secs: Option<u64>,
 }
 
 /// The top-level shape of `.safeguard.toml` as far as limits are concerned.
@@ -287,6 +310,9 @@ impl LimitsConfig {
         if let Some(v) = self.max_wasm_size {
             base.max_wasm_size = v;
         }
+        if let Some(v) = self.rpc_timeout_secs {
+            base.rpc_timeout_secs = v;
+        }
         base
     }
 }
@@ -303,6 +329,7 @@ mod tests {
         assert_eq!(p.max_entries, DEFAULT_MAX_ENTRIES);
         assert_eq!(p.max_walk_depth, DEFAULT_MAX_WALK_DEPTH);
         assert_eq!(p.max_wasm_size, DEFAULT_MAX_WASM_SIZE);
+        assert_eq!(p.rpc_timeout_secs, DEFAULT_RPC_TIMEOUT_SECS);
     }
 
     #[test]
@@ -364,6 +391,7 @@ mod tests {
         assert_eq!(p.max_xdr_len, DEFAULT_MAX_XDR_LEN);
         assert_eq!(p.max_walk_depth, DEFAULT_MAX_WALK_DEPTH);
         assert_eq!(p.max_wasm_size, DEFAULT_MAX_WASM_SIZE);
+        assert_eq!(p.rpc_timeout_secs, DEFAULT_RPC_TIMEOUT_SECS);
     }
 
     #[test]
@@ -391,5 +419,29 @@ mod tests {
         assert_eq!(p.max_wasm_size, 1024);
         // Other limits are unaffected.
         assert_eq!(p.max_xdr_depth, DEFAULT_MAX_XDR_DEPTH);
+    }
+
+    #[test]
+    fn config_applies_rpc_timeout_override() {
+        let cfg = LimitsConfig {
+            rpc_timeout_secs: Some(5),
+            ..LimitsConfig::default()
+        };
+        let p = cfg.apply_to(ResourcePolicy::default());
+        assert_eq!(p.rpc_timeout_secs, 5);
+        // Other limits are unaffected.
+        assert_eq!(p.max_wasm_size, DEFAULT_MAX_WASM_SIZE);
+    }
+
+    #[test]
+    fn rpc_timeout_zero_disables_timeout() {
+        // A caller that wants no timeout at all sets rpc_timeout_secs = 0.
+        // The code path in loader checks for 0 and skips setting the timeout.
+        let cfg = LimitsConfig {
+            rpc_timeout_secs: Some(0),
+            ..LimitsConfig::default()
+        };
+        let p = cfg.apply_to(ResourcePolicy::default());
+        assert_eq!(p.rpc_timeout_secs, 0);
     }
 }

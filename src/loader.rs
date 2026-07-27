@@ -191,6 +191,10 @@ pub fn fetch_wasm_from_rpc_with_policy_and_cache(
         .to_xdr_base64(policy.xdr_limits())
         .map_err(|e| anyhow::anyhow!("Failed to serialize LedgerKey to base64: {}", e))?;
 
+    // Derive the per-request timeout from the policy once, so both round-trips
+    // use the same budget. Duration::ZERO signals "no timeout" to query_rpc.
+    let rpc_timeout = std::time::Duration::from_secs(policy.rpc_timeout_secs);
+
     // 4. Query getLedgerEntries RPC — first round-trip: resolve the code hash.
     let response = query_rpc(
         rpc_url,
@@ -200,6 +204,7 @@ pub fn fetch_wasm_from_rpc_with_policy_and_cache(
                 .to_xdr_base64(Limits::none())
                 .map_err(|e| anyhow::anyhow!("Failed to serialize LedgerKey: {}", e))?]
         }),
+        rpc_timeout,
     )?;
 
     let entries = response["result"]["entries"]
@@ -273,6 +278,7 @@ pub fn fetch_wasm_from_rpc_with_policy_and_cache(
                 .to_xdr_base64(Limits::none())
                 .map_err(|e| anyhow::anyhow!("Failed to serialize code key: {}", e))?]
         }),
+        rpc_timeout,
     )?;
 
     let code_entries = code_response["result"]["entries"]
@@ -459,8 +465,16 @@ pub fn validate_rpc_url(rpc_url: &str, allow_http_local: bool) -> Result<()> {
 }
 
 /// Helper to execute JSON-RPC request to Stellar RPC.
+///
 /// Disables redirect following to prevent HTTPS-to-HTTP downgrade attacks.
-fn query_rpc(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+/// `timeout` is the overall per-request budget (covers connect, TLS, send,
+/// and read). Pass `Duration::ZERO` to disable the timeout entirely.
+fn query_rpc(
+    rpc_url: &str,
+    method: &str,
+    params: serde_json::Value,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value> {
     let payload = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -468,14 +482,34 @@ fn query_rpc(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<s
         "params": params
     });
 
-    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let mut builder = ureq::AgentBuilder::new().redirects(0);
+    if !timeout.is_zero() {
+        builder = builder.timeout(timeout);
+    }
+    let agent = builder.build();
 
     let response: serde_json::Value = agent
         .post(rpc_url)
         .send_json(payload)
-        .map_err(|e| anyhow::anyhow!("RPC request failed: {}", e))?
+        .map_err(|e| {
+            // Surface a clear, actionable message when the request timed out.
+            // ureq wraps transport errors (including timeout) as io::Error;
+            // the display string contains "timed out" for both kinds.
+            let msg = e.to_string();
+            if msg.contains("timed out") || msg.contains("Timeout") || msg.contains("timeout") {
+                anyhow::anyhow!(
+                    "RPC request to '{}' timed out after {} second(s). \
+                     The endpoint may be unresponsive. \
+                     Use --rpc-timeout-secs to adjust the timeout.",
+                    rpc_url,
+                    timeout.as_secs(),
+                )
+            } else {
+                anyhow::anyhow!("RPC request to '{}' failed: {}", rpc_url, e)
+            }
+        })?
         .into_json()
-        .map_err(|e| anyhow::anyhow!("Failed to parse RPC response: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to parse RPC response from '{}': {}", rpc_url, e))?;
 
     if let Some(err) = response.get("error") {
         let msg = err["message"].as_str().unwrap_or("Unknown RPC error");

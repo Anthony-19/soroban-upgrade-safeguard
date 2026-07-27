@@ -49,6 +49,7 @@ max_xdr_len = 1048576
 max_entries = 1000
 max_walk_depth = 128
 max_wasm_size = 26214400  # 25 MiB — reject inputs larger than this before reading
+rpc_timeout_secs = 30    # per-request RPC timeout; set to 0 to disable
 
 # Define one or more reviewed suppression rules
 [[suppress]]
@@ -89,6 +90,7 @@ Each CLI flag and configuration parameter has a corresponding environment variab
 | `--max-entries`| `limits.max_entries`| `SAFEGUARD_MAX_ENTRIES` | Unsigned Pointer Integer (usize)|
 | `--max-walk-depth`| `limits.max_walk_depth`| `SAFEGUARD_MAX_WALK_DEPTH`| Unsigned Pointer Integer (usize)|
 | `--max-wasm-size`| `limits.max_wasm_size`| `SAFEGUARD_MAX_WASM_SIZE`| Unsigned Pointer Integer (usize, bytes)|
+| `--rpc-timeout-secs`| `limits.rpc_timeout_secs`| `SAFEGUARD_RPC_TIMEOUT_SECS`| Unsigned 64-bit Integer (seconds)|
 
 ---
 
@@ -120,7 +122,8 @@ Every report execution generates a `VerdictSettings` metadata block captured wit
     "max_xdr_len": 1048576,
     "max_entries": 1000,
     "max_walk_depth": 128,
-    "max_wasm_size": 26214400
+    "max_wasm_size": 26214400,
+    "rpc_timeout_secs": 30
   }
 }
 ```
@@ -173,6 +176,8 @@ Safeguard provides the following command line options. You can view them by runn
   Sets the maximum recursion depth for structural type walk evaluations.
 * **`--max-wasm-size <BYTES>`**
   Sets the maximum raw WASM binary size in bytes (default: 26,214,400 — 25 MiB). For disk files the size is checked via `fs::metadata` before any bytes are read into memory; for RPC-fetched bytes it is checked after receipt. An input exceeding this limit exits with code 2 (resource-limit violation). Settable via `SAFEGUARD_MAX_WASM_SIZE` or `limits.max_wasm_size` in `.safeguard.toml`.
+* **`--rpc-timeout-secs <SECS>`**
+  Sets the overall per-request timeout for RPC calls in seconds (default: 30). The budget covers TCP connect, TLS handshake, sending the request body, and reading the full response. When the endpoint stalls and the timeout fires, the error message names the RPC URL and the configured timeout so the cause is immediately clear. Set to `0` to disable the timeout entirely (not recommended in CI). Settable via `SAFEGUARD_RPC_TIMEOUT_SECS` or `limits.rpc_timeout_secs` in `.safeguard.toml`.
 
 ---
 
@@ -329,6 +334,12 @@ Safeguard protects your CI runner systems and memory footprints from malicious, 
 * **Purpose**: Caps the raw WASM binary size **before** the file is read into memory (disk) or accepted from an RPC response. A legitimate compiled Soroban contract is well under 1 MiB; the 25 MiB default is a wide safety margin that rejects multi-gigabyte adversarial inputs without allocating memory for them. Violations surface as exit code 2 (resource-limit violation), distinct from exit code 1 (breaking changes found).
 * **Symptom**: Error message `WASM input size N bytes exceeds the maximum of M bytes (raise max_wasm_size)`.
 * **Remediation**: If you have a genuinely large contract that exceeds the default, raise the limit via `--max-wasm-size`, `SAFEGUARD_MAX_WASM_SIZE`, or `limits.max_wasm_size` in `.safeguard.toml`. For adversarial inputs the correct response is to reject them rather than raise the limit.
+
+#### 6. `rpc_timeout_secs` (CLI: `--rpc-timeout-secs`, Default: `30` seconds)
+* **Purpose**: Bounds the total time allowed for each RPC round-trip (there are at most two per contract fetch: one to resolve the code hash, one to fetch the code entry). Without this limit an unresponsive endpoint stalls the process indefinitely, burning an entire CI job's time budget with no output.
+* **Behaviour**: When the timeout fires, the error names the RPC URL and the configured limit so the cause is immediately actionable. The overall budget covers TCP connect, TLS handshake, sending the request, and reading the full response body.
+* **Symptom**: Error message `RPC request to '<url>' timed out after N second(s)`.
+* **Remediation**: If your endpoint is legitimately slow, raise the limit via `--rpc-timeout-secs`, `SAFEGUARD_RPC_TIMEOUT_SECS`, or `limits.rpc_timeout_secs` in `.safeguard.toml`. Set to `0` to disable the timeout entirely (not recommended in CI).
 
 ---
 

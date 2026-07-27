@@ -157,6 +157,13 @@ struct Args {
     #[arg(long, value_name = "BYTES")]
     max_wasm_size: Option<usize>,
 
+    /// Overall timeout in seconds for each RPC request. Overrides `[limits]`
+    /// and the default (30 s). Covers TCP connect, TLS handshake, sending the
+    /// request body, and reading the full response. Set to `0` to disable the
+    /// timeout entirely (not recommended in CI).
+    #[arg(long, value_name = "SECS")]
+    rpc_timeout_secs: Option<u64>,
+
     /// Treat identical duplicate spec entries (same name, byte-identical
     /// definition) as informational rather than warnings.
     ///
@@ -244,14 +251,23 @@ fn resolve_policy(args: &Args, config_path: Option<&Path>) -> Result<ResourcePol
     if let Some(v) = args.max_wasm_size {
         policy.max_wasm_size = v;
     }
+    if let Some(v) = args.rpc_timeout_secs {
+        policy.rpc_timeout_secs = v;
+    }
 
     // Environment variable overrides sit between the config file and CLI flags
     // in precedence (CLI wins over env, env wins over file).
     if let Ok(v) = std::env::var("SAFEGUARD_MAX_WASM_SIZE") {
         if let Ok(n) = v.parse::<usize>() {
-            // Only apply if the CLI flag was not already set.
             if args.max_wasm_size.is_none() {
                 policy.max_wasm_size = n;
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("SAFEGUARD_RPC_TIMEOUT_SECS") {
+        if let Ok(n) = v.parse::<u64>() {
+            if args.rpc_timeout_secs.is_none() {
+                policy.rpc_timeout_secs = n;
             }
         }
     }

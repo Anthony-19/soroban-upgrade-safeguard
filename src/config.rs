@@ -122,6 +122,13 @@ pub struct Args {
     /// and against the decoded length for RPC-fetched bytes.
     #[arg(long, value_name = "BYTES")]
     pub max_wasm_size: Option<usize>,
+
+    /// Overall timeout in seconds for each RPC request. Overrides `[limits]`
+    /// and the default (30 s). Covers TCP connect, TLS handshake, sending the
+    /// request body, and reading the full response. Set to `0` to disable the
+    /// timeout entirely (not recommended in CI).
+    #[arg(long, value_name = "SECS")]
+    pub rpc_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -284,6 +291,9 @@ impl ResolvedConfig {
         if let Some(v) = env_usize("SAFEGUARD_MAX_WASM_SIZE") {
             policy.max_wasm_size = v;
         }
+        if let Some(v) = env_u64("SAFEGUARD_RPC_TIMEOUT_SECS") {
+            policy.rpc_timeout_secs = v;
+        }
         if let Some(v) = args.max_xdr_depth {
             policy.max_xdr_depth = v;
         }
@@ -298,6 +308,9 @@ impl ResolvedConfig {
         }
         if let Some(v) = args.max_wasm_size {
             policy.max_wasm_size = v;
+        }
+        if let Some(v) = args.rpc_timeout_secs {
+            policy.rpc_timeout_secs = v;
         }
 
         // Suppressions config resolution
@@ -432,6 +445,10 @@ fn env_usize(var_name: &str) -> Option<usize> {
 }
 
 fn env_u32(var_name: &str) -> Option<u32> {
+    std::env::var(var_name).ok().and_then(|val| val.parse().ok())
+}
+
+fn env_u64(var_name: &str) -> Option<u64> {
     std::env::var(var_name).ok().and_then(|val| val.parse().ok())
 }
 
