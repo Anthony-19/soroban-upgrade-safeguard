@@ -79,7 +79,7 @@ impl TypeClass {
 /// The default classifies *everything* as [`TypeClass::Storage`]: with no
 /// configuration the tool makes no event claims at all, so a name that merely
 /// contains "event" is never treated as one.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ClassificationConfig {
     /// Exact type names to treat as events.

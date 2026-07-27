@@ -53,7 +53,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::diff::Finding;
 use crate::rules::canonical_rule_id;
@@ -66,7 +66,7 @@ pub const DEFAULT_CONFIG_FILE: &str = ".safeguard.toml";
 /// `deny_unknown_fields` is deliberate: this is the one config file that can
 /// turn the safety gate off, so a mistyped key (`targets`, `[[suppression]]`)
 /// must be a loud parse error rather than a silently dropped rule.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SuppressionConfig {
     /// Configurable maximum number of suppressions. Enforced globally.
@@ -97,7 +97,7 @@ pub struct SuppressionConfig {
 ///
 /// `deny_unknown_fields` guards against a typo (e.g. `targets` for `target`)
 /// silently changing what the rule matches.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SuppressionRule {
     /// The stable rule id to match exactly (e.g. `"struct_field_type_changed"`).
@@ -151,14 +151,18 @@ impl SuppressionRule {
     /// Whether this rule matches `finding` exactly on both rule id and target.
     fn matches(&self, finding: &Finding) -> bool {
         self.canonical_rule_id().is_some_and(|rule_id| {
-            canonical_rule_id(&finding.category)
+            canonical_rule_id(stable_category(&finding.category))
                 .is_some_and(|finding_rule_id| rule_id == finding_rule_id)
                 && self.target.as_deref() == finding.target.as_deref()
+                && self
+                    .fingerprint
+                    .as_ref()
+                    .map_or(true, |fp| fp.eq_ignore_ascii_case(&compute_fingerprint(finding)))
         })
     }
 
     fn canonical_rule_id(&self) -> Option<&'static str> {
-        canonical_rule_id(&self.rule_id)
+        canonical_rule_id(stable_category(&self.rule_id))
     }
 }
 
@@ -209,6 +213,16 @@ impl SuppressionConfig {
         }
 
         for rule in &self.rules {
+            if let Some(expiry_str) = &rule.expiry {
+                if is_expired(expiry_str)? {
+                    anyhow::bail!(
+                        "Suppression rule for category '{}' has expired on {}.",
+                        rule.rule_id,
+                        expiry_str
+                    );
+                }
+            }
+
             let is_new_format =
                 rule.fingerprint.is_some() || rule.author.is_some() || rule.expiry.is_some();
             if is_new_format {
@@ -231,16 +245,6 @@ impl SuppressionConfig {
                         "Missing 'fingerprint' for suppression rule under category '{}' (target: '{:?}').",
                         rule.rule_id,
                         rule.target
-                    );
-                }
-            }
-
-            if let Some(expiry_str) = &rule.expiry {
-                if is_expired(expiry_str)? {
-                    anyhow::bail!(
-                        "Suppression rule for category '{}' has expired on {}.",
-                        rule.rule_id,
-                        expiry_str
                     );
                 }
             }

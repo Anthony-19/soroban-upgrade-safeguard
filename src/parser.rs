@@ -382,6 +382,14 @@ pub fn extract_metadata_with_policy(
                     }
                 }
             }
+            Payload::ExportSection(reader) => {
+                for export in reader {
+                    let export = export.context("Failed to parse WASM export")?;
+                    if matches!(export.kind, wasmparser::ExternalKind::Func) {
+                        metadata.exported_function_names.insert(export.name.to_string());
+                    }
+                }
+            }
             _ => {}
         }
     }

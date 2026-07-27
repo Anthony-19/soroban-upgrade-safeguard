@@ -459,7 +459,11 @@ mod tests {
     #[test]
     fn test_resolve_path_absolute() {
         let base = Path::new("/base");
-        let abs = PathBuf::from("c:/absolute/path.toml");
+        let abs = if cfg!(windows) {
+            PathBuf::from("c:/absolute/path.toml")
+        } else {
+            PathBuf::from("/absolute/path.toml")
+        };
         assert_eq!(resolve_path(base, abs.clone()), abs);
     }
 

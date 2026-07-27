@@ -226,35 +226,6 @@ fn main() {
         }
     }
 }
-
-fn run() -> Result<()> {
-    let args = Args::parse();
-
-    // Validate category filter arguments
-    let all_categories: Vec<String> = args
-        .include_category
-        .iter()
-        .chain(args.exclude_category.iter())
-        .cloned()
-        .collect();
-    if !all_categories.is_empty() {
-        if let Err(unknown) = validate_categories(&all_categories) {
-            anyhow::bail!(
-                "Unknown category name(s): {}. Valid categories are: {}",
-                unknown.join(", "),
-                report::KNOWN_CATEGORIES.join(", ")
-            );
-        }
-    }
-    let category_filter = CategoryFilter {
-        include: if args.include_category.is_empty() {
-            None
-        } else {
-            Some(args.include_category.iter().cloned().collect())
-        },
-        exclude: args.exclude_category.iter().cloned().collect(),
-    };
-
 /// Write `content` to a file if `output_path` is `Some`, otherwise print it
 /// to stdout. Writing to a file is atomic: the full string is rendered before
 /// any file is opened, so a failed comparison never leaves a partial file.
@@ -348,9 +319,6 @@ fn run() -> Result<()> {
     };
 
     // In JSON or Markdown mode, decorative progress goes to stderr so stdout
-    // stays a single, pristine document. In text mode it stays on stdout
-    // exactly as before.
-    let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
     // stays a single, pristine document. An explicit output file also keeps
     // stdout empty in text mode: the report is in that file and all progress
     // belongs on stderr rather than alongside it.
@@ -684,7 +652,6 @@ fn run() -> Result<()> {
                     "dependency_findings": infra_findings,
                 });
 
-                println!("{}", serde_json::to_string_pretty(&batch_json)?);
                 let rendered = serde_json::to_string_pretty(&batch_json)?;
                 emit_report_output(&rendered, args.output.as_deref(), &progress)?;
             }
@@ -1047,20 +1014,6 @@ fn run() -> Result<()> {
         safety_report.apply_category_filter(&category_filter);
     }
 
-    match args.format {
-        OutputFormat::Json => {
-            // Single JSON document to stdout; no decorative text, no ANSI codes.
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&safety_report.to_json())?
-            );
-        }
-        OutputFormat::Markdown => {
-            println!("{}", safety_report.generate_summary_markdown());
-        }
-        OutputFormat::Text => {
-            println!("{}", safety_report.generate_summary_text(args.explain));
-        }
     // Render the report to a string first so --output can write it atomically.
     let rendered = match args.format {
         OutputFormat::Json => serde_json::to_string_pretty(&safety_report.to_json())?,
