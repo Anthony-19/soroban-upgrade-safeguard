@@ -82,7 +82,8 @@ soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
 ### Saving a report
 
 Use `--output <PATH>` to write only the rendered report to a file. The format is
-selected with `--format text`, `--format json`, or `--format markdown`; progress
+selected with `--format text`, `--format json`, `--format markdown`, or
+`--format html`; progress
 messages are sent to stderr, leaving stdout and the file free of progress text.
 The report is rendered before the file is opened, so a comparison that fails
 before producing a report does not create or truncate the requested output file.
@@ -115,6 +116,60 @@ auto-loads `.safeguard.toml` from the current directory, or use `--config <PATH>
 to point at another file. See [`.safeguard.example.toml`](.safeguard.example.toml)
 for a documented template and the [documentation](docs/documentation.md#suppressing-known-breaking-changes)
 for the full `target` convention.
+
+### Tuning severity per category
+
+`--strict` promotes every warning at once, and a suppression only ever silences
+one named finding. When a whole category simply matters more or less in your
+project, set it in a `[severity]` table instead:
+
+```toml
+[severity]
+"Parameter Renamed"  = "info"      # No named-argument RPC clients here.
+"Struct Field Added" = "critical"  # Downstream indexers require a migration.
+```
+
+Keys accept the display name, the stable `rule_id`, or a legacy event-flavored
+alias; values are `critical`, `warning`, or `info`. An unknown category is
+rejected when the config loads, with near matches suggested, so a typo can never
+leave you trusting a policy that is not actually in effect.
+
+Overrides are applied where suppression is applied, so the analysis itself stays
+a pure description of what changed. Every overridden finding is marked
+`[SEVERITY critical → warning]` in the report, and a verdict that changed
+*because* of an override is stated prominently in all formats — a gate that can
+be quietly reconfigured into always passing is worse than no gate at all.
+
+### Publishing a report as a build artifact
+
+`--format html` emits a single self-contained file: inline CSS, no external
+requests, so it renders correctly from artifact storage with no network access.
+It carries the same information as the other formats — including suppressed
+findings and their reasons — and adds what only a page can do: Info findings
+collapsed so critical ones are not buried, categories grouped with counts, and
+severity filtering in the page. Batch mode renders every pair into one document.
+
+```bash
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
+  --format html --output ./upgrade-report.html
+```
+
+### Looking up what a category means
+
+Every finding category has a written explanation of what the change breaks and
+what to do about it. `--explain` attaches it to findings during a comparison;
+the `explain` subcommand looks one up directly, which is what you need when
+reading a report from CI or writing a suppression rule:
+
+```bash
+soroban-upgrade-safeguard explain                         # list every category
+soroban-upgrade-safeguard explain "Union Case Reordered"  # guidance for one
+```
+
+Matching elsewhere is exact and the names are long, so a near miss suggests
+candidates rather than just failing. The listing prints each category's stable
+`rule_id` and default severity — the exact strings `[[suppress]]` and
+`[severity]` match on.
 
 ### Comparing against a previous report (baseline)
 

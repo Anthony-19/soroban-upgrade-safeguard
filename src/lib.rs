@@ -54,6 +54,7 @@ pub mod parser;
 pub mod rename;
 pub mod report;
 pub mod rules;
+pub mod severity_override;
 pub mod spec;
 pub mod storage_schema;
 pub mod suppression;

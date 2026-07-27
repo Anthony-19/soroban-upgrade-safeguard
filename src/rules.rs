@@ -481,3 +481,98 @@ pub fn display_label_for_rule_id(rule_id: &str) -> Option<&'static str> {
 pub fn guidance_for_rule_id(rule_id: &str) -> Option<&'static str> {
     rule_by_id(rule_id).map(|rule| rule.guidance)
 }
+
+/// Every registered category, by display label, sorted for stable output.
+///
+/// This is the enumerable inventory the `explain` subcommand lists and the
+/// `[severity]` config validator checks against, so neither has to scrape
+/// category names out of source text.
+pub fn all_category_labels() -> Vec<&'static str> {
+    let mut labels: Vec<&'static str> = RULES.iter().map(|rule| rule.label).collect();
+    labels.sort_unstable();
+    labels
+}
+
+/// Resolve a user-typed category to a rule, accepting either the display label
+/// ("Union Case Reordered") or the stable rule id ("union_case_reordered"), in
+/// any letter case.
+///
+/// Exact matching is what the suppression config and the report layer use, so
+/// this stays deliberately narrow: it forgives capitalization only. Anything
+/// looser belongs in [`suggest_categories`], where the user sees and confirms
+/// the correction rather than silently getting a rule they did not name.
+pub fn lookup_rule_lenient(input: &str) -> Option<&'static RuleDefinition> {
+    let trimmed = input.trim();
+    if let Some(rule) = rule_by_id(trimmed).or_else(|| rule_by_label(trimmed)) {
+        return Some(rule);
+    }
+    let needle = trimmed.to_ascii_lowercase();
+    RULES.iter().find(|rule| {
+        rule.id.eq_ignore_ascii_case(&needle) || rule.label.eq_ignore_ascii_case(&needle)
+    })
+}
+
+/// Category labels close to `input`, best match first, for "did you mean?".
+///
+/// Category names are long and matching elsewhere is exact, so an approximate
+/// memory of a name would otherwise produce a silent no-op (a suppression rule
+/// that never fires, a severity override that never applies). Returning
+/// candidates turns that into a correctable mistake.
+pub fn suggest_categories(input: &str) -> Vec<&'static str> {
+    let needle = input.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored: Vec<(usize, &'static str)> = RULES
+        .iter()
+        .map(|rule| {
+            let label = rule.label.to_ascii_lowercase();
+            // A substring hit ("union case") is a stronger signal than raw edit
+            // distance across a long name, so it sorts ahead of everything else.
+            let distance = if label.contains(&needle) || needle.contains(&label) {
+                0
+            } else {
+                edit_distance(&needle, &label)
+            };
+            (distance, rule.label)
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+
+    // Scale the tolerance to the input length so a short typo does not drag in
+    // every long category name.
+    let tolerance = (needle.len() / 2).clamp(3, 8);
+    scored
+        .into_iter()
+        .filter(|(distance, _)| *distance <= tolerance)
+        .take(5)
+        .map(|(_, label)| label)
+        .collect()
+}
+
+/// Levenshtein distance over ASCII-lowercased bytes, two rows at a time.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+
+    for (i, &ac) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &bc) in b.iter().enumerate() {
+            let substitution = prev[j] + usize::from(ac != bc);
+            curr[j + 1] = substitution.min(prev[j + 1] + 1).min(curr[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    prev[b.len()]
+}
