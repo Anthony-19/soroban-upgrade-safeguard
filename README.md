@@ -25,6 +25,39 @@ A powerful CLI tool to analyze and validate Soroban smart contract upgrades on t
 
 ## Installation
 
+### From a prebuilt binary (recommended)
+
+Download the archive for your platform from the [latest release](https://github.com/ShippedLabs/soroban-upgrade-safeguard/releases/latest), verify the checksum, and place the binary on your `PATH`:
+
+```bash
+# Linux x86_64
+curl -LO https://github.com/ShippedLabs/soroban-upgrade-safeguard/releases/latest/download/soroban-upgrade-safeguard-{version}-x86_64-unknown-linux-gnu.tar.gz
+tar xzf soroban-upgrade-safeguard-{version}-x86_64-unknown-linux-gnu.tar.gz
+sudo mv soroban-upgrade-safeguard-{version}-x86_64-unknown-linux-gnu/soroban-upgrade-safeguard /usr/local/bin/
+
+# macOS x86_64 (Intel)
+curl -LO https://github.com/ShippedLabs/soroban-upgrade-safeguard/releases/latest/download/soroban-upgrade-safeguard-{version}-x86_64-apple-darwin.zip
+unzip soroban-upgrade-safeguard-{version}-x86_64-apple-darwin.zip
+sudo mv soroban-upgrade-safeguard-{version}-x86_64-apple-darwin/soroban-upgrade-safeguard /usr/local/bin/
+
+# macOS ARM64 (Apple Silicon)
+curl -LO https://github.com/ShippedLabs/soroban-upgrade-safeguard/releases/latest/download/soroban-upgrade-safeguard-{version}-aarch64-apple-darwin.zip
+unzip soroban-upgrade-safeguard-{version}-aarch64-apple-darwin.zip
+sudo mv soroban-upgrade-safeguard-{version}-aarch64-apple-darwin/soroban-upgrade-safeguard /usr/local/bin/
+```
+
+Each release also publishes a `CHECKSUMS` file containing the SHA-256 hash of every archive. Download it alongside the archive and verify your download before using the binary:
+
+```bash
+sha256sum --check CHECKSUMS
+# or on macOS:
+shasum -a 256 --check CHECKSUMS
+```
+
+### From source
+
+If you have the Rust toolchain installed, you can also install from source:
+
 ```bash
 cargo install --path .
 ```
