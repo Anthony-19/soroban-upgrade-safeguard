@@ -2,6 +2,13 @@
 name = "soroban-upgrade-safeguard"
 version = "0.1.0"
 edition = "2021"
+# Determined from the dependency graph actually locked in Cargo.lock (see
+# `cargo metadata`'s per-package `rust_version` field): clap 4.6.1 is the
+# highest floor among all direct and transitive dependencies, at 1.85. Raising
+# a dependency above its current locked version can raise this floor further;
+# see docs/contributing.md#minimum-supported-rust-version for the policy on
+# when that requires bumping this field.
+rust-version = "1.85"
 description = "A safety tool to check for breaking changes in Soroban contract upgrades."
 license = "MIT"
 repository = "https://github.com/ShippedLabs/soroban-upgrade-safeguard"
@@ -16,6 +23,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "soroban-upgrade-safeguard"
 path = "src/main.rs"
+
+[[bench]]
+name = "pipeline"
+harness = false
 
 [dependencies]
 # WASM parsing
@@ -39,6 +50,10 @@ indicatif = "0.17"
 hex = "0.4"
 sha2 = "0.10"
 ureq = { version = "2.9", features = ["json"] }
+# Bounded data-parallelism for comparing batch pairs concurrently (see
+# compare_contracts' caller in main.rs). Defaults to one worker per available
+# CPU; override with the RAYON_NUM_THREADS environment variable.
+rayon = "1"
 
 [dev-dependencies]
 # Property-based/fuzz testing for the decode + type-walk paths (see
@@ -47,3 +62,6 @@ proptest = "1"
 # Validates real emitted JSON output against the committed schema (see
 # tests/schema_validation.rs) so the schema and the output cannot drift apart.
 jsonschema = "0.18"
+# Benchmark harness for the analysis pipeline (see benches/pipeline.rs).
+# Dev-only: does not affect the shipped binary.
+criterion = "0.5"

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use colored::Colorize;
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -427,45 +428,86 @@ fn run() -> Result<()> {
         let mut overall_safe = true;
         let mut any_limit_violation = false;
 
-        for (i, pair) in pairs.iter().enumerate() {
-            let contract_name = pair_names[i].clone();
+        // Compare all pairs concurrently. Rayon bounds parallelism to the
+        // available CPU count by default (override via RAYON_NUM_THREADS).
+        //
+        // Each pair's progress lines are captured into its own buffer rather
+        // than written straight to stdout/stderr — concurrent writers would
+        // interleave unrelated pairs' output. Buffers are flushed after the
+        // parallel phase completes, one pair at a time, in original
+        // manifest/scan order (not completion order): this keeps the printed
+        // transcript exactly as readable as the old sequential version and
+        // reproducible run-to-run regardless of which pair actually finished
+        // first. The final report results are collected into a `BTreeMap`
+        // keyed by contract name either way, so JSON/Markdown/text rendering
+        // was already independent of completion order before this change.
+        //
+        // A panic partway through one pair's comparison is caught and
+        // recorded as that pair's failure instead of unwinding across the
+        // thread boundary and taking down every other in-flight pair with it.
+        let pair_outcomes: Vec<(String, Vec<String>, Result<report::SafetyReport>)> = pairs
+            .par_iter()
+            .enumerate()
+            .map(|(i, pair)| {
+                let contract_name = pair_names[i].clone();
+                let lines = std::cell::RefCell::new(Vec::new());
+                let capture = |line: String| lines.borrow_mut().push(line);
 
-            progress(format!(
-                "📦 [{}/{}] Comparing contract pair: {}",
-                i + 1,
-                pairs.len(),
-                contract_name.bold()
-            ));
+                capture(format!(
+                    "📦 [{}/{}] Comparing contract pair: {}",
+                    i + 1,
+                    pairs.len(),
+                    contract_name.bold()
+                ));
 
-            // Per-pair policy: a pair that trips a resource limit (or otherwise
-            // errors) fails only that pair — it must not abort the whole batch,
-            // so its result is recorded and the loop continues.
-            let outcome = (|| -> Result<report::SafetyReport> {
-                let old_wasm = loader::load_wasm(&pair.old)?;
-                let new_wasm = loader::load_wasm(&pair.new)?;
-                compare_contracts(
-                    &ContractComparison {
-                        old_bytes: &old_wasm.bytes,
-                        old_path: &old_wasm.path,
-                        new_bytes: &new_wasm.bytes,
-                        new_path: &new_wasm.path,
-                        suppressions: &suppressions,
-                        policy: &policy,
-                        // Storage schemas are contract-specific and rejected in
-                        // batch mode, so no pair carries one.
-                        storage_schemas: None,
+                // Per-pair policy: a pair that trips a resource limit, errors,
+                // or panics fails only that pair — it must not abort the whole
+                // batch, so its result is recorded and every other pair still
+                // runs to completion.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || -> Result<report::SafetyReport> {
+                        let old_wasm = loader::load_wasm(&pair.old)?;
+                        let new_wasm = loader::load_wasm(&pair.new)?;
+                        compare_contracts(
+                            &ContractComparison {
+                                old_bytes: &old_wasm.bytes,
+                                old_path: &old_wasm.path,
+                                new_bytes: &new_wasm.bytes,
+                                new_path: &new_wasm.path,
+                                suppressions: &suppressions,
+                                policy: &policy,
+                                // Storage schemas are contract-specific and
+                                // rejected in batch mode, so no pair carries one.
+                                storage_schemas: None,
+                            },
+                            &args,
+                            &capture,
+                        )
                     },
-                    &args,
-                    &progress,
-                )
-            })();
+                ))
+                .unwrap_or_else(|panic_payload| {
+                    let message = panic_payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "panicked with a non-string payload".to_string());
+                    Err(anyhow::anyhow!("Comparison panicked: {message}"))
+                });
+
+                (contract_name, lines.into_inner(), outcome)
+            })
+            .collect();
+
+        for (contract_name, lines, outcome) in pair_outcomes {
+            for line in lines {
+                progress(line);
+            }
 
             match outcome {
                 Ok(mut report) => {
                     if !all_categories.is_empty() {
                         report.apply_category_filter(&category_filter);
                     }
-                Ok(report) => {
                     if !report.is_safe {
                         overall_safe = false;
                     }
