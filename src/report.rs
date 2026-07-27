@@ -346,6 +346,16 @@ pub struct SafetyReport {
     /// Set by [`crate::baseline::apply`] when a `--baseline` report was
     /// supplied. `None` means no baseline comparison was requested.
     pub baseline_diff: Option<crate::baseline::BaselineDiff>,
+    /// When `true`, [`Self::generate_summary_text`] appends a highlighted
+    /// two-line type diff after each type-change finding.  Set from the
+    /// `--diff-types` CLI flag.  Has no effect on JSON or Markdown output.
+    pub diff_types: bool,
+    /// Whether color is enabled for this report's text rendering.
+    ///
+    /// Mirrors the process-wide color decision made by `main` and stored here
+    /// so [`Self::generate_summary_text`] can pass the right value to
+    /// [`crate::type_diff::render_type_diff`] without accessing global state.
+    pub use_color: bool,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -543,6 +553,8 @@ impl SafetyReport {
             metrics: None,
             unmatched_suppressions,
             baseline_diff: None,
+            diff_types: false,
+            use_color: false,
         }
     }
 
@@ -842,6 +854,17 @@ impl SafetyReport {
                             &format!("    ↳ guidance: {}\n", remediation)
                                 .green()
                                 .to_string(),
+                        );
+                    }
+                }
+                if self.diff_types
+                    && crate::type_diff::is_type_change_category(&finding.category)
+                {
+                    if let Some((old_ty, new_ty)) =
+                        crate::type_diff::extract_type_pair(&finding.message)
+                    {
+                        output.push_str(
+                            &crate::type_diff::render_type_diff(&old_ty, &new_ty, self.use_color),
                         );
                     }
                 }
@@ -1601,6 +1624,8 @@ mod tests {
             },
             unmatched_suppressions: Vec::new(),
             baseline_diff: None,
+            diff_types: false,
+            use_color: false,
         };
 
         // Identical upgrade -> patch

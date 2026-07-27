@@ -202,6 +202,17 @@ struct Args {
     /// run on its own). Has no effect without `--baseline`.
     #[arg(long, requires = "baseline")]
     baseline_fail_on_new: bool,
+
+    /// Render a highlighted two-line type diff after each type-change finding.
+    ///
+    /// For every finding whose category is a type change (e.g. "Struct Field
+    /// Type Changed"), the old and new signatures are printed aligned with the
+    /// differing portion highlighted in red/green.  The view respects
+    /// `--no-color`: when color is disabled the changed span is wrapped in
+    /// square brackets instead.  Has no effect on `--format json` or
+    /// `--format markdown`.
+    #[arg(long)]
+    diff_types: bool,
 }
 
 /// Resolve the effective [`ResourcePolicy`]: built-in defaults, overlaid by the
@@ -1122,6 +1133,16 @@ fn run() -> Result<()> {
     )?;
     safety_report.baseline_source = baseline_source.map(|s| s.to_string());
     safety_report.verified_code_hash = verified_hash_hex;
+    safety_report.diff_types = args.diff_types;
+    // use_color is false when color has been globally disabled (which
+    // colored::control::set_override(false) handles for the colored crate
+    // itself), but we need the same decision here to drive our own
+    // render_type_diff call.  Re-derive it from the same inputs main() used.
+    safety_report.use_color = !soroban_upgrade_safeguard::color::should_disable_color(
+        args.no_color,
+        std::env::var_os("NO_COLOR").is_some(),
+        std::io::stdout().is_terminal(),
+    );
 
     if !all_categories.is_empty() {
         safety_report.apply_category_filter(&category_filter);
