@@ -48,6 +48,7 @@ max_xdr_depth = 128
 max_xdr_len = 1048576
 max_entries = 1000
 max_walk_depth = 128
+max_wasm_size = 26214400  # 25 MiB — reject inputs larger than this before reading
 
 # Define one or more reviewed suppression rules
 [[suppress]]
@@ -87,6 +88,7 @@ Each CLI flag and configuration parameter has a corresponding environment variab
 | `--max-xdr-len`| `limits.max_xdr_len`| `SAFEGUARD_MAX_XDR_LEN` | Unsigned Pointer Integer (usize)|
 | `--max-entries`| `limits.max_entries`| `SAFEGUARD_MAX_ENTRIES` | Unsigned Pointer Integer (usize)|
 | `--max-walk-depth`| `limits.max_walk_depth`| `SAFEGUARD_MAX_WALK_DEPTH`| Unsigned Pointer Integer (usize)|
+| `--max-wasm-size`| `limits.max_wasm_size`| `SAFEGUARD_MAX_WASM_SIZE`| Unsigned Pointer Integer (usize, bytes)|
 
 ---
 
@@ -116,7 +118,8 @@ Every report execution generates a `VerdictSettings` metadata block captured wit
     "max_xdr_depth": 128,
     "max_xdr_len": 1048576,
     "max_entries": 1000,
-    "max_walk_depth": 128
+    "max_walk_depth": 128,
+    "max_wasm_size": 26214400
   }
 }
 ```
@@ -167,6 +170,8 @@ Safeguard provides the following command line options. You can view them by runn
   Sets the maximum allowed decoded spec entries across all sections.
 * **`--max-walk-depth <N>`**
   Sets the maximum recursion depth for structural type walk evaluations.
+* **`--max-wasm-size <BYTES>`**
+  Sets the maximum raw WASM binary size in bytes (default: 26,214,400 — 25 MiB). For disk files the size is checked via `fs::metadata` before any bytes are read into memory; for RPC-fetched bytes it is checked after receipt. An input exceeding this limit exits with code 2 (resource-limit violation). Settable via `SAFEGUARD_MAX_WASM_SIZE` or `limits.max_wasm_size` in `.safeguard.toml`.
 
 ---
 
@@ -318,6 +323,11 @@ Safeguard protects your CI runner systems and memory footprints from malicious, 
 * **Purpose**: Restricts recursive structural comparison, formatting, and rendering algorithms.
 * **Symptom**: Validation fails under complex nested structs check.
 * **Remediation**: Raise this limit only if Safeguard explicitly recommends doing so during validation.
+
+#### 5. `max_wasm_size` (CLI: `--max-wasm-size`, Default: `26,214,400` bytes / 25 MiB)
+* **Purpose**: Caps the raw WASM binary size **before** the file is read into memory (disk) or accepted from an RPC response. A legitimate compiled Soroban contract is well under 1 MiB; the 25 MiB default is a wide safety margin that rejects multi-gigabyte adversarial inputs without allocating memory for them. Violations surface as exit code 2 (resource-limit violation), distinct from exit code 1 (breaking changes found).
+* **Symptom**: Error message `WASM input size N bytes exceeds the maximum of M bytes (raise max_wasm_size)`.
+* **Remediation**: If you have a genuinely large contract that exceeds the default, raise the limit via `--max-wasm-size`, `SAFEGUARD_MAX_WASM_SIZE`, or `limits.max_wasm_size` in `.safeguard.toml`. For adversarial inputs the correct response is to reject them rather than raise the limit.
 
 ---
 

@@ -150,6 +150,13 @@ struct Args {
     #[arg(long, value_name = "N")]
     max_walk_depth: Option<usize>,
 
+    /// Maximum raw WASM binary size in bytes. Overrides `[limits]` and the
+    /// default (25 MiB). The file size is checked via `fs::metadata` before
+    /// any bytes are read into memory; RPC-fetched bytes are checked after
+    /// receipt. Inputs exceeding this limit exit with code 2.
+    #[arg(long, value_name = "BYTES")]
+    max_wasm_size: Option<usize>,
+
     /// Treat identical duplicate spec entries (same name, byte-identical
     /// definition) as informational rather than warnings.
     ///
@@ -222,6 +229,20 @@ fn resolve_policy(args: &Args, config_path: Option<&Path>) -> Result<ResourcePol
     }
     if let Some(v) = args.max_walk_depth {
         policy.max_walk_depth = v;
+    }
+    if let Some(v) = args.max_wasm_size {
+        policy.max_wasm_size = v;
+    }
+
+    // Environment variable overrides sit between the config file and CLI flags
+    // in precedence (CLI wins over env, env wins over file).
+    if let Ok(v) = std::env::var("SAFEGUARD_MAX_WASM_SIZE") {
+        if let Ok(n) = v.parse::<usize>() {
+            // Only apply if the CLI flag was not already set.
+            if args.max_wasm_size.is_none() {
+                policy.max_wasm_size = n;
+            }
+        }
     }
 
     Ok(policy)
@@ -1064,11 +1085,11 @@ fn run() -> Result<()> {
 
         module
     } else {
-        loader::load_wasm(&args.wasm_paths[0])?
+        loader::load_wasm_with_policy(&args.wasm_paths[0], &policy)?
     };
 
     // New WASM
-    let new = loader::load_wasm(new_wasm_path)?;
+    let new = loader::load_wasm_with_policy(new_wasm_path, &policy)?;
 
     if !suppressions.rules.is_empty() {
         progress(format!(
@@ -1405,7 +1426,7 @@ fn resolve_contract_source(
     allow_http_local: bool,
 ) -> Result<loader::WasmModule> {
     match source {
-        ContractSource::File(path) => loader::load_wasm(path),
+        ContractSource::File(path) => loader::load_wasm_with_policy(path, policy),
         ContractSource::OnChain {
             contract_id,
             rpc_url,

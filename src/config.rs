@@ -116,6 +116,12 @@ pub struct Args {
     /// detection). Overrides `[limits]` and the default.
     #[arg(long, value_name = "N")]
     pub max_walk_depth: Option<usize>,
+
+    /// Maximum raw WASM binary size in bytes. Overrides `[limits]` and the
+    /// default (25 MiB). Checked via `fs::metadata` before reading disk files
+    /// and against the decoded length for RPC-fetched bytes.
+    #[arg(long, value_name = "BYTES")]
+    pub max_wasm_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -275,6 +281,9 @@ impl ResolvedConfig {
         if let Some(v) = env_usize("SAFEGUARD_MAX_WALK_DEPTH") {
             policy.max_walk_depth = v;
         }
+        if let Some(v) = env_usize("SAFEGUARD_MAX_WASM_SIZE") {
+            policy.max_wasm_size = v;
+        }
         if let Some(v) = args.max_xdr_depth {
             policy.max_xdr_depth = v;
         }
@@ -286,6 +295,9 @@ impl ResolvedConfig {
         }
         if let Some(v) = args.max_walk_depth {
             policy.max_walk_depth = v;
+        }
+        if let Some(v) = args.max_wasm_size {
+            policy.max_wasm_size = v;
         }
 
         // Suppressions config resolution

@@ -51,9 +51,37 @@ impl std::error::Error for IntegrityError {}
 
 /// Reads a WASM file from disk, validates it is a valid WASM binary,
 /// and returns a `WasmModule` ready for further analysis.
+///
+/// Uses [`ResourcePolicy::default`] for the WASM size ceiling. Prefer
+/// [`load_wasm_with_policy`] when a caller-supplied policy is available so the
+/// configured `max_wasm_size` is respected.
 pub fn load_wasm(path: &Path) -> Result<WasmModule> {
+    load_wasm_with_policy(path, &ResourcePolicy::default())
+}
+
+/// Like [`load_wasm`], but enforces the size ceiling from `policy`.
+///
+/// The file size is checked against `policy.max_wasm_size` via
+/// `fs::metadata` **before** the file is opened for reading, so an
+/// oversized input is rejected without allocating memory for it. The
+/// error is a [`LimitError::WasmSizeExceeded`] so the CLI can assign it
+/// exit code 2 (resource-limit violation) rather than 1 (broken upgrade).
+pub fn load_wasm_with_policy(path: &Path, policy: &ResourcePolicy) -> Result<WasmModule> {
     if path.is_dir() {
         bail!("'{}' is a directory, not a WASM file", path.display());
+    }
+
+    // Check size via metadata before allocating.
+    let file_size = std::fs::metadata(path)
+        .with_context(|| format!("Failed to read file metadata: {}", path.display()))?
+        .len() as usize;
+
+    if file_size > policy.max_wasm_size {
+        return Err(LimitError::WasmSizeExceeded {
+            limit: policy.max_wasm_size,
+            actual: file_size,
+        }
+        .into());
     }
 
     let bytes =
@@ -273,6 +301,18 @@ pub fn fetch_wasm_from_rpc_with_policy_and_cache(
     };
 
     let wasm_bytes = contract_code.code.to_vec();
+
+    // ── Size check (RPC path) ──────────────────────────────────────────────
+    // Apply the same ceiling that `load_wasm_with_policy` enforces for disk
+    // files. The check runs before the hash comparison so an oversized payload
+    // is rejected without doing any cryptographic work on it.
+    if wasm_bytes.len() > policy.max_wasm_size {
+        return Err(LimitError::WasmSizeExceeded {
+            limit: policy.max_wasm_size,
+            actual: wasm_bytes.len(),
+        }
+        .into());
+    }
 
     let computed_hash = Sha256::digest(&wasm_bytes);
     if computed_hash[..] != wasm_hash.0[..] {
@@ -595,6 +635,45 @@ mod tests {
         let err = load_wasm(&path).unwrap_err();
         let msg = format!("{:#}", err);
         assert!(msg.contains(&path.display().to_string()), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_load_wasm_rejects_oversized_file() {
+        use crate::limits::{LimitError, ResourcePolicy};
+
+        // Write a tiny but valid-looking WASM file (magic + version).
+        let path = std::env::temp_dir()
+            .join("soroban-upgrade-safeguard-oversized.wasm");
+        let wasm_magic = b"\x00asm\x01\x00\x00\x00";
+        std::fs::write(&path, wasm_magic).unwrap();
+
+        // Set a limit smaller than the file so the check fires.
+        let policy = ResourcePolicy {
+            max_wasm_size: 4, // file is 8 bytes — smaller than magic + version
+            ..ResourcePolicy::default()
+        };
+
+        let err = load_wasm_with_policy(&path, &policy).unwrap_err();
+
+        // Must surface as a LimitError, not a generic anyhow error, so the
+        // CLI can assign it exit code 2.
+        let limit_err = crate::limits::find_limit_error(&err)
+            .expect("expected a LimitError in the chain");
+        match limit_err {
+            LimitError::WasmSizeExceeded { limit, actual } => {
+                assert_eq!(*limit, 4);
+                assert_eq!(*actual, 8);
+            }
+            other => panic!("expected WasmSizeExceeded, got {other:?}"),
+        }
+
+        // The error message must name both the limit and the actual size.
+        let msg = err.to_string();
+        assert!(msg.contains('4') || msg.contains("4"), "limit missing: {msg}");
+        assert!(msg.contains('8') || msg.contains("8"), "actual missing: {msg}");
+        assert!(msg.contains("max_wasm_size"), "hint missing: {msg}");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

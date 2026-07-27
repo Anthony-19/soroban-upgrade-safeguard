@@ -46,6 +46,15 @@ pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
 /// accept programmatically-built (never-decoded) types.
 pub const DEFAULT_MAX_WALK_DEPTH: usize = 128;
 
+/// Default maximum raw WASM binary size in bytes (25 MiB).
+///
+/// This bound is checked **before** the file is read into memory (via
+/// `fs::metadata`) for disk inputs, and against `wasm_bytes.len()` for bytes
+/// received over RPC. A legitimate compiled Soroban contract is well under
+/// 1 MiB; 25 MiB is a wide safety margin that comfortably rejects gigabyte
+/// inputs while accepting any real contract.
+pub const DEFAULT_MAX_WASM_SIZE: usize = 25 * 1024 * 1024;
+
 /// A single, reusable policy bounding how much work untrusted input may cause.
 ///
 /// Every limit is independently configurable. `Copy` so it can be threaded by
@@ -62,6 +71,12 @@ pub struct ResourcePolicy {
     /// Maximum recursion depth for the type walkers. Independent of
     /// [`Self::max_xdr_depth`].
     pub max_walk_depth: usize,
+    /// Maximum raw WASM binary size in bytes.
+    ///
+    /// Checked against `fs::metadata` **before** a disk file is read, and
+    /// against `wasm_bytes.len()` for bytes received over RPC. Violations
+    /// surface as [`LimitError::WasmSizeExceeded`].
+    pub max_wasm_size: usize,
 }
 
 impl Default for ResourcePolicy {
@@ -71,6 +86,7 @@ impl Default for ResourcePolicy {
             max_xdr_len: DEFAULT_MAX_XDR_LEN,
             max_entries: DEFAULT_MAX_ENTRIES,
             max_walk_depth: DEFAULT_MAX_WALK_DEPTH,
+            max_wasm_size: DEFAULT_MAX_WASM_SIZE,
         }
     }
 }
@@ -129,6 +145,11 @@ pub enum LimitError {
     WalkDepthExceeded { limit: usize },
     /// The decoded entry count exceeded [`ResourcePolicy::max_entries`].
     EntryCountExceeded { limit: usize, kind: EntryKind },
+    /// The raw WASM binary size exceeded [`ResourcePolicy::max_wasm_size`].
+    ///
+    /// Checked before any bytes are read into memory for disk files, and
+    /// against the decoded byte length for RPC-fetched WASM.
+    WasmSizeExceeded { limit: usize, actual: usize },
 }
 
 impl fmt::Display for LimitError {
@@ -151,6 +172,11 @@ impl fmt::Display for LimitError {
                 f,
                 "{} entry count exceeded the maximum of {limit} (raise `max_entries`)",
                 kind.label()
+            ),
+            LimitError::WasmSizeExceeded { limit, actual } => write!(
+                f,
+                "WASM input size {actual} bytes exceeds the maximum of {limit} bytes \
+                 (raise `max_wasm_size`)"
             ),
         }
     }
@@ -208,6 +234,9 @@ pub struct LimitsConfig {
     /// Overrides [`ResourcePolicy::max_walk_depth`].
     #[serde(default)]
     pub max_walk_depth: Option<usize>,
+    /// Overrides [`ResourcePolicy::max_wasm_size`].
+    #[serde(default)]
+    pub max_wasm_size: Option<usize>,
 }
 
 /// The top-level shape of `.safeguard.toml` as far as limits are concerned.
@@ -255,6 +284,9 @@ impl LimitsConfig {
         if let Some(v) = self.max_walk_depth {
             base.max_walk_depth = v;
         }
+        if let Some(v) = self.max_wasm_size {
+            base.max_wasm_size = v;
+        }
         base
     }
 }
@@ -270,6 +302,7 @@ mod tests {
         assert_eq!(p.max_xdr_len, DEFAULT_MAX_XDR_LEN);
         assert_eq!(p.max_entries, DEFAULT_MAX_ENTRIES);
         assert_eq!(p.max_walk_depth, DEFAULT_MAX_WALK_DEPTH);
+        assert_eq!(p.max_wasm_size, DEFAULT_MAX_WASM_SIZE);
     }
 
     #[test]
@@ -330,5 +363,33 @@ mod tests {
         // Untouched fields keep the base value.
         assert_eq!(p.max_xdr_len, DEFAULT_MAX_XDR_LEN);
         assert_eq!(p.max_walk_depth, DEFAULT_MAX_WALK_DEPTH);
+        assert_eq!(p.max_wasm_size, DEFAULT_MAX_WASM_SIZE);
+    }
+
+    #[test]
+    fn wasm_size_exceeded_displays_limit_and_actual() {
+        let e = LimitError::WasmSizeExceeded {
+            limit: 1024,
+            actual: 2048,
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("2048"), "actual size missing: {msg}");
+        assert!(msg.contains("1024"), "limit missing: {msg}");
+        assert!(msg.contains("max_wasm_size"), "hint missing: {msg}");
+        // Must box cleanly into anyhow.
+        let any: anyhow::Error = e.clone().into();
+        assert_eq!(any.downcast_ref::<LimitError>(), Some(&e));
+    }
+
+    #[test]
+    fn config_applies_max_wasm_size_override() {
+        let cfg = LimitsConfig {
+            max_wasm_size: Some(1024),
+            ..LimitsConfig::default()
+        };
+        let p = cfg.apply_to(ResourcePolicy::default());
+        assert_eq!(p.max_wasm_size, 1024);
+        // Other limits are unaffected.
+        assert_eq!(p.max_xdr_depth, DEFAULT_MAX_XDR_DEPTH);
     }
 }
