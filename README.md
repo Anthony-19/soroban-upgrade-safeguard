@@ -25,8 +25,44 @@ A powerful CLI tool to analyze and validate Soroban smart contract upgrades on t
 
 ## Installation
 
+Install the latest published version from [crates.io](https://crates.io/crates/soroban-upgrade-safeguard):
+
+```bash
+cargo install soroban-upgrade-safeguard
+```
+
+Or install from a local checkout:
+
 ```bash
 cargo install --path .
+```
+
+## Docker
+
+You can use the published container image from the GitHub Container Registry without installing a Rust toolchain. Images are published on version tags (e.g. `v0.1.0`) for pinning in CI/CD pipelines, as well as on `main` and `latest`.
+
+Pull the latest published image:
+
+```bash
+docker pull ghcr.io/shippedlabs/soroban-upgrade-safeguard:latest
+```
+
+Run against local WASM files by mounting your workspace into the container:
+
+```bash
+docker run --rm \
+  -v $(pwd)/wasm:/wasms \
+  ghcr.io/shippedlabs/soroban-upgrade-safeguard:latest \
+  /wasms/v1.wasm /wasms/v2.wasm
+```
+
+To pin a specific released version in CI:
+
+```bash
+docker run --rm \
+  -v $(pwd)/wasm:/wasms \
+  ghcr.io/shippedlabs/soroban-upgrade-safeguard:v0.1.0 \
+  /wasms/v1.wasm /wasms/v2.wasm
 ```
 
 ## Usage

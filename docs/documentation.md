@@ -75,7 +75,13 @@ Scope:  Exported interface + environment metadata only — storage layout is NOT
 
 ## Installation
 
-Build and install the binary from the repository root:
+Install the published crate from crates.io:
+
+```bash
+cargo install soroban-upgrade-safeguard
+```
+
+Alternatively, you can build and install the binary from a local checkout of the repository root:
 
 ```bash
 cargo install --path .
@@ -89,7 +95,13 @@ cargo run -- <OLD_WASM> <NEW_WASM>
 
 ## Docker
 
-Build the image from the repository root:
+Pre-built images are published automatically to the GitHub Container Registry (`ghcr.io`) from CI. You can pull a published image directly:
+
+```bash
+docker pull ghcr.io/shippedlabs/soroban-upgrade-safeguard:latest
+```
+
+Alternatively, you can build the image manually from the repository root:
 
 ```bash
 docker build -t soroban-upgrade-safeguard .

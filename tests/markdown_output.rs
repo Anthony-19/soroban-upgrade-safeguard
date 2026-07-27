@@ -136,3 +136,69 @@ fn markdown_output_includes_build_metrics_table() {
         "Markdown metrics table must contain Functions row"
     );
 }
+
+/// Run the binary with `--format markdown` plus extra flags and return
+/// (exit code, stdout, stderr).
+fn run_markdown_ext(old: &str, new: &str, extra: &[&str]) -> (i32, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg(wasm(old))
+        .arg(wasm(new))
+        .args(["--format", "markdown"])
+        .args(extra)
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    (code, stdout, stderr)
+}
+
+#[test]
+fn markdown_strict_mode_banner_is_present() {
+    // v1→v3 produces warnings only (no criticals); --strict makes it a failure.
+    let (code, stdout, _stderr) = run_markdown_ext("v1.wasm", "v3.wasm", &["--strict"]);
+
+    assert_eq!(code, 1, "--strict with warnings must exit 1");
+
+    // The strict-mode indicator must appear.
+    assert!(
+        stdout.contains("[STRICT MODE ACTIVE]"),
+        "Markdown report must show STRICT MODE ACTIVE banner, got:\n{stdout}"
+    );
+
+    // Must NOT describe a warnings-only failure as a critical failure.
+    assert!(
+        !stdout.contains("Critical breaking changes detected"),
+        "Warnings-only strict failure must not say 'Critical breaking changes', got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Exported-interface breaking changes detected"),
+        "Warnings-only strict failure must not use the generic failed label, got:\n{stdout}"
+    );
+
+    // Must use the accurate warnings-only description.
+    assert!(
+        stdout.contains("Warnings detected in strict mode"),
+        "Markdown report must describe a warnings-only strict failure accurately, got:\n{stdout}"
+    );
+
+    // Output must remain free of ANSI codes.
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "Markdown output must not contain ANSI codes"
+    );
+}
+
+#[test]
+fn markdown_strict_mode_non_strict_run_has_no_banner() {
+    // Same pair without --strict: should pass and show no strict banner.
+    let (code, stdout, _stderr) = run_markdown_ext("v1.wasm", "v3.wasm", &[]);
+
+    assert_eq!(code, 0, "warnings-only without --strict must exit 0");
+    assert!(
+        !stdout.contains("[STRICT MODE ACTIVE]"),
+        "Non-strict run must not show STRICT MODE ACTIVE banner"
+    );
+}

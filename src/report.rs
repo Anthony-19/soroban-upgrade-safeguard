@@ -924,8 +924,14 @@ impl SafetyReport {
         let mut output = String::new();
         output.push_str("# Soroban Upgrade Safety Report\n\n");
 
+        if self.strict {
+            output.push_str("> ⚠️ **[STRICT MODE ACTIVE]** — Warnings are treated as failures.\n\n");
+        }
+
         let status = if self.is_safe {
             self.passed_status_label()
+        } else if self.strict && self.critical_count == 0 {
+            "❌ FAILED (Warnings detected in strict mode)"
         } else {
             self.failed_status_label()
         };
