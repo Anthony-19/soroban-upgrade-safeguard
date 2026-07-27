@@ -122,3 +122,66 @@ jobs:
           command: check
           # Run all four checks: advisories, licenses, bans, sources.
           arguments: --config deny.toml
+
+  docker:
+    name: Build and verify Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: soroban-upgrade-safeguard:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify Docker image against test fixtures
+        shell: bash
+        run: |
+          set -eo pipefail
+          echo "Running verification tests against soroban-upgrade-safeguard:test..."
+          
+          # 1. Clean pair (v1 vs v1) must pass (exit 0)
+          echo "Test 1: Clean pair (v1 vs v1)"
+          docker run --rm -v "${{ github.workspace }}/tests/wasm:/wasms" \
+            soroban-upgrade-safeguard:test /wasms/v1.wasm /wasms/v1.wasm
+          
+          # 2. Breaking pair (v1 vs v2) must fail (exit 1)
+          echo "Test 2: Breaking pair (v1 vs v2)"
+          if docker run --rm -v "${{ github.workspace }}/tests/wasm:/wasms" \
+            soroban-upgrade-safeguard:test /wasms/v1.wasm /wasms/v2.wasm; then
+            echo "ERROR: Expected breaking pair (v1 vs v2) to fail, but it passed!"
+            exit 1
+          else
+            echo "Successfully detected breaking changes (expected failure)."
+          fi
+          
+          # 3. Warning-only pair (v1 vs v3) must pass without --strict (exit 0)
+          echo "Test 3: Warning pair (v1 vs v3) without strict mode"
+          docker run --rm -v "${{ github.workspace }}/tests/wasm:/wasms" \
+            soroban-upgrade-safeguard:test /wasms/v1.wasm /wasms/v3.wasm
+            
+          # 4. Warning-only pair (v1 vs v3) must fail with --strict (exit 1)
+          echo "Test 4: Warning pair (v1 vs v3) with strict mode"
+          if docker run --rm -v "${{ github.workspace }}/tests/wasm:/wasms" \
+            soroban-upgrade-safeguard:test /wasms/v1.wasm /wasms/v3.wasm --strict; then
+            echo "ERROR: Expected strict mode on warning pair (v1 vs v3) to fail, but it passed!"
+            exit 1
+          else
+            echo "Successfully detected strict mode failure on warnings (expected failure)."
+          fi
+          
+          # 5. JSON output format check
+          echo "Test 5: JSON output format check"
+          OUTPUT=$(docker run --rm -v "${{ github.workspace }}/tests/wasm:/wasms" \
+            soroban-upgrade-safeguard:test /wasms/v1.wasm /wasms/v1.wasm --format json)
+          echo "$OUTPUT" | grep -q '"is_safe": true'
+          
+          echo "All Docker image verification checks passed!"
