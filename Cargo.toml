@@ -24,6 +24,10 @@ path = "src/lib.rs"
 name = "soroban-upgrade-safeguard"
 path = "src/main.rs"
 
+[[bench]]
+name = "pipeline"
+harness = false
+
 [dependencies]
 # WASM parsing
 wasmparser = "0.201.0"
@@ -54,3 +58,6 @@ proptest = "1"
 # Validates real emitted JSON output against the committed schema (see
 # tests/schema_validation.rs) so the schema and the output cannot drift apart.
 jsonschema = "0.18"
+# Benchmark harness for the analysis pipeline (see benches/pipeline.rs).
+# Dev-only: does not affect the shipped binary.
+criterion = "0.5"

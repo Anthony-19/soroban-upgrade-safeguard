@@ -11,13 +11,14 @@ Thank you for your interest in improving Soroban Upgrade Safeguard. This guide e
 5. [Testing](#testing)
 6. [Test Fixtures](#test-fixtures)
 7. [Fuzzing](#fuzzing)
-8. [Code Coverage](#code-coverage)
-9. [Minimum Supported Rust Version](#minimum-supported-rust-version)
-10. [Coding Guidelines](#coding-guidelines)
-11. [Adding a New Detection Rule](#adding-a-new-detection-rule)
-12. [Commit and Pull Request Process](#commit-and-pull-request-process)
-13. [Reporting Bugs](#reporting-bugs)
-14. [Code of Conduct](#code-of-conduct)
+8. [Benchmarking](#benchmarking)
+9. [Code Coverage](#code-coverage)
+10. [Minimum Supported Rust Version](#minimum-supported-rust-version)
+11. [Coding Guidelines](#coding-guidelines)
+12. [Adding a New Detection Rule](#adding-a-new-detection-rule)
+13. [Commit and Pull Request Process](#commit-and-pull-request-process)
+14. [Reporting Bugs](#reporting-bugs)
+15. [Code of Conduct](#code-of-conduct)
 
 ## Ways to Contribute
 
@@ -181,6 +182,39 @@ cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<crash-file>
 `stellar-xdr`'s `arbitrary` feature is declared in `fuzz/Cargo.toml` rather than
 in the crate's release dependencies, so structure-aware targets can use it
 without pulling it into the shipped binary (see issue #79).
+
+## Benchmarking
+
+There was no performance measurement of any kind until issue #135: the tool's
+cost profile — and whether a given change makes it worse — was previously
+unknown. `benches/pipeline.rs` uses [Criterion](https://github.com/bheisler/criterion.rs)
+to benchmark the four stages of the analysis pipeline independently:
+
+- **Parsing** — decoding concatenated `ScSpecEntry` XDR bytes.
+- **Spec building** — `ContractSpec::from_entries_checked`, including duplicate detection.
+- **Diffing** — `diff::compare` across two specs.
+- **Cascade detection** — the reverse-dependency graph walk in `mapper.rs`.
+- **Report rendering** — text-format `SafetyReport` generation.
+
+The checked-in `tests/wasm` fixtures are too small to show how cost scales, so
+each stage runs against synthetically generated specs at three sizes (10, 100,
+1000 items) rather than one small real-world input — the interesting question
+is the scaling curve, not a single absolute number. Run the full suite with:
+
+```bash
+cargo bench
+```
+
+Criterion keeps a rolling baseline in `target/criterion/` and reports the
+percentage change against the previous run for every benchmark, so the first
+run after this harness lands establishes the baseline and every run after
+that is a comparison. A meaningful change is a consistent shift outside
+Criterion's reported noise threshold (it flags this explicitly per
+benchmark, e.g. "Performance has regressed") — a single run drifting by a
+few percent with no such flag is noise, not a regression. Investigate any
+stage whose growth from size 10 to size 1000 is worse than roughly linear;
+that is the shape issue #135 flags as a risk in `detect_cascading_layout_breaks`
+and the duplicate-scan in `report.rs`'s suppression matching.
 
 ## Code Coverage
 
