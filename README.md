@@ -25,6 +25,14 @@ A powerful CLI tool to analyze and validate Soroban smart contract upgrades on t
 
 ## Installation
 
+Install the latest published version from [crates.io](https://crates.io/crates/soroban-upgrade-safeguard):
+
+```bash
+cargo install soroban-upgrade-safeguard
+```
+
+Or install from a local checkout:
+
 ```bash
 cargo install --path .
 ```

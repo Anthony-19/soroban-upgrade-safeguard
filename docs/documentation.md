@@ -75,7 +75,13 @@ Scope:  Exported interface + environment metadata only — storage layout is NOT
 
 ## Installation
 
-Build and install the binary from the repository root:
+Install the published crate from crates.io:
+
+```bash
+cargo install soroban-upgrade-safeguard
+```
+
+Alternatively, you can build and install the binary from a local checkout of the repository root:
 
 ```bash
 cargo install --path .
