@@ -401,6 +401,7 @@ fn run() -> Result<()> {
             let pairs = scan_directories(
                 args.old_dir.as_ref().unwrap(),
                 args.new_dir.as_ref().unwrap(),
+                &progress,
             )?;
             (pairs, vec![])
         };
@@ -1350,7 +1351,11 @@ fn collect_wasm_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
     Ok(files)
 }
 
-fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>> {
+fn scan_directories(
+    old_dir: &Path,
+    new_dir: &Path,
+    progress: &impl Fn(String),
+) -> Result<Vec<ContractPair>> {
     if !old_dir.is_dir() {
         anyhow::bail!("Old directory '{}' is not a directory", old_dir.display());
     }
@@ -1376,22 +1381,22 @@ fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>>
                 name,
             });
         } else {
-            eprintln!(
+            progress(format!(
                 "⚠️  Warning: Match not found for '{}' in new directory '{}'",
                 rel_path.display(),
                 new_dir.display()
-            );
+            ));
         }
     }
 
     // Warn about files in new_dir that have no counterpart in old_dir
     for (rel_path, _) in &collect_wasm_files(new_dir)? {
         if !old_files.iter().any(|(r, _)| r == rel_path) {
-            eprintln!(
+            progress(format!(
                 "⚠️  Warning: No old counterpart found for '{}' in old directory '{}'",
                 rel_path.display(),
                 old_dir.display()
-            );
+            ));
         }
     }
 
