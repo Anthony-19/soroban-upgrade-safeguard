@@ -82,8 +82,8 @@ soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
 ### Saving a report
 
 Use `--output <PATH>` to write only the rendered report to a file. The format is
-selected with `--format text`, `--format json`, `--format markdown`, or
-`--format html`; progress
+selected with `--format text`, `--format json`, `--format markdown`,
+`--format html`, `--format github-actions`, or `--format junit`; progress
 messages are sent to stderr, leaving stdout and the file free of progress text.
 The report is rendered before the file is opened, so a comparison that fails
 before producing a report does not create or truncate the requested output file.
@@ -153,6 +153,85 @@ severity filtering in the page. Batch mode renders every pair into one document.
 soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
   --format html --output ./upgrade-report.html
 ```
+
+### Reporting findings as CI test results
+
+Most CI systems already have a test-report UI that ingests JUnit XML.
+`--format junit` emits into it, so a breaking change shows up as a failing test
+case in the same view the pipeline uses for everything else, rather than as text
+buried in a log.
+
+```bash
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
+  --format junit --output ./upgrade-report.xml
+```
+
+Each finding becomes one `<testcase>`, named `<category>: <target>`:
+
+| Finding | Case status |
+| :--- | :--- |
+| Critical | `<failure>` |
+| Warning | `<failure>` under `--strict`, otherwise passing |
+| Info | passing |
+| Suppressed (any severity) | `<skipped>`, carrying the suppression reason |
+
+A suppression is an acknowledgement, so it renders as *skipped* — visible in the
+report, never counted as a failure. A run with no findings still emits one
+passing case, because an empty suite reads as "no tests ran" rather than as a
+clean upgrade. In batch mode each contract gets its own `<testsuite>`, and a pair
+that could not be analyzed at all is an `<error>` rather than a `<failure>`: the
+upgrade was never assessed, which is a different thing from an upgrade assessed
+as unsafe.
+
+### Gating on the recommended version bump
+
+Every report carries a recommended SemVer bump (`major` for critical findings,
+`minor` for warnings or info, `patch` for none). `--expect-bump` turns it into an
+assertion, so a release that intends to cut a minor fails when the changes
+actually require a major — the mismatch by which a breaking change ships under a
+non-breaking version number.
+
+```bash
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --expect-bump minor
+```
+
+Levels are ordered `patch < minor < major`. The run fails only when the
+recommendation is **more severe** than the declared bump; declaring a bump that
+meets or exceeds it passes, since over-bumping is a release decision rather than
+a safety problem. In batch mode the value compared against is the most severe
+recommendation across all pairs, because those contracts ship together.
+
+**Exit behaviour.** The gate is independent of the safe/unsafe verdict and of
+`--strict`: it does not change either, and neither changes it. A failed gate
+exits `1`, the same code breaking changes produce, and its message is printed
+even when the run was already failing — a pipeline should see every reason it
+failed. A resource-limit violation still takes precedence and exits `2`, so
+"the input was rejected" stays distinguishable from "the gate failed".
+
+### Comparing sets of contracts by glob pattern
+
+Batch mode also accepts glob patterns, which is the shape a Cargo workspace
+already produces: build outputs land at
+`target/wasm32-unknown-unknown/release/*.wasm`, with no flat directory to scan
+and no manifest to hand-write.
+
+```bash
+soroban-upgrade-safeguard \
+  --old-glob 'baseline/target/wasm32-unknown-unknown/release/*.wasm' \
+  --new-glob 'target/wasm32-unknown-unknown/release/*.wasm'
+```
+
+Quote the patterns so the shell does not expand them first. `*` and `?` match
+within one path segment; `**` matches any number of directories.
+
+Old and new matches are paired by **file stem** — the same key a directory scan
+derives a pair's name from, so a contract keeps one identity regardless of which
+batch mode selected it. Only `.wasm` files participate, so a broad pattern does
+not sweep in build metadata. A file matched by one pattern but not the other is
+reported with the same unmatched-file warning directory scanning emits, never
+silently dropped. Two files sharing a stem on the same side make the pairing
+ambiguous and fail the run rather than risk comparing the wrong build; use
+`--manifest` to name those pairs explicitly.
 
 ### Looking up what a category means
 
@@ -370,9 +449,12 @@ run continues — and the overall run exits `2` if any pair hit a limit.
 
 | Code | Meaning |
 | :--- | :--- |
-| `0` | Safe — no critical findings (or all suppressed). |
-| `1` | Breaking changes detected, or a generic error (missing/malformed file). |
+| `0` | Safe — no critical findings (or all suppressed), and any `--expect-bump` gate was satisfied. |
+| `1` | Breaking changes detected, a failed `--expect-bump` gate, or a generic error (missing/malformed file). |
 | `2` | A resource limit was exceeded on untrusted input (raise the relevant limit to proceed). |
+
+Precedence is `2` > `1` > `0`: a resource-limit violation is reported even when
+the run would also have failed on findings or on the bump gate.
 
 ## How it Works
 

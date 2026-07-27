@@ -200,7 +200,7 @@ soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
 
 The first argument should be the build that is currently deployed on chain. The second argument should be the build you intend to deploy. Order matters: the comparison is directional, because removing a field from the old version is treated differently from adding a field in the new version.
 
-Common flags: `--format <text|json|markdown>`, `--explain`, `--strict`, `--config <PATH>`, and the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)).
+Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, and the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)).
 
 ## How the Analysis Works
 
@@ -686,7 +686,7 @@ tooling, so its shape is published as a JSON Schema (Draft 2020-12) under
 - [`schema/report.schema.json`](../schema/report.schema.json) — the single-pair
   document (`--format json` on a contract pair).
 - [`schema/batch-report.schema.json`](../schema/batch-report.schema.json) — the
-  batch document (`--manifest` or `--old-dir`/`--new-dir` with `--format json`),
+  batch document (`--manifest`, `--old-dir`/`--new-dir`, or `--old-glob`/`--new-glob` with `--format json`),
   whose top level differs from the single-pair shape and embeds a single-pair
   report per contract under `results`.
 
@@ -862,7 +862,7 @@ limit, else `1` if any pair had breaking changes, else `0`.
 The tool is designed to drop into a continuous integration pipeline.
 
 - Exit code `0`: no critical findings. The upgrade is considered safe to deploy.
-- Exit code `1`: at least one critical finding, or a fatal error such as a missing or malformed WASM file.
+- Exit code `1`: at least one critical finding, a failed `--expect-bump` gate, or a fatal error such as a missing or malformed WASM file.
 - Exit code `2`: a resource limit was exceeded on untrusted input (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)). Raise the relevant limit to proceed.
 
 Because the process exits non-zero on critical findings, you can gate a deployment job on it directly:
