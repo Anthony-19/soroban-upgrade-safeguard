@@ -268,7 +268,14 @@ pub const ALL_CATEGORIES: &[&str] = &[
     "Parameter Renamed",
     "Parameter Reordered",
     "Parameter Type Changed",
+    "Parameter Type Widened",
+    "Parameter Type Narrowed",
+    "Parameter Type Signedness Changed",
+    "Parameter Documentation Changed",
     "Return Type Changed",
+    "Return Type Widened",
+    "Return Type Narrowed",
+    "Return Type Signedness Changed",
     // Type identity.
     "Type Renamed",
     "Type Renamed With Changes",
@@ -280,6 +287,10 @@ pub const ALL_CATEGORIES: &[&str] = &[
     "Struct Field Added",
     "Struct Field Reordered",
     "Struct Field Type Changed",
+    "Struct Field Type Widened",
+    "Struct Field Type Narrowed",
+    "Struct Field Type Signedness Changed",
+    "Struct Field Documentation Changed",
     // Enums.
     "Enum Removed",
     "Enum Added",
@@ -287,16 +298,22 @@ pub const ALL_CATEGORIES: &[&str] = &[
     "Enum Case Removed",
     "Enum Case Added",
     "Enum Case Value Changed",
+    "Enum Case Documentation Changed",
     // Unions.
     "Union Removed",
     "Union Added",
+    "Union Documentation Changed",
     "Union Case Removed",
     "Union Case Added",
     "Union Case Reordered",
     "Union Case Type Changed",
+    "Union Case Type Widened",
+    "Union Case Type Narrowed",
+    "Union Case Type Signedness Changed",
     // Error enums.
     "Error Enum Removed",
     "Error Enum Added",
+    "Error Enum Documentation Changed",
     "Error Enum Case Removed",
     "Error Enum Case Added",
     "Error Enum Case Value Changed",
@@ -717,26 +734,16 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
             Some(new_fn) => {
                 check_function_signature(name, old_fn, new_fn, report);
                 // Compare function doc-strings and emit informational findings
-                if old_fn.doc != new_fn.doc {
-                    let old_doc_empty = old_fn.doc.to_string().is_empty();
-                    let new_doc_empty = new_fn.doc.to_string().is_empty();
-                    let message = if old_doc_empty && !new_doc_empty {
-                        format!("Function '{}' documentation was added.", name)
-                    } else if !old_doc_empty && new_doc_empty {
-                        format!("Function '{}' documentation was removed.", name)
-                    } else {
-                        format!("Function '{}' documentation changed.", name)
-                    };
-
-                    report.findings.push(Finding {
-                        severity: Severity::Info,
-                        category: "Function Documentation Changed".to_string(),
-                        message,
-                        type_name: None,
-                        target: Some(name.clone()),
-                        classification: None,
-                    });
-                }
+                push_doc_finding(
+                    report,
+                    "Function Documentation Changed",
+                    &format!("Function '{}'", name),
+                    &old_fn.doc.to_string(),
+                    &new_fn.doc.to_string(),
+                    None,
+                    Some(name.clone()),
+                    None,
+                );
             }
         }
     }
@@ -813,31 +820,43 @@ fn check_function_signature(
         });
 
         // Check for genuine type changes by matching parameter name.
-        let new_by_name: std::collections::HashMap<String, &ScSpecTypeDef> = new_inputs
+        let new_by_name: std::collections::HashMap<String, &ScSpecFunctionInputV0> = new_inputs
             .iter()
-            .map(|input| (input.name.to_string(), &input.type_))
+            .map(|input| (input.name.to_string(), input))
             .collect();
 
         for (i, old_input) in old_inputs.iter().enumerate() {
             let p_name = old_input.name.to_string();
-            if let Some(new_type) = new_by_name.get(&p_name) {
-                if !types_equal(&old_input.type_, new_type) {
-                    report.findings.push(Finding {
-                        severity: Severity::Critical,
-                        category: "Parameter Type Changed".to_string(),
-                        message: format!(
+            if let Some(new_input) = new_by_name.get(&p_name) {
+                if !types_equal(&old_input.type_, &new_input.type_) {
+                    push_type_change_finding(
+                        report,
+                        &old_input.type_,
+                        &new_input.type_,
+                        "Parameter Type",
+                        format!(
                             "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
                             name,
                             i,
                             p_name,
                             crate::mapper::type_to_string(&old_input.type_),
-                            crate::mapper::type_to_string(new_type)
+                            crate::mapper::type_to_string(&new_input.type_)
                         ),
-                        type_name: None,
-                        target: Some(format!("{}.{}", name, p_name)),
-                        classification: None,
-                    });
+                        None,
+                        Some(format!("{}.{}", name, p_name)),
+                        None,
+                    );
                 }
+                push_doc_finding(
+                    report,
+                    "Parameter Documentation Changed",
+                    &format!("Function '{}': parameter '{}'", name, p_name),
+                    &old_input.doc.to_string(),
+                    &new_input.doc.to_string(),
+                    None,
+                    Some(format!("{}.{}", name, p_name)),
+                    None,
+                );
             }
         }
     } else {
@@ -861,10 +880,12 @@ fn check_function_signature(
             }
 
             if !types_equal(&old_input.type_, &new_input.type_) {
-                report.findings.push(Finding {
-                    severity: Severity::Critical,
-                    category: "Parameter Type Changed".to_string(),
-                    message: format!(
+                push_type_change_finding(
+                    report,
+                    &old_input.type_,
+                    &new_input.type_,
+                    "Parameter Type",
+                    format!(
                         "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
                         name,
                         i,
@@ -872,11 +893,22 @@ fn check_function_signature(
                         crate::mapper::type_to_string(&old_input.type_),
                         crate::mapper::type_to_string(&new_input.type_)
                     ),
-                    type_name: None,
-                    target: Some(format!("{}.{}", name, old_name)),
-                    classification: None,
-                });
+                    None,
+                    Some(format!("{}.{}", name, old_name)),
+                    None,
+                );
             }
+
+            push_doc_finding(
+                report,
+                "Parameter Documentation Changed",
+                &format!("Function '{}': parameter '{}'", name, old_name),
+                &old_input.doc.to_string(),
+                &new_input.doc.to_string(),
+                None,
+                Some(format!("{}.{}", name, old_name)),
+                None,
+            );
         }
     }
 
@@ -901,20 +933,22 @@ fn check_function_signature(
     } else {
         for (i, (old_out, new_out)) in old_outputs.iter().zip(new_outputs.iter()).enumerate() {
             if !types_equal(old_out, new_out) {
-                report.findings.push(Finding {
-                    severity: Severity::Critical,
-                    category: "Return Type Changed".to_string(),
-                    message: format!(
+                push_type_change_finding(
+                    report,
+                    old_out,
+                    new_out,
+                    "Return Type",
+                    format!(
                         "Function '{}': return type {} changed from `{}` to `{}`.",
                         name,
                         i,
                         crate::mapper::type_to_string(old_out),
                         crate::mapper::type_to_string(new_out)
                     ),
-                    type_name: None,
-                    target: Some(name.to_string()),
-                    classification: None,
-                });
+                    None,
+                    Some(name.to_string()),
+                    None,
+                );
             }
         }
     }
@@ -924,6 +958,191 @@ fn check_function_signature(
 /// We use the PartialEq derive on the XDR types.
 fn types_equal(a: &ScSpecTypeDef, b: &ScSpecTypeDef) -> bool {
     a == b
+}
+
+/// How a numeric type change relates the old and new representations.
+enum NumericChangeKind {
+    /// Every value representable in the old type fits in the new type
+    /// without loss (e.g. `u32` -> `u64`, or `u64` -> `i128`).
+    Widened,
+    /// The new type cannot represent every value the old type could
+    /// (e.g. `u64` -> `u32`): values that don't fit are truncated.
+    Narrowed,
+    /// Old and new disagree on sign in a way that isn't a safe widening
+    /// (e.g. `u32` -> `i32`, or `i64` -> `u32`): the stored bit pattern is
+    /// reinterpreted, which can turn a valid value into a nonsensical one.
+    SignednessChanged,
+}
+
+/// Bit width and signedness of a plain integer `ScSpecTypeDef`, or `None` for
+/// any other type (including `Timepoint`/`Duration`, which are u64-shaped but
+/// semantically distinct rather than plain numeric storage).
+fn numeric_kind(t: &ScSpecTypeDef) -> Option<(u32, bool)> {
+    Some(match t {
+        ScSpecTypeDef::U32 => (32, false),
+        ScSpecTypeDef::I32 => (32, true),
+        ScSpecTypeDef::U64 => (64, false),
+        ScSpecTypeDef::I64 => (64, true),
+        ScSpecTypeDef::U128 => (128, false),
+        ScSpecTypeDef::I128 => (128, true),
+        ScSpecTypeDef::U256 => (256, false),
+        ScSpecTypeDef::I256 => (256, true),
+        _ => return None,
+    })
+}
+
+/// Classify a numeric type change by ordering the two integer types on bit
+/// width and signedness. Returns `None` when either side isn't a plain integer
+/// type (the caller then falls back to the unclassified "Changed" wording).
+fn classify_numeric_type_change(
+    old: &ScSpecTypeDef,
+    new: &ScSpecTypeDef,
+) -> Option<NumericChangeKind> {
+    let (old_bits, old_signed) = numeric_kind(old)?;
+    let (new_bits, new_signed) = numeric_kind(new)?;
+    if old_bits == new_bits && old_signed == new_signed {
+        return None;
+    }
+    Some(match (old_signed, new_signed) {
+        (false, false) | (true, true) => {
+            if new_bits > old_bits {
+                NumericChangeKind::Widened
+            } else {
+                NumericChangeKind::Narrowed
+            }
+        }
+        // unsigned -> signed is a safe widening only if the signed type has
+        // strictly more bits, since it then needs one of those extra bits
+        // just to hold the sign and still covers the old unsigned range.
+        (false, true) if new_bits > old_bits => NumericChangeKind::Widened,
+        // Any other signedness flip (signed -> unsigned, or same/fewer bits)
+        // can reinterpret the old bit pattern rather than merely truncate it.
+        _ => NumericChangeKind::SignednessChanged,
+    })
+}
+
+/// The category suffix, severity, and detail sentence for a type change,
+/// derived from [`classify_numeric_type_change`].
+struct TypeChangeClass {
+    suffix: &'static str,
+    severity: Severity,
+    detail: Option<&'static str>,
+}
+
+fn classify_type_change(old: &ScSpecTypeDef, new: &ScSpecTypeDef) -> TypeChangeClass {
+    match classify_numeric_type_change(old, new) {
+        Some(NumericChangeKind::Widened) => TypeChangeClass {
+            suffix: "Widened",
+            severity: Severity::Warning,
+            detail: Some(
+                "This is a widening numeric conversion: every value representable in the old \
+                 type fits in the new type without loss, but the on-chain layout still changes, \
+                 so existing stored values must still be migrated to the new encoding.",
+            ),
+        },
+        Some(NumericChangeKind::Narrowed) => TypeChangeClass {
+            suffix: "Narrowed",
+            severity: Severity::Critical,
+            detail: Some(
+                "This is a narrowing numeric conversion: values that don't fit in the new type \
+                 will be truncated, corrupting stored data.",
+            ),
+        },
+        Some(NumericChangeKind::SignednessChanged) => TypeChangeClass {
+            suffix: "Signedness Changed",
+            severity: Severity::Critical,
+            detail: Some(
+                "This changes signedness: existing stored bit patterns will be reinterpreted \
+                 with a different sign, corrupting stored values.",
+            ),
+        },
+        None => TypeChangeClass {
+            suffix: "Changed",
+            severity: Severity::Critical,
+            detail: None,
+        },
+    }
+}
+
+/// Push a type-change finding whose category and severity reflect whether the
+/// change is a plain (non-numeric) type change, or a numeric widening,
+/// narrowing, or signedness change.
+///
+/// `base_category` is the category prefix (e.g. `"Parameter Type"`, which
+/// becomes `"Parameter Type Widened"`/`"...Narrowed"`/`"...Signedness
+/// Changed"`/`"...Changed"`). `base_message` is the full sentence describing
+/// the change, ending in a period; the numeric detail sentence (if any) is
+/// appended after it, so a non-numeric change renders exactly as it did
+/// before this classification existed.
+#[allow(clippy::too_many_arguments)]
+fn push_type_change_finding(
+    report: &mut DiffReport,
+    old_ty: &ScSpecTypeDef,
+    new_ty: &ScSpecTypeDef,
+    base_category: &str,
+    base_message: String,
+    type_name: Option<String>,
+    target: Option<String>,
+    classification: Option<TypeClass>,
+) {
+    let class = classify_type_change(old_ty, new_ty);
+    let message = match class.detail {
+        Some(detail) => format!("{} {}", base_message, detail),
+        None => base_message,
+    };
+    report.findings.push(Finding {
+        severity: class.severity,
+        category: format!("{} {}", base_category, class.suffix),
+        message,
+        type_name,
+        target,
+        classification,
+    });
+}
+
+/// Build the Added/Removed/Changed documentation-change message fragment for
+/// `subject` (e.g. `"Function 'transfer'"` or `"Struct 'Data': field
+/// 'amount'"`), or `None` if the docs are identical. Shared by every entity
+/// kind (functions, structs, enums, unions, error enums, and their members)
+/// so the wording stays consistent everywhere a doc comparison is made.
+fn doc_change_message(subject: &str, old_doc: &str, new_doc: &str) -> Option<String> {
+    if old_doc == new_doc {
+        return None;
+    }
+    let old_empty = old_doc.is_empty();
+    let new_empty = new_doc.is_empty();
+    Some(if old_empty && !new_empty {
+        format!("{} documentation was added.", subject)
+    } else if !old_empty && new_empty {
+        format!("{} documentation was removed.", subject)
+    } else {
+        format!("{} documentation changed.", subject)
+    })
+}
+
+/// Push an `Info` documentation-change finding via [`doc_change_message`], if
+/// `old_doc` and `new_doc` differ.
+#[allow(clippy::too_many_arguments)]
+fn push_doc_finding(
+    report: &mut DiffReport,
+    category: &str,
+    subject: &str,
+    old_doc: &str,
+    new_doc: &str,
+    type_name: Option<String>,
+    target: Option<String>,
+    classification: Option<TypeClass>,
+) {
+    if let Some(message) = doc_change_message(subject, old_doc, new_doc) {
+        report.findings.push(Finding {
+            severity: Severity::Info,
+            category: category.to_string(),
+            message,
+            type_name,
+            target,
+            classification,
+        });
+    }
 }
 
 /// Compare struct definitions between old and new contract specs.
@@ -945,26 +1164,16 @@ fn compare_structs(
             let class = classification.classify(name);
             check_struct_fields(name, old_struct, new_struct, class, report);
             // Compare struct doc-strings (informational only)
-            if old_struct.doc != new_struct.doc {
-                let old_doc_empty = old_struct.doc.to_string().is_empty();
-                let new_doc_empty = new_struct.doc.to_string().is_empty();
-                let message = if old_doc_empty && !new_doc_empty {
-                    format!("Struct '{}' documentation was added.", name)
-                } else if !old_doc_empty && new_doc_empty {
-                    format!("Struct '{}' documentation was removed.", name)
-                } else {
-                    format!("Struct '{}' documentation changed.", name)
-                };
-
-                report.findings.push(Finding {
-                    severity: Severity::Info,
-                    category: "Struct Documentation Changed".to_string(),
-                    message,
-                    type_name: Some(name.clone()),
-                    target: Some(name.clone()),
-                    classification: Some(class),
-                });
-            }
+            push_doc_finding(
+                report,
+                "Struct Documentation Changed",
+                &format!("Struct '{}'", name),
+                &old_struct.doc.to_string(),
+                &new_struct.doc.to_string(),
+                Some(name.clone()),
+                Some(name.clone()),
+                Some(class),
+            );
         }
     }
 
@@ -1104,26 +1313,41 @@ fn check_struct_fields(
 
         // Field type changed
         if !types_equal(&old_field.type_, &new_field.type_) {
-            report.findings.push(Finding {
-                severity: Severity::Critical,
-                category: "Struct Field Type Changed".to_string(),
-                message: with_heuristic_note(
-                    format!(
-                        "{} '{}': field '{}' (position {}) type changed from `{}` to `{}`.",
-                        msg_prefix,
-                        name,
-                        old_name,
-                        i,
-                        crate::mapper::type_to_string(&old_field.type_),
-                        crate::mapper::type_to_string(&new_field.type_)
-                    ),
-                    class,
+            let base_message = with_heuristic_note(
+                format!(
+                    "{} '{}': field '{}' (position {}) type changed from `{}` to `{}`.",
+                    msg_prefix,
+                    name,
+                    old_name,
+                    i,
+                    crate::mapper::type_to_string(&old_field.type_),
+                    crate::mapper::type_to_string(&new_field.type_)
                 ),
-                type_name: Some(name.to_string()),
-                target: Some(format!("{}.{}", name, old_name)),
-                classification: Some(class),
-            });
+                class,
+            );
+            push_type_change_finding(
+                report,
+                &old_field.type_,
+                &new_field.type_,
+                "Struct Field Type",
+                base_message,
+                Some(name.to_string()),
+                Some(format!("{}.{}", name, old_name)),
+                Some(class),
+            );
         }
+
+        // Field documentation changed
+        push_doc_finding(
+            report,
+            "Struct Field Documentation Changed",
+            &format!("Struct '{}': field '{}'", name, old_name),
+            &old_field.doc.to_string(),
+            &new_field.doc.to_string(),
+            Some(name.to_string()),
+            Some(format!("{}.{}", name, old_name)),
+            Some(class),
+        );
     }
 
     // Check for new fields appended at the end
@@ -1160,26 +1384,16 @@ fn compare_enums(
             let class = classification.classify(name);
             check_enum_cases(name, old_enum, new_enum, class, report);
             // Compare enum doc-strings (informational only)
-            if old_enum.doc != new_enum.doc {
-                let old_doc_empty = old_enum.doc.to_string().is_empty();
-                let new_doc_empty = new_enum.doc.to_string().is_empty();
-                let message = if old_doc_empty && !new_doc_empty {
-                    format!("Enum '{}' documentation was added.", name)
-                } else if !old_doc_empty && new_doc_empty {
-                    format!("Enum '{}' documentation was removed.", name)
-                } else {
-                    format!("Enum '{}' documentation changed.", name)
-                };
-
-                report.findings.push(Finding {
-                    severity: Severity::Info,
-                    category: "Enum Documentation Changed".to_string(),
-                    message,
-                    type_name: Some(name.clone()),
-                    target: Some(name.clone()),
-                    classification: Some(class),
-                });
-            }
+            push_doc_finding(
+                report,
+                "Enum Documentation Changed",
+                &format!("Enum '{}'", name),
+                &old_enum.doc.to_string(),
+                &new_enum.doc.to_string(),
+                Some(name.clone()),
+                Some(name.clone()),
+                Some(class),
+            );
         }
     }
 
@@ -1307,6 +1521,17 @@ fn check_enum_cases(
                         classification: Some(class),
                     });
                 }
+
+                push_doc_finding(
+                    report,
+                    "Enum Case Documentation Changed",
+                    &format!("Enum '{}': case '{}'", name, old_name),
+                    &old_case.doc.to_string(),
+                    &new_case.doc.to_string(),
+                    Some(name.to_string()),
+                    Some(format!("{}.{}", name, old_name)),
+                    Some(class),
+                );
             }
         }
     }
@@ -1343,6 +1568,17 @@ fn compare_unions(
     for (name, old_union) in &old.unions {
         if let Some(new_union) = new.unions.get(name) {
             check_union_cases(name, old_union, new_union, report);
+            let class = classification.classify(name);
+            push_doc_finding(
+                report,
+                "Union Documentation Changed",
+                &format!("Union '{}'", name),
+                &old_union.doc.to_string(),
+                &new_union.doc.to_string(),
+                Some(name.clone()),
+                Some(name.clone()),
+                Some(class),
+            );
         }
     }
 
@@ -1463,21 +1699,40 @@ fn check_union_cases(
         }
 
         if !union_cases_equal(old_case, new_case) {
-            report.findings.push(Finding {
-                severity: Severity::Critical,
-                category: "Union Case Type Changed".to_string(),
-                message: format!(
-                    "Union '{}': case '{}' (position {}) type changed from `{}` to `{}`.",
-                    name,
-                    old_name,
-                    i,
-                    union_case_type_signature(old_case),
-                    union_case_type_signature(new_case)
+            let base_message = format!(
+                "Union '{}': case '{}' (position {}) type changed from `{}` to `{}`.",
+                name,
+                old_name,
+                i,
+                union_case_type_signature(old_case),
+                union_case_type_signature(new_case)
+            );
+            // Numeric classification only applies when both sides are a
+            // single-value payload — a multi-value tuple change doesn't map
+            // onto a single old-type/new-type pair.
+            match (
+                union_case_single_type(old_case),
+                union_case_single_type(new_case),
+            ) {
+                (Some(old_ty), Some(new_ty)) => push_type_change_finding(
+                    report,
+                    old_ty,
+                    new_ty,
+                    "Union Case Type",
+                    base_message,
+                    Some(name.to_string()),
+                    Some(format!("{}.{}", name, old_name)),
+                    None,
                 ),
-                type_name: Some(name.to_string()),
-                target: Some(format!("{}.{}", name, old_name)),
-                classification: None,
-            });
+                _ => report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category: "Union Case Type Changed".to_string(),
+                    message: base_message,
+                    type_name: Some(name.to_string()),
+                    target: Some(format!("{}.{}", name, old_name)),
+                    classification: None,
+                }),
+            }
         }
     }
 
@@ -1504,6 +1759,22 @@ fn union_case_name(case: &ScSpecUdtUnionCaseV0) -> String {
     match case {
         ScSpecUdtUnionCaseV0::VoidV0(v) => v.name.to_string(),
         ScSpecUdtUnionCaseV0::TupleV0(t) => t.name.to_string(),
+    }
+}
+
+/// The single payload type of a union case, when it carries exactly one
+/// value (e.g. `Deposit(u64)`). `None` for a void case or a multi-value tuple
+/// case, where a type change can't be expressed as a single old/new pair.
+fn union_case_single_type(case: &ScSpecUdtUnionCaseV0) -> Option<&ScSpecTypeDef> {
+    match case {
+        ScSpecUdtUnionCaseV0::VoidV0(_) => None,
+        ScSpecUdtUnionCaseV0::TupleV0(t) => {
+            let types: &[ScSpecTypeDef] = t.type_.as_ref();
+            match types {
+                [only] => Some(only),
+                _ => None,
+            }
+        }
     }
 }
 
@@ -1548,6 +1819,17 @@ fn compare_error_enums(
     for (name, old_error_enum) in &old.error_enums {
         if let Some(new_error_enum) = new.error_enums.get(name) {
             check_error_enum_cases(name, old_error_enum, new_error_enum, report);
+            // Error enums are never classified as events (see module docs above).
+            push_doc_finding(
+                report,
+                "Error Enum Documentation Changed",
+                &format!("Error enum '{}'", name),
+                &old_error_enum.doc.to_string(),
+                &new_error_enum.doc.to_string(),
+                Some(name.clone()),
+                Some(name.clone()),
+                None,
+            );
         }
     }
 
@@ -2513,5 +2795,387 @@ mod tests {
         let tf = type_finding.unwrap();
         assert_eq!(tf.severity, Severity::Critical);
         assert!(tf.message.contains("parameter 0 ('a') type changed")); // Index in old is 0
+    }
+
+    // ---------------------------------------------------------------
+    // Numeric widening / narrowing / signedness classification
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn numeric_classification_widening_same_signedness() {
+        assert!(matches!(
+            classify_numeric_type_change(&ScSpecTypeDef::U32, &ScSpecTypeDef::U64),
+            Some(NumericChangeKind::Widened)
+        ));
+        assert!(matches!(
+            classify_numeric_type_change(&ScSpecTypeDef::I32, &ScSpecTypeDef::I128),
+            Some(NumericChangeKind::Widened)
+        ));
+    }
+
+    #[test]
+    fn numeric_classification_widening_across_signedness() {
+        // u64 -> i128: every u64 value fits in i128, so this is a safe widening
+        // even though signedness differs.
+        assert!(matches!(
+            classify_numeric_type_change(&ScSpecTypeDef::U64, &ScSpecTypeDef::I128),
+            Some(NumericChangeKind::Widened)
+        ));
+    }
+
+    #[test]
+    fn numeric_classification_narrowing_same_signedness() {
+        assert!(matches!(
+            classify_numeric_type_change(&ScSpecTypeDef::U64, &ScSpecTypeDef::U32),
+            Some(NumericChangeKind::Narrowed)
+        ));
+    }
+
+    #[test]
+    fn numeric_classification_signedness_changed() {
+        // Same width, sign flip: reinterprets the bit pattern.
+        assert!(matches!(
+            classify_numeric_type_change(&ScSpecTypeDef::U32, &ScSpecTypeDef::I32),
+            Some(NumericChangeKind::SignednessChanged)
+        ));
+        // signed -> unsigned can never safely widen: negative values have no
+        // unsigned representation.
+        assert!(matches!(
+            classify_numeric_type_change(&ScSpecTypeDef::I64, &ScSpecTypeDef::U64),
+            Some(NumericChangeKind::SignednessChanged)
+        ));
+        assert!(matches!(
+            classify_numeric_type_change(&ScSpecTypeDef::I64, &ScSpecTypeDef::U32),
+            Some(NumericChangeKind::SignednessChanged)
+        ));
+    }
+
+    #[test]
+    fn numeric_classification_none_for_non_numeric_types() {
+        assert!(classify_numeric_type_change(&ScSpecTypeDef::U32, &ScSpecTypeDef::Bool).is_none());
+        assert!(classify_numeric_type_change(&ScSpecTypeDef::Bool, &ScSpecTypeDef::Void).is_none());
+    }
+
+    #[test]
+    fn struct_field_widening_is_warning_not_critical() {
+        let old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U64)])]);
+        let report = compare(&old, &new);
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Type Widened")
+            .expect("expected a Struct Field Type Widened finding");
+        assert_eq!(finding.severity, Severity::Warning);
+        assert!(finding.message.contains("widening"));
+
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.category == "Struct Field Type Changed"));
+    }
+
+    #[test]
+    fn struct_field_narrowing_is_critical() {
+        let old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U64)])]);
+        let new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let report = compare(&old, &new);
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Type Narrowed")
+            .expect("expected a Struct Field Type Narrowed finding");
+        assert_eq!(finding.severity, Severity::Critical);
+        assert!(finding.message.contains("truncat"));
+    }
+
+    #[test]
+    fn struct_field_signedness_change_is_critical() {
+        let old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::I32)])]);
+        let report = compare(&old, &new);
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Type Signedness Changed")
+            .expect("expected a Struct Field Type Signedness Changed finding");
+        assert_eq!(finding.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn struct_field_non_numeric_type_change_is_unaffected() {
+        let old = spec_with_structs(vec![("Data", vec![("flag", ScSpecTypeDef::U32)])]);
+        let new = spec_with_structs(vec![("Data", vec![("flag", ScSpecTypeDef::Bool)])]);
+        let report = compare(&old, &new);
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Type Changed")
+            .expect("non-numeric changes must keep the original category");
+        assert_eq!(finding.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn parameter_widening_and_return_type_narrowing_are_classified() {
+        let old = spec_with_functions(vec![("transfer", vec![("amount", ScSpecTypeDef::U32)])]);
+        let new = spec_with_functions(vec![("transfer", vec![("amount", ScSpecTypeDef::U64)])]);
+        let report = compare(&old, &new);
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.category == "Parameter Type Widened" && f.severity == Severity::Warning));
+
+        let mut old_fn = spec_with_functions(vec![("get_balance", vec![])]);
+        let mut new_fn = spec_with_functions(vec![("get_balance", vec![])]);
+        old_fn.functions.get_mut("get_balance").unwrap().outputs =
+            VecM::try_from(vec![ScSpecTypeDef::U64]).unwrap();
+        new_fn.functions.get_mut("get_balance").unwrap().outputs =
+            VecM::try_from(vec![ScSpecTypeDef::U32]).unwrap();
+        let report2 = compare(&old_fn, &new_fn);
+        assert!(report2
+            .findings
+            .iter()
+            .any(|f| f.category == "Return Type Narrowed" && f.severity == Severity::Critical));
+    }
+
+    // ---------------------------------------------------------------
+    // Documentation changes on unions, error enums, and members
+    // ---------------------------------------------------------------
+
+    fn union_with_case(
+        union_name: &str,
+        case_name: &str,
+        doc: &str,
+        types: Vec<ScSpecTypeDef>,
+    ) -> ScSpecUdtUnionV0 {
+        ScSpecUdtUnionV0 {
+            doc: doc.try_into().unwrap(),
+            lib: StringM::default(),
+            name: union_name.try_into().unwrap(),
+            cases: VecM::try_from(vec![ScSpecUdtUnionCaseV0::TupleV0(
+                stellar_xdr::curr::ScSpecUdtUnionCaseTupleV0 {
+                    doc: StringM::default(),
+                    name: case_name.try_into().unwrap(),
+                    type_: VecM::try_from(types).unwrap(),
+                },
+            )])
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn union_documentation_change_produces_info_finding() {
+        let mut old = ContractSpec::default();
+        old.unions.insert(
+            "Event".to_string(),
+            union_with_case("Event", "Deposit", "", vec![ScSpecTypeDef::U64]),
+        );
+        let mut new = ContractSpec::default();
+        new.unions.insert(
+            "Event".to_string(),
+            union_with_case("Event", "Deposit", "records a deposit", vec![ScSpecTypeDef::U64]),
+        );
+
+        let report = compare(&old, &new);
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Union Documentation Changed")
+            .expect("expected a Union Documentation Changed finding");
+        assert_eq!(finding.severity, Severity::Info);
+        assert!(finding.message.contains("was added"));
+    }
+
+    #[test]
+    fn union_case_widening_is_classified() {
+        let mut old = ContractSpec::default();
+        old.unions.insert(
+            "Event".to_string(),
+            union_with_case("Event", "Deposit", "", vec![ScSpecTypeDef::U32]),
+        );
+        let mut new = ContractSpec::default();
+        new.unions.insert(
+            "Event".to_string(),
+            union_with_case("Event", "Deposit", "", vec![ScSpecTypeDef::U64]),
+        );
+
+        let report = compare(&old, &new);
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Union Case Type Widened")
+            .expect("expected a Union Case Type Widened finding");
+        assert_eq!(finding.severity, Severity::Warning);
+    }
+
+    fn error_enum_with_case(name: &str, case_name: &str, doc: &str) -> ScSpecUdtErrorEnumV0 {
+        ScSpecUdtErrorEnumV0 {
+            doc: doc.try_into().unwrap(),
+            lib: StringM::default(),
+            name: name.try_into().unwrap(),
+            cases: VecM::try_from(vec![ScSpecUdtErrorEnumCaseV0 {
+                doc: StringM::default(),
+                name: case_name.try_into().unwrap(),
+                value: 1,
+            }])
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn error_enum_documentation_change_produces_info_finding() {
+        let mut old = ContractSpec::default();
+        old.error_enums
+            .insert("Error".to_string(), error_enum_with_case("Error", "NotFound", "old doc"));
+        let mut new = ContractSpec::default();
+        new.error_enums
+            .insert("Error".to_string(), error_enum_with_case("Error", "NotFound", "new doc"));
+
+        let report = compare(&old, &new);
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Error Enum Documentation Changed")
+            .expect("expected an Error Enum Documentation Changed finding");
+        assert_eq!(finding.severity, Severity::Info);
+        assert!(finding.message.contains("changed"));
+        assert!(finding.classification.is_none());
+    }
+
+    #[test]
+    fn struct_field_documentation_change_produces_targeted_info_finding() {
+        let mut old = ContractSpec::default();
+        old.structs.insert(
+            "Data".to_string(),
+            ScSpecUdtStructV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: "Data".try_into().unwrap(),
+                fields: VecM::try_from(vec![ScSpecUdtStructFieldV0 {
+                    doc: "old doc".try_into().unwrap(),
+                    name: "amount".try_into().unwrap(),
+                    type_: ScSpecTypeDef::U64,
+                }])
+                .unwrap(),
+            },
+        );
+        let mut new = ContractSpec::default();
+        new.structs.insert(
+            "Data".to_string(),
+            ScSpecUdtStructV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: "Data".try_into().unwrap(),
+                fields: VecM::try_from(vec![ScSpecUdtStructFieldV0 {
+                    doc: "amount in stroops".try_into().unwrap(),
+                    name: "amount".try_into().unwrap(),
+                    type_: ScSpecTypeDef::U64,
+                }])
+                .unwrap(),
+            },
+        );
+
+        let report = compare(&old, &new);
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Documentation Changed")
+            .expect("expected a Struct Field Documentation Changed finding");
+        assert_eq!(finding.severity, Severity::Info);
+        assert_eq!(finding.target.as_deref(), Some("Data.amount"));
+    }
+
+    /// Helper: build a single-function ContractSpec with an explicit doc on
+    /// its one parameter.
+    fn spec_with_function_param_doc(fn_name: &str, param_name: &str, doc: &str) -> ContractSpec {
+        let mut spec = ContractSpec::default();
+        spec.functions.insert(
+            fn_name.to_string(),
+            stellar_xdr::curr::ScSpecFunctionV0 {
+                doc: StringM::default(),
+                name: fn_name.try_into().unwrap(),
+                inputs: VecM::try_from(vec![stellar_xdr::curr::ScSpecFunctionInputV0 {
+                    doc: doc.try_into().unwrap(),
+                    name: param_name.try_into().unwrap(),
+                    type_: ScSpecTypeDef::Address,
+                }])
+                .unwrap(),
+                outputs: VecM::default(),
+            },
+        );
+        spec
+    }
+
+    #[test]
+    fn parameter_documentation_change_produces_targeted_info_finding() {
+        let old = spec_with_function_param_doc("transfer", "to", "old");
+        let new = spec_with_function_param_doc("transfer", "to", "recipient address");
+
+        let report = compare(&old, &new);
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Parameter Documentation Changed")
+            .expect("expected a Parameter Documentation Changed finding");
+        assert_eq!(finding.severity, Severity::Info);
+        assert_eq!(finding.target.as_deref(), Some("transfer.to"));
+    }
+
+    #[test]
+    fn enum_case_documentation_change_produces_targeted_info_finding() {
+        let mut old = ContractSpec::default();
+        old.enums.insert(
+            "Status".to_string(),
+            ScSpecUdtEnumV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: "Status".try_into().unwrap(),
+                cases: VecM::try_from(vec![ScSpecUdtEnumCaseV0 {
+                    doc: StringM::default(),
+                    name: "Active".try_into().unwrap(),
+                    value: 0,
+                }])
+                .unwrap(),
+            },
+        );
+        let mut new = ContractSpec::default();
+        new.enums.insert(
+            "Status".to_string(),
+            ScSpecUdtEnumV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: "Status".try_into().unwrap(),
+                cases: VecM::try_from(vec![ScSpecUdtEnumCaseV0 {
+                    doc: "entity is active".try_into().unwrap(),
+                    name: "Active".try_into().unwrap(),
+                    value: 0,
+                }])
+                .unwrap(),
+            },
+        );
+
+        let report = compare(&old, &new);
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Enum Case Documentation Changed")
+            .expect("expected an Enum Case Documentation Changed finding");
+        assert_eq!(finding.severity, Severity::Info);
+        assert_eq!(finding.target.as_deref(), Some("Status.Active"));
+    }
+
+    #[test]
+    fn doc_findings_never_affect_is_safe() {
+        let old = spec_with_function_param_doc("transfer", "to", "old");
+        let new = spec_with_function_param_doc("transfer", "to", "new");
+
+        let report = compare(&old, &new);
+        let safety = crate::report::SafetyReport::new(&report);
+        assert!(safety.is_safe);
+        assert_eq!(safety.critical_count, 0);
     }
 }

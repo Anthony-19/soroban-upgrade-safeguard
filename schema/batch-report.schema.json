@@ -1,6 +1,54 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "BaselineDiff": {
+      "description": "Summary of a run compared against a baseline report, attached to [`SafetyReport::baseline_diff`] and rendered in every output format.",
+      "properties": {
+        "baseline_tool_version": {
+          "description": "The `tool_version` recorded in the baseline JSON.",
+          "type": "string"
+        },
+        "fail_on_new_only": {
+          "description": "Whether the verdict was recomputed to consider only new findings.",
+          "type": "boolean"
+        },
+        "new_count": {
+          "description": "Count of current findings not present in the baseline.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "persisting_count": {
+          "description": "Count of current findings also present in the baseline.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "resolved": {
+          "description": "Findings present in the baseline but absent from the current run.",
+          "items": {
+            "$ref": "#/definitions/ResolvedFinding"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "baseline_tool_version",
+        "fail_on_new_only",
+        "new_count",
+        "persisting_count",
+        "resolved"
+      ],
+      "type": "object"
+    },
+    "BaselineStatus": {
+      "description": "Whether a finding in the current run was already present in the baseline.",
+      "enum": [
+        "new",
+        "persisting"
+      ],
+      "type": "string"
+    },
     "FailedPair": {
       "properties": {
         "error": {
@@ -19,6 +67,17 @@
     "ReportedFinding": {
       "description": "A finding as it appears in the report, augmented with suppression state.\n\nThe raw [`Finding`] from the diff layer is left untouched; suppression is a report-time concern layered on top. A suppressed finding is still listed in full — it simply does not count toward the failing set.",
       "properties": {
+        "baseline_status": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BaselineStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whether this finding is new or persisting relative to a `--baseline` report. `None` when no baseline was supplied."
+        },
         "category": {
           "type": "string"
         },
@@ -110,9 +169,42 @@
       ],
       "type": "object"
     },
+    "ResolvedFinding": {
+      "description": "A finding that was present in the baseline but is absent from the current run — i.e. it appears to have been fixed.",
+      "properties": {
+        "category": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "target": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "category",
+        "message"
+      ],
+      "type": "object"
+    },
     "SafetyReportJson": {
       "description": "A machine-readable view of a [`SafetyReport`] for `--format json`.\n\nBorrows from the owning report. Categories are stored in a [`BTreeMap`] so the emitted JSON has a stable, diffable key order.",
       "properties": {
+        "baseline_diff": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BaselineDiff"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Present when `--baseline` was supplied: classifies this run's findings as new/persisting relative to it, and lists resolved ones."
+        },
         "baseline_source": {
           "type": [
             "string",
@@ -169,6 +261,10 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "tool_version": {
+          "description": "This tool's version, so a later run can detect an incompatible baseline before comparing against this report via `--baseline`.",
+          "type": "string"
+        },
         "total_findings": {
           "format": "uint",
           "minimum": 0.0,
@@ -191,6 +287,7 @@
         "scope",
         "strict",
         "suppressed_count",
+        "tool_version",
         "total_findings"
       ],
       "type": "object"
