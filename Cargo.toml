@@ -50,6 +50,10 @@ indicatif = "0.17"
 hex = "0.4"
 sha2 = "0.10"
 ureq = { version = "2.9", features = ["json"] }
+# Bounded data-parallelism for comparing batch pairs concurrently (see
+# compare_contracts' caller in main.rs). Defaults to one worker per available
+# CPU; override with the RAYON_NUM_THREADS environment variable.
+rayon = "1"
 
 [dev-dependencies]
 # Property-based/fuzz testing for the decode + type-walk paths (see

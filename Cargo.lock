@@ -1706,6 +1706,7 @@ dependencies = [
  "indicatif",
  "jsonschema",
  "proptest",
+ "rayon",
  "schemars",
  "serde",
  "serde_json",
