@@ -200,6 +200,8 @@ soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
 
 The first argument should be the build that is currently deployed on chain. The second argument should be the build you intend to deploy. Order matters: the comparison is directional, because removing a field from the old version is treated differently from adding a field in the new version.
 
+Both arguments accept binary `.wasm` files and WebAssembly Text format `.wat` files interchangeably. A `.wat` file is assembled to binary before analysis, so the output and exit codes are identical regardless of input format.
+
 Common flags: `--format <text|json|markdown>`, `--explain`, `--strict`, `--config <PATH>`, and the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)).
 
 ### Batch Mode
@@ -310,7 +312,7 @@ Skipped comparisons are reported as "not available" in the analysis scope rather
 
 The analysis runs as a short pipeline. Each stage lives in its own module under `src/`.
 
-1. **Load and validate (`loader.rs`).** Each file is read from disk and checked for the WASM magic header. The tool then walks every WASM payload to confirm the binary is structurally well formed before any deeper work happens. A corrupt or non-WASM file fails fast with a clear message.
+1. **Load and validate (`loader.rs`).** Each file is read from disk and checked for the WASM magic header. The tool accepts both binary WASM (`.wasm`) and WebAssembly Text format (`.wat`). A `.wat` file is detected by its extension or by the absence of the `\0asm` magic bytes, assembled to binary using the `wat` crate, and then validated identically to a binary input — nothing downstream is aware of the distinction. A malformed `.wat` produces a clear assembly error naming the file and the parse problem. The tool then walks every WASM payload to confirm the binary is structurally well formed before any deeper work happens. A corrupt or non-WASM file fails fast with a clear message.
 
    When the baseline is fetched from an RPC endpoint (`--contract-id` / `--rpc-url`), the loader applies a **zero-trust pipeline**: the URL is validated for transport security (HTTPS required unless `--allow-http-local` is set), the RPC response entries are checked for matching ledger keys, and the SHA-256 hash of the fetched bytecode is verified against the on-chain contract instance hash. An optional `--expected-wasm-hash` flag provides additional hash pinning.
 

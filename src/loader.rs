@@ -61,6 +61,12 @@ pub fn load_wasm(path: &Path) -> Result<WasmModule> {
 
 /// Like [`load_wasm`], but enforces the size ceiling from `policy`.
 ///
+/// Accepts both binary WASM (`.wasm`) and WebAssembly Text format (`.wat`).
+/// When a `.wat` file is detected — either by the `.wat` extension or by the
+/// absence of the `\0asm` binary magic — it is assembled to binary before any
+/// further validation runs, so the rest of the pipeline is completely unaware
+/// of the distinction.
+///
 /// The file size is checked against `policy.max_wasm_size` via
 /// `fs::metadata` **before** the file is opened for reading, so an
 /// oversized input is rejected without allocating memory for it. The
@@ -84,8 +90,34 @@ pub fn load_wasm_with_policy(path: &Path, policy: &ResourcePolicy) -> Result<Was
         .into());
     }
 
-    let bytes =
+    let raw =
         std::fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
+
+    // Detect WebAssembly Text format. The binary magic is `\0asm`; anything
+    // that lacks it and has a `.wat` extension (or whose first non-whitespace
+    // byte is `(`, the universal WAT opening) is treated as text.
+    let is_wat = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("wat"))
+        .unwrap_or(false)
+        || raw.get(0..4) != Some(b"\0asm");
+
+    let bytes: Vec<u8> = if is_wat {
+        // Assemble WAT → binary. `wat::parse_bytes` accepts both the textual
+        // `(module ...)` form and already-binary bytes, so it is safe to call
+        // even when we are not fully certain it is text.
+        wat::parse_bytes(&raw).map_err(|e| {
+            // `wat::Error` implements Display with a clear, positioned message.
+            anyhow::anyhow!(
+                "WAT assembly failed for '{}': {}",
+                path.display(),
+                e
+            )
+        })?.into_owned()
+    } else {
+        raw
+    };
 
     if bytes.len() < 4 || &bytes[0..4] != b"\0asm" {
         bail!(
@@ -718,5 +750,62 @@ mod tests {
             verified_hash: None,
         };
         assert!(module.verified_hash.is_none());
+    }
+
+    // ── WAT (.wat) input ─────────────────────────────────────────────────────
+
+    /// A minimal WAT module with no `contractspecv0` section. The loader must
+    /// assemble it, validate it, and then let the downstream parser reject it
+    /// for the missing spec — not fail during loading.
+    #[test]
+    fn test_load_wat_assembles_to_binary() {
+        let wat_src = b"(module)";
+        let mut f = tempfile::NamedTempFile::with_suffix(".wat").unwrap();
+        std::io::Write::write_all(&mut f, wat_src).unwrap();
+
+        // load_wasm_with_policy must succeed: assembly works, magic bytes are
+        // present in the output, structure is valid.
+        let module = load_wasm_with_policy(f.path(), &crate::limits::ResourcePolicy::default())
+            .expect("valid WAT must load without error");
+
+        assert_eq!(&module.bytes[0..4], b"\0asm", "assembled binary must have WASM magic");
+        assert!(module.verified_hash.is_none());
+        // The path string is preserved as given.
+        assert_eq!(module.path, f.path().to_string_lossy());
+    }
+
+    #[test]
+    fn test_load_wat_malformed_gives_clear_error() {
+        let bad_wat = b"(module (this is not valid wat !!!)";
+        let mut f = tempfile::NamedTempFile::with_suffix(".wat").unwrap();
+        std::io::Write::write_all(&mut f, bad_wat).unwrap();
+
+        let err = load_wasm_with_policy(f.path(), &crate::limits::ResourcePolicy::default())
+            .expect_err("malformed WAT must fail");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("WAT assembly failed"),
+            "error must name the assembly stage: {msg}"
+        );
+        assert!(
+            msg.contains(&f.path().display().to_string()),
+            "error must name the file: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_binary_wasm_unchanged_by_wat_detection() {
+        // A binary .wasm must not be passed through the WAT assembler.
+        // Use the canonical WASM magic + version header as the file content.
+        let wasm_bytes: Vec<u8> = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let mut f = tempfile::NamedTempFile::with_suffix(".wasm").unwrap();
+        std::io::Write::write_all(&mut f, &wasm_bytes).unwrap();
+
+        let module = load_wasm_with_policy(f.path(), &crate::limits::ResourcePolicy::default())
+            .expect("valid binary WASM must load without error");
+
+        // Bytes are the original binary, not re-assembled.
+        assert_eq!(module.bytes, wasm_bytes);
     }
 }
