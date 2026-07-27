@@ -41,6 +41,7 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+pub mod baseline;
 pub mod classification;
 pub mod color;
 pub mod config;

@@ -167,6 +167,20 @@ struct Args {
     /// destination regardless of this flag.
     #[arg(long, value_name = "PATH")]
     output: Option<PathBuf>,
+
+    /// Compare this run against a previously saved `--format json` report.
+    /// Findings are classified as new, persisting, or resolved relative to
+    /// it (shown in all output formats). By default this only labels
+    /// findings — it does not change the pass/fail verdict or exit code; see
+    /// `--baseline-fail-on-new`. Single-contract-pair mode only.
+    #[arg(long, value_name = "PATH")]
+    baseline: Option<PathBuf>,
+
+    /// With `--baseline`, recompute the verdict to consider only findings
+    /// classified as new (a persisting Critical finding no longer fails the
+    /// run on its own). Has no effect without `--baseline`.
+    #[arg(long, requires = "baseline")]
+    baseline_fail_on_new: bool,
 }
 
 /// Resolve the effective [`ResourcePolicy`]: built-in defaults, overlaid by the
@@ -295,6 +309,13 @@ fn run() -> Result<()> {
 
     if is_batch && !args.wasm_paths.is_empty() {
         anyhow::bail!("Cannot specify positional WASM paths when using batch mode (--manifest or --old-dir/--new-dir)");
+    }
+
+    if is_batch && args.baseline.is_some() {
+        anyhow::bail!(
+            "--baseline compares a single contract pair's report and cannot be used with batch \
+             mode (--manifest or --old-dir/--new-dir). Run the pair on its own to use a baseline."
+        );
     }
 
     // A storage schema describes one specific contract's layout, so a single
@@ -1012,6 +1033,15 @@ fn run() -> Result<()> {
 
     if !all_categories.is_empty() {
         safety_report.apply_category_filter(&category_filter);
+    }
+
+    if let Some(baseline_path) = &args.baseline {
+        soroban_upgrade_safeguard::baseline::apply(
+            &mut safety_report,
+            baseline_path,
+            args.baseline_fail_on_new,
+        )
+        .with_context(|| format!("Failed to apply baseline '{}'", baseline_path.display()))?;
     }
 
     // Render the report to a string first so --output can write it atomically.

@@ -202,6 +202,10 @@ pub struct ReportedFinding {
     /// Optional remediation/explanation advice for the user.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remediation: Option<String>,
+    /// Whether this finding is new or persisting relative to a `--baseline`
+    /// report. `None` when no baseline was supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_status: Option<crate::baseline::BaselineStatus>,
 }
 
 /// Per-build size and interface-count metrics, carried in the report for all
@@ -339,6 +343,9 @@ pub struct SafetyReport {
     /// Suppression rules from the config that matched no finding during this run.
     /// Non-empty indicates a potential typo or a stale rule, surfaced to stderr.
     pub unmatched_suppressions: Vec<crate::suppression::SuppressionRule>,
+    /// Set by [`crate::baseline::apply`] when a `--baseline` report was
+    /// supplied. `None` means no baseline comparison was requested.
+    pub baseline_diff: Option<crate::baseline::BaselineDiff>,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -378,6 +385,13 @@ pub struct SafetyReportJson<'a> {
     /// Suppression rules from the config that matched no finding.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unmatched_suppressions: Vec<UnmatchedSuppressionJson>,
+    /// This tool's version, so a later run can detect an incompatible
+    /// baseline before comparing against this report via `--baseline`.
+    pub tool_version: &'static str,
+    /// Present when `--baseline` was supplied: classifies this run's
+    /// findings as new/persisting relative to it, and lists resolved ones.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_diff: Option<&'a crate::baseline::BaselineDiff>,
 }
 
 /// JSON representation of a suppression rule that matched no finding.
@@ -478,6 +492,7 @@ impl SafetyReport {
                     suppression_expiry: rule_ref.and_then(|r| r.expiry.clone()),
                     suppression_fingerprint: rule_ref.and_then(|r| r.fingerprint.clone()),
                     remediation,
+                    baseline_status: None,
                 });
         }
 
@@ -527,6 +542,7 @@ impl SafetyReport {
             new_spec_summary: None,
             metrics: None,
             unmatched_suppressions,
+            baseline_diff: None,
         }
     }
 
@@ -611,6 +627,8 @@ impl SafetyReport {
                 .collect(),
             metrics: self.metrics.as_ref(),
             unmatched_suppressions,
+            tool_version: env!("CARGO_PKG_VERSION"),
+            baseline_diff: self.baseline_diff.as_ref(),
         }
     }
 
@@ -738,6 +756,20 @@ impl SafetyReport {
         if let Some(hash) = &self.verified_code_hash {
             output.push_str(&format!("Verified Code Hash: {}\n", hash.dimmed()));
         }
+        if let Some(bd) = &self.baseline_diff {
+            output.push_str(&format!(
+                "Baseline: {} new, {} persisting, {} resolved (vs. tool v{}){}\n",
+                bd.new_count.to_string().bold(),
+                bd.persisting_count,
+                bd.resolved.len(),
+                bd.baseline_tool_version,
+                if bd.fail_on_new_only {
+                    " — verdict reflects new findings only"
+                } else {
+                    ""
+                },
+            ));
+        }
 
         output.push_str(
             &"----------------------------------------\n\n"
@@ -794,10 +826,14 @@ impl SafetyReport {
                     continue;
                 }
 
+                let baseline_tag = match reported.baseline_status {
+                    Some(crate::baseline::BaselineStatus::New) => "[NEW] ",
+                    _ => "",
+                };
                 let formatted = match finding.severity {
-                    Severity::Critical => format!("🔴 {}", finding.message).red(),
-                    Severity::Warning => format!("🟡 {}", finding.message).yellow(),
-                    Severity::Info => format!("🔵 {}", finding.message).cyan(),
+                    Severity::Critical => format!("🔴 {}{}", baseline_tag, finding.message).red(),
+                    Severity::Warning => format!("🟡 {}{}", baseline_tag, finding.message).yellow(),
+                    Severity::Info => format!("🔵 {}{}", baseline_tag, finding.message).cyan(),
                 };
                 output.push_str(&format!("{}\n", formatted));
                 if explain {
@@ -811,6 +847,16 @@ impl SafetyReport {
                 }
             }
             output.push('\n');
+        }
+
+        if let Some(bd) = &self.baseline_diff {
+            if !bd.resolved.is_empty() {
+                output.push_str(&"✅ RESOLVED SINCE BASELINE\n".green().bold().to_string());
+                for r in &bd.resolved {
+                    output.push_str(&format!("{}\n", r.message).green().to_string());
+                }
+                output.push('\n');
+            }
         }
 
         if !self.is_safe {
@@ -1009,6 +1055,20 @@ impl SafetyReport {
         if let Some(hash) = &self.verified_code_hash {
             output.push_str(&format!("**Verified Code Hash**: `{}`\n\n", hash));
         }
+        if let Some(bd) = &self.baseline_diff {
+            output.push_str(&format!(
+                "**Baseline**: {} new, {} persisting, {} resolved (vs. tool v{}){}\n\n",
+                bd.new_count,
+                bd.persisting_count,
+                bd.resolved.len(),
+                bd.baseline_tool_version,
+                if bd.fail_on_new_only {
+                    " — verdict reflects new findings only"
+                } else {
+                    ""
+                },
+            ));
+        }
 
         output.push_str("---\n\n");
 
@@ -1046,9 +1106,26 @@ impl SafetyReport {
                     Severity::Warning => "🟡",
                     Severity::Info => "🔵",
                 };
-                output.push_str(&format!("- {} {}\n", emoji, finding.message));
+                let baseline_tag = match reported.baseline_status {
+                    Some(crate::baseline::BaselineStatus::New) => "**[NEW]** ",
+                    _ => "",
+                };
+                output.push_str(&format!(
+                    "- {} {}{}\n",
+                    emoji, baseline_tag, finding.message
+                ));
             }
             output.push('\n');
+        }
+
+        if let Some(bd) = &self.baseline_diff {
+            if !bd.resolved.is_empty() {
+                output.push_str("### ✅ Resolved Since Baseline\n\n");
+                for r in &bd.resolved {
+                    output.push_str(&format!("- {}\n", r.message));
+                }
+                output.push('\n');
+            }
         }
 
         if !self.is_safe {
@@ -1523,6 +1600,7 @@ mod tests {
                 max_walk_depth: 0,
             },
             unmatched_suppressions: Vec::new(),
+            baseline_diff: None,
         };
 
         // Identical upgrade -> patch

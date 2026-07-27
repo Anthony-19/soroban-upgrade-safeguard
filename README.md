@@ -116,6 +116,47 @@ to point at another file. See [`.safeguard.example.toml`](.safeguard.example.tom
 for a documented template and the [documentation](docs/documentation.md#suppressing-known-breaking-changes)
 for the full `target` convention.
 
+### Comparing against a previous report (baseline)
+
+A project mid-migration often carries a set of known findings, and repeating all
+of them every run buries the one that is genuinely new. Save a JSON report and
+pass it back as a baseline to see only what changed:
+
+```bash
+# Record the current state once.
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
+  --format json --output ./baseline.json
+
+# Later runs classify each finding against it.
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v3.wasm \
+  --baseline ./baseline.json
+```
+
+Every finding is labelled **new** (absent from the baseline) or **persisting**
+(present in both), and findings the baseline had but this run does not are listed
+as **resolved**. All three appear in text, JSON, and Markdown output. Matching is
+on `rule_id`/`category` plus `target` — the same stable keys suppression uses —
+so rewording a message never turns a persisting finding into a new one.
+
+Unlike suppression, a baseline is a snapshot rather than a permanent,
+hand-written acknowledgement, so it needs no rule per finding.
+
+**Effect on the verdict and exit code.** By default a baseline only *labels*
+findings: the verdict and exit code are unchanged, so a persisting Critical
+finding still fails the run exactly as it would without a baseline. Add
+`--baseline-fail-on-new` to gate the verdict on new findings only, which lets a
+migration proceed while still failing on anything newly introduced:
+
+```bash
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v3.wasm \
+  --baseline ./baseline.json --baseline-fail-on-new
+```
+
+Reports record the `tool_version` that produced them. A baseline from an
+incompatible major version is rejected with a clear error rather than silently
+mismatching; regenerate it with the current version. `--baseline` applies to a
+single contract pair and cannot be combined with batch mode.
+
 ## GitHub Action
 
 Use the reusable GitHub Action in your CI workflows to automatically check Soroban contract upgrades on pull requests.
