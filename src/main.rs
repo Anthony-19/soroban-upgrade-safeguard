@@ -17,6 +17,7 @@ use soroban_upgrade_safeguard::{
     report::{validate_categories, CategoryFilter},
     storage_schema::StorageSchema,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
+    wasm_cache::WasmCache,
     CompareOptions,
 };
 
@@ -167,6 +168,19 @@ struct Args {
     /// destination regardless of this flag.
     #[arg(long, value_name = "PATH")]
     output: Option<PathBuf>,
+
+    /// Disable the local WASM cache for this run.
+    ///
+    /// By default, WASM fetched from RPC is cached on disk keyed by its
+    /// code hash so repeat fetches are served locally. Pass this flag (or set
+    /// `SAFEGUARD_NO_CACHE=1`) to skip both cache reads and writes and always
+    /// perform a fresh network fetch.
+    ///
+    /// To clear the cache entirely, delete the platform cache directory:
+    ///   Linux/macOS: ~/.cache/soroban-upgrade-safeguard/wasm/
+    ///   Windows:     %LOCALAPPDATA%\soroban-upgrade-safeguard\wasm\
+    #[arg(long)]
+    no_cache: bool,
 
     /// Compare this run against a previously saved `--format json` report.
     /// Findings are classified as new, persisting, or resolved relative to
@@ -967,7 +981,32 @@ fn run() -> Result<()> {
     // same resource policy as file input.
     let old = if let Some(contract_id) = old_source {
         let rpc_url = args.rpc_url.as_ref().unwrap();
-        let module = loader::fetch_wasm_from_rpc_with_policy(contract_id, rpc_url, &policy)?;
+
+        // Respect --no-cache / SAFEGUARD_NO_CACHE=1.
+        let no_cache = args.no_cache
+            || std::env::var("SAFEGUARD_NO_CACHE")
+                .ok()
+                .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true"))
+                .unwrap_or(false);
+
+        let cache = if no_cache {
+            None
+        } else {
+            match WasmCache::open() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("⚠️  Could not open WASM cache, proceeding without it: {e:#}");
+                    None
+                }
+            }
+        };
+
+        let module = loader::fetch_wasm_from_rpc_with_policy_and_cache(
+            contract_id,
+            rpc_url,
+            &policy,
+            cache.as_ref(),
+        )?;
 
         // If the caller pinned an expected hash, verify it now against the hash
         // that was verified on-chain during the RPC fetch.
