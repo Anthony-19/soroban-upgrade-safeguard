@@ -308,6 +308,51 @@ Skipped comparisons are reported as "not available" in the analysis scope rather
 
 `--old-spec` cannot be combined with `--contract-id` (RPC already fetches the full WASM).
 
+### Building from source with `--old-crate` / `--new-crate`
+
+Instead of pointing at a pre-built WASM artifact, either side of a comparison can be a **local Cargo crate directory**. The tool builds it automatically and feeds the result into the analysis pipeline:
+
+```bash
+# Build the new side from source; compare against a deployed on-chain contract
+soroban-upgrade-safeguard \
+  --contract-id CDEPLOYED... \
+  --rpc-url https://soroban-mainnet.stellar.org \
+  --new-crate ./contracts/my_contract
+
+# Build both sides from source (useful when iterating across two branches)
+soroban-upgrade-safeguard \
+  --old-crate ./contracts/v1 \
+  --new-crate ./contracts/v2
+
+# Build the new side from source; old side is a saved WASM artifact
+soroban-upgrade-safeguard deployed.wasm --new-crate ./contracts/my_contract
+```
+
+Pass a path to a directory containing `Cargo.toml`. The tool runs:
+
+```text
+cargo build --target wasm32-unknown-unknown --release --locked
+```
+
+inside that directory, locates the produced `.wasm` artifact via `cargo metadata`, and loads it through the normal validation path. Nothing downstream is aware that the bytes came from a build rather than a file.
+
+#### Toolchain requirements
+
+| Requirement | How to satisfy |
+| :--- | :--- |
+| **Cargo** on `$PATH` | Install Rust via [rustup.rs](https://rustup.rs) |
+| **`wasm32-unknown-unknown` target** installed | `rustup target add wasm32-unknown-unknown` |
+| **`crate-type = ["cdylib"]`** in `[lib]` | Required for Cargo to produce a `.wasm` artifact |
+
+Both requirements are checked before the build starts. A missing target produces a clear error with the exact `rustup` command to run rather than a cryptic rustc error.
+
+#### CI notes
+
+- Cargo's dependency downloads run on first use. Subsequent runs are fast if the Cargo cache is warm.
+- `--locked` is set automatically, so the build respects the crate's `Cargo.lock` and is reproducible.
+- The build always targets `--release` so the Soroban SDK emits the `contractspecv0` custom section that this tool reads.
+- `--old-crate` cannot be combined with `--contract-id` or `--old-spec`. `--new-crate` cannot be combined with `--new-spec`.
+
 ## How the Analysis Works
 
 The analysis runs as a short pipeline. Each stage lives in its own module under `src/`.

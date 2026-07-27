@@ -42,6 +42,7 @@
 //! ```
 
 pub mod baseline;
+pub mod builder;
 pub mod classification;
 pub mod color;
 pub mod config;
