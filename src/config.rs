@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::limits::{LimitsConfig, ResourcePolicy};
+use crate::severity_override::SeverityOverrides;
 use crate::suppression::{SuppressionConfig, SuppressionRule};
 
 /// Output format for the safety report.
@@ -13,6 +14,7 @@ pub enum OutputFormat {
     Text,
     Json,
     Markdown,
+    Html,
 }
 
 #[derive(clap::Parser, Debug, Clone, Default)]
@@ -136,6 +138,9 @@ pub struct FileConfig {
     pub limits: Option<LimitsConfig>,
     #[serde(default, rename = "suppress")]
     pub suppress: Vec<SuppressionRule>,
+    /// The `[severity]` table: per-category severity overrides.
+    #[serde(default)]
+    pub severity: SeverityOverrides,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -294,6 +299,7 @@ impl ResolvedConfig {
             suppressions.max_suppressions = fc.max_suppressions;
             suppressions.allow_targetless = fc.allow_targetless;
             suppressions.rules = fc.suppress.clone();
+            suppressions.severity_overrides = fc.severity.clone();
         }
         if let Some(v) = env_usize("SAFEGUARD_MAX_SUPPRESSIONS") {
             suppressions.max_suppressions = Some(v);
@@ -447,6 +453,7 @@ fn env_format(var_name: &str) -> Option<OutputFormat> {
             "text" => Some(OutputFormat::Text),
             "json" => Some(OutputFormat::Json),
             "markdown" => Some(OutputFormat::Markdown),
+            "html" => Some(OutputFormat::Html),
             _ => None,
         }
     })

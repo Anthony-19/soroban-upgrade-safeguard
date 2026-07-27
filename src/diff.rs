@@ -4,7 +4,7 @@ use crate::parser::{ContractEnvMeta, ContractMeta, RUST_VERSION_KEY, SDK_VERSION
 use crate::rename::{match_renames, Rename};
 use crate::spec::ContractSpec;
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use stellar_xdr::curr::{
     ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef, ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0,
@@ -13,12 +13,24 @@ use stellar_xdr::curr::{
 };
 
 /// Severity of a detected issue.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Critical,
     Warning,
     Info,
+}
+
+impl Severity {
+    /// The lowercase wire/config name for this severity, matching the string a
+    /// `[severity]` override in `.safeguard.toml` uses and the JSON encoding.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Severity::Critical => "critical",
+            Severity::Warning => "warning",
+            Severity::Info => "info",
+        }
+    }
 }
 
 /// A single finding from the comparison analysis.
