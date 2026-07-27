@@ -11,11 +11,12 @@ Thank you for your interest in improving Soroban Upgrade Safeguard. This guide e
 5. [Testing](#testing)
 6. [Test Fixtures](#test-fixtures)
 7. [Fuzzing](#fuzzing)
-8. [Coding Guidelines](#coding-guidelines)
-9. [Adding a New Detection Rule](#adding-a-new-detection-rule)
-10. [Commit and Pull Request Process](#commit-and-pull-request-process)
-11. [Reporting Bugs](#reporting-bugs)
-12. [Code of Conduct](#code-of-conduct)
+8. [Code Coverage](#code-coverage)
+9. [Coding Guidelines](#coding-guidelines)
+10. [Adding a New Detection Rule](#adding-a-new-detection-rule)
+11. [Commit and Pull Request Process](#commit-and-pull-request-process)
+12. [Reporting Bugs](#reporting-bugs)
+13. [Code of Conduct](#code-of-conduct)
 
 ## Ways to Contribute
 
@@ -176,6 +177,31 @@ cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<crash-file>
 `stellar-xdr`'s `arbitrary` feature is declared in `fuzz/Cargo.toml` rather than
 in the crate's release dependencies, so structure-aware targets can use it
 without pulling it into the shipped binary (see issue #79).
+
+## Code Coverage
+
+CI measures line coverage on every pull request with
+[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) and publishes the
+per-file summary — including the count for `src/diff.rs`, where most detection
+rules live — to the run's job summary. Run it locally with:
+
+```bash
+cargo install cargo-llvm-cov
+rustup component add llvm-tools-preview
+cargo llvm-cov --workspace --summary-only
+```
+
+Add `--html` and open `target/llvm-cov/html/index.html` for a line-by-line
+view of exactly which branches a test suite run did or did not reach.
+
+The coverage job does not fail the build on a threshold. With over forty
+finding categories emitted from `src/diff.rs`, and known gaps such as
+`fetch_wasm_from_rpc`'s error paths (unreachable without a network) and the
+batch renderers in `src/main.rs`, a threshold chosen before anyone has looked
+at the real baseline tends to get lowered to fit rather than met. Establish
+the baseline first, call out any detection rule with zero coverage as a
+follow-up issue, and decide on enforcement — and the number — deliberately
+afterward.
 
 ## Coding Guidelines
 
