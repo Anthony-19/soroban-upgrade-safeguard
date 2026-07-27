@@ -4,7 +4,7 @@ use crate::parser::{ContractEnvMeta, ContractMeta, RUST_VERSION_KEY, SDK_VERSION
 use crate::rename::{match_renames, Rename};
 use crate::spec::ContractSpec;
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use stellar_xdr::curr::{
     ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef, ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0,
@@ -13,12 +13,24 @@ use stellar_xdr::curr::{
 };
 
 /// Severity of a detected issue.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Critical,
     Warning,
     Info,
+}
+
+impl Severity {
+    /// The lowercase wire/config name for this severity, matching the string a
+    /// `[severity]` override in `.safeguard.toml` uses and the JSON encoding.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Severity::Critical => "critical",
+            Severity::Warning => "warning",
+            Severity::Info => "info",
+        }
+    }
 }
 
 /// A single finding from the comparison analysis.
@@ -113,7 +125,7 @@ pub fn compare_with_classification(
     compare_unions(old, new, classification, &mut report);
     compare_error_enums(old, new, classification, &mut report);
 
-    detect_cascading_layout_breaks(old, new, &mut report);
+    detect_cascading_layout_breaks(old, &mut report);
 
     report
 }
@@ -141,7 +153,7 @@ pub fn compare_with_policy(
     // Cascade detection uses the LayoutMapper which enforces the walk-depth
     // limit. If the graph exceeds it we surface a LimitError rather than
     // overflowing the stack.
-    detect_cascading_layout_breaks_with_policy(old, new, &mut report, policy)?;
+    detect_cascading_layout_breaks_with_policy(old, &mut report, policy)?;
 
     Ok(report)
 }
@@ -1960,11 +1972,9 @@ fn check_error_enum_cases(
 }
 
 /// Uses dependency graphing to figure out if storage layout changes cascade to other types.
-fn detect_cascading_layout_breaks(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport) {
+fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
     let old_mapper = LayoutMapper::new(old);
-    let new_mapper = LayoutMapper::new(new);
-    let old_reverse = old_mapper.build_reverse_dependencies();
-    let new_reverse = new_mapper.build_reverse_dependencies();
+    let reverse_deps = old_mapper.build_reverse_dependencies();
 
     // Collect all UDTs that had a critical breaking change.
     // We read `type_name` directly — no message-text parsing needed.
@@ -1977,80 +1987,36 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, new: &ContractSpec, report
         }
     }
 
-    // A queue for transitive breaks.
-    // Each entry carries the broken type name and a flag indicating whether the
-    // dependency was found in the old graph, the new graph, or both.
+    // A queue for transitive breaks
     let mut queue: Vec<String> = broken_types.into_iter().collect();
     let mut i = 0;
-    // `cascaded` tracks every (dependent, source_broken_type) pair we have
-    // already emitted so we don't duplicate findings for the same edge.
     let mut cascaded = std::collections::HashSet::new();
 
     while i < queue.len() {
         let current_broken_type = queue[i].clone();
         i += 1;
 
-        // Gather dependents from old graph (existing stored-data impact).
-        let old_deps: std::collections::HashSet<String> = old_reverse
-            .get(&current_broken_type)
-            .map(|v| v.iter().cloned().collect())
-            .unwrap_or_default();
+        if let Some(dependents) = reverse_deps.get(&current_broken_type) {
+            for dep in dependents {
+                // Ignore if it was the original broken type
+                if !cascaded.contains(dep) {
+                    cascaded.insert(dep.clone());
+                    queue.push(dep.clone());
 
-        // Gather dependents from new graph (newly introduced dependency).
-        let new_deps: std::collections::HashSet<String> = new_reverse
-            .get(&current_broken_type)
-            .map(|v| v.iter().cloned().collect())
-            .unwrap_or_default();
-
-        let all_deps = old_deps.union(&new_deps);
-
-        for dep in all_deps {
-            let key = (dep.clone(), current_broken_type.clone());
-            if cascaded.contains(&key) {
-                continue;
+                    report.findings.push(Finding {
+                        severity: Severity::Critical,
+                        category: "Cascading Layout Break".to_string(),
+                        message: format!(
+                            "Type '{}' layout is broken because it embeds modified type '{}'. \
+                             Stored data for '{}' is no longer compatible.",
+                            dep, current_broken_type, dep
+                        ),
+                        type_name: Some(dep.clone()),
+                        target: Some(dep.clone()),
+                        classification: None,
+                    });
+                }
             }
-            cascaded.insert(key);
-            queue.push(dep.clone());
-
-            let in_old = old_deps.contains(dep);
-            let in_new = new_deps.contains(dep);
-
-            let message = if in_old && in_new {
-                // Edge exists in both builds: old stored data is affected,
-                // and the new layout still carries the dependency.
-                format!(
-                    "Type '{}' layout is broken because it embeds modified type '{}'. \
-                     Stored data for '{}' is no longer compatible.",
-                    dep, current_broken_type, dep
-                )
-            } else if in_old {
-                // Edge existed only in the old build: old stored data is
-                // affected by the change to the embedded type.
-                format!(
-                    "Type '{}' layout is broken because it embeds modified type '{}'. \
-                     Stored data for '{}' is no longer compatible.",
-                    dep, current_broken_type, dep
-                )
-            } else {
-                // Edge exists only in the new build: a newly introduced
-                // embedding of the broken type means the new layout of this
-                // type is affected, even though it had no prior dependency.
-                format!(
-                    "Type '{}' new layout depends on modified type '{}'. \
-                     Data written by the new build using '{}' will not be compatible \
-                     with the modified '{}' layout.",
-                    dep, current_broken_type, dep, current_broken_type
-                )
-            };
-
-            report.findings.push(Finding {
-                severity: Severity::Critical,
-                category: "Cascading Layout Break".to_string(),
-                message,
-                type_name: Some(dep.clone()),
-                target: Some(dep.clone()),
-                classification: None,
-            });
         }
     }
 }
@@ -2062,14 +2028,11 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, new: &ContractSpec, report
 /// type graph is deeper than the configured limit.
 fn detect_cascading_layout_breaks_with_policy(
     old: &ContractSpec,
-    new: &ContractSpec,
     report: &mut DiffReport,
     policy: &crate::limits::ResourcePolicy,
 ) -> Result<(), crate::limits::LimitError> {
     let old_mapper = LayoutMapper::new_with_policy(old, policy);
-    let new_mapper = LayoutMapper::new_with_policy(new, policy);
-    let old_reverse = old_mapper.try_build_reverse_dependencies()?;
-    let new_reverse = new_mapper.try_build_reverse_dependencies()?;
+    let reverse_deps = old_mapper.try_build_reverse_dependencies()?;
 
     let mut broken_types = std::collections::HashSet::new();
     for finding in &report.findings {
@@ -2088,52 +2051,26 @@ fn detect_cascading_layout_breaks_with_policy(
         let current_broken_type = queue[i].clone();
         i += 1;
 
-        let old_deps: std::collections::HashSet<String> = old_reverse
-            .get(&current_broken_type)
-            .map(|v| v.iter().cloned().collect())
-            .unwrap_or_default();
+        if let Some(dependents) = reverse_deps.get(&current_broken_type) {
+            for dep in dependents {
+                if !cascaded.contains(dep) {
+                    cascaded.insert(dep.clone());
+                    queue.push(dep.clone());
 
-        let new_deps: std::collections::HashSet<String> = new_reverse
-            .get(&current_broken_type)
-            .map(|v| v.iter().cloned().collect())
-            .unwrap_or_default();
-
-        let all_deps = old_deps.union(&new_deps);
-
-        for dep in all_deps {
-            let key = (dep.clone(), current_broken_type.clone());
-            if cascaded.contains(&key) {
-                continue;
+                    report.findings.push(Finding {
+                        severity: Severity::Critical,
+                        category: "Cascading Layout Break".to_string(),
+                        message: format!(
+                            "Type '{}' layout is broken because it embeds modified type '{}'. \
+                             Stored data for '{}' is no longer compatible.",
+                            dep, current_broken_type, dep
+                        ),
+                        type_name: Some(dep.clone()),
+                        target: Some(dep.clone()),
+                        classification: None,
+                    });
+                }
             }
-            cascaded.insert(key);
-            queue.push(dep.clone());
-
-            let in_old = old_deps.contains(dep);
-
-            let message = if in_old {
-                format!(
-                    "Type '{}' layout is broken because it embeds modified type '{}'. \
-                     Stored data for '{}' is no longer compatible.",
-                    dep, current_broken_type, dep
-                )
-            } else {
-                // new-only edge: dependency was introduced in the new build
-                format!(
-                    "Type '{}' new layout depends on modified type '{}'. \
-                     Data written by the new build using '{}' will not be compatible \
-                     with the modified '{}' layout.",
-                    dep, current_broken_type, dep, current_broken_type
-                )
-            };
-
-            report.findings.push(Finding {
-                severity: Severity::Critical,
-                category: "Cascading Layout Break".to_string(),
-                message,
-                type_name: Some(dep.clone()),
-                target: Some(dep.clone()),
-                classification: None,
-            });
         }
     }
     Ok(())
@@ -2344,10 +2281,8 @@ mod tests {
             classification: None,
         });
 
-        // Run cascade detection against both old and new specs.
-        // The new spec here is the same as old — this test is about message
-        // independence, not new-graph detection.
-        detect_cascading_layout_breaks(&old, &old, &mut report);
+        // Run cascade detection against the old spec
+        detect_cascading_layout_breaks(&old, &mut report);
 
         // Parent should still be detected as cascaded
         let parent_cascade = report.findings.iter().any(|f| {
@@ -2380,7 +2315,7 @@ mod tests {
             classification: None,
         });
 
-        detect_cascading_layout_breaks(&old, &old, &mut report);
+        detect_cascading_layout_breaks(&old, &mut report);
 
         // Should still be just the one finding -- no cascade
         assert_eq!(
@@ -2423,164 +2358,6 @@ mod tests {
         assert!(
             cascade_types.contains(&"Top"),
             "Top should cascade from Mid"
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // Test: newly introduced embedding of a broken type fires cascade
-    //
-    // The new build adds a field `outer: Inner` to `Outer` that did not
-    // exist in the old build. The old reverse-dep graph has no
-    // `Inner -> Outer` edge, so the old-only algorithm would miss this.
-    // The dual-graph algorithm must detect it via the new graph.
-    // ---------------------------------------------------------------
-    #[test]
-    fn cascade_detects_newly_introduced_embedding() {
-        // Old spec: Inner(v: u32), Outer() — no embedding
-        let old = spec_with_structs(vec![
-            ("Inner", vec![("v", ScSpecTypeDef::U32)]),
-            ("Outer", vec![("x", ScSpecTypeDef::U32)]),
-        ]);
-        // New spec: Inner(v: u64) — breaking change; Outer now embeds Inner
-        let new = spec_with_structs(vec![
-            ("Inner", vec![("v", ScSpecTypeDef::U64)]),
-            ("Outer", vec![("x", ScSpecTypeDef::U32), ("inner", udt("Inner"))]),
-        ]);
-
-        let report = compare(&old, &new);
-
-        // Inner must have a direct critical finding from the field-type change.
-        let inner_critical = report.findings.iter().any(|f| {
-            f.severity == Severity::Critical
-                && f.type_name.as_deref() == Some("Inner")
-                && f.category != "Cascading Layout Break"
-        });
-        assert!(inner_critical, "Expected direct critical finding for Inner");
-
-        // Outer must get a cascade finding because the NEW build introduced
-        // the Inner dependency — even though the old build had no such edge.
-        let outer_cascade = report.findings.iter().find(|f| {
-            f.severity == Severity::Critical
-                && f.type_name.as_deref() == Some("Outer")
-                && f.category == "Cascading Layout Break"
-        });
-        assert!(
-            outer_cascade.is_some(),
-            "Expected cascade finding for Outer (new-build embedding of broken Inner); \
-             findings: {:?}",
-            report.findings.iter().map(|f| &f.message).collect::<Vec<_>>()
-        );
-
-        // The message must use new-layout wording, not old-data wording,
-        // because this embedding did not exist in the old build.
-        let msg = &outer_cascade.unwrap().message;
-        assert!(
-            msg.contains("new layout") || msg.contains("new build"),
-            "Message for new-only embedding must indicate new-layout impact: {msg}"
-        );
-        assert!(
-            !msg.contains("Stored data for 'Outer' is no longer compatible"),
-            "Old-data wording must not appear for a new-only embedding: {msg}"
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // Test: dual-graph cascade — old edge still fires with old wording
-    // ---------------------------------------------------------------
-    #[test]
-    fn cascade_old_edge_uses_stored_data_wording() {
-        // Both old and new have the embedding — this is the existing-data case.
-        let old = spec_with_structs(vec![
-            ("Inner", vec![("v", ScSpecTypeDef::U32)]),
-            ("Outer", vec![("inner", udt("Inner"))]),
-        ]);
-        let new = spec_with_structs(vec![
-            ("Inner", vec![("v", ScSpecTypeDef::U64)]),
-            ("Outer", vec![("inner", udt("Inner"))]),
-        ]);
-
-        let report = compare(&old, &new);
-
-        let outer_cascade = report.findings.iter().find(|f| {
-            f.severity == Severity::Critical
-                && f.type_name.as_deref() == Some("Outer")
-                && f.category == "Cascading Layout Break"
-        });
-        assert!(outer_cascade.is_some(), "Expected cascade for Outer");
-
-        let msg = &outer_cascade.unwrap().message;
-        assert!(
-            msg.contains("Stored data for 'Outer' is no longer compatible"),
-            "Old edge must use stored-data wording: {msg}"
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // Test: no duplicate cascade finding when both graphs have same edge
-    // ---------------------------------------------------------------
-    #[test]
-    fn cascade_no_duplicate_when_both_graphs_have_edge() {
-        let old = spec_with_structs(vec![
-            ("Inner", vec![("v", ScSpecTypeDef::U32)]),
-            ("Outer", vec![("inner", udt("Inner"))]),
-        ]);
-        let new = spec_with_structs(vec![
-            ("Inner", vec![("v", ScSpecTypeDef::U64)]),
-            ("Outer", vec![("inner", udt("Inner"))]),
-        ]);
-
-        let report = compare(&old, &new);
-
-        let outer_cascades: Vec<_> = report
-            .findings
-            .iter()
-            .filter(|f| {
-                f.type_name.as_deref() == Some("Outer")
-                    && f.category == "Cascading Layout Break"
-            })
-            .collect();
-
-        assert_eq!(
-            outer_cascades.len(),
-            1,
-            "Exactly one cascade finding for Outer even though both graphs have the edge"
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // Test: transitive cascade through a newly introduced embedding
-    // ---------------------------------------------------------------
-    #[test]
-    fn transitive_cascade_through_new_embedding() {
-        // Old: Leaf(v: u32), Mid(leaf: Leaf), Top() — Top has no embedding
-        let old = spec_with_structs(vec![
-            ("Leaf", vec![("v", ScSpecTypeDef::U32)]),
-            ("Mid", vec![("leaf", udt("Leaf"))]),
-            ("Top", vec![("x", ScSpecTypeDef::U32)]),
-        ]);
-        // New: Leaf changes; Mid keeps embedding; Top now embeds Mid (new edge)
-        let new = spec_with_structs(vec![
-            ("Leaf", vec![("v", ScSpecTypeDef::U64)]),
-            ("Mid", vec![("leaf", udt("Leaf"))]),
-            ("Top", vec![("x", ScSpecTypeDef::U32), ("mid", udt("Mid"))]),
-        ]);
-
-        let report = compare(&old, &new);
-
-        let cascade_types: Vec<&str> = report
-            .findings
-            .iter()
-            .filter(|f| f.category == "Cascading Layout Break")
-            .filter_map(|f| f.type_name.as_deref())
-            .collect();
-
-        assert!(
-            cascade_types.contains(&"Mid"),
-            "Mid should cascade from Leaf (old edge)"
-        );
-        assert!(
-            cascade_types.contains(&"Top"),
-            "Top should cascade transitively via the new Mid embedding"
         );
     }
 

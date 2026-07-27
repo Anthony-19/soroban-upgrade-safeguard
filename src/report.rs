@@ -222,6 +222,15 @@ pub struct ReportedFinding {
     /// Optional remediation/explanation advice for the user.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remediation: Option<String>,
+    /// The severity the analysis engine originally assigned, present only when
+    /// a `[severity]` override changed it.
+    ///
+    /// `finding.severity` always carries the *effective* severity — what the
+    /// verdict, counts, and exit code were computed from. This field preserves
+    /// what the tool would have said on its own, so a reader can always tell an
+    /// engine verdict apart from a configured one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_severity: Option<Severity>,
     /// Whether this finding is new or persisting relative to a `--baseline`
     /// report. `None` when no baseline was supplied.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -334,6 +343,14 @@ pub struct SafetyReport {
     pub suppressed_count: usize,
     /// Number of findings hidden by category filtering.
     pub filtered_count: usize,
+    /// Number of findings whose severity a `[severity]` override changed.
+    pub severity_overridden_count: usize,
+    /// Whether the pass/fail verdict differs from what it would have been
+    /// without the `[severity]` overrides.
+    ///
+    /// Reported prominently in every format. An override that turns a failing
+    /// gate green is exactly the case a reader must not be able to miss.
+    pub verdict_changed_by_override: bool,
     pub suppressed_critical_count: usize,
     pub total_findings: usize,
     pub is_safe: bool,
@@ -404,6 +421,13 @@ pub struct SafetyReportJson<'a> {
     pub suppressed_count: usize,
     /// Findings hidden by category filtering.
     pub filtered_count: usize,
+    /// Findings whose severity a `[severity]` config override changed. Each one
+    /// also carries its pre-override `original_severity`.
+    pub severity_overridden_count: usize,
+    /// Whether the verdict differs from what it would have been without the
+    /// `[severity]` overrides. A machine consumer treating `is_safe` as a gate
+    /// should surface this rather than pass silently.
+    pub verdict_changed_by_override: bool,
     pub total_findings: usize,
     pub recommended_bump: &'static str,
     pub baseline_source: Option<&'a str>,
@@ -464,30 +488,56 @@ impl SafetyReport {
         let mut suppressed_critical_count = 0;
         let mut failing_critical_count = 0;
         let mut failing_warning_count = 0;
+        // The same failing tallies computed from the engine's own severities,
+        // used only to detect a verdict that flipped because of an override.
+        let mut engine_failing_critical_count = 0;
+        let mut engine_failing_warning_count = 0;
+        let mut severity_overridden_count = 0;
         let mut findings_by_category: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
 
         // Track which rule indices actually matched at least one finding.
         let mut matched_rule_indices: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
 
+        let overrides = &suppressions.severity_overrides;
+
         for finding in &diff.findings {
-            match finding.severity {
+            // Policy is applied here, in the report layer, alongside suppression
+            // — the diff layer stays a pure description of what changed.
+            let engine_severity = finding.severity.clone();
+            let severity = overrides
+                .severity_for(&finding.category)
+                .unwrap_or_else(|| engine_severity.clone());
+            let overridden = severity != engine_severity;
+            if overridden {
+                severity_overridden_count += 1;
+            }
+
+            match severity {
                 Severity::Critical => critical_count += 1,
                 Severity::Warning => warning_count += 1,
                 Severity::Info => info_count += 1,
             }
 
+            // Suppression matches on category, target, and fingerprint — never
+            // on severity — so an override can never move a finding out from
+            // under an existing suppression rule.
             let rule = suppressions.matching_rule_with_index(finding);
             let suppressed = rule.is_some();
             if suppressed {
                 suppressed_count += 1;
-                if finding.severity == Severity::Critical {
+                if severity == Severity::Critical {
                     suppressed_critical_count += 1;
                 }
             } else {
-                match finding.severity {
+                match severity {
                     Severity::Critical => failing_critical_count += 1,
                     Severity::Warning => failing_warning_count += 1,
+                    _ => {}
+                }
+                match engine_severity {
+                    Severity::Critical => engine_failing_critical_count += 1,
+                    Severity::Warning => engine_failing_warning_count += 1,
                     _ => {}
                 }
             }
@@ -508,13 +558,18 @@ impl SafetyReport {
                 None
             };
 
+            // The fingerprint covers category, target, and message — not
+            // severity — so overriding a category does not invalidate the
+            // fingerprints in an existing suppression config.
             let fingerprint = crate::suppression::compute_fingerprint(finding);
+            let mut effective_finding = finding.clone();
+            effective_finding.severity = severity;
             findings_by_category
                 .entry(finding.category.clone())
                 .or_default()
                 .push(ReportedFinding {
                     rule_id,
-                    finding: finding.clone(),
+                    finding: effective_finding,
                     fingerprint,
                     suppressed,
                     suppression_reason: rule_ref.and_then(|r| r.reason.clone()),
@@ -522,6 +577,7 @@ impl SafetyReport {
                     suppression_expiry: rule_ref.and_then(|r| r.expiry.clone()),
                     suppression_fingerprint: rule_ref.and_then(|r| r.fingerprint.clone()),
                     remediation,
+                    original_severity: overridden.then_some(engine_severity),
                     baseline_status: None,
                 });
         }
@@ -535,11 +591,19 @@ impl SafetyReport {
             .map(|(_, r)| r.clone())
             .collect();
 
-        let is_safe = if strict {
-            failing_critical_count == 0 && failing_warning_count == 0
-        } else {
-            failing_critical_count == 0
+        let verdict = |critical: usize, warning: usize| {
+            if strict {
+                critical == 0 && warning == 0
+            } else {
+                critical == 0
+            }
         };
+        let is_safe = verdict(failing_critical_count, failing_warning_count);
+        // A demotion that turns a failing gate green is the one outcome a reader
+        // must never miss, so the difference is computed here and stated in the
+        // report rather than left for the user to infer.
+        let verdict_changed_by_override =
+            is_safe != verdict(engine_failing_critical_count, engine_failing_warning_count);
 
         let settings = ReportSettings {
             strict,
@@ -558,6 +622,8 @@ impl SafetyReport {
             info_count,
             suppressed_count,
             filtered_count: 0,
+            severity_overridden_count,
+            verdict_changed_by_override,
             suppressed_critical_count,
             total_findings: diff.findings.len(),
             is_safe,
@@ -595,6 +661,50 @@ impl SafetyReport {
             "❌ FAILED (Breaking changes detected in the exported interface or declared storage)"
         } else {
             "❌ FAILED (Exported-interface breaking changes detected)"
+        }
+    }
+
+    /// The sentence stating that a `[severity]` override changed the verdict,
+    /// or `None` when it did not.
+    ///
+    /// A tool that can be quietly reconfigured into always passing is worse than
+    /// no tool, so this is the one line that must appear, unhedged, in every
+    /// format whenever configuration — not analysis — decided the outcome.
+    pub fn override_verdict_notice(&self) -> Option<String> {
+        if !self.verdict_changed_by_override {
+            return None;
+        }
+        Some(if self.is_safe {
+            "VERDICT CHANGED BY CONFIG: this run passes only because the [severity] table \
+             lowered one or more findings. Without those overrides it would have FAILED."
+                .to_string()
+        } else {
+            "VERDICT CHANGED BY CONFIG: this run fails only because the [severity] table \
+             raised one or more findings. Without those overrides it would have PASSED."
+                .to_string()
+        })
+    }
+
+    /// The override notice rendered for text output, empty when not applicable.
+    fn override_verdict_notice_text(&self) -> String {
+        match self.override_verdict_notice() {
+            // Red rather than dimmed: a demotion that greens a failing gate is
+            // the case this line exists to make impossible to skim past.
+            Some(notice) => format!("{}\n", format!("⚠️  {notice}").red().bold()),
+            None => String::new(),
+        }
+    }
+
+    /// The `[SEVERITY: critical → warning]` tag for a finding whose severity an
+    /// override changed, or an empty string when it was left alone.
+    fn override_tag(reported: &ReportedFinding) -> String {
+        match &reported.original_severity {
+            Some(original) => format!(
+                "[SEVERITY {} → {}] ",
+                original.label(),
+                reported.finding.severity.label()
+            ),
+            None => String::new(),
         }
     }
 
@@ -648,6 +758,8 @@ impl SafetyReport {
             },
             suppressed_count: self.suppressed_count,
             filtered_count: self.filtered_count,
+            severity_overridden_count: self.severity_overridden_count,
+            verdict_changed_by_override: self.verdict_changed_by_override,
             total_findings: self.total_findings,
             recommended_bump: self.recommended_bump(),
             baseline_source: self.baseline_source.as_deref(),
@@ -773,6 +885,19 @@ impl SafetyReport {
                     .dimmed()
             ));
         }
+        if self.severity_overridden_count > 0 {
+            output.push_str(&format!(
+                "Overridden: {}\n",
+                self.severity_overridden_count.to_string().magenta().bold()
+            ));
+            output.push_str(&format!(
+                "{}",
+                "  ↳ Severities were changed by the [severity] table in the config.\n"
+                    .magenta()
+                    .dimmed()
+            ));
+        }
+        output.push_str(&self.override_verdict_notice_text());
         let bump = self.recommended_bump();
         let bump_str = match bump {
             "major" => "major".red().bold(),
@@ -835,10 +960,12 @@ impl SafetyReport {
             for reported in &group {
                 let finding = &reported.finding;
 
+                let override_tag = Self::override_tag(reported);
+
                 if reported.suppressed {
                     // Suppressed findings are still listed, but clearly marked
                     // and dimmed so they read as acknowledged, not active.
-                    let label = format!("🔕 [SUPPRESSED] {}", finding.message)
+                    let label = format!("🔕 [SUPPRESSED] {override_tag}{}", finding.message)
                         .dimmed()
                         .to_string();
                     output.push_str(&format!("{}\n", label));
@@ -862,10 +989,11 @@ impl SafetyReport {
                     Some(crate::baseline::BaselineStatus::New) => "[NEW] ",
                     _ => "",
                 };
+                let body = format!("{baseline_tag}{override_tag}{}", finding.message);
                 let formatted = match finding.severity {
-                    Severity::Critical => format!("🔴 {}{}", baseline_tag, finding.message).red(),
-                    Severity::Warning => format!("🟡 {}{}", baseline_tag, finding.message).yellow(),
-                    Severity::Info => format!("🔵 {}{}", baseline_tag, finding.message).cyan(),
+                    Severity::Critical => format!("🔴 {body}").red(),
+                    Severity::Warning => format!("🟡 {body}").yellow(),
+                    Severity::Info => format!("🔵 {body}").cyan(),
                 };
                 output.push_str(&format!("{}\n", formatted));
                 if explain {
@@ -1087,6 +1215,15 @@ impl SafetyReport {
             output.push_str(&format!("| **Filtered** | {} |\n", self.filtered_count));
             output.push_str("\n> ⚠️  Findings were hidden by `--include-category`/`--exclude-category`. The verdict reflects the remaining visible findings only.\n\n");
         }
+        if self.severity_overridden_count > 0 {
+            output.push_str(&format!(
+                "| **Severity overridden** | {} |\n",
+                self.severity_overridden_count
+            ));
+        }
+        if let Some(notice) = self.override_verdict_notice() {
+            output.push_str(&format!("\n> ⚠️ **{}**\n\n", notice));
+        }
         output.push_str(&format!(
             "\n**Recommended SemVer Bump**: `{}`\n\n",
             self.recommended_bump()
@@ -1136,8 +1273,20 @@ impl SafetyReport {
             for reported in &group {
                 let finding = &reported.finding;
 
+                let override_tag = match &reported.original_severity {
+                    Some(original) => format!(
+                        "**[SEVERITY {} → {}]** ",
+                        original.label(),
+                        finding.severity.label()
+                    ),
+                    None => String::new(),
+                };
+
                 if reported.suppressed {
-                    output.push_str(&format!("- 🔕 **[SUPPRESSED]** {}\n", finding.message));
+                    output.push_str(&format!(
+                        "- 🔕 **[SUPPRESSED]** {override_tag}{}\n",
+                        finding.message
+                    ));
                     if let Some(reason) = &reported.suppression_reason {
                         output.push_str(&format!("  - ↳ reason: {}\n", reason));
                     }
@@ -1159,8 +1308,8 @@ impl SafetyReport {
                     _ => "",
                 };
                 output.push_str(&format!(
-                    "- {} {}{}\n",
-                    emoji, baseline_tag, finding.message
+                    "- {} {}{}{}\n",
+                    emoji, baseline_tag, override_tag, finding.message
                 ));
                 if self.settings.explain {
                     if let Some(remediation) = &reported.remediation {
@@ -1253,7 +1402,8 @@ impl SafetyReport {
             let group = self.findings_by_category.get(category).unwrap();
             for reported in group {
                 let finding = &reported.finding;
-                let text = format!("[{}] {}", finding.category, finding.message);
+                let override_tag = Self::override_tag(reported);
+                let text = format!("[{}] {override_tag}{}", finding.category, finding.message);
 
                 if reported.suppressed {
                     // Suppressed findings are demoted to notice so they are
@@ -1273,19 +1423,154 @@ impl SafetyReport {
         // Human-readable summary after the annotations.
         let status = if self.is_safe { "PASSED" } else { "FAILED" };
         output.push_str(&format!(
-            "\nSoroban Upgrade Safeguard: {} — {} critical, {} warning(s), {} info ({} suppressed)\n",
+            "\nSoroban Upgrade Safeguard: {} — {} critical, {} warning(s), {} info ({} suppressed, {} severity-overridden)\n",
             status,
             self.critical_count,
             self.warning_count,
             self.info_count,
             self.suppressed_count,
+            self.severity_overridden_count,
         ));
+
+        // A configured verdict is escalated to a warning annotation so it shows
+        // up in the checks UI, not just buried in the log body.
+        if let Some(notice) = self.override_verdict_notice() {
+            output.push_str(&format!("::warning::{}\n", notice));
+        }
 
         if group_title.is_some() {
             output.push_str("::endgroup::\n");
         }
 
         output
+    }
+
+    /// Generate a single JUnit `<testsuite>` element for this report.
+    ///
+    /// Each finding becomes one `<testcase>`, named by its category and target,
+    /// so a CI system's existing test-report UI renders a breaking change as a
+    /// failing test rather than as text buried in a log.
+    ///
+    /// Status mapping:
+    ///
+    /// - `Critical` → `<failure>`.
+    /// - `Warning`  → `<failure>` under `--strict`, otherwise a passing case.
+    /// - `Info`     → a passing case.
+    /// - Suppressed → `<skipped>` carrying the suppression reason, at any
+    ///   severity. A skipped case reads as *acknowledged* in every CI UI, which
+    ///   is exactly what a suppression is; it is never reported as a failure.
+    ///
+    /// `suite_name` names the suite (the contract name in batch mode). A report
+    /// with no findings still emits one passing case so the suite is never empty
+    /// — an empty suite renders as "no tests ran", which reads as a broken job
+    /// rather than as a clean upgrade.
+    pub fn generate_summary_junit(&self, suite_name: Option<&str>) -> String {
+        let suite = suite_name.unwrap_or("soroban-upgrade-safeguard");
+        let classname = format!("soroban-upgrade-safeguard.{}", suite);
+
+        // Sort categories for deterministic output.
+        let mut categories: Vec<&String> = self.findings_by_category.keys().collect();
+        categories.sort();
+
+        let mut cases = String::new();
+        let (mut tests, mut failures, mut skipped) = (0usize, 0usize, 0usize);
+
+        for category in categories {
+            for reported in self.findings_by_category.get(category).unwrap() {
+                let finding = &reported.finding;
+                tests += 1;
+
+                let case_name = match finding.target.as_deref() {
+                    Some(target) if !target.is_empty() => {
+                        format!("{}: {}", finding.category, target)
+                    }
+                    _ => finding.category.clone(),
+                };
+
+                cases.push_str(&format!(
+                    "    <testcase classname=\"{}\" name=\"{}\"",
+                    escape_xml(&classname),
+                    escape_xml(&case_name),
+                ));
+
+                if reported.suppressed {
+                    skipped += 1;
+                    let reason = reported
+                        .suppression_reason
+                        .as_deref()
+                        .unwrap_or("acknowledged by a suppression rule");
+                    cases.push_str(&format!(
+                        ">\n      <skipped message=\"{}\"/>\n    </testcase>\n",
+                        escape_xml(reason),
+                    ));
+                    continue;
+                }
+
+                let fails = match finding.severity {
+                    Severity::Critical => true,
+                    Severity::Warning => self.strict,
+                    Severity::Info => false,
+                };
+
+                if fails {
+                    failures += 1;
+                    cases.push_str(&format!(
+                        ">\n      <failure type=\"{}\" message=\"{}\">{}</failure>\n    </testcase>\n",
+                        escape_xml(finding.severity.label()),
+                        escape_xml(&finding.message),
+                        escape_xml(&Self::junit_case_body(reported)),
+                    ));
+                } else {
+                    // A passing case still carries the message so a reader who
+                    // opens it sees what the tool actually observed.
+                    cases.push_str(&format!(
+                        ">\n      <system-out>{}</system-out>\n    </testcase>\n",
+                        escape_xml(&Self::junit_case_body(reported)),
+                    ));
+                }
+            }
+        }
+
+        if tests == 0 {
+            tests = 1;
+            cases.push_str(&format!(
+                "    <testcase classname=\"{}\" name=\"no breaking changes detected\"/>\n",
+                escape_xml(&classname),
+            ));
+        }
+
+        format!(
+            "  <testsuite name=\"{}\" tests=\"{}\" failures=\"{}\" errors=\"0\" skipped=\"{}\">\n\
+             {}  </testsuite>\n",
+            escape_xml(suite),
+            tests,
+            failures,
+            skipped,
+            cases,
+        )
+    }
+
+    /// The body text of a JUnit `<testcase>`: the finding's message plus the
+    /// stable rule id and any severity-override or remediation context.
+    fn junit_case_body(reported: &ReportedFinding) -> String {
+        let mut body = format!(
+            "[{}] {}\nrule_id: {}\nfingerprint: {}",
+            reported.finding.severity.label(),
+            reported.finding.message,
+            reported.rule_id,
+            reported.fingerprint,
+        );
+        if let Some(ref original) = reported.original_severity {
+            body.push_str(&format!(
+                "\nseverity overridden: {} -> {}",
+                original.label(),
+                reported.finding.severity.label(),
+            ));
+        }
+        if let Some(ref remediation) = reported.remediation {
+            body.push_str(&format!("\nremediation: {}", remediation));
+        }
+        body
     }
 
     /// Append the informational build-metrics table to Markdown output.
@@ -1330,6 +1615,365 @@ impl SafetyReport {
         }
     }
 
+    /// Render this report as a complete, self-contained HTML document.
+    ///
+    /// Intended for publishing as a build artifact, where the reader never
+    /// opens the job log. See [`html_document`] for the offline guarantees.
+    pub fn generate_summary_html(&self) -> String {
+        html_document(
+            "Soroban Upgrade Safety Report",
+            &self.html_section(None, true),
+        )
+    }
+
+    /// Render this report as an HTML fragment, for embedding in a larger
+    /// document. Batch mode uses this to put every contract pair in one file.
+    ///
+    /// `heading`, when given, names the contract pair. `top_level` controls
+    /// whether the status uses `<h1>` or `<h2>`, so batch pairs nest correctly
+    /// under the batch heading.
+    pub fn html_section(&self, heading: Option<&str>, top_level: bool) -> String {
+        let mut out = String::new();
+        let level = if top_level { 1 } else { 2 };
+
+        out.push_str("<section class=\"report\">\n");
+        if let Some(name) = heading {
+            out.push_str(&format!(
+                "<h{level} class=\"pair-name\">{}</h{level}>\n",
+                escape_html(name)
+            ));
+        }
+
+        // ── Status banner ──────────────────────────────────────────────────
+        let (status_class, status_text) = if self.is_safe {
+            ("pass", self.passed_status_label())
+        } else if self.strict && self.critical_count == 0 {
+            ("fail", "❌ FAILED (Warnings detected in strict mode)")
+        } else {
+            ("fail", self.failed_status_label())
+        };
+        if heading.is_none() {
+            out.push_str(&format!(
+                "<h{level} class=\"title\">Soroban Upgrade Safety Report</h{level}>\n"
+            ));
+        }
+        if self.strict {
+            out.push_str("<p class=\"banner strict\">⚠️ STRICT MODE ACTIVE — warnings are treated as failures.</p>\n");
+        }
+        out.push_str(&format!(
+            "<p class=\"banner {status_class}\">{}</p>\n",
+            escape_html(status_text)
+        ));
+
+        // A configured verdict must be as loud here as it is in the terminal.
+        if let Some(notice) = self.override_verdict_notice() {
+            out.push_str(&format!(
+                "<p class=\"banner override-verdict\">⚠️ {}</p>\n",
+                escape_html(&notice)
+            ));
+        }
+
+        // ── Scope ──────────────────────────────────────────────────────────
+        out.push_str(&format!(
+            "<p class=\"scope\">{}</p>\n",
+            escape_html(&self.scope.summary_line())
+        ));
+        let storage_class = if self.scope.storage_analyzed() {
+            "scope"
+        } else {
+            "scope gap"
+        };
+        out.push_str(&format!(
+            "<p class=\"{storage_class}\">{}</p>\n",
+            escape_html(&self.scope.storage_status_line())
+        ));
+
+        if self.scope.old_spec_section_count > 1 || self.scope.new_spec_section_count > 1 {
+            out.push_str(&format!(
+                "<p class=\"banner warn\">⚠️ Multi-section WASM detected: old has {} \
+                 contractspecv0 section(s), new has {}.</p>\n",
+                self.scope.old_spec_section_count, self.scope.new_spec_section_count,
+            ));
+        }
+        let all_dups: Vec<String> = self
+            .scope
+            .old_duplicate_names
+            .iter()
+            .map(|n| format!("old:{n}"))
+            .chain(
+                self.scope
+                    .new_duplicate_names
+                    .iter()
+                    .map(|n| format!("new:{n}")),
+            )
+            .collect();
+        if !all_dups.is_empty() {
+            out.push_str(&format!(
+                "<p class=\"banner fail\">❌ Duplicate spec entries detected: {}</p>\n",
+                escape_html(&all_dups.join(", "))
+            ));
+        }
+
+        // ── Counts ─────────────────────────────────────────────────────────
+        out.push_str("<ul class=\"stats\">\n");
+        out.push_str(&stat_tile("Critical", self.critical_count, "critical"));
+        out.push_str(&stat_tile("Warning", self.warning_count, "warning"));
+        out.push_str(&stat_tile("Info", self.info_count, "info"));
+        if self.suppressed_count > 0 {
+            out.push_str(&stat_tile(
+                "Suppressed",
+                self.suppressed_count,
+                "suppressed",
+            ));
+        }
+        if self.filtered_count > 0 {
+            out.push_str(&stat_tile("Filtered", self.filtered_count, "filtered"));
+        }
+        if self.severity_overridden_count > 0 {
+            out.push_str(&stat_tile(
+                "Severity overridden",
+                self.severity_overridden_count,
+                "overridden",
+            ));
+        }
+        out.push_str("</ul>\n");
+
+        out.push_str(&format!(
+            "<p class=\"meta\">Recommended SemVer bump: <code>{}</code></p>\n",
+            self.recommended_bump()
+        ));
+        if let Some(source) = &self.baseline_source {
+            out.push_str(&format!(
+                "<p class=\"meta\">Baseline source: <code>{}</code></p>\n",
+                escape_html(source)
+            ));
+        }
+        if let Some(hash) = &self.verified_code_hash {
+            out.push_str(&format!(
+                "<p class=\"meta\">Verified code hash: <code>{}</code></p>\n",
+                escape_html(hash)
+            ));
+        }
+        if let Some(bd) = &self.baseline_diff {
+            out.push_str(&format!(
+                "<p class=\"meta\">Baseline: {} new, {} persisting, {} resolved (vs. tool v{}){}</p>\n",
+                bd.new_count,
+                bd.persisting_count,
+                bd.resolved.len(),
+                escape_html(&bd.baseline_tool_version),
+                if bd.fail_on_new_only {
+                    " — verdict reflects new findings only"
+                } else {
+                    ""
+                },
+            ));
+        }
+        if self.filtered_count > 0 {
+            out.push_str(
+                "<p class=\"note\">Findings were hidden by --include-category/--exclude-category. \
+                 The verdict reflects the remaining visible findings only.</p>\n",
+            );
+        }
+
+        if self.total_findings == 0 {
+            out.push_str(
+                "<p class=\"empty\">No relevant changes detected. The exported interface is \
+                 identical in its exports and types.</p>\n",
+            );
+            out.push_str(&format!(
+                "<p class=\"note\">{}</p>\n",
+                escape_html(STORAGE_NOT_VERIFIED_NOTE)
+            ));
+            self.append_metrics_html(&mut out);
+            out.push_str("</section>\n");
+            return out;
+        }
+
+        // ── Findings, grouped by category with counts ──────────────────────
+        let mut categories: Vec<&String> = self.findings_by_category.keys().collect();
+        categories.sort_by(|a, b| {
+            let rank = |name: &str| if name == "Environment" { 0 } else { 1 };
+            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+        });
+
+        for category in categories {
+            let mut group = self.findings_by_category.get(category).unwrap().clone();
+            group.sort_by(|a, b| a.finding.message.cmp(&b.finding.message));
+
+            // Groups that are entirely informational start collapsed so the
+            // critical findings are not buried under them.
+            let all_info = group
+                .iter()
+                .all(|r| r.finding.severity == Severity::Info || r.suppressed);
+            let open = if all_info { "" } else { " open" };
+
+            out.push_str(&format!("<details class=\"category\"{open}>\n"));
+            out.push_str(&format!(
+                "<summary>{} <span class=\"count\">{}</span></summary>\n",
+                escape_html(category),
+                group.len()
+            ));
+            out.push_str("<ul class=\"findings\">\n");
+
+            for reported in &group {
+                let finding = &reported.finding;
+                let sev = finding.severity.label();
+                let mut classes = format!("finding sev-{sev}");
+                if reported.suppressed {
+                    classes.push_str(" suppressed");
+                }
+                out.push_str(&format!("<li class=\"{classes}\">"));
+                out.push_str(&format!(
+                    "<span class=\"badge badge-{sev}\">{sev}</span> "
+                ));
+                if reported.suppressed {
+                    out.push_str("<span class=\"badge badge-suppressed\">suppressed</span> ");
+                }
+                if matches!(
+                    reported.baseline_status,
+                    Some(crate::baseline::BaselineStatus::New)
+                ) {
+                    out.push_str("<span class=\"badge badge-new\">new</span> ");
+                }
+                if let Some(original) = &reported.original_severity {
+                    out.push_str(&format!(
+                        "<span class=\"badge badge-overridden\">severity {} → {}</span> ",
+                        original.label(),
+                        sev
+                    ));
+                }
+                // Every message is WASM-derived: type and field names come
+                // straight out of an untrusted binary, so nothing reaches the
+                // page unescaped.
+                out.push_str(&format!(
+                    "<span class=\"message\">{}</span>",
+                    escape_html(&finding.message)
+                ));
+                if let Some(target) = &finding.target {
+                    out.push_str(&format!(
+                        " <code class=\"target\">{}</code>",
+                        escape_html(target)
+                    ));
+                }
+                if let Some(reason) = &reported.suppression_reason {
+                    out.push_str(&format!(
+                        "<div class=\"sub\">reason: {}</div>",
+                        escape_html(reason)
+                    ));
+                }
+                if let Some(remediation) = &reported.remediation {
+                    out.push_str(&format!(
+                        "<div class=\"sub guidance\">guidance: {}</div>",
+                        escape_html(remediation)
+                    ));
+                }
+                out.push_str("</li>\n");
+            }
+
+            out.push_str("</ul>\n</details>\n");
+        }
+
+        if let Some(bd) = &self.baseline_diff {
+            if !bd.resolved.is_empty() {
+                out.push_str("<details class=\"category\">\n<summary>✅ Resolved Since Baseline \
+                              <span class=\"count\">");
+                out.push_str(&bd.resolved.len().to_string());
+                out.push_str("</span></summary>\n<ul class=\"findings\">\n");
+                for r in &bd.resolved {
+                    out.push_str(&format!(
+                        "<li class=\"finding resolved\">{}</li>\n",
+                        escape_html(&r.message)
+                    ));
+                }
+                out.push_str("</ul>\n</details>\n");
+            }
+        }
+
+        if !self.is_safe {
+            out.push_str("<p class=\"banner fail\">⚠️ ACTION REQUIRED: the new contract version \
+                          modifies existing storage layouts or function interfaces. Deploying \
+                          this upgrade will result in orphaned data, serialization panics, or \
+                          broken integrations.</p>\n");
+        }
+
+        // ── Suppression audit log ──────────────────────────────────────────
+        let mut suppressed_list = Vec::new();
+        for group in self.findings_by_category.values() {
+            for reported in group {
+                if reported.suppressed {
+                    suppressed_list.push(reported);
+                }
+            }
+        }
+        suppressed_list.sort_by(|a, b| {
+            a.finding
+                .category
+                .cmp(&b.finding.category)
+                .then_with(|| a.finding.message.cmp(&b.finding.message))
+        });
+
+        if !suppressed_list.is_empty() {
+            out.push_str("<details class=\"category\" open>\n<summary>🔕 Applied Suppressions \
+                          Audit Log <span class=\"count\">");
+            out.push_str(&suppressed_list.len().to_string());
+            out.push_str("</span></summary>\n");
+            out.push_str("<div class=\"table-scroll\"><table>\n<thead><tr>\
+                          <th>Category</th><th>Target</th><th>Fingerprint</th>\
+                          <th>Author</th><th>Expiry</th><th>Reason</th>\
+                          </tr></thead>\n<tbody>\n");
+            for reported in suppressed_list {
+                let f = &reported.finding;
+                out.push_str(&format!(
+                    "<tr><td>{}</td><td><code>{}</code></td><td><code>{}</code></td>\
+                     <td>{}</td><td>{}</td><td>{}</td></tr>\n",
+                    escape_html(&f.category),
+                    escape_html(f.target.as_deref().unwrap_or("-")),
+                    escape_html(reported.suppression_fingerprint.as_deref().unwrap_or("-")),
+                    escape_html(reported.suppression_author.as_deref().unwrap_or("-")),
+                    escape_html(reported.suppression_expiry.as_deref().unwrap_or("-")),
+                    escape_html(reported.suppression_reason.as_deref().unwrap_or("-")),
+                ));
+            }
+            out.push_str("</tbody>\n</table></div>\n</details>\n");
+        }
+
+        self.append_metrics_html(&mut out);
+        out.push_str("</section>\n");
+        out
+    }
+
+    /// Append the informational build-metrics table to HTML output.
+    fn append_metrics_html(&self, out: &mut String) {
+        let Some(ref m) = self.metrics else { return };
+        let fmt_count = |d: i64| if d >= 0 { format!("+{d}") } else { d.to_string() };
+        out.push_str("<details class=\"category\">\n<summary>📊 Build Metrics</summary>\n");
+        out.push_str("<div class=\"table-scroll\"><table>\n<thead><tr><th>Metric</th><th>Old</th>\
+                      <th>New</th><th>Delta</th></tr></thead>\n<tbody>\n");
+        out.push_str(&format!(
+            "<tr><td>WASM size</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+            BuildMetrics::format_bytes(m.old_size_bytes),
+            BuildMetrics::format_bytes(m.new_size_bytes),
+            BuildMetrics::format_delta(m.size_delta_bytes),
+        ));
+        for (label, old, new) in [
+            ("Functions", m.old_function_count, m.new_function_count),
+            ("Structs", m.old_struct_count, m.new_struct_count),
+            ("Enums", m.old_enum_count, m.new_enum_count),
+            ("Unions", m.old_union_count, m.new_union_count),
+            (
+                "Error Enums",
+                m.old_error_enum_count,
+                m.new_error_enum_count,
+            ),
+        ] {
+            out.push_str(&format!(
+                "<tr><td>{label}</td><td>{old}</td><td>{new}</td><td>{}</td></tr>\n",
+                fmt_count(new as i64 - old as i64)
+            ));
+        }
+        out.push_str("</tbody>\n</table></div>\n</details>\n");
+    }
+
     /// Apply a category filter to the report, removing findings from
     /// excluded / non-included categories. The original `total_findings`
     /// count is preserved; the difference is reported via `filtered_count`.
@@ -1342,6 +1986,9 @@ impl SafetyReport {
         let mut info = 0usize;
         let mut failing_critical = 0usize;
         let mut failing_warning = 0usize;
+        let mut engine_failing_critical = 0usize;
+        let mut engine_failing_warning = 0usize;
+        let mut overridden = 0usize;
 
         for (category, findings) in &self.findings_by_category {
             if filter.should_include(category) {
@@ -1351,10 +1998,22 @@ impl SafetyReport {
                         Severity::Warning => warning += 1,
                         Severity::Info => info += 1,
                     }
+                    if rf.original_severity.is_some() {
+                        overridden += 1;
+                    }
                     if !rf.suppressed {
                         match rf.finding.severity {
                             Severity::Critical => failing_critical += 1,
                             Severity::Warning => failing_warning += 1,
+                            _ => {}
+                        }
+                        // What the engine would have counted, so the
+                        // "verdict changed by override" claim stays accurate
+                        // for the filtered subset rather than describing a set
+                        // of findings this report no longer shows.
+                        match rf.original_severity.as_ref().unwrap_or(&rf.finding.severity) {
+                            Severity::Critical => engine_failing_critical += 1,
+                            Severity::Warning => engine_failing_warning += 1,
                             _ => {}
                         }
                     }
@@ -1369,14 +2028,223 @@ impl SafetyReport {
         self.critical_count = critical;
         self.warning_count = warning;
         self.info_count = info;
+        self.severity_overridden_count = overridden;
         self.findings_by_category = new_categories;
-        self.is_safe = if self.strict {
-            failing_critical == 0 && failing_warning == 0
-        } else {
-            failing_critical == 0
+        let verdict = |c: usize, w: usize| {
+            if self.strict {
+                c == 0 && w == 0
+            } else {
+                c == 0
+            }
         };
+        self.is_safe = verdict(failing_critical, failing_warning);
+        self.verdict_changed_by_override =
+            self.is_safe != verdict(engine_failing_critical, engine_failing_warning);
         self.category_filter = filter.clone();
     }
+}
+
+/// Escape text for safe interpolation into HTML element content or a quoted
+/// attribute value.
+///
+/// Finding messages embed type, field, parameter, and function names read
+/// straight out of a WASM binary the tool does not trust. Emitting those
+/// unescaped would make the report an injection vector into whoever opens it,
+/// so every WASM-derived string passes through here — including ones that look
+/// harmless, since the guarantee has to hold without case-by-case reasoning.
+pub fn escape_html(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Escape a string for use as XML text or as an attribute value.
+///
+/// Same five entities as [`escape_html`], plus one thing XML needs that HTML
+/// does not: control characters outside the XML 1.0 legal set are dropped
+/// rather than emitted. Finding messages carry type, field, and function names
+/// read straight out of an untrusted WASM binary, and a stray control byte in
+/// one of those would make the whole document unparseable — which in a CI
+/// test-report UI shows up as a missing report, not as an error.
+pub fn escape_xml(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            '\t' | '\n' | '\r' => out.push(ch),
+            c if (c as u32) < 0x20 => {}
+            c if (0x7f..=0x9f).contains(&(c as u32)) => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Wrap one or more rendered `<testsuite>` elements in a complete JUnit XML
+/// document. Suites carry their own counts, so the root element only names the
+/// run — every common CI ingester reads the per-suite attributes.
+pub fn junit_document(name: &str, suites: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites name=\"{}\">\n{}</testsuites>\n",
+        escape_xml(name),
+        suites,
+    )
+}
+
+/// One `<li>` tile in the counts row.
+fn stat_tile(label: &str, value: usize, class: &str) -> String {
+    format!(
+        "<li class=\"stat stat-{class}\"><span class=\"stat-value\">{value}</span>\
+         <span class=\"stat-label\">{}</span></li>\n",
+        escape_html(label)
+    )
+}
+
+/// Wrap rendered report sections in a complete, standalone HTML document.
+///
+/// The result is deliberately self-contained: CSS and the severity-filter
+/// script are inline and there are no image, font, or script URLs of any kind.
+/// These reports are served from artifact storage, which is often opened
+/// offline or behind a strict content policy, so anything fetched over the
+/// network would silently degrade the page for exactly the readers it targets.
+pub fn html_document(title: &str, body: &str) -> String {
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+:root {{
+  --bg: #ffffff; --fg: #1b1f24; --muted: #57606a; --line: #d8dee4; --panel: #f6f8fa;
+  --critical: #cf222e; --warning: #9a6700; --info: #0969da; --pass: #1a7f37;
+  --overridden: #8250df;
+}}
+@media (prefers-color-scheme: dark) {{
+  :root {{
+    --bg: #0d1117; --fg: #e6edf3; --muted: #9198a1; --line: #30363d; --panel: #161b22;
+    --critical: #ff7b72; --warning: #d29922; --info: #79c0ff; --pass: #3fb950;
+    --overridden: #d2a8ff;
+  }}
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0; padding: 2rem 1rem; background: var(--bg); color: var(--fg);
+  font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+}}
+main {{ max-width: 60rem; margin: 0 auto; }}
+h1, h2 {{ line-height: 1.25; }}
+h1 {{ font-size: 1.6rem; }}
+h2 {{ font-size: 1.25rem; margin-top: 2rem; }}
+code {{
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.875em; background: var(--panel); padding: 0.1em 0.35em;
+  border-radius: 4px; overflow-wrap: anywhere;
+}}
+.banner {{
+  padding: 0.7rem 0.9rem; border-radius: 6px; border: 1px solid var(--line);
+  font-weight: 600; background: var(--panel);
+}}
+.banner.pass {{ color: var(--pass); border-color: var(--pass); }}
+.banner.fail {{ color: var(--critical); border-color: var(--critical); }}
+.banner.warn, .banner.strict {{ color: var(--warning); border-color: var(--warning); }}
+.banner.override-verdict {{ color: var(--overridden); border-color: var(--overridden); }}
+.scope {{ color: var(--muted); font-size: 0.9rem; margin: 0.4rem 0; }}
+.scope.gap {{ color: var(--warning); }}
+.note, .meta {{ color: var(--muted); font-size: 0.9rem; }}
+.empty {{ color: var(--pass); font-weight: 600; }}
+.stats {{ display: flex; flex-wrap: wrap; gap: 0.6rem; list-style: none; padding: 0; }}
+.stat {{
+  flex: 1 1 7rem; padding: 0.6rem 0.8rem; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--panel);
+}}
+.stat-value {{ display: block; font-size: 1.5rem; font-weight: 700; }}
+.stat-label {{ display: block; font-size: 0.78rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }}
+.stat-critical .stat-value {{ color: var(--critical); }}
+.stat-warning .stat-value {{ color: var(--warning); }}
+.stat-info .stat-value {{ color: var(--info); }}
+.stat-overridden .stat-value {{ color: var(--overridden); }}
+.controls {{
+  position: sticky; top: 0; z-index: 1; display: flex; flex-wrap: wrap; gap: 1rem;
+  padding: 0.7rem 0.9rem; margin-bottom: 1.5rem; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 6px; font-size: 0.9rem;
+}}
+.controls label {{ cursor: pointer; user-select: none; }}
+details.category {{
+  border: 1px solid var(--line); border-radius: 6px; margin: 0.6rem 0; background: var(--panel);
+}}
+details.category > summary {{
+  cursor: pointer; padding: 0.6rem 0.9rem; font-weight: 600; list-style-position: inside;
+}}
+.count {{
+  display: inline-block; min-width: 1.5rem; padding: 0 0.4rem; margin-left: 0.4rem;
+  border-radius: 999px; background: var(--bg); border: 1px solid var(--line);
+  font-size: 0.8rem; text-align: center; color: var(--muted);
+}}
+ul.findings {{ list-style: none; margin: 0; padding: 0 0.9rem 0.8rem; }}
+li.finding {{
+  padding: 0.5rem 0; border-top: 1px solid var(--line); overflow-wrap: anywhere;
+}}
+li.finding.suppressed {{ opacity: 0.65; }}
+.badge {{
+  display: inline-block; padding: 0.05em 0.5em; border-radius: 999px;
+  font-size: 0.72rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.03em; border: 1px solid currentColor; vertical-align: middle;
+}}
+.badge-critical {{ color: var(--critical); }}
+.badge-warning {{ color: var(--warning); }}
+.badge-info {{ color: var(--info); }}
+.badge-suppressed, .badge-new {{ color: var(--muted); }}
+.badge-overridden {{ color: var(--overridden); }}
+.sub {{ color: var(--muted); font-size: 0.86rem; margin-top: 0.25rem; }}
+.sub.guidance {{ color: var(--pass); }}
+.table-scroll {{ overflow-x: auto; padding: 0 0.9rem 0.9rem; }}
+table {{ border-collapse: collapse; width: 100%; font-size: 0.88rem; }}
+th, td {{ border: 1px solid var(--line); padding: 0.4rem 0.6rem; text-align: left; }}
+th {{ background: var(--bg); }}
+section.report {{ margin-bottom: 2.5rem; }}
+body.hide-critical li.sev-critical,
+body.hide-warning li.sev-warning,
+body.hide-info li.sev-info {{ display: none; }}
+</style>
+</head>
+<body>
+<main>
+<div class="controls" role="group" aria-label="Filter findings by severity">
+  <span>Show:</span>
+  <label><input type="checkbox" class="sev-toggle" data-sev="critical" checked> Critical</label>
+  <label><input type="checkbox" class="sev-toggle" data-sev="warning" checked> Warning</label>
+  <label><input type="checkbox" class="sev-toggle" data-sev="info" checked> Info</label>
+</div>
+{body}
+</main>
+<script>
+document.addEventListener('change', function (event) {{
+  var box = event.target;
+  if (!box.classList || !box.classList.contains('sev-toggle')) return;
+  document.body.classList.toggle('hide-' + box.dataset.sev, !box.checked);
+}});
+</script>
+</body>
+</html>
+"##,
+        title = escape_html(title),
+        body = body,
+    )
 }
 
 /// All known finding categories used by the analysis engine.
@@ -1630,6 +2498,8 @@ mod tests {
             info_count: 0,
             suppressed_count: 0,
             filtered_count: 0,
+            severity_overridden_count: 0,
+            verdict_changed_by_override: false,
             suppressed_critical_count: 0,
             total_findings: 0,
             is_safe: true,

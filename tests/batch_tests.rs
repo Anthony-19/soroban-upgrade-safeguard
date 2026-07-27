@@ -1072,3 +1072,269 @@ fn manifest_with_three_colliding_derived_names_disambiguates_all() {
     // total_pairs must equal the number of results
     assert_eq!(json["total_pairs"].as_u64().unwrap(), 3);
 }
+
+// ---------------------------------------------------------------------------
+// Glob input mode
+// ---------------------------------------------------------------------------
+//
+// A Cargo workspace drops its build outputs at paths like
+// `target/wasm32-unknown-unknown/release/*.wasm`. Pointing the tool at that
+// pattern directly avoids the two avoidable steps the other batch modes force:
+// gathering the files into a flat directory, or hand-writing a manifest.
+//
+// Old and new matches are paired by **file stem** — the same key a directory
+// scan derives a pair's display name from — so a contract keeps one identity
+// no matter which batch mode selected it.
+
+/// Build an old/new fixture tree under `CARGO_TARGET_TMPDIR/<name>` and return
+/// the two release directories. Each entry of `specs` is
+/// `(stem, old_fixture, new_fixture)`; a fixture of `None` means that side is
+/// deliberately absent.
+fn build_glob_tree(
+    name: &str,
+    specs: &[(&str, Option<&str>, Option<&str>)],
+) -> (PathBuf, PathBuf) {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&root);
+
+    // Mirror a real Cargo layout so the pattern under test is the realistic one.
+    let old_dir = root.join("old/target/wasm32-unknown-unknown/release");
+    let new_dir = root.join("new/target/wasm32-unknown-unknown/release");
+    std::fs::create_dir_all(&old_dir).expect("create old dir");
+    std::fs::create_dir_all(&new_dir).expect("create new dir");
+
+    for (stem, old_fixture, new_fixture) in specs {
+        if let Some(fixture) = old_fixture {
+            std::fs::copy(wasm(fixture), old_dir.join(format!("{stem}.wasm"))).expect("copy old");
+        }
+        if let Some(fixture) = new_fixture {
+            std::fs::copy(wasm(fixture), new_dir.join(format!("{stem}.wasm"))).expect("copy new");
+        }
+    }
+
+    (old_dir, new_dir)
+}
+
+#[test]
+fn glob_mode_pairs_by_file_stem() {
+    let (old_dir, new_dir) = build_glob_tree(
+        "glob_basic",
+        &[
+            ("token", Some("v1.wasm"), Some("v1.wasm")),
+            ("pool", Some("v1.wasm"), Some("v2.wasm")),
+        ],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args([
+            "--old-glob",
+            &format!("{}/*.wasm", old_dir.display()),
+            "--new-glob",
+            &format!("{}/*.wasm", new_dir.display()),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+    let results = json["results"].as_object().expect("results must be an object");
+
+    assert_eq!(results.len(), 2, "both stems must be paired");
+    assert_eq!(
+        results["token"]["is_safe"],
+        Value::Bool(true),
+        "token is v1 → v1"
+    );
+    assert_eq!(
+        results["pool"]["is_safe"],
+        Value::Bool(false),
+        "pool is v1 → v2"
+    );
+
+    // The pair name is the file stem, matching what a directory scan derives.
+    assert!(results.contains_key("token") && results.contains_key("pool"));
+    assert_eq!(output.status.code().unwrap(), 1, "a breaking pair exits 1");
+}
+
+#[test]
+fn glob_mode_reports_files_matched_on_only_one_side() {
+    let (old_dir, new_dir) = build_glob_tree(
+        "glob_unmatched",
+        &[
+            ("shared", Some("v1.wasm"), Some("v1.wasm")),
+            ("only_old", Some("v1.wasm"), None),
+            ("only_new", None, Some("v1.wasm")),
+        ],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args([
+            "--old-glob",
+            &format!("{}/*.wasm", old_dir.display()),
+            "--new-glob",
+            &format!("{}/*.wasm", new_dir.display()),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+
+    // Only the stem present on both sides is compared…
+    let results = json["results"].as_object().expect("results must be an object");
+    assert_eq!(results.len(), 1);
+    assert!(results.contains_key("shared"));
+
+    // …and neither unmatched file is silently dropped. The wording is the same
+    // one directory scanning already uses.
+    assert!(
+        stderr.contains("Match not found for") && stderr.contains("only_old"),
+        "an old-only file must be reported, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("No old counterpart found for") && stderr.contains("only_new"),
+        "a new-only file must be reported, got: {stderr}"
+    );
+}
+
+#[test]
+fn glob_mode_supports_recursive_double_star() {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("glob_recursive");
+    let _ = std::fs::remove_dir_all(&root);
+    let old_nested = root.join("old/a/b/release");
+    let new_nested = root.join("new/x/y/release");
+    std::fs::create_dir_all(&old_nested).expect("create old");
+    std::fs::create_dir_all(&new_nested).expect("create new");
+    std::fs::copy(wasm("v1.wasm"), old_nested.join("deep.wasm")).expect("copy old");
+    std::fs::copy(wasm("v1.wasm"), new_nested.join("deep.wasm")).expect("copy new");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args([
+            "--old-glob",
+            &format!("{}/old/**/*.wasm", root.display()),
+            "--new-glob",
+            &format!("{}/new/**/*.wasm", root.display()),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+    let results = json["results"].as_object().expect("results must be an object");
+
+    assert_eq!(results.len(), 1, "`**` must descend into nested directories");
+    assert!(results.contains_key("deep"));
+    assert_eq!(output.status.code().unwrap(), 0);
+}
+
+#[test]
+fn glob_mode_ignores_non_wasm_matches() {
+    let (old_dir, new_dir) = build_glob_tree(
+        "glob_non_wasm",
+        &[("token", Some("v1.wasm"), Some("v1.wasm"))],
+    );
+    // A broad pattern would otherwise sweep in build metadata and rlibs.
+    std::fs::write(old_dir.join("token.d"), b"deps").expect("write old artifact");
+    std::fs::write(new_dir.join("token.d"), b"deps").expect("write new artifact");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args([
+            "--old-glob",
+            &format!("{}/*", old_dir.display()),
+            "--new-glob",
+            &format!("{}/*", new_dir.display()),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let json: Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+    let results = json["results"].as_object().expect("results must be an object");
+
+    assert_eq!(results.len(), 1, "only .wasm files participate");
+    assert!(results.contains_key("token"));
+}
+
+#[test]
+fn glob_mode_with_no_matches_fails_with_a_clear_error() {
+    let (old_dir, new_dir) = build_glob_tree(
+        "glob_no_match",
+        &[("token", Some("v1.wasm"), Some("v1.wasm"))],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args([
+            "--old-glob",
+            &format!("{}/nothing-*.wasm", old_dir.display()),
+            "--new-glob",
+            &format!("{}/*.wasm", new_dir.display()),
+        ])
+        .output()
+        .expect("failed to run binary");
+
+    assert_ne!(output.status.code().unwrap(), 0);
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    assert!(
+        stderr.contains("matched no .wasm files"),
+        "an empty match must say so, got: {stderr}"
+    );
+}
+
+#[test]
+fn glob_mode_conflicts_with_the_other_batch_modes() {
+    let (old_dir, new_dir) = build_glob_tree(
+        "glob_conflicts",
+        &[("token", Some("v1.wasm"), Some("v1.wasm"))],
+    );
+    let manifest = write_manifest(
+        "glob_conflict_manifest.toml",
+        &format!(
+            "[[pairs]]\nold = \"{}\"\nnew = \"{}\"\n",
+            wasm("v1.wasm").display(),
+            wasm("v1.wasm").display()
+        ),
+    );
+
+    // --manifest + globs
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args([
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--old-glob",
+            &format!("{}/*.wasm", old_dir.display()),
+            "--new-glob",
+            &format!("{}/*.wasm", new_dir.display()),
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert_ne!(output.status.code().unwrap(), 0);
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    assert!(stderr.contains("Cannot specify both"), "got: {stderr}");
+
+    // --old-dir/--new-dir + globs
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args([
+            "--old-dir",
+            old_dir.to_str().unwrap(),
+            "--new-dir",
+            new_dir.to_str().unwrap(),
+            "--old-glob",
+            &format!("{}/*.wasm", old_dir.display()),
+            "--new-glob",
+            &format!("{}/*.wasm", new_dir.display()),
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert_ne!(output.status.code().unwrap(), 0);
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    assert!(stderr.contains("Cannot specify both"), "got: {stderr}");
+}
