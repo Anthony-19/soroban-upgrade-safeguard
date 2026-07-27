@@ -17,6 +17,7 @@ use soroban_upgrade_safeguard::{
     report::{validate_categories, CategoryFilter},
     storage_schema::StorageSchema,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
+    wasm_cache::WasmCache,
     CompareOptions,
 };
 
@@ -149,6 +150,13 @@ struct Args {
     #[arg(long, value_name = "N")]
     max_walk_depth: Option<usize>,
 
+    /// Maximum raw WASM binary size in bytes. Overrides `[limits]` and the
+    /// default (25 MiB). The file size is checked via `fs::metadata` before
+    /// any bytes are read into memory; RPC-fetched bytes are checked after
+    /// receipt. Inputs exceeding this limit exit with code 2.
+    #[arg(long, value_name = "BYTES")]
+    max_wasm_size: Option<usize>,
+
     /// Treat identical duplicate spec entries (same name, byte-identical
     /// definition) as informational rather than warnings.
     ///
@@ -168,6 +176,19 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     output: Option<PathBuf>,
 
+    /// Disable the local WASM cache for this run.
+    ///
+    /// By default, WASM fetched from RPC is cached on disk keyed by its
+    /// code hash so repeat fetches are served locally. Pass this flag (or set
+    /// `SAFEGUARD_NO_CACHE=1`) to skip both cache reads and writes and always
+    /// perform a fresh network fetch.
+    ///
+    /// To clear the cache entirely, delete the platform cache directory:
+    ///   Linux/macOS: ~/.cache/soroban-upgrade-safeguard/wasm/
+    ///   Windows:     %LOCALAPPDATA%\soroban-upgrade-safeguard\wasm\
+    #[arg(long)]
+    no_cache: bool,
+
     /// Compare this run against a previously saved `--format json` report.
     /// Findings are classified as new, persisting, or resolved relative to
     /// it (shown in all output formats). By default this only labels
@@ -181,6 +202,17 @@ struct Args {
     /// run on its own). Has no effect without `--baseline`.
     #[arg(long, requires = "baseline")]
     baseline_fail_on_new: bool,
+
+    /// Render a highlighted two-line type diff after each type-change finding.
+    ///
+    /// For every finding whose category is a type change (e.g. "Struct Field
+    /// Type Changed"), the old and new signatures are printed aligned with the
+    /// differing portion highlighted in red/green.  The view respects
+    /// `--no-color`: when color is disabled the changed span is wrapped in
+    /// square brackets instead.  Has no effect on `--format json` or
+    /// `--format markdown`.
+    #[arg(long)]
+    diff_types: bool,
 }
 
 /// Resolve the effective [`ResourcePolicy`]: built-in defaults, overlaid by the
@@ -208,6 +240,20 @@ fn resolve_policy(args: &Args, config_path: Option<&Path>) -> Result<ResourcePol
     }
     if let Some(v) = args.max_walk_depth {
         policy.max_walk_depth = v;
+    }
+    if let Some(v) = args.max_wasm_size {
+        policy.max_wasm_size = v;
+    }
+
+    // Environment variable overrides sit between the config file and CLI flags
+    // in precedence (CLI wins over env, env wins over file).
+    if let Ok(v) = std::env::var("SAFEGUARD_MAX_WASM_SIZE") {
+        if let Ok(n) = v.parse::<usize>() {
+            // Only apply if the CLI flag was not already set.
+            if args.max_wasm_size.is_none() {
+                policy.max_wasm_size = n;
+            }
+        }
     }
 
     Ok(policy)
@@ -411,6 +457,28 @@ fn run() -> Result<()> {
         //     other.
         let pair_names: Vec<String> = resolve_pair_names(&pairs)?;
 
+        // Open the WASM cache once for the whole batch.  A batch is exactly
+        // where refetching the same deployed contract repeatedly is most
+        // expensive, so caching pays off most here.  The cache is shared
+        // across rayon threads via a reference; `WasmCache` is `Send + Sync`
+        // because it performs only independent, hash-keyed file operations.
+        let no_cache_batch = args.no_cache
+            || std::env::var("SAFEGUARD_NO_CACHE")
+                .ok()
+                .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true"))
+                .unwrap_or(false);
+        let batch_cache: Option<WasmCache> = if no_cache_batch {
+            None
+        } else {
+            match WasmCache::open() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("⚠️  Could not open WASM cache, proceeding without it: {e:#}");
+                    None
+                }
+            }
+        };
+
         let mut results = std::collections::BTreeMap::new();
         let mut failed: std::collections::BTreeMap<String, PairFailure> =
             std::collections::BTreeMap::new();
@@ -455,8 +523,18 @@ fn run() -> Result<()> {
                 // runs to completion.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                     || -> Result<report::SafetyReport> {
-                        let old_wasm = loader::load_wasm(&pair.old)?;
-                        let new_wasm = loader::load_wasm(&pair.new)?;
+                        let old_wasm = resolve_contract_source(
+                            &pair.old,
+                            &policy,
+                            batch_cache.as_ref(),
+                            args.allow_http_local,
+                        )?;
+                        let new_wasm = resolve_contract_source(
+                            &pair.new,
+                            &policy,
+                            batch_cache.as_ref(),
+                            args.allow_http_local,
+                        )?;
                         compare_contracts(
                             &ContractComparison {
                                 old_bytes: &old_wasm.bytes,
@@ -967,7 +1045,32 @@ fn run() -> Result<()> {
     // same resource policy as file input.
     let old = if let Some(contract_id) = old_source {
         let rpc_url = args.rpc_url.as_ref().unwrap();
-        let module = loader::fetch_wasm_from_rpc_with_policy(contract_id, rpc_url, &policy)?;
+
+        // Respect --no-cache / SAFEGUARD_NO_CACHE=1.
+        let no_cache = args.no_cache
+            || std::env::var("SAFEGUARD_NO_CACHE")
+                .ok()
+                .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true"))
+                .unwrap_or(false);
+
+        let cache = if no_cache {
+            None
+        } else {
+            match WasmCache::open() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("⚠️  Could not open WASM cache, proceeding without it: {e:#}");
+                    None
+                }
+            }
+        };
+
+        let module = loader::fetch_wasm_from_rpc_with_policy_and_cache(
+            contract_id,
+            rpc_url,
+            &policy,
+            cache.as_ref(),
+        )?;
 
         // If the caller pinned an expected hash, verify it now against the hash
         // that was verified on-chain during the RPC fetch.
@@ -993,11 +1096,11 @@ fn run() -> Result<()> {
 
         module
     } else {
-        loader::load_wasm(&args.wasm_paths[0])?
+        loader::load_wasm_with_policy(&args.wasm_paths[0], &policy)?
     };
 
     // New WASM
-    let new = loader::load_wasm(new_wasm_path)?;
+    let new = loader::load_wasm_with_policy(new_wasm_path, &policy)?;
 
     if !suppressions.rules.is_empty() {
         progress(format!(
@@ -1030,6 +1133,16 @@ fn run() -> Result<()> {
     )?;
     safety_report.baseline_source = baseline_source.map(|s| s.to_string());
     safety_report.verified_code_hash = verified_hash_hex;
+    safety_report.diff_types = args.diff_types;
+    // use_color is false when color has been globally disabled (which
+    // colored::control::set_override(false) handles for the colored crate
+    // itself), but we need the same decision here to drive our own
+    // render_type_diff call.  Re-derive it from the same inputs main() used.
+    safety_report.use_color = !soroban_upgrade_safeguard::color::should_disable_color(
+        args.no_color,
+        std::env::var_os("NO_COLOR").is_some(),
+        std::io::stdout().is_terminal(),
+    );
 
     if !all_categories.is_empty() {
         safety_report.apply_category_filter(&category_filter);
@@ -1096,10 +1209,119 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+/// One side of a manifest contract pair — either a local file or an on-chain
+/// contract fetched via RPC.
+///
+/// # Manifest syntax
+///
+/// **Local file** — a plain string (backward-compatible with existing manifests):
+///
+/// ```toml
+/// [[pairs]]
+/// old = "path/to/old.wasm"
+/// new = "path/to/new.wasm"
+/// ```
+///
+/// **On-chain contract** — an inline table with `contract_id` and `rpc_url`:
+///
+/// ```toml
+/// [[pairs]]
+/// old = { contract_id = "CCONTRACT...", rpc_url = "https://soroban-testnet.stellar.org" }
+/// new = "path/to/new.wasm"
+/// ```
+///
+/// Either or both sides may be on-chain. WASM fetched via RPC is cached by
+/// code hash (see `--no-cache`) so a repeated contract in a large batch only
+/// hits the network once.
+#[derive(Clone, Debug)]
+enum ContractSource {
+    /// A WASM binary on the local filesystem.
+    File(PathBuf),
+    /// A deployed Soroban contract, fetched from Stellar RPC.
+    OnChain {
+        contract_id: String,
+        rpc_url: String,
+    },
+}
+
+impl<'de> serde::Deserialize<'de> for ContractSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+        use std::fmt;
+
+        struct ContractSourceVisitor;
+
+        impl<'de> Visitor<'de> for ContractSourceVisitor {
+            type Value = ContractSource;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(
+                    f,
+                    "a file path string or an on-chain table \
+                     {{ contract_id = \"C...\", rpc_url = \"https://...\" }}"
+                )
+            }
+
+            // Plain string → local file path (backward-compatible).
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<ContractSource, E> {
+                Ok(ContractSource::File(PathBuf::from(v)))
+            }
+
+            fn visit_string<E: de::Error>(self, v: String) -> Result<ContractSource, E> {
+                Ok(ContractSource::File(PathBuf::from(v)))
+            }
+
+            // Inline table → on-chain contract.
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<ContractSource, M::Error> {
+                let mut contract_id: Option<String> = None;
+                let mut rpc_url: Option<String> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "contract_id" => {
+                            if contract_id.is_some() {
+                                return Err(de::Error::duplicate_field("contract_id"));
+                            }
+                            contract_id = Some(map.next_value()?);
+                        }
+                        "rpc_url" => {
+                            if rpc_url.is_some() {
+                                return Err(de::Error::duplicate_field("rpc_url"));
+                            }
+                            rpc_url = Some(map.next_value()?);
+                        }
+                        other => {
+                            return Err(de::Error::unknown_field(
+                                other,
+                                &["contract_id", "rpc_url"],
+                            ))
+                        }
+                    }
+                }
+
+                let contract_id = contract_id
+                    .ok_or_else(|| de::Error::missing_field("contract_id"))?;
+                let rpc_url =
+                    rpc_url.ok_or_else(|| de::Error::missing_field("rpc_url"))?;
+
+                Ok(ContractSource::OnChain {
+                    contract_id,
+                    rpc_url,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(ContractSourceVisitor)
+    }
+}
+
 #[derive(serde::Deserialize, Clone, Debug)]
 struct ContractPair {
-    old: PathBuf,
-    new: PathBuf,
+    old: ContractSource,
+    new: ContractSource,
     name: Option<String>,
 }
 
@@ -1212,6 +1434,35 @@ fn compare_contracts(
     Ok(safety_report)
 }
 
+/// Load a [`loader::WasmModule`] from either a local file or an on-chain
+/// contract, applying `policy`, optional `cache`, and URL-security settings.
+///
+/// This is the single entry-point for source resolution used by both the
+/// single-pair path and the batch loop, so on-chain and file sources behave
+/// consistently regardless of the calling context.
+fn resolve_contract_source(
+    source: &ContractSource,
+    policy: &ResourcePolicy,
+    cache: Option<&WasmCache>,
+    allow_http_local: bool,
+) -> Result<loader::WasmModule> {
+    match source {
+        ContractSource::File(path) => loader::load_wasm_with_policy(path, policy),
+        ContractSource::OnChain {
+            contract_id,
+            rpc_url,
+        } => {
+            loader::validate_rpc_url(rpc_url, allow_http_local)?;
+            loader::fetch_wasm_from_rpc_with_policy_and_cache(
+                contract_id,
+                rpc_url,
+                policy,
+                cache,
+            )
+        }
+    }
+}
+
 /// Assign a stable, unique display name to every pair in the batch.
 ///
 /// Two rules govern the assignment:
@@ -1252,11 +1503,14 @@ fn resolve_pair_names(pairs: &[ContractPair]) -> Result<Vec<String>> {
 
     for (i, pair) in pairs.iter().enumerate() {
         let candidate = pair.name.clone().unwrap_or_else(|| {
-            pair.new
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(String::from)
-                .unwrap_or_else(|| format!("pair_{}", i + 1))
+            match &pair.new {
+                ContractSource::File(path) => path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("pair_{}", i + 1)),
+                ContractSource::OnChain { contract_id, .. } => contract_id.clone(),
+            }
         });
 
         let count = counts.entry(candidate.clone()).or_insert(0);
@@ -1396,8 +1650,8 @@ fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>>
                 .and_then(|s| s.to_str())
                 .map(String::from);
             pairs.push(ContractPair {
-                old: old_abs_path.clone(),
-                new: new_abs_path.clone(),
+                old: ContractSource::File(old_abs_path.clone()),
+                new: ContractSource::File(new_abs_path.clone()),
                 name,
             });
         } else {

@@ -48,6 +48,7 @@ max_xdr_depth = 128
 max_xdr_len = 1048576
 max_entries = 1000
 max_walk_depth = 128
+max_wasm_size = 26214400  # 25 MiB — reject inputs larger than this before reading
 
 # Define one or more reviewed suppression rules
 [[suppress]]
@@ -80,12 +81,14 @@ Each CLI flag and configuration parameter has a corresponding environment variab
 | (Positional) | `wasm_paths` | `SAFEGUARD_WASM_PATHS` | Comma-separated paths |
 | `--contract-id`| `contract_id`| `SAFEGUARD_CONTRACT_ID` | String |
 | `--rpc-url` | `rpc_url` | `SAFEGUARD_RPC_URL` | String (URL) |
+| `--no-cache` | — | `SAFEGUARD_NO_CACHE` | Boolean (`true`/`1` or `false`/`0`) |
 | (TOML-only) | `max_suppressions`| `SAFEGUARD_MAX_SUPPRESSIONS` | Unsigned Integer |
 | (TOML-only) | `allow_targetless`| `SAFEGUARD_ALLOW_TARGETLESS` | Boolean (`true`/`1` or `false`/`0`) |
 | `--max-xdr-depth`| `limits.max_xdr_depth`| `SAFEGUARD_MAX_XDR_DEPTH`| Unsigned 32-bit Integer |
 | `--max-xdr-len`| `limits.max_xdr_len`| `SAFEGUARD_MAX_XDR_LEN` | Unsigned Pointer Integer (usize)|
 | `--max-entries`| `limits.max_entries`| `SAFEGUARD_MAX_ENTRIES` | Unsigned Pointer Integer (usize)|
 | `--max-walk-depth`| `limits.max_walk_depth`| `SAFEGUARD_MAX_WALK_DEPTH`| Unsigned Pointer Integer (usize)|
+| `--max-wasm-size`| `limits.max_wasm_size`| `SAFEGUARD_MAX_WASM_SIZE`| Unsigned Pointer Integer (usize, bytes)|
 
 ---
 
@@ -115,7 +118,8 @@ Every report execution generates a `VerdictSettings` metadata block captured wit
     "max_xdr_depth": 128,
     "max_xdr_len": 1048576,
     "max_entries": 1000,
-    "max_walk_depth": 128
+    "max_walk_depth": 128,
+    "max_wasm_size": 26214400
   }
 }
 ```
@@ -144,6 +148,14 @@ Safeguard provides the following command line options. You can view them by runn
   The target contract ID deployed on the Stellar network (RPC mode only).
 * **`--rpc-url <URL>`**
   The Stellar RPC server URL used to query and fetch the on-chain contract code (RPC mode only).
+* **`--allow-http-local`**
+  Allow plain `http://` RPC URLs when the host is `localhost` or `127.0.0.1`. Without this flag only `https://` URLs are accepted. Applies to both single-pair RPC mode and on-chain pairs declared in a manifest.
+* **`--no-cache`** / `SAFEGUARD_NO_CACHE=1`
+  Skip both reading from and writing to the local WASM cache for this run. By default, WASM fetched from RPC is cached on disk keyed by its code hash so repeat fetches of the same deployed code are served locally. Use this flag (or the environment variable) to force a fresh network fetch.
+
+  To clear the cache entirely without disabling it, delete the platform cache directory:
+  - **Linux / macOS**: `~/.cache/soroban-upgrade-safeguard/wasm/`
+  - **Windows**: `%LOCALAPPDATA%\soroban-upgrade-safeguard\wasm\`
 * **`--manifest <PATH>`**
   Path to a batch manifest configuration TOML file containing multiple contract pairs to compare (Manifest mode).
 * **`--old-dir <PATH>`**
@@ -158,6 +170,8 @@ Safeguard provides the following command line options. You can view them by runn
   Sets the maximum allowed decoded spec entries across all sections.
 * **`--max-walk-depth <N>`**
   Sets the maximum recursion depth for structural type walk evaluations.
+* **`--max-wasm-size <BYTES>`**
+  Sets the maximum raw WASM binary size in bytes (default: 26,214,400 — 25 MiB). For disk files the size is checked via `fs::metadata` before any bytes are read into memory; for RPC-fetched bytes it is checked after receipt. An input exceeding this limit exits with code 2 (resource-limit violation). Settable via `SAFEGUARD_MAX_WASM_SIZE` or `limits.max_wasm_size` in `.safeguard.toml`.
 
 ---
 
@@ -178,6 +192,71 @@ Safeguard resolves its operation mode dynamically based on the set of provided a
 * **Trigger**: `--manifest <PATH>` is specified.
 * **Behavior**: Safeguard reads the manifest file (which lists pairs of contracts) and runs comparisons on all of them in batch.
 * **Restrictions**: No positional arguments are allowed.
+
+#### Manifest pair sources
+
+Each side of a pair can be a **local file path** (string) or an **on-chain contract** (inline table with `contract_id` and `rpc_url`). The two forms can be mixed freely within the same manifest and across pairs.
+
+**File-only pair** — backward-compatible, unchanged from previous versions:
+
+```toml
+[[pairs]]
+old = "wasm/old/my_contract.wasm"
+new = "wasm/new/my_contract.wasm"
+name = "my_contract"
+```
+
+**Old side from RPC, new side from local file** — the primary upgrade-check workflow:
+
+```toml
+[[pairs]]
+old = { contract_id = "CCONTRACT_ID_HERE", rpc_url = "https://soroban-testnet.stellar.org" }
+new  = "target/wasm32-unknown-unknown/release/my_contract.wasm"
+name = "my_contract"
+```
+
+**Both sides from RPC** — compare two deployed versions directly:
+
+```toml
+[[pairs]]
+old = { contract_id = "COLD_CONTRACT_ID", rpc_url = "https://soroban-mainnet.stellar.org" }
+new  = { contract_id = "CNEW_CONTRACT_ID", rpc_url = "https://soroban-mainnet.stellar.org" }
+name = "my_contract"
+```
+
+**Mixed batch** — file and on-chain pairs in a single run:
+
+```toml
+[[pairs]]
+old = "wasm/old/token.wasm"
+new  = "wasm/new/token.wasm"
+name = "token"
+
+[[pairs]]
+old = { contract_id = "CPOOL_CONTRACT_ID", rpc_url = "https://soroban-testnet.stellar.org" }
+new  = "wasm/new/pool.wasm"
+name = "pool"
+```
+
+**JSON manifest** — same syntax, just written as JSON objects:
+
+```json
+{
+  "pairs": [
+    {
+      "old": { "contract_id": "CCONTRACT_ID_HERE", "rpc_url": "https://soroban-testnet.stellar.org" },
+      "new": "target/wasm32-unknown-unknown/release/my_contract.wasm",
+      "name": "my_contract"
+    }
+  ]
+}
+```
+
+> **Derived names for on-chain pairs.** When a pair has no explicit `name`, the name is derived from the `new` side: the WASM file stem for a local file, or the full `contract_id` string for an on-chain source. Provide an explicit `name` to keep reports readable when contract IDs are long.
+
+> **Caching.** WASM fetched from RPC is cached on disk keyed by code hash (see `--no-cache`). A batch is exactly where the cache matters most: if the same deployed contract appears in several pairs, it is fetched only once for the whole run.
+
+> **URL security.** Each on-chain pair's `rpc_url` is validated independently. `https://` is always accepted. Plain `http://` is only permitted for `localhost` / `127.0.0.1` when `--allow-http-local` is passed.
 
 ### 4. Directory Scan Mode
 * **Trigger**: Both `--old-dir <PATH>` and `--new-dir <PATH>` are specified.
@@ -244,6 +323,11 @@ Safeguard protects your CI runner systems and memory footprints from malicious, 
 * **Purpose**: Restricts recursive structural comparison, formatting, and rendering algorithms.
 * **Symptom**: Validation fails under complex nested structs check.
 * **Remediation**: Raise this limit only if Safeguard explicitly recommends doing so during validation.
+
+#### 5. `max_wasm_size` (CLI: `--max-wasm-size`, Default: `26,214,400` bytes / 25 MiB)
+* **Purpose**: Caps the raw WASM binary size **before** the file is read into memory (disk) or accepted from an RPC response. A legitimate compiled Soroban contract is well under 1 MiB; the 25 MiB default is a wide safety margin that rejects multi-gigabyte adversarial inputs without allocating memory for them. Violations surface as exit code 2 (resource-limit violation), distinct from exit code 1 (breaking changes found).
+* **Symptom**: Error message `WASM input size N bytes exceeds the maximum of M bytes (raise max_wasm_size)`.
+* **Remediation**: If you have a genuinely large contract that exceeds the default, raise the limit via `--max-wasm-size`, `SAFEGUARD_MAX_WASM_SIZE`, or `limits.max_wasm_size` in `.safeguard.toml`. For adversarial inputs the correct response is to reject them rather than raise the limit.
 
 ---
 

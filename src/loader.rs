@@ -10,6 +10,7 @@ use stellar_xdr::curr::{
 use wasmparser::Parser;
 
 use crate::limits::{LimitError, ResourcePolicy};
+use crate::wasm_cache::WasmCache;
 
 /// Holds raw WASM bytes alongside the validated file path.
 #[derive(Debug)]
@@ -50,9 +51,37 @@ impl std::error::Error for IntegrityError {}
 
 /// Reads a WASM file from disk, validates it is a valid WASM binary,
 /// and returns a `WasmModule` ready for further analysis.
+///
+/// Uses [`ResourcePolicy::default`] for the WASM size ceiling. Prefer
+/// [`load_wasm_with_policy`] when a caller-supplied policy is available so the
+/// configured `max_wasm_size` is respected.
 pub fn load_wasm(path: &Path) -> Result<WasmModule> {
+    load_wasm_with_policy(path, &ResourcePolicy::default())
+}
+
+/// Like [`load_wasm`], but enforces the size ceiling from `policy`.
+///
+/// The file size is checked against `policy.max_wasm_size` via
+/// `fs::metadata` **before** the file is opened for reading, so an
+/// oversized input is rejected without allocating memory for it. The
+/// error is a [`LimitError::WasmSizeExceeded`] so the CLI can assign it
+/// exit code 2 (resource-limit violation) rather than 1 (broken upgrade).
+pub fn load_wasm_with_policy(path: &Path, policy: &ResourcePolicy) -> Result<WasmModule> {
     if path.is_dir() {
         bail!("'{}' is a directory, not a WASM file", path.display());
+    }
+
+    // Check size via metadata before allocating.
+    let file_size = std::fs::metadata(path)
+        .with_context(|| format!("Failed to read file metadata: {}", path.display()))?
+        .len() as usize;
+
+    if file_size > policy.max_wasm_size {
+        return Err(LimitError::WasmSizeExceeded {
+            limit: policy.max_wasm_size,
+            actual: file_size,
+        }
+        .into());
     }
 
     let bytes =
@@ -92,6 +121,10 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
 /// Fetches a deployed Soroban contract's WASM bytes from Stellar RPC by contract
 /// ID, bounding XDR (de)serialization by `policy`.
 ///
+/// This is a convenience wrapper around [`fetch_wasm_from_rpc_with_policy_and_cache`]
+/// that does not use the local cache. Prefer the cache-aware variant in the CLI
+/// so repeat fetches of the same code hash are served locally.
+///
 /// RPC responses are attacker-influenced (the contract ID is arbitrary), so the
 /// `LedgerEntry` payloads are decoded under `policy.xdr_limits()`: an oversized or
 /// deeply nested entry fails with a [`LimitError`] instead of exhausting memory or
@@ -101,6 +134,42 @@ pub fn fetch_wasm_from_rpc_with_policy(
     contract_id: &str,
     rpc_url: &str,
     policy: &ResourcePolicy,
+) -> Result<WasmModule> {
+    fetch_wasm_from_rpc_with_policy_and_cache(contract_id, rpc_url, policy, None)
+}
+
+/// Fetches a deployed Soroban contract's WASM bytes from Stellar RPC by contract
+/// ID, with an optional local disk cache.
+///
+/// # Cache behaviour
+///
+/// When `cache` is `Some`:
+///
+/// 1. The contract instance is fetched from RPC to resolve the **code hash**
+///    (one network round-trip).
+/// 2. The cache is checked for that hash. On a hit, the bytes are returned
+///    immediately — the second round-trip (fetching the code entry) is skipped.
+/// 3. On a miss, the code entry is fetched, integrity-verified, and then
+///    written to the cache before returning.
+///
+/// When `cache` is `None` the function behaves exactly like
+/// [`fetch_wasm_from_rpc_with_policy`]: two round-trips, no caching.
+///
+/// The cache is keyed by **code hash**, not contract ID, so an upgraded
+/// contract (same ID, new code) always results in a cache miss and a fresh
+/// fetch.
+///
+/// # Errors
+///
+/// Returns a [`LimitError`] when the input exceeds a configured limit, or an
+/// [`IntegrityError`] if the fetched WASM hash does not match what the contract
+/// instance declared. Cache write failures are non-fatal: a warning is printed
+/// to stderr and the successfully-fetched WASM is returned regardless.
+pub fn fetch_wasm_from_rpc_with_policy_and_cache(
+    contract_id: &str,
+    rpc_url: &str,
+    policy: &ResourcePolicy,
+    cache: Option<&WasmCache>,
 ) -> Result<WasmModule> {
     // 1. Parse contract_id using stellar_strkey
     let strkey = stellar_strkey::Strkey::from_string(contract_id)
@@ -122,7 +191,7 @@ pub fn fetch_wasm_from_rpc_with_policy(
         .to_xdr_base64(policy.xdr_limits())
         .map_err(|e| anyhow::anyhow!("Failed to serialize LedgerKey to base64: {}", e))?;
 
-    // 4. Query getLedgerEntries RPC
+    // 4. Query getLedgerEntries RPC — first round-trip: resolve the code hash.
     let response = query_rpc(
         rpc_url,
         "getLedgerEntries",
@@ -169,6 +238,19 @@ pub fn fetch_wasm_from_rpc_with_policy(
             );
         }
     };
+
+    // ── Cache check ────────────────────────────────────────────────────────
+    // The code hash is now known. Check the local cache before performing the
+    // second network round-trip to fetch the code entry.
+    if let Some(c) = cache {
+        if let Some(cached_bytes) = c.get(&wasm_hash.0) {
+            return Ok(WasmModule {
+                path: format!("stellar://{}", contract_id),
+                bytes: cached_bytes,
+                verified_hash: Some(wasm_hash.0),
+            });
+        }
+    }
 
     let code_ledger_key = LedgerKey::ContractCode(LedgerKeyContractCode {
         hash: wasm_hash.clone(),
@@ -220,6 +302,18 @@ pub fn fetch_wasm_from_rpc_with_policy(
 
     let wasm_bytes = contract_code.code.to_vec();
 
+    // ── Size check (RPC path) ──────────────────────────────────────────────
+    // Apply the same ceiling that `load_wasm_with_policy` enforces for disk
+    // files. The check runs before the hash comparison so an oversized payload
+    // is rejected without doing any cryptographic work on it.
+    if wasm_bytes.len() > policy.max_wasm_size {
+        return Err(LimitError::WasmSizeExceeded {
+            limit: policy.max_wasm_size,
+            actual: wasm_bytes.len(),
+        }
+        .into());
+    }
+
     let computed_hash = Sha256::digest(&wasm_bytes);
     if computed_hash[..] != wasm_hash.0[..] {
         return Err(IntegrityError {
@@ -247,6 +341,15 @@ pub fn fetch_wasm_from_rpc_with_policy(
             contract_id
         )
     })?;
+
+    // ── Cache store ────────────────────────────────────────────────────────
+    // Only reached after both the on-chain hash comparison and structural
+    // validation have passed, so only verified WASM is ever persisted.
+    if let Some(c) = cache {
+        if let Err(e) = c.put(&wasm_hash.0, &wasm_bytes) {
+            eprintln!("⚠️  Failed to write WASM to cache: {e:#}");
+        }
+    }
 
     Ok(WasmModule {
         path: format!("stellar://{}", contract_id),
@@ -532,6 +635,45 @@ mod tests {
         let err = load_wasm(&path).unwrap_err();
         let msg = format!("{:#}", err);
         assert!(msg.contains(&path.display().to_string()), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_load_wasm_rejects_oversized_file() {
+        use crate::limits::{LimitError, ResourcePolicy};
+
+        // Write a tiny but valid-looking WASM file (magic + version).
+        let path = std::env::temp_dir()
+            .join("soroban-upgrade-safeguard-oversized.wasm");
+        let wasm_magic = b"\x00asm\x01\x00\x00\x00";
+        std::fs::write(&path, wasm_magic).unwrap();
+
+        // Set a limit smaller than the file so the check fires.
+        let policy = ResourcePolicy {
+            max_wasm_size: 4, // file is 8 bytes — smaller than magic + version
+            ..ResourcePolicy::default()
+        };
+
+        let err = load_wasm_with_policy(&path, &policy).unwrap_err();
+
+        // Must surface as a LimitError, not a generic anyhow error, so the
+        // CLI can assign it exit code 2.
+        let limit_err = crate::limits::find_limit_error(&err)
+            .expect("expected a LimitError in the chain");
+        match limit_err {
+            LimitError::WasmSizeExceeded { limit, actual } => {
+                assert_eq!(*limit, 4);
+                assert_eq!(*actual, 8);
+            }
+            other => panic!("expected WasmSizeExceeded, got {other:?}"),
+        }
+
+        // The error message must name both the limit and the actual size.
+        let msg = err.to_string();
+        assert!(msg.contains('4') || msg.contains("4"), "limit missing: {msg}");
+        assert!(msg.contains('8') || msg.contains("8"), "actual missing: {msg}");
+        assert!(msg.contains("max_wasm_size"), "hint missing: {msg}");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -50,12 +50,17 @@ indicatif = "0.17"
 hex = "0.4"
 sha2 = "0.10"
 ureq = { version = "2.9", features = ["json"] }
+# Platform-appropriate user cache directory (e.g. ~/.cache on Linux,
+# ~/Library/Caches on macOS, %LOCALAPPDATA% on Windows).
+dirs = "5.0"
 # Bounded data-parallelism for comparing batch pairs concurrently (see
 # compare_contracts' caller in main.rs). Defaults to one worker per available
 # CPU; override with the RAYON_NUM_THREADS environment variable.
 rayon = "1"
 
 [dev-dependencies]
+# Temporary directory / file helpers used by wasm_cache tests.
+tempfile = "3"
 # Property-based/fuzz testing for the decode + type-walk paths (see
 # tests/fuzz_walk.rs). Dev-only: it does not affect the shipped binary.
 proptest = "1"

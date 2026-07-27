@@ -57,6 +57,8 @@ pub mod rules;
 pub mod spec;
 pub mod storage_schema;
 pub mod suppression;
+pub mod type_diff;
+pub mod wasm_cache;
 
 use std::path::Path;
 
