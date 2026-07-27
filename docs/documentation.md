@@ -254,6 +254,58 @@ soroban-upgrade-safeguard --manifest /absolute/path/to/ci/contracts.toml
 
 and the same WASM files are loaded every time. Directory-scan paths (`--old-dir`, `--new-dir`) and paths passed directly on the CLI are still resolved against the working directory, as expected.
 
+### Spec JSON input mode
+
+Instead of a WASM binary, either side of a comparison can be supplied as a **contract spec JSON file** using `--old-spec` or `--new-spec`:
+
+```bash
+# Check a candidate WASM against a published spec (old side is spec JSON)
+soroban-upgrade-safeguard --old-spec published-spec.json candidate.wasm
+
+# Spec vs spec (both sides are spec JSON files)
+soroban-upgrade-safeguard --old-spec v1-spec.json --new-spec v2-spec.json
+
+# Spec as the new side only
+soroban-upgrade-safeguard deployed.wasm --new-spec candidate-spec.json
+```
+
+#### Spec JSON file format
+
+The file must be a JSON object with a single `entries` array. Each element is a **base64-encoded `SCSpecEntry` XDR value** — the same encoding used in Stellar RPC responses:
+
+```json
+{
+  "entries": [
+    "AAAAAQAAAA...",
+    "AAAAAQAAAB..."
+  ]
+}
+```
+
+To produce this file from a WASM binary with the Stellar CLI:
+
+```bash
+stellar contract inspect --wasm contract.wasm --output xdr-base64-array \
+  | python3 -c "import sys, json; print(json.dumps({'entries': json.load(sys.stdin)}))" \
+  > contract-spec.json
+```
+
+#### Skipped comparisons in spec-only mode
+
+A spec JSON file contains only the `contractspecv0` interface entries. Comparisons that require data from the full WASM binary are skipped when one or both sides is a spec file, and the report records exactly what was skipped:
+
+| Comparison | WASM vs WASM | Spec vs WASM / WASM vs Spec | Spec vs Spec |
+| :--- | :---: | :---: | :---: |
+| Exported interface (functions, types) | ✅ | ✅ | ✅ |
+| Environment metadata (`contractenvmetav0`) | ✅ | ⚠️ skipped | ⚠️ skipped |
+| Build metadata (`contractmetav0`) | ✅ | ⚠️ skipped | ⚠️ skipped |
+| Export section (binary vs spec agreement) | ✅ | ⚠️ skipped | ⚠️ skipped |
+| Import section (host-function diff) | ✅ | ⚠️ skipped | ⚠️ skipped |
+
+Skipped comparisons are reported as "not available" in the analysis scope rather than silently ignored, so the verdict is never read as broader than what actually ran. The exported interface comparison — the primary safety gate — always runs regardless of input mode.
+
+`--old-spec` cannot be combined with `--contract-id` (RPC already fetches the full WASM).
+
 ## How the Analysis Works
 
 The analysis runs as a short pipeline. Each stage lives in its own module under `src/`.

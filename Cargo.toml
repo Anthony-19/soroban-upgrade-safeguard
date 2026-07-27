@@ -50,6 +50,7 @@ indicatif = "0.17"
 hex = "0.4"
 sha2 = "0.10"
 ureq = { version = "2.9", features = ["json"] }
+base64 = "0.22"
 # Platform-appropriate user cache directory (e.g. ~/.cache on Linux,
 # ~/Library/Caches on macOS, %LOCALAPPDATA% on Windows).
 dirs = "5.0"

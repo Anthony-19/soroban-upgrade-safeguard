@@ -55,6 +55,7 @@ pub mod rename;
 pub mod report;
 pub mod rules;
 pub mod spec;
+pub mod spec_input;
 pub mod storage_schema;
 pub mod suppression;
 pub mod type_diff;
@@ -211,13 +212,34 @@ pub fn compare_wasm_bytes_with_options(
     let default_policy = ResourcePolicy::default();
     let policy = options.policy.unwrap_or(&default_policy);
 
-    let empty_suppressions = SuppressionConfig::default();
-    let suppressions = options.suppressions.unwrap_or(&empty_suppressions);
-
     let old_meta = parser::extract_metadata_with_policy(old_wasm, policy)
         .context("Failed to extract metadata from the old WASM")?;
     let new_meta = parser::extract_metadata_with_policy(new_wasm, policy)
         .context("Failed to extract metadata from the new WASM")?;
+
+    run_pipeline_with_metadata(old_meta, new_meta, Some((old_wasm.len(), new_wasm.len())), options)
+}
+
+/// The single canonical analysis pipeline over pre-parsed [`parser::SorobanMetadata`].
+///
+/// Both the WASM-bytes path and the spec-JSON path converge here. The function
+/// gates each comparison (env metadata, exports, imports) on whether both sides
+/// have the required data, and records what was and was not compared in the
+/// returned report's [`report::AnalysisScope`].
+///
+/// `wasm_sizes` carries `(old_bytes, new_bytes)` for build-metrics reporting;
+/// pass `None` when the input is not a full WASM binary (spec-JSON mode).
+pub fn run_pipeline_with_metadata(
+    old_meta: parser::SorobanMetadata,
+    new_meta: parser::SorobanMetadata,
+    wasm_sizes: Option<(usize, usize)>,
+    options: &CompareOptions<'_>,
+) -> Result<SafetyReport> {
+    let default_policy = ResourcePolicy::default();
+    let policy = options.policy.unwrap_or(&default_policy);
+
+    let empty_suppressions = SuppressionConfig::default();
+    let suppressions = options.suppressions.unwrap_or(&empty_suppressions);
 
     // Build specs with duplicate detection. Conflicting duplicates are wired
     // into the diff report as Critical findings so they affect the exit code
@@ -247,37 +269,53 @@ pub fn compare_wasm_bytes_with_options(
         options.compat_duplicates,
     );
 
-    diff::compare_env_metadata(
-        old_meta.env_meta.as_ref(),
-        new_meta.env_meta.as_ref(),
-        &mut diff_report,
-    );
+    // Environment metadata is only available from a full WASM binary.  A
+    // spec-only input leaves `env_meta` as `None`.  Only run the comparison
+    // when at least one side has data — `compare_env_metadata` already handles
+    // the (None, None) case by producing no findings, but we record the scope
+    // honestly so the user knows what was skipped.
+    let env_metadata_available =
+        old_meta.env_meta.is_some() || new_meta.env_meta.is_some();
+    if env_metadata_available {
+        diff::compare_env_metadata(
+            old_meta.env_meta.as_ref(),
+            new_meta.env_meta.as_ref(),
+            &mut diff_report,
+        );
+    }
 
     diff::compare_contract_metadata(
         old_meta.meta.as_ref(),
         new_meta.meta.as_ref(),
         &mut diff_report,
     );
-    // Compare exported function names from the binary export sections.
-    // This catches a removed export that callers depend on, and also any
-    // mismatch between what the binary actually exports and what its spec claims.
-    diff::compare_exports(
-        &old_meta.exported_function_names,
-        &new_meta.exported_function_names,
-        &old_spec.functions.keys().cloned().collect(),
-        &new_spec.functions.keys().cloned().collect(),
-        &mut diff_report,
-    );
 
-    diff::compare_wasm_imports(&old_meta.imports, &new_meta.imports, &mut diff_report);
+    // Export and import comparisons require the WASM binary export/import
+    // sections.  Spec-only inputs have empty sets for both.  Only run when at
+    // least one side has export data, to avoid generating spurious "all
+    // functions unexported" findings when both sides are spec-only.
+    let exports_available = !old_meta.exported_function_names.is_empty()
+        || !new_meta.exported_function_names.is_empty();
+    if exports_available {
+        diff::compare_exports(
+            &old_meta.exported_function_names,
+            &new_meta.exported_function_names,
+            &old_spec.functions.keys().cloned().collect(),
+            &new_spec.functions.keys().cloned().collect(),
+            &mut diff_report,
+        );
+    }
 
-    // The pipeline always compares the exported interface and environment
-    // metadata; storage layout is analyzed only when a schema is supplied for
-    // both builds. The scope records which of those actually held so the verdict
-    // is never read as broader than the analysis behind it.
+    let imports_available = !old_meta.imports.is_empty() || !new_meta.imports.is_empty();
+    if imports_available {
+        diff::compare_wasm_imports(&old_meta.imports, &new_meta.imports, &mut diff_report);
+    }
+
     let mut scope = report::AnalysisScope {
         exported_interface: true,
-        env_metadata: true,
+        env_metadata: env_metadata_available,
+        wasm_exports_compared: exports_available,
+        wasm_imports_compared: imports_available,
         storage_schema: report::StorageScopeState::NotAnalyzed,
         old_spec_section_count: old_meta.spec_section_count,
         new_spec_section_count: new_meta.spec_section_count,
@@ -332,11 +370,11 @@ pub fn compare_wasm_bytes_with_options(
     safety_report.new_spec_summary = Some(new_spec_summary);
     safety_report.scope = scope;
 
-    // Populate build metrics so all output formats can report size and
-    // interface-count deltas without the caller needing to extract them.
+    // Build metrics: use actual WASM byte lengths when available, zero otherwise.
+    let (old_bytes, new_bytes) = wasm_sizes.unwrap_or((0, 0));
     safety_report.metrics = Some(report::BuildMetrics::new(
-        old_wasm.len(),
-        new_wasm.len(),
+        old_bytes,
+        new_bytes,
         old_spec.functions.len(),
         new_spec.functions.len(),
         old_spec.structs.len(),
@@ -350,6 +388,26 @@ pub fn compare_wasm_bytes_with_options(
     ));
 
     Ok(safety_report)
+}
+
+/// Compare two Soroban contract specs supplied as pre-parsed
+/// [`parser::SorobanMetadata`].
+///
+/// This is the entry point for mixed-mode comparisons (spec-JSON vs WASM, or
+/// spec-JSON vs spec-JSON). The metadata structs are produced by either
+/// [`parser::extract_metadata_with_policy`] (from a WASM binary) or
+/// [`spec_input::load_spec_json`] (from a spec JSON file).
+///
+/// Comparisons that require data only present in a full WASM binary (env
+/// metadata, export section, import section) are skipped when the relevant
+/// fields are absent, and the returned report's
+/// [`report::AnalysisScope`] records exactly what was and was not compared.
+pub fn compare_spec_inputs_with_options(
+    old_meta: parser::SorobanMetadata,
+    new_meta: parser::SorobanMetadata,
+    options: &CompareOptions<'_>,
+) -> Result<SafetyReport> {
+    run_pipeline_with_metadata(old_meta, new_meta, None, options)
 }
 
 /// Compare two Soroban contract builds read from WASM files on disk.

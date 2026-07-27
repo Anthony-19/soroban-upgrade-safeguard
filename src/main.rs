@@ -13,8 +13,9 @@ use soroban_upgrade_safeguard::{
         DependencyGraph,
     },
     limits::{find_limit_error, LimitsConfig, ResourcePolicy},
-    loader, report,
+    loader, parser, report,
     report::{validate_categories, CategoryFilter},
+    spec_input,
     storage_schema::StorageSchema,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
     wasm_cache::WasmCache,
@@ -195,6 +196,25 @@ struct Args {
     ///   Windows:     %LOCALAPPDATA%\soroban-upgrade-safeguard\wasm\
     #[arg(long)]
     no_cache: bool,
+
+    /// Treat the old side as a spec JSON file instead of a WASM binary.
+    ///
+    /// The file must contain `{ "entries": ["<base64-xdr>", ...] }` where
+    /// each element is a base64-encoded `SCSpecEntry` XDR value. Comparisons
+    /// that require a full WASM binary (env metadata, exports, imports) are
+    /// skipped and recorded in the report scope. Cannot be combined with
+    /// `--contract-id`.
+    #[arg(long, value_name = "PATH", conflicts_with = "contract_id")]
+    old_spec: Option<PathBuf>,
+
+    /// Treat the new side as a spec JSON file instead of a WASM binary.
+    ///
+    /// The file must contain `{ "entries": ["<base64-xdr>", ...] }` where
+    /// each element is a base64-encoded `SCSpecEntry` XDR value. Comparisons
+    /// that require a full WASM binary (env metadata, exports, imports) are
+    /// skipped and recorded in the report scope.
+    #[arg(long, value_name = "PATH")]
+    new_spec: Option<PathBuf>,
 
     /// Compare this run against a previously saved `--format json` report.
     /// Findings are classified as new, persisting, or resolved relative to
@@ -1138,21 +1158,69 @@ fn run() -> Result<()> {
         Some("Local File")
     };
     let verified_hash_hex = old.verified_hash.as_ref().map(hex::encode);
-    let mut safety_report = compare_contracts(
-        &ContractComparison {
-            old_bytes: &old.bytes,
-            old_path: &old.path,
-            new_bytes: &new.bytes,
-            new_path: &new.path,
-            suppressions: &suppressions,
-            policy: &policy,
-            storage_schemas: storage_schemas
-                .as_ref()
-                .map(|(old_schema, new_schema)| (old_schema, new_schema)),
-        },
-        &args,
-        &progress,
-    )?;
+
+    // Route to the right pipeline variant depending on whether either side is
+    // a spec-only JSON file.  Both paths produce a SafetyReport; the spec path
+    // uses run_pipeline_with_metadata directly so it can set wasm_sizes
+    // correctly and skip WASM-only comparisons.
+    let mut safety_report = if args.old_spec.is_some() || args.new_spec.is_some() {
+        // Build SorobanMetadata for the old side.
+        let old_meta = if let Some(ref spec_path) = args.old_spec {
+            progress(format!("   📄 Old side: spec JSON '{}'", spec_path.display()));
+            spec_input::load_spec_json(spec_path, &policy)?
+        } else {
+            parser::extract_metadata_with_policy(&old.bytes, &policy)
+                .context("Failed to extract metadata from the old WASM")?
+        };
+
+        // Build SorobanMetadata for the new side.
+        let new_meta = if let Some(ref spec_path) = args.new_spec {
+            progress(format!("   📄 New side: spec JSON '{}'", spec_path.display()));
+            spec_input::load_spec_json(spec_path, &policy)?
+        } else {
+            parser::extract_metadata_with_policy(&new.bytes, &policy)
+                .context("Failed to extract metadata from the new WASM")?
+        };
+
+        let wasm_sizes = match (args.old_spec.is_some(), args.new_spec.is_some()) {
+            (false, false) => Some((old.bytes.len(), new.bytes.len())),
+            (false, true) => Some((old.bytes.len(), 0)),
+            (true, false) => Some((0, new.bytes.len())),
+            (true, true) => None,
+        };
+
+        soroban_upgrade_safeguard::run_pipeline_with_metadata(
+            old_meta,
+            new_meta,
+            wasm_sizes,
+            &CompareOptions {
+                policy: Some(&policy),
+                suppressions: Some(&suppressions),
+                explain: args.explain,
+                strict: args.strict,
+                compat_duplicates: args.compat_duplicates,
+                storage_schemas: storage_schemas
+                    .as_ref()
+                    .map(|(old_schema, new_schema)| (old_schema, new_schema)),
+            },
+        )?
+    } else {
+        compare_contracts(
+            &ContractComparison {
+                old_bytes: &old.bytes,
+                old_path: &old.path,
+                new_bytes: &new.bytes,
+                new_path: &new.path,
+                suppressions: &suppressions,
+                policy: &policy,
+                storage_schemas: storage_schemas
+                    .as_ref()
+                    .map(|(old_schema, new_schema)| (old_schema, new_schema)),
+            },
+            &args,
+            &progress,
+        )?
+    };
     safety_report.baseline_source = baseline_source.map(|s| s.to_string());
     safety_report.verified_code_hash = verified_hash_hex;
     safety_report.diff_types = args.diff_types;
