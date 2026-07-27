@@ -202,6 +202,58 @@ The first argument should be the build that is currently deployed on chain. The 
 
 Common flags: `--format <text|json|markdown>`, `--explain`, `--strict`, `--config <PATH>`, and the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)).
 
+### Batch Mode
+
+Instead of a single pair, you can compare many contracts in one invocation using a manifest file or a directory scan.
+
+**Manifest mode** — pass a TOML or JSON file listing one or more pairs:
+
+```bash
+soroban-upgrade-safeguard --manifest ci/contracts.toml
+```
+
+Each pair declares its `old` and `new` sides as file paths (or on-chain contract sources). An optional `name` gives the pair a stable display name in the report.
+
+```toml
+[[pairs]]
+old  = "wasm/v1.wasm"
+new  = "wasm/v2.wasm"
+name = "token"
+```
+
+**Directory scan mode** — compare every `.wasm` file that appears under both directories at the same relative path:
+
+```bash
+soroban-upgrade-safeguard --old-dir wasm/old --new-dir wasm/new
+```
+
+#### Manifest path resolution
+
+Relative paths inside a manifest are resolved against the **directory that contains the manifest file**, not the working directory of the process that invoked the tool. Absolute paths are left unchanged.
+
+This means a manifest checked in at `ci/contracts.toml` containing
+
+```toml
+[[pairs]]
+old = "wasm/v1.wasm"
+new = "wasm/v2.wasm"
+```
+
+always refers to `ci/wasm/v1.wasm` and `ci/wasm/v2.wasm`, regardless of which directory you run the command from. You can invoke the tool as:
+
+```bash
+# From the repo root
+soroban-upgrade-safeguard --manifest ci/contracts.toml
+
+# From ci/
+soroban-upgrade-safeguard --manifest contracts.toml
+
+# From anywhere else
+soroban-upgrade-safeguard --manifest /absolute/path/to/ci/contracts.toml
+```
+
+and the same WASM files are loaded every time. Directory-scan paths (`--old-dir`, `--new-dir`) and paths passed directly on the CLI are still resolved against the working directory, as expected.
+
 ## How the Analysis Works
 
 The analysis runs as a short pipeline. Each stage lives in its own module under `src/`.

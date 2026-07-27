@@ -97,7 +97,8 @@ Each CLI flag and configuration parameter has a corresponding environment variab
 To prevent fragile paths when running the CLI from subdirectories or in CI pipelines, Safeguard applies context-specific path resolution:
 
 * **Config File Sources**: Paths defined in `.safeguard.toml` (e.g. `manifest`, `old_dir`, `new_dir`, `wasm_paths`) are resolved **relative to the directory containing the configuration file**.
-* **CLI & Environment Sources**: Paths passed on the command line or via environment variables are resolved **relative to the current working directory of the process**.
+* **Manifest pair paths**: Relative `old` and `new` paths inside a `--manifest` file are resolved **relative to the directory that contains that manifest file**, not the working directory. Absolute paths are left unchanged. This means a manifest checked in at `ci/contracts.toml` works correctly regardless of which directory the tool is invoked from.
+* **CLI & Environment Sources**: Paths passed on the command line or via environment variables are resolved **relative to the current working directory of the process**. This includes `--old-dir`, `--new-dir`, and positional WASM arguments.
 
 ---
 

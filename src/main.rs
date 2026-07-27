@@ -1526,17 +1526,66 @@ fn resolve_pair_names(pairs: &[ContractPair]) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// Resolve a [`ContractSource::File`] path against `base` if it is relative.
+///
+/// Absolute paths and [`ContractSource::OnChain`] sources are returned
+/// unchanged.  This is called after parsing a manifest so that every relative
+/// path in the manifest is interpreted relative to the manifest's own directory
+/// rather than the caller's working directory.
+fn rebase_source(source: ContractSource, base: &Path) -> ContractSource {
+    match source {
+        ContractSource::File(p) if p.is_relative() => ContractSource::File(base.join(p)),
+        other => other,
+    }
+}
+
+/// Rebase every [`ContractPair`] in `pairs` against `base`.
+///
+/// See [`rebase_source`].
+fn rebase_pairs(pairs: Vec<ContractPair>, base: &Path) -> Vec<ContractPair> {
+    pairs
+        .into_iter()
+        .map(|pair| ContractPair {
+            old: rebase_source(pair.old, base),
+            new: rebase_source(pair.new, base),
+            name: pair.name,
+        })
+        .collect()
+}
+
 fn parse_manifest(path: &Path) -> Result<(Vec<ContractPair>, Vec<ContractDependency>)> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read manifest file: {}", path.display()))?;
 
+    // Relative paths inside the manifest are resolved against the directory
+    // that contains the manifest, not the caller's working directory.  An
+    // absolute manifest path whose parent cannot be determined (theoretically
+    // impossible on all supported platforms) falls back to the CWD so the
+    // behaviour degrades gracefully rather than hard-failing.
+    let manifest_dir = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
     // Capture both errors before deciding which to surface.
     let toml_err = match toml::from_str::<Manifest>(&content) {
-        Ok(manifest) => return Ok((manifest.pairs, manifest.dependencies)),
+        Ok(manifest) => {
+            return Ok((
+                rebase_pairs(manifest.pairs, &manifest_dir),
+                manifest.dependencies,
+            ))
+        }
         Err(e) => e,
     };
     let json_err = match serde_json::from_str::<Manifest>(&content) {
-        Ok(manifest) => return Ok((manifest.pairs, manifest.dependencies)),
+        Ok(manifest) => {
+            return Ok((
+                rebase_pairs(manifest.pairs, &manifest_dir),
+                manifest.dependencies,
+            ))
+        }
         Err(e) => e,
     };
 
