@@ -96,7 +96,7 @@ cargo build
 Run the tool against two WASM files without installing it:
 
 ```bash
-cargo run -- ./tests/wasm/old.wasm ./tests/wasm/new.wasm
+cargo run -- ./tests/wasm/v1.wasm ./tests/wasm/v2.wasm
 ```
 
 Build an optimized release binary:
