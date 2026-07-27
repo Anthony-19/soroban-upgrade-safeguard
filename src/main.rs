@@ -30,6 +30,8 @@ enum OutputFormat {
     Json,
     /// Markdown document suitable for PR descriptions and comments.
     Markdown,
+    /// A single self-contained HTML file for publishing as a build artifact.
+    Html,
     /// GitHub Actions workflow commands so findings appear as annotations in
     /// the run summary and pull-request checks.
     GithubActions,
@@ -49,7 +51,10 @@ enum OutputFormat {
     override_usage = "soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM> [OPTIONS]\n       \
                       soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM> [OPTIONS]\n       \
                       soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]\n       \
-                      soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]"
+                      soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]",
+    // Appended below the options, so the four usage lines above stay untouched.
+    after_help = "Subcommands:\n  explain [CATEGORY]  \
+                  Look up what a finding category means; lists all when given no argument."
 )]
 struct Args {
     /// WASM paths: <OLD_WASM> <NEW_WASM> in local mode, or just <NEW_WASM> in RPC mode
@@ -261,7 +266,107 @@ fn emit_report_output(
     Ok(())
 }
 
+/// Usage text for `explain`, kept next to its handler.
+const EXPLAIN_USAGE: &str = "\
+Look up what a finding category means and how to respond to it.
+
+Usage: soroban-upgrade-safeguard explain [CATEGORY]
+
+  explain              List every known category.
+  explain <CATEGORY>   Print the remediation guidance for one category.
+
+CATEGORY accepts either the display name (\"Union Case Reordered\") or the
+stable rule id (\"union_case_reordered\"), in any letter case. These are the
+same names a [[suppress]] rule and the [severity] table match on.";
+
+/// Handle the `explain` subcommand.
+///
+/// This is dispatched from `argv` before clap parses, rather than declared as a
+/// clap subcommand. The root command takes 0..=2 positional WASM paths, and
+/// mixing variadic positionals with subcommands changes how clap resolves the
+/// first argument in all four existing usage modes. Those modes are the tool's
+/// entire interface, so `explain` is routed around that machinery instead of
+/// through it: the parser the four modes rely on is left byte-for-byte
+/// unchanged, and a file genuinely named `explain` is the only cost.
+fn run_explain(rest: &[String]) -> Result<()> {
+    use soroban_upgrade_safeguard::rules::{
+        all_category_labels, all_rules, lookup_rule_lenient, suggest_categories,
+    };
+
+    let name = match rest.first().map(String::as_str) {
+        Some("-h") | Some("--help") => {
+            println!("{EXPLAIN_USAGE}");
+            return Ok(());
+        }
+        // No argument: list every category so the names are discoverable
+        // without a comparison run that happens to produce them.
+        None => {
+            println!("Known finding categories ({}):\n", all_rules().len());
+            let labels = all_category_labels();
+            let width = labels.iter().map(|l| l.len()).max().unwrap_or(0);
+            for label in labels {
+                let rule = lookup_rule_lenient(label).expect("label comes from the registry");
+                println!(
+                    "  {:<width$}  {}  [{}]",
+                    label,
+                    rule.severity.label(),
+                    rule.id,
+                    width = width
+                );
+            }
+            println!(
+                "\nRun `soroban-upgrade-safeguard explain <CATEGORY>` for the guidance on one \
+                 of these."
+            );
+            return Ok(());
+        }
+        Some(name) => name,
+    };
+
+    let Some(rule) = lookup_rule_lenient(name) else {
+        // Matching everywhere else is exact and these names are long, so a
+        // near miss gets corrected rather than merely rejected.
+        let suggestions = suggest_categories(name);
+        if suggestions.is_empty() {
+            anyhow::bail!(
+                "Unknown category '{name}'. Run `soroban-upgrade-safeguard explain` to list \
+                 every known category."
+            );
+        }
+        anyhow::bail!(
+            "Unknown category '{name}'.\n\nDid you mean:\n{}\n\nRun \
+             `soroban-upgrade-safeguard explain` to list every known category.",
+            suggestions
+                .iter()
+                .map(|s| format!("  {s}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    };
+
+    println!("{}", rule.label.bold());
+    println!("  rule id:          {}", rule.id);
+    println!("  default severity: {}", rule.severity.label());
+    println!();
+    println!("{}", rule.guidance);
+    Ok(())
+}
+
 fn run() -> Result<()> {
+    // `explain` is intercepted before clap so the four comparison usage modes
+    // keep parsing exactly as they do today. See `run_explain`.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("explain") {
+        if should_disable_color(
+            false,
+            std::env::var_os("NO_COLOR").is_some(),
+            std::io::stdout().is_terminal(),
+        ) {
+            colored::control::set_override(false);
+        }
+        return run_explain(&argv[2..]);
+    }
+
     let args = Args::parse();
 
     if should_disable_color(
@@ -345,7 +450,8 @@ fn run() -> Result<()> {
     // belongs on stderr rather than alongside it.
     let clean_stdout = args.output.is_some()
         || args.format == OutputFormat::Json
-        || args.format == OutputFormat::Markdown;
+        || args.format == OutputFormat::Markdown
+        || args.format == OutputFormat::Html;
     let progress = |line: String| {
         if clean_stdout {
             eprintln!("{line}");
@@ -877,6 +983,123 @@ fn run() -> Result<()> {
                     println!("========================================\n");
                 }
             }
+            OutputFormat::Html => {
+                use soroban_upgrade_safeguard::report::escape_html;
+
+                // Every pair renders into one document: an artifact reader
+                // should open a single file and see the whole batch, not have
+                // to chase one file per contract.
+                let mut body = String::new();
+                body.push_str("<h1>Soroban Upgrade Safety Report (Batch Mode)</h1>\n");
+
+                let (status_class, status_text) = if overall_safe {
+                    ("pass", "✅ PASSED (All contracts safe)")
+                } else {
+                    ("fail", "❌ FAILED (Some contracts have breaking changes)")
+                };
+                body.push_str(&format!(
+                    "<p class=\"banner {status_class}\">{status_text}</p>\n"
+                ));
+
+                body.push_str("<h2>Summary</h2>\n<div class=\"table-scroll\"><table>\n");
+                body.push_str(
+                    "<thead><tr><th>Contract</th><th>Status</th><th>Critical</th>\
+                     <th>Warning</th><th>Info</th><th>Suppressed</th><th>Overridden</th>\
+                     </tr></thead>\n<tbody>\n",
+                );
+                for (name, report) in &results {
+                    body.push_str(&format!(
+                        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
+                         <td>{}</td><td>{}</td></tr>\n",
+                        escape_html(name),
+                        if report.is_safe {
+                            "✅ PASSED"
+                        } else {
+                            "❌ FAILED"
+                        },
+                        report.critical_count,
+                        report.warning_count,
+                        report.info_count,
+                        report.suppressed_count,
+                        report.severity_overridden_count,
+                    ));
+                }
+                for (name, failure) in &failed {
+                    body.push_str(&format!(
+                        "<tr><td>{}</td><td>{}</td><td>—</td><td>—</td><td>—</td>\
+                         <td>—</td><td>—</td></tr>\n",
+                        escape_html(name),
+                        if failure.is_limit {
+                            "⛔ ERROR (limit)"
+                        } else {
+                            "⛔ ERROR"
+                        },
+                    ));
+                }
+                body.push_str("</tbody>\n</table></div>\n");
+
+                if !failed.is_empty() {
+                    body.push_str("<h2>Errored Pairs</h2>\n<ul class=\"findings\">\n");
+                    for (name, failure) in &failed {
+                        body.push_str(&format!(
+                            "<li class=\"finding sev-critical\"><strong>{}</strong>: {}</li>\n",
+                            escape_html(name),
+                            escape_html(&failure.message),
+                        ));
+                    }
+                    body.push_str("</ul>\n");
+                }
+
+                for (name, report) in &results {
+                    body.push_str(&report.html_section(Some(name), false));
+                }
+
+                if !cross_findings.is_empty() {
+                    body.push_str("<h2>Cross-Contract Dependency Findings</h2>\n");
+                    body.push_str("<div class=\"table-scroll\"><table>\n");
+                    body.push_str(
+                        "<thead><tr><th>Affected Contract</th><th>Changed Contract</th>\
+                         <th>Depth</th><th>Severity</th><th>Category</th><th>Target</th>\
+                         </tr></thead>\n<tbody>\n",
+                    );
+                    for cf in &cross_findings {
+                        body.push_str(&format!(
+                            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
+                             <td><code>{}</code></td></tr>\n",
+                            escape_html(&cf.affected_contract),
+                            escape_html(&cf.changed_contract),
+                            cf.propagation_depth,
+                            cf.finding.severity.label(),
+                            escape_html(&cf.finding.category),
+                            escape_html(cf.finding.target.as_deref().unwrap_or("-")),
+                        ));
+                    }
+                    body.push_str("</tbody>\n</table></div>\n");
+                }
+
+                if !cycle_findings_list.is_empty() || !missing_findings_list.is_empty() {
+                    body.push_str("<h2>Dependency Graph Findings</h2>\n<ul class=\"findings\">\n");
+                    for f in cycle_findings_list
+                        .iter()
+                        .chain(missing_findings_list.iter())
+                    {
+                        body.push_str(&format!(
+                            "<li class=\"finding sev-{}\"><span class=\"badge badge-{}\">{}</span> {}</li>\n",
+                            f.severity.label(),
+                            f.severity.label(),
+                            f.severity.label(),
+                            escape_html(&f.message),
+                        ));
+                    }
+                    body.push_str("</ul>\n");
+                }
+
+                let rendered = soroban_upgrade_safeguard::report::html_document(
+                    "Soroban Upgrade Safety Report (Batch Mode)",
+                    &body,
+                );
+                emit_report_output(&rendered, args.output.as_deref(), &progress)?;
+            }
             OutputFormat::GithubActions => {
                 // Each contract pair is wrapped in a log group so the run
                 // summary stays readable when many pairs are compared.
@@ -1048,6 +1271,7 @@ fn run() -> Result<()> {
     let rendered = match args.format {
         OutputFormat::Json => serde_json::to_string_pretty(&safety_report.to_json())?,
         OutputFormat::Markdown => safety_report.generate_summary_markdown(),
+        OutputFormat::Html => safety_report.generate_summary_html(),
         OutputFormat::Text => safety_report.generate_summary_text(args.explain),
         OutputFormat::GithubActions => safety_report.generate_summary_github_actions(None),
     };
