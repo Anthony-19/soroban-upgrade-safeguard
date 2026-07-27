@@ -202,11 +202,108 @@ The first argument should be the build that is currently deployed on chain. The 
 
 Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, and the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)).
 
+### Spec JSON input mode
+
+Instead of a WASM binary, either side of a comparison can be supplied as a **contract spec JSON file** using `--old-spec` or `--new-spec`:
+
+```bash
+# Check a candidate WASM against a published spec (old side is spec JSON)
+soroban-upgrade-safeguard --old-spec published-spec.json candidate.wasm
+
+# Spec vs spec (both sides are spec JSON files)
+soroban-upgrade-safeguard --old-spec v1-spec.json --new-spec v2-spec.json
+
+# Spec as the new side only
+soroban-upgrade-safeguard deployed.wasm --new-spec candidate-spec.json
+```
+
+#### Spec JSON file format
+
+The file must be a JSON object with a single `entries` array. Each element is a **base64-encoded `SCSpecEntry` XDR value** — the same encoding used in Stellar RPC responses:
+
+```json
+{
+  "entries": [
+    "AAAAAQAAAA...",
+    "AAAAAQAAAB..."
+  ]
+}
+```
+
+To produce this file from a WASM binary with the Stellar CLI:
+
+```bash
+stellar contract inspect --wasm contract.wasm --output xdr-base64-array \
+  | python3 -c "import sys, json; print(json.dumps({'entries': json.load(sys.stdin)}))" \
+  > contract-spec.json
+```
+
+#### Skipped comparisons in spec-only mode
+
+A spec JSON file contains only the `contractspecv0` interface entries. Comparisons that require data from the full WASM binary are skipped when one or both sides is a spec file, and the report records exactly what was skipped:
+
+| Comparison | WASM vs WASM | Spec vs WASM / WASM vs Spec | Spec vs Spec |
+| :--- | :---: | :---: | :---: |
+| Exported interface (functions, types) | ✅ | ✅ | ✅ |
+| Environment metadata (`contractenvmetav0`) | ✅ | ⚠️ skipped | ⚠️ skipped |
+| Build metadata (`contractmetav0`) | ✅ | ⚠️ skipped | ⚠️ skipped |
+| Export section (binary vs spec agreement) | ✅ | ⚠️ skipped | ⚠️ skipped |
+| Import section (host-function diff) | ✅ | ⚠️ skipped | ⚠️ skipped |
+
+Skipped comparisons are reported as "not available" in the analysis scope rather than silently ignored, so the verdict is never read as broader than what actually ran. The exported interface comparison — the primary safety gate — always runs regardless of input mode.
+
+`--old-spec` cannot be combined with `--contract-id` (RPC already fetches the full WASM).
+
+### Building from source with `--old-crate` / `--new-crate`
+
+Instead of pointing at a pre-built WASM artifact, either side of a comparison can be a **local Cargo crate directory**. The tool builds it automatically and feeds the result into the analysis pipeline:
+
+```bash
+# Build the new side from source; compare against a deployed on-chain contract
+soroban-upgrade-safeguard \
+  --contract-id CDEPLOYED... \
+  --rpc-url https://soroban-mainnet.stellar.org \
+  --new-crate ./contracts/my_contract
+
+# Build both sides from source (useful when iterating across two branches)
+soroban-upgrade-safeguard \
+  --old-crate ./contracts/v1 \
+  --new-crate ./contracts/v2
+
+# Build the new side from source; old side is a saved WASM artifact
+soroban-upgrade-safeguard deployed.wasm --new-crate ./contracts/my_contract
+```
+
+Pass a path to a directory containing `Cargo.toml`. The tool runs:
+
+```text
+cargo build --target wasm32-unknown-unknown --release --locked
+```
+
+inside that directory, locates the produced `.wasm` artifact via `cargo metadata`, and loads it through the normal validation path. Nothing downstream is aware that the bytes came from a build rather than a file.
+
+#### Toolchain requirements
+
+| Requirement | How to satisfy |
+| :--- | :--- |
+| **Cargo** on `$PATH` | Install Rust via [rustup.rs](https://rustup.rs) |
+| **`wasm32-unknown-unknown` target** installed | `rustup target add wasm32-unknown-unknown` |
+| **`crate-type = ["cdylib"]`** in `[lib]` | Required for Cargo to produce a `.wasm` artifact |
+
+Both requirements are checked before the build starts. A missing target produces a clear error with the exact `rustup` command to run rather than a cryptic rustc error.
+
+#### CI notes
+
+- Cargo's dependency downloads run on first use. Subsequent runs are fast if the Cargo cache is warm.
+- `--locked` is set automatically, so the build respects the crate's `Cargo.lock` and is reproducible.
+- The build always targets `--release` so the Soroban SDK emits the `contractspecv0` custom section that this tool reads.
+- `--old-crate` cannot be combined with `--contract-id` or `--old-spec`. `--new-crate` cannot be combined with `--new-spec`.
+
 ## How the Analysis Works
 
 The analysis runs as a short pipeline. Each stage lives in its own module under `src/`.
 
-1. **Load and validate (`loader.rs`).** Each file is read from disk and checked for the WASM magic header. The tool then walks every WASM payload to confirm the binary is structurally well formed before any deeper work happens. A corrupt or non-WASM file fails fast with a clear message.
+1. **Load and validate (`loader.rs`).** Each file is read from disk and checked for the WASM magic header. The tool accepts both binary WASM (`.wasm`) and WebAssembly Text format (`.wat`). A `.wat` file is detected by its extension or by the absence of the `\0asm` magic bytes, assembled to binary using the `wat` crate, and then validated identically to a binary input — nothing downstream is aware of the distinction. A malformed `.wat` produces a clear assembly error naming the file and the parse problem. The tool then walks every WASM payload to confirm the binary is structurally well formed before any deeper work happens. A corrupt or non-WASM file fails fast with a clear message.
 
    When the baseline is fetched from an RPC endpoint (`--contract-id` / `--rpc-url`), the loader applies a **zero-trust pipeline**: the URL is validated for transport security (HTTPS required unless `--allow-http-local` is set), the RPC response entries are checked for matching ledger keys, and the SHA-256 hash of the fetched bytecode is verified against the on-chain contract instance hash. An optional `--expected-wasm-hash` flag provides additional hash pinning.
 

@@ -7,14 +7,16 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use soroban_upgrade_safeguard::{
+    builder,
     color::should_disable_color,
     dependency::{
         cycle_findings, missing_contract_findings, ContractDependency, CrossContractFinding,
         DependencyGraph,
     },
     limits::{find_limit_error, LimitsConfig, ResourcePolicy},
-    loader, report,
+    loader, parser, report,
     report::{validate_categories, CategoryFilter},
+    spec_input,
     storage_schema::StorageSchema,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
     wasm_cache::WasmCache,
@@ -281,6 +283,50 @@ struct Args {
     ///   Windows:     %LOCALAPPDATA%\soroban-upgrade-safeguard\wasm\
     #[arg(long)]
     no_cache: bool,
+
+    /// Treat the old side as a spec JSON file instead of a WASM binary.
+    ///
+    /// The file must contain `{ "entries": ["<base64-xdr>", ...] }` where
+    /// each element is a base64-encoded `SCSpecEntry` XDR value. Comparisons
+    /// that require a full WASM binary (env metadata, exports, imports) are
+    /// skipped and recorded in the report scope. Cannot be combined with
+    /// `--contract-id`.
+    #[arg(long, value_name = "PATH", conflicts_with = "contract_id")]
+    old_spec: Option<PathBuf>,
+
+    /// Treat the new side as a spec JSON file instead of a WASM binary.
+    ///
+    /// The file must contain `{ "entries": ["<base64-xdr>", ...] }` where
+    /// each element is a base64-encoded `SCSpecEntry` XDR value. Comparisons
+    /// that require a full WASM binary (env metadata, exports, imports) are
+    /// skipped and recorded in the report scope.
+    #[arg(long, value_name = "PATH")]
+    new_spec: Option<PathBuf>,
+
+    /// Build a local Soroban contract crate and use it as the old side.
+    ///
+    /// Pass a path to a Cargo crate directory (containing `Cargo.toml`). The
+    /// tool runs `cargo build --target wasm32-unknown-unknown --release
+    /// --locked` in that directory and feeds the produced WASM into the
+    /// analysis pipeline. The `wasm32-unknown-unknown` target must be
+    /// installed (`rustup target add wasm32-unknown-unknown`). Cannot be
+    /// combined with `--contract-id` or `--old-spec`.
+    #[arg(
+        long,
+        value_name = "CRATE_PATH",
+        conflicts_with_all = ["contract_id", "old_spec"]
+    )]
+    old_crate: Option<PathBuf>,
+
+    /// Build a local Soroban contract crate and use it as the new side.
+    ///
+    /// Pass a path to a Cargo crate directory (containing `Cargo.toml`). The
+    /// tool runs `cargo build --target wasm32-unknown-unknown --release
+    /// --locked` in that directory and feeds the produced WASM into the
+    /// analysis pipeline. The `wasm32-unknown-unknown` target must be
+    /// installed. Cannot be combined with `--new-spec`.
+    #[arg(long, value_name = "CRATE_PATH", conflicts_with = "new_spec")]
+    new_crate: Option<PathBuf>,
 
     /// Compare this run against a previously saved `--format json` report.
     /// Findings are classified as new, persisting, or resolved relative to
@@ -1385,13 +1431,20 @@ fn run() -> Result<()> {
         (1, None) => {
             anyhow::bail!(
                 "Missing OLD_WASM path. Provide two WASM files, or use --contract-id and --rpc-url \
-                 to fetch the old contract from chain.\n\n\
+                 to fetch the old contract from chain, or use --old-crate to build from source.\n\n\
                  Usage: soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>\n       \
-                 soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>\n\n\
+                 soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>\n       \
+                 soroban-upgrade-safeguard --old-crate <PATH> <NEW_WASM>\n       \
+                 soroban-upgrade-safeguard --old-crate <PATH> --new-crate <PATH>\n\n\
                  Or use batch mode:\n       \
                  soroban-upgrade-safeguard --manifest <MANIFEST_PATH>\n       \
                  soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>"
             );
+        }
+        (0, None) if args.old_crate.is_some() || args.new_crate.is_some() => {
+            // Both sides are crates — handled below; use a sentinel that the
+            // crate branches override.
+            (None, &PathBuf::new())
         }
         _ => {
             anyhow::bail!(
@@ -1472,12 +1525,29 @@ fn run() -> Result<()> {
         }
 
         module
+    } else if let Some(ref crate_path) = args.old_crate {
+        // --old-crate: build from source then load the artifact.
+        progress(format!(
+            "   🔨 Building old side from crate '{}'...",
+            crate_path.display()
+        ));
+        builder::build_contract_crate(crate_path, &policy)
+            .with_context(|| format!("Failed to build old crate '{}'", crate_path.display()))?
     } else {
         loader::load_wasm_with_policy(&args.wasm_paths[0], &policy)?
     };
 
-    // New WASM
-    let new = loader::load_wasm_with_policy(new_wasm_path, &policy)?;
+    // New WASM — from file, or built from a local crate.
+    let new = if let Some(ref crate_path) = args.new_crate {
+        progress(format!(
+            "   🔨 Building new side from crate '{}'...",
+            crate_path.display()
+        ));
+        builder::build_contract_crate(crate_path, &policy)
+            .with_context(|| format!("Failed to build new crate '{}'", crate_path.display()))?
+    } else {
+        loader::load_wasm_with_policy(new_wasm_path, &policy)?
+    };
 
     if !suppressions.rules.is_empty() {
         progress(format!(
@@ -1489,25 +1559,75 @@ fn run() -> Result<()> {
     // Generate Safety Report using the factored helper
     let baseline_source: Option<&str> = if old_source.is_some() {
         Some("RPC")
+    } else if args.old_crate.is_some() {
+        Some("Local Crate Build")
     } else {
         Some("Local File")
     };
     let verified_hash_hex = old.verified_hash.as_ref().map(hex::encode);
-    let mut safety_report = compare_contracts(
-        &ContractComparison {
-            old_bytes: &old.bytes,
-            old_path: &old.path,
-            new_bytes: &new.bytes,
-            new_path: &new.path,
-            suppressions: &suppressions,
-            policy: &policy,
-            storage_schemas: storage_schemas
-                .as_ref()
-                .map(|(old_schema, new_schema)| (old_schema, new_schema)),
-        },
-        &args,
-        &progress,
-    )?;
+
+    // Route to the right pipeline variant depending on whether either side is
+    // a spec-only JSON file.  Both paths produce a SafetyReport; the spec path
+    // uses run_pipeline_with_metadata directly so it can set wasm_sizes
+    // correctly and skip WASM-only comparisons.
+    let mut safety_report = if args.old_spec.is_some() || args.new_spec.is_some() {
+        // Build SorobanMetadata for the old side.
+        let old_meta = if let Some(ref spec_path) = args.old_spec {
+            progress(format!("   📄 Old side: spec JSON '{}'", spec_path.display()));
+            spec_input::load_spec_json(spec_path, &policy)?
+        } else {
+            parser::extract_metadata_with_policy(&old.bytes, &policy)
+                .context("Failed to extract metadata from the old WASM")?
+        };
+
+        // Build SorobanMetadata for the new side.
+        let new_meta = if let Some(ref spec_path) = args.new_spec {
+            progress(format!("   📄 New side: spec JSON '{}'", spec_path.display()));
+            spec_input::load_spec_json(spec_path, &policy)?
+        } else {
+            parser::extract_metadata_with_policy(&new.bytes, &policy)
+                .context("Failed to extract metadata from the new WASM")?
+        };
+
+        let wasm_sizes = match (args.old_spec.is_some(), args.new_spec.is_some()) {
+            (false, false) => Some((old.bytes.len(), new.bytes.len())),
+            (false, true) => Some((old.bytes.len(), 0)),
+            (true, false) => Some((0, new.bytes.len())),
+            (true, true) => None,
+        };
+
+        soroban_upgrade_safeguard::run_pipeline_with_metadata(
+            old_meta,
+            new_meta,
+            wasm_sizes,
+            &CompareOptions {
+                policy: Some(&policy),
+                suppressions: Some(&suppressions),
+                explain: args.explain,
+                strict: args.strict,
+                compat_duplicates: args.compat_duplicates,
+                storage_schemas: storage_schemas
+                    .as_ref()
+                    .map(|(old_schema, new_schema)| (old_schema, new_schema)),
+            },
+        )?
+    } else {
+        compare_contracts(
+            &ContractComparison {
+                old_bytes: &old.bytes,
+                old_path: &old.path,
+                new_bytes: &new.bytes,
+                new_path: &new.path,
+                suppressions: &suppressions,
+                policy: &policy,
+                storage_schemas: storage_schemas
+                    .as_ref()
+                    .map(|(old_schema, new_schema)| (old_schema, new_schema)),
+            },
+            &args,
+            &progress,
+        )?
+    };
     safety_report.baseline_source = baseline_source.map(|s| s.to_string());
     safety_report.verified_code_hash = verified_hash_hex;
     safety_report.diff_types = args.diff_types;

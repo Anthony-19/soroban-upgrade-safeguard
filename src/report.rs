@@ -51,7 +51,14 @@ pub struct AnalysisScope {
     /// The exported `contractspecv0` interface is always compared.
     pub exported_interface: bool,
     /// Whether environment metadata (`contractenvmetav0`) was compared.
+    /// `false` when one or both sides is a spec-only JSON input.
     pub env_metadata: bool,
+    /// Whether the WASM binary export section was compared.
+    /// `false` when one or both sides is a spec-only JSON input.
+    pub wasm_exports_compared: bool,
+    /// Whether the WASM binary import section was compared.
+    /// `false` when one or both sides is a spec-only JSON input.
+    pub wasm_imports_compared: bool,
     /// The storage-layout analysis state for this run.
     pub storage_schema: StorageScopeState,
     /// Number of distinct `contractspecv0` sections in the old WASM (0 if not parsed).
@@ -73,6 +80,8 @@ impl Default for AnalysisScope {
         Self {
             exported_interface: true,
             env_metadata: false,
+            wasm_exports_compared: false,
+            wasm_imports_compared: false,
             storage_schema: StorageScopeState::NotAnalyzed,
             old_spec_section_count: 0,
             new_spec_section_count: 0,
@@ -91,15 +100,22 @@ impl AnalysisScope {
     /// One-sentence bounded claim describing what this verdict certifies. When
     /// no schema was supplied it reduces to [`SCOPE_SUMMARY_LINE`].
     pub fn summary_line(&self) -> String {
+        let spec_only_note = if !self.env_metadata || !self.wasm_exports_compared {
+            " (spec-only input: env metadata, export, and import comparisons skipped)"
+        } else {
+            ""
+        };
         match &self.storage_schema {
-            StorageScopeState::NotAnalyzed => SCOPE_SUMMARY_LINE.to_string(),
+            StorageScopeState::NotAnalyzed => {
+                format!("{}{}", SCOPE_SUMMARY_LINE, spec_only_note)
+            }
             StorageScopeState::Analyzed {
                 key_types,
                 value_types,
             } => format!(
                 "Exported interface + environment metadata, plus a declared storage schema \
                  ({key_types} key type(s), {value_types} value type(s)). Storage coverage is \
-                 limited to the declared types."
+                 limited to the declared types.{spec_only_note}"
             ),
         }
     }
@@ -126,6 +142,8 @@ impl AnalysisScope {
 pub struct ScopeJson {
     pub exported_interface_analyzed: bool,
     pub env_metadata_analyzed: bool,
+    pub wasm_exports_compared: bool,
+    pub wasm_imports_compared: bool,
     pub storage_layout_analyzed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_key_types: Option<usize>,
@@ -157,6 +175,8 @@ impl AnalysisScope {
         ScopeJson {
             exported_interface_analyzed: self.exported_interface,
             env_metadata_analyzed: self.env_metadata,
+            wasm_exports_compared: self.wasm_exports_compared,
+            wasm_imports_compared: self.wasm_imports_compared,
             storage_layout_analyzed: self.storage_analyzed(),
             storage_key_types,
             storage_value_types,
