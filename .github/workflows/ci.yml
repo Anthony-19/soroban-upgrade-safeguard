@@ -77,6 +77,32 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  msrv:
+    name: Minimum supported Rust version (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to the exact version declared as `rust-version` in Cargo.toml,
+      # not `stable`. If a dependency bump silently raises the real floor
+      # above this, `--locked` below makes that surface here as a build
+      # failure instead of going unnoticed.
+      - name: Install Rust 1.85 (declared MSRV)
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-msrv-
+
+      - run: cargo build --locked
+      - run: cargo test --locked
+
   audit:
     name: Dependency audit (vulnerabilities + licenses)
     runs-on: ubuntu-latest

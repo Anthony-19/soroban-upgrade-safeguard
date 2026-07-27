@@ -12,11 +12,12 @@ Thank you for your interest in improving Soroban Upgrade Safeguard. This guide e
 6. [Test Fixtures](#test-fixtures)
 7. [Fuzzing](#fuzzing)
 8. [Code Coverage](#code-coverage)
-9. [Coding Guidelines](#coding-guidelines)
-10. [Adding a New Detection Rule](#adding-a-new-detection-rule)
-11. [Commit and Pull Request Process](#commit-and-pull-request-process)
-12. [Reporting Bugs](#reporting-bugs)
-13. [Code of Conduct](#code-of-conduct)
+9. [Minimum Supported Rust Version](#minimum-supported-rust-version)
+10. [Coding Guidelines](#coding-guidelines)
+11. [Adding a New Detection Rule](#adding-a-new-detection-rule)
+12. [Commit and Pull Request Process](#commit-and-pull-request-process)
+13. [Reporting Bugs](#reporting-bugs)
+14. [Code of Conduct](#code-of-conduct)
 
 ## Ways to Contribute
 
@@ -32,7 +33,10 @@ Small, focused changes are easier to review and land faster than large ones. If 
 
 ## Development Setup
 
-You need a recent stable Rust toolchain. Install it with rustup if you do not already have it:
+You need Rust 1.85 or later — see
+[Minimum Supported Rust Version](#minimum-supported-rust-version) for how that
+floor is determined and kept honest. Install a toolchain with rustup if you do
+not already have one:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -202,6 +206,33 @@ at the real baseline tends to get lowered to fit rather than met. Establish
 the baseline first, call out any detection rule with zero coverage as a
 follow-up issue, and decide on enforcement — and the number — deliberately
 afterward.
+
+## Minimum Supported Rust Version
+
+`rust-version` in `Cargo.toml` declares 1.85. This is not a guess: it is the
+highest `rust-version` among every direct and transitive dependency actually
+resolved in `Cargo.lock` at the time it was set (checkable yourself with
+`cargo metadata --format-version 1`, which surfaces each package's declared
+`rust_version`; at the time of writing the binding constraint was clap
+4.6.1's floor of 1.85). CI's `msrv` job builds and tests against exactly that
+version with `cargo build --locked` / `cargo test --locked`, so the declared
+floor is verified on every pull request rather than trusted blindly.
+
+The real minimum is a function of the dependency tree, not just this crate's
+own code, so it can rise on an ordinary dependency update with no visible
+diff in `src/`. When bumping a dependency, re-run `cargo metadata` (or check
+the new version's own `rust-version`) and compare against 1.85: if the
+update raises the floor, bump `rust-version` in the same pull request so the
+change is deliberate and documented rather than discovered later by a user
+on an older toolchain hitting a compile error. The `msrv` CI job exists
+specifically to catch the case where this step is missed — a dependency
+bump that silently raises the real floor fails that job instead of merging
+quietly.
+
+Pinning the toolchain contributors build with (a `rust-toolchain.toml`) is a
+separate decision from declaring this floor, and is not currently done:
+`rust-version` states what the crate supports, not what any given
+contributor's local toolchain must be.
 
 ## Coding Guidelines
 
