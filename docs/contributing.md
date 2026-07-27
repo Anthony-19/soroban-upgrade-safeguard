@@ -43,13 +43,14 @@ not already have one:
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-Then clone the repository and confirm it builds:
-
-```bash
-git clone <your-fork-url>
-cd soroban-upgrade-safeguard
-cargo build
-```
+1. **Fork the Repository**: Navigate to [ShippedLabs/soroban-upgrade-safeguard](https://github.com/ShippedLabs/soroban-upgrade-safeguard) on GitHub and click the **Fork** button to create a copy under your personal GitHub account.
+   
+2. **Clone Your Fork**: Clone your personal fork locally to your machine:
+   ```bash
+   git clone [https://github.com/](https://github.com/)<your-username>/soroban-upgrade-safeguard.git
+   cd soroban-upgrade-safeguard
+   cargo build
+   ```
 
 We recommend installing the standard formatting and linting components:
 
