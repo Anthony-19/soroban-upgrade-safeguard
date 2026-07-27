@@ -174,7 +174,7 @@ docker run --rm \
 
 ### CI example
 
-The image preserves exit code semantics (0 = safe, 1 = critical findings). Use it directly as a pipeline step:
+The image preserves exit code semantics (0 = safe, 1 = unsafe verdict, 3 = tool error). Use it directly as a pipeline step:
 
 ```yaml
 - name: Check upgrade safety
@@ -900,9 +900,10 @@ Raise a limit only if a legitimate, unusually large contract is rejected.
 ### Behavior when a limit is exceeded
 
 An input that exceeds a limit is rejected with a controlled, typed error and the CLI
-exits with **code 2** — distinct from `1` (breaking changes) so a pipeline can tell
-"the input was rejected as adversarial" apart from "the upgrade is unsafe". The
-process never aborts with a stack overflow or an out-of-memory kill.
+exits with **code 2** — distinct from `1` (unsafe verdict) and `3` (operational error)
+so a pipeline can tell "the input was rejected as adversarial" apart from both "the
+upgrade is unsafe" and "the tool itself failed". The process never aborts with a stack
+overflow or an out-of-memory kill.
 
 In **batch mode**, the policy is enforced **per pair**: a pair that trips a limit (or
 otherwise errors) fails only that pair and is reported as errored — the rest of the
@@ -913,9 +914,14 @@ limit, else `1` if any pair had breaking changes, else `0`.
 
 The tool is designed to drop into a continuous integration pipeline.
 
-- Exit code `0`: no critical findings. The upgrade is considered safe to deploy.
-- Exit code `1`: at least one critical finding, or a fatal error such as a missing or malformed WASM file.
-- Exit code `2`: a resource limit was exceeded on untrusted input (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)). Raise the relevant limit to proceed.
+| Code | Meaning |
+| :--- | :--- |
+| `0` | **Safe** — no critical findings (or all suppressed). The upgrade is considered safe to deploy. |
+| `1` | **Unsafe** — at least one critical finding (or warning in strict mode). The analysis ran and the verdict is a deliberate block. |
+| `2` | **Resource limit exceeded** — untrusted input was rejected before it could exhaust memory or the stack (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)). Raise the relevant limit to proceed. |
+| `3` | **Operational error** — the tool could not complete the run: missing or malformed file, bad manifest, unreachable RPC endpoint, or any other setup failure. The analysis did not run; this result carries no safety signal. |
+
+Codes `0` and `1` are the normal comparison outcomes. Code `3` is distinct from code `1` so a CI pipeline can tell "the safety gate is working and the upgrade is blocked" (1) from "the tool itself failed and the gate gave no result" (3).
 
 Because the process exits non-zero on critical findings, you can gate a deployment job on it directly:
 
@@ -923,7 +929,7 @@ Because the process exits non-zero on critical findings, you can gate a deployme
 soroban-upgrade-safeguard ./on-chain.wasm ./candidate.wasm
 ```
 
-If that command fails, the pipeline stops before the upgrade is published.
+If that command exits `1`, the upgrade has breaking changes. If it exits `3`, the invocation was wrong and the pipeline should surface the error rather than treating it as a passing gate.
 
 ## Limitations
 

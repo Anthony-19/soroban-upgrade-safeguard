@@ -143,7 +143,7 @@ Safeguard provides the following command line options. You can view them by runn
 * **`-f, --format <FORMAT>`**
   Set the output report format. Options: `text` (default, user-friendly terminal output), `json` (for programmatic parsing), `markdown` (ideal for CI/CD job summaries).
 * **`-s, --strict`**
-  Enforces a strict exit policy. If any Warning or Critical breaking changes are detected, Safeguard will exit with code `1`.
+  Enforces a strict exit policy. If any Warning or Critical breaking changes are detected, Safeguard will exit with code `1` (unsafe verdict).
 * **`-e, --explain`**
   Prints concise explanations and remediation guidance for each breaking change category found.
 * **`--no-color`**
@@ -298,7 +298,7 @@ Here are the most common configuration mistakes and how to resolve them:
 * **Remediation**: Re-evaluate the breaking change. If it is still intentional, edit `.safeguard.toml` to update the `expiry` date to a future date.
 
 ### 5. Fingerprint Mismatches
-* **Symptom**: The gate fails (exit code 1) indicating critical breaking changes are present, even though you have a suppression rule for the category and target.
+* **Symptom**: The gate fails (exit code 1 — unsafe verdict) indicating critical breaking changes are present, even though you have a suppression rule for the category and target.
 * **Reason**: When using the strict new-format suppression, the calculated SHA-256 fingerprint of the diff finding must match the `fingerprint` property of the rule exactly.
 * **Remediation**: Check the JSON output or standard error logs for the actual calculated fingerprint of the finding, and verify that the `fingerprint` field in your `.safeguard.toml` matches it exactly (character-for-character).
 
@@ -340,6 +340,19 @@ Safeguard protects your CI runner systems and memory footprints from malicious, 
 * **Behaviour**: When the timeout fires, the error names the RPC URL and the configured limit so the cause is immediately actionable. The overall budget covers TCP connect, TLS handshake, sending the request, and reading the full response body.
 * **Symptom**: Error message `RPC request to '<url>' timed out after N second(s)`.
 * **Remediation**: If your endpoint is legitimately slow, raise the limit via `--rpc-timeout-secs`, `SAFEGUARD_RPC_TIMEOUT_SECS`, or `limits.rpc_timeout_secs` in `.safeguard.toml`. Set to `0` to disable the timeout entirely (not recommended in CI).
+
+---
+
+## Exit Codes
+
+| Code | Meaning | When CI should… |
+| :--- | :--- | :--- |
+| `0` | **Safe** — no critical findings (or all suppressed). | Proceed with deployment. |
+| `1` | **Unsafe** — at least one critical finding (or warning in strict mode). | Block deployment. |
+| `2` | **Resource limit exceeded** — untrusted input rejected before it could exhaust memory/stack. | Investigate the input or raise the relevant limit. |
+| `3` | **Operational error** — missing file, malformed WASM, bad manifest, unreachable RPC endpoint, etc. The tool could not run; the result carries **no safety signal**. | Treat as a broken gate — surface the error and do not proceed. |
+
+Codes `0` and `1` are the normal comparison outcomes. Code `3` is deliberately distinct from code `1` so a pipeline can tell "the safety gate is working and blocked the upgrade" (1) from "the tool itself failed and gave no result" (3).
 
 ---
 

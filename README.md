@@ -316,8 +316,9 @@ run continues — and the overall run exits `2` if any pair hit a limit.
 | Code | Meaning |
 | :--- | :--- |
 | `0` | Safe — no critical findings (or all suppressed). |
-| `1` | Breaking changes detected, or a generic error (missing/malformed file). |
+| `1` | Unsafe — at least one critical finding (or warning in strict mode). |
 | `2` | A resource limit was exceeded on untrusted input (raise the relevant limit to proceed). |
+| `3` | Operational error — missing file, malformed WASM, bad manifest, unreachable RPC endpoint, etc. The tool could not run; the result carries no safety signal. |
 
 ## How it Works
 

@@ -276,10 +276,14 @@ fn resolve_policy(args: &Args, config_path: Option<&Path>) -> Result<ResourcePol
 }
 
 /// Exit codes:
-/// - `0`: safe (no breaking changes, or all suppressed).
-/// - `1`: breaking changes detected, or a generic/IO/parse error.
-/// - `2`: a resource-limit violation on untrusted input (distinct so CI can tell
-///   "input was rejected as adversarial" apart from "the upgrade is unsafe").
+/// - `0`: safe — no critical findings, or all suppressed.
+/// - `1`: unsafe — at least one critical (or warning in strict mode) finding.
+/// - `2`: resource-limit violation on untrusted input — raise the relevant
+///   limit to proceed; distinct from 1 so CI can tell "adversarial input
+///   rejected" from "upgrade is unsafe".
+/// - `3`: operational error — the tool could not complete the run: missing
+///   file, malformed WASM, bad manifest, unreachable RPC endpoint, etc.
+///   The analysis did not run; the result carries no safety signal.
 fn main() {
     match run() {
         Ok(()) => {}
@@ -296,9 +300,11 @@ fn main() {
                 );
                 std::process::exit(2);
             }
-            // Preserve anyhow's full error-chain formatting for everything else.
+            // Operational error: the tool could not run. Preserve anyhow's
+            // full error-chain formatting and exit 3 so CI can distinguish
+            // "tool broken" from "upgrade unsafe" (exit 1).
             eprintln!("Error: {err:?}");
-            std::process::exit(1);
+            std::process::exit(3);
         }
     }
 }
