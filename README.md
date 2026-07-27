@@ -170,7 +170,7 @@ run continues — and the overall run exits `2` if any pair hit a limit.
 
 ## How it Works
 
-The tool parses the `contractspecv0` custom sections from both WASM files, decodes the XDR representations of the contract's interface, and performs a deep structural comparison. It builds a type dependency map to identify when a simple change in a shared struct might cascade into breaking multiple storage entries. When storage-schema manifests are supplied, the declared types are resolved into the same model and run through the same comparison.
+The tool parses the `contractspecv0` and `contractenvmetav0` custom sections from both WASM files, decodes the XDR representations, and performs a deep structural comparison across **functions, structs, enums, unions, and error enums**. It also compares the environment metadata for protocol and SDK version changes. It builds a type dependency map to identify when a simple change in a shared type might cascade into breaking multiple storage entries. When storage-schema manifests are supplied, the declared types are resolved into the same model and run through the same comparison.
 
 ## Severity Levels
 
