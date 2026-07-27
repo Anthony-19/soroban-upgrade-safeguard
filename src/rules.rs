@@ -59,10 +59,52 @@ pub const RULES: &[RuleDefinition] = &[
         guidance: "This is a breaking change. Update caller arguments and client SDKs to match the new parameter type.",
     },
     RuleDefinition {
+        id: "parameter_type_widened",
+        label: "Parameter Type Widened",
+        severity: Severity::Warning,
+        guidance: "This is a widening numeric conversion — every old value fits in the new type without loss, but it is still a layout change. Update client SDKs to the new parameter type and confirm callers pass values that fit the new range.",
+    },
+    RuleDefinition {
+        id: "parameter_type_narrowed",
+        label: "Parameter Type Narrowed",
+        severity: Severity::Critical,
+        guidance: "This is a breaking, lossy change. Values that don't fit the narrower type will be truncated. Revert the narrowing or validate/migrate call sites before deploying.",
+    },
+    RuleDefinition {
+        id: "parameter_type_signedness_changed",
+        label: "Parameter Type Signedness Changed",
+        severity: Severity::Critical,
+        guidance: "This is a breaking change. Changing signedness reinterprets the underlying bits, which can turn valid values into unexpected ones. Revert the signedness change or carefully audit every caller.",
+    },
+    RuleDefinition {
+        id: "parameter_documentation_changed",
+        label: "Parameter Documentation Changed",
+        severity: Severity::Info,
+        guidance: "No code changes required. Parameter documentation often pins down units or semantics (e.g. stroops vs. whole units) — confirm the new wording is accurate and update client-facing docs.",
+    },
+    RuleDefinition {
         id: "return_type_changed",
         label: "Return Type Changed",
         severity: Severity::Critical,
         guidance: "This is a breaking change. Update caller expectations and client SDKs to match the new return type.",
+    },
+    RuleDefinition {
+        id: "return_type_widened",
+        label: "Return Type Widened",
+        severity: Severity::Warning,
+        guidance: "This is a widening numeric conversion — every old value fits in the new type without loss, but it is still a layout change. Update client SDKs that decode this return type.",
+    },
+    RuleDefinition {
+        id: "return_type_narrowed",
+        label: "Return Type Narrowed",
+        severity: Severity::Critical,
+        guidance: "This is a breaking, lossy change. Values that don't fit the narrower return type will be truncated. Revert the narrowing or update callers to handle the new range.",
+    },
+    RuleDefinition {
+        id: "return_type_signedness_changed",
+        label: "Return Type Signedness Changed",
+        severity: Severity::Critical,
+        guidance: "This is a breaking change. Changing signedness reinterprets the underlying bits of the returned value. Revert the signedness change or audit every caller that consumes this return value.",
     },
     RuleDefinition {
         id: "event_definition_removed",
@@ -123,6 +165,30 @@ pub const RULES: &[RuleDefinition] = &[
         label: "Event Field Type Changed",
         severity: Severity::Critical,
         guidance: "This is a breaking change. Update event indexers and consumers to handle the new field type.",
+    },
+    RuleDefinition {
+        id: "struct_field_type_widened",
+        label: "Struct Field Type Widened",
+        severity: Severity::Warning,
+        guidance: "This is a widening numeric conversion — every old value fits in the new type without loss, but stored data still uses the old encoding. Migrate existing storage entries to the new field type before relying on it.",
+    },
+    RuleDefinition {
+        id: "struct_field_type_narrowed",
+        label: "Struct Field Type Narrowed",
+        severity: Severity::Critical,
+        guidance: "This is a breaking change. Narrowing a stored field's type can truncate every existing value. Revert the narrowing or run a state migration that validates values fit the new type.",
+    },
+    RuleDefinition {
+        id: "struct_field_type_signedness_changed",
+        label: "Struct Field Type Signedness Changed",
+        severity: Severity::Critical,
+        guidance: "This is a breaking change. Changing a stored field's signedness reinterprets its bit pattern, corrupting existing values. Revert the signedness change or run a state migration that reinterprets and revalidates stored data.",
+    },
+    RuleDefinition {
+        id: "struct_field_documentation_changed",
+        label: "Struct Field Documentation Changed",
+        severity: Severity::Info,
+        guidance: "No code changes required. Confirm the updated field documentation is accurate and reflected in client-facing docs.",
     },
     RuleDefinition {
         id: "struct_field_added",
@@ -191,6 +257,12 @@ pub const RULES: &[RuleDefinition] = &[
         guidance: "No action required. Update event indexers and consumers to handle the new event enum case if necessary.",
     },
     RuleDefinition {
+        id: "enum_case_documentation_changed",
+        label: "Enum Case Documentation Changed",
+        severity: Severity::Info,
+        guidance: "No code changes required. Confirm the updated case documentation is accurate and reflected in client-facing docs.",
+    },
+    RuleDefinition {
         id: "union_removed",
         label: "Union Removed",
         severity: Severity::Critical,
@@ -201,6 +273,12 @@ pub const RULES: &[RuleDefinition] = &[
         label: "Union Added",
         severity: Severity::Info,
         guidance: "No action required. Ensure consumers are aware of the new union type if needed.",
+    },
+    RuleDefinition {
+        id: "union_documentation_changed",
+        label: "Union Documentation Changed",
+        severity: Severity::Info,
+        guidance: "No code changes required. Ensure documentation changes are aligned with the union's intended usage.",
     },
     RuleDefinition {
         id: "union_case_removed",
@@ -221,6 +299,24 @@ pub const RULES: &[RuleDefinition] = &[
         guidance: "This is a breaking change. Changing union case payload types breaks layout serialization. Revert the type change or migrate existing data.",
     },
     RuleDefinition {
+        id: "union_case_type_widened",
+        label: "Union Case Type Widened",
+        severity: Severity::Warning,
+        guidance: "This is a widening numeric conversion — every old value fits in the new type without loss, but stored data still uses the old encoding. Migrate existing storage entries to the new case payload type before relying on it.",
+    },
+    RuleDefinition {
+        id: "union_case_type_narrowed",
+        label: "Union Case Type Narrowed",
+        severity: Severity::Critical,
+        guidance: "This is a breaking change. Narrowing a union case's payload type can truncate every existing value. Revert the narrowing or run a state migration that validates values fit the new type.",
+    },
+    RuleDefinition {
+        id: "union_case_type_signedness_changed",
+        label: "Union Case Type Signedness Changed",
+        severity: Severity::Critical,
+        guidance: "This is a breaking change. Changing a union case payload's signedness reinterprets its bit pattern, corrupting existing values. Revert the signedness change or run a state migration.",
+    },
+    RuleDefinition {
         id: "union_case_added",
         label: "Union Case Added",
         severity: Severity::Info,
@@ -237,6 +333,12 @@ pub const RULES: &[RuleDefinition] = &[
         label: "Error Enum Added",
         severity: Severity::Info,
         guidance: "No action required. Inform client integrations about the new error enum if needed.",
+    },
+    RuleDefinition {
+        id: "error_enum_documentation_changed",
+        label: "Error Enum Documentation Changed",
+        severity: Severity::Info,
+        guidance: "No code changes required. Ensure documentation changes are aligned with the error enum's intended usage.",
     },
     RuleDefinition {
         id: "error_enum_case_removed",
