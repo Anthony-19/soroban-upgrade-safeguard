@@ -1270,6 +1270,11 @@ impl SafetyReport {
                     if let Some(reason) = &reported.suppression_reason {
                         output.push_str(&format!("  - ↳ reason: {}\n", reason));
                     }
+                    if self.settings.explain {
+                        if let Some(remediation) = &reported.remediation {
+                            output.push_str(&format!("  - ↳ guidance: {}\n", remediation));
+                        }
+                    }
                     continue;
                 }
 
@@ -1286,6 +1291,11 @@ impl SafetyReport {
                     "- {} {}{}{}\n",
                     emoji, baseline_tag, override_tag, finding.message
                 ));
+                if self.settings.explain {
+                    if let Some(remediation) = &reported.remediation {
+                        output.push_str(&format!("  - ↳ guidance: {}\n", remediation));
+                    }
+                }
             }
             output.push('\n');
         }

@@ -452,6 +452,7 @@ run continues — and the overall run exits `2` if any pair hit a limit.
 | `0` | Safe — no critical findings (or all suppressed), and any `--expect-bump` gate was satisfied. |
 | `1` | Breaking changes detected, a failed `--expect-bump` gate, or a generic error (missing/malformed file). |
 | `2` | A resource limit was exceeded on untrusted input (raise the relevant limit to proceed). |
+| `3` | Operational error — missing file, malformed WASM, bad manifest, unreachable RPC endpoint, etc. The tool could not run; the result carries no safety signal. |
 
 Precedence is `2` > `1` > `0`: a resource-limit violation is reported even when
 the run would also have failed on findings or on the bump gate.
