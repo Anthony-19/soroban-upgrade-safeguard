@@ -424,44 +424,79 @@ fn find_entry_by_key<'a>(
     }
 }
 
-/// Validates an RPC URL for secure transport.
+/// Extract the host portion of a `<scheme>://<rest>` URL remainder, dropping
+/// any userinfo, port, path, query, or fragment.
+fn url_host(rest: &str) -> &str {
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(rest);
+    // Strip `user:pass@` if present.
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    authority.split(':').next().unwrap_or(authority)
+}
+
+/// Validates an RPC URL for basic shape and secure transport.
 ///
+/// This runs *before* any network request is attempted, so a URL that is simply
+/// wrong (no scheme, a typo like `htps://`, an empty host) is reported as a URL
+/// problem rather than surfacing later as an opaque transport error.
+///
+/// - Rejects a URL with no scheme, an unsupported scheme, or no host.
 /// - Rejects non-`https` URLs unless `allow_http_local` is `true`.
 /// - When `allow_http_local` is `true`, only `localhost` and `127.0.0.1` are
 ///   accepted for `http://` URLs.
-/// - Rejects unknown/unexpected schemes.
 pub fn validate_rpc_url(rpc_url: &str, allow_http_local: bool) -> Result<()> {
-    if rpc_url.starts_with("https://") {
-        return Ok(());
+    let trimmed = rpc_url.trim();
+    if trimmed.is_empty() {
+        bail!("Invalid RPC URL: the value is empty. Expected an 'https://' endpoint.");
     }
 
-    if let Some(rest) = rpc_url.strip_prefix("http://") {
-        if !allow_http_local {
-            bail!(
-                "Insecure RPC URL scheme 'http' for '{}'. \
-                 Use 'https://' for secure transport, or pass \
-                 --allow-http-local for local development only.",
-                rpc_url
-            );
-        }
+    // A URL with no `scheme://` at all is the most common mistake, and the one
+    // that otherwise fails deepest inside the request machinery.
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        bail!(
+            "Invalid RPC URL '{}': no scheme. Expected an 'https://' endpoint \
+             (e.g. https://soroban-testnet.stellar.org).",
+            rpc_url
+        );
+    };
 
-        let host = rest.split('/').next().unwrap_or(rest);
-        let host = host.split(':').next().unwrap_or(host);
-
-        if host != "localhost" && host != "127.0.0.1" {
-            bail!(
-                "HTTP RPC URL '{}' is not allowed. \
-                 --allow-http-local only permits localhost or 127.0.0.1.",
-                rpc_url
-            );
-        }
-        return Ok(());
+    let host = url_host(rest);
+    if host.is_empty() {
+        bail!(
+            "Invalid RPC URL '{}': no host after the scheme. Expected an \
+             'https://<host>' endpoint.",
+            rpc_url
+        );
     }
 
-    bail!(
-        "Unsupported RPC URL scheme in '{}'. Use 'https://'.",
-        rpc_url
-    )
+    match scheme.to_ascii_lowercase().as_str() {
+        "https" => Ok(()),
+        "http" => {
+            if !allow_http_local {
+                bail!(
+                    "Insecure RPC URL scheme 'http' for '{}'. \
+                     Use 'https://' for secure transport, or pass \
+                     --allow-http-local for local development only.",
+                    rpc_url
+                );
+            }
+            if host != "localhost" && host != "127.0.0.1" {
+                bail!(
+                    "HTTP RPC URL '{}' is not allowed. \
+                     --allow-http-local only permits localhost or 127.0.0.1.",
+                    rpc_url
+                );
+            }
+            Ok(())
+        }
+        other => bail!(
+            "Invalid RPC URL '{}': unsupported scheme '{}'. Use 'https://'.",
+            rpc_url,
+            other
+        ),
+    }
 }
 
 /// Helper to execute JSON-RPC request to Stellar RPC.
@@ -555,7 +590,35 @@ mod tests {
     fn test_validate_rpc_url_rejects_unsupported_scheme() {
         let err = validate_rpc_url("ftp://rpc.example.com", false).unwrap_err();
         let msg = format!("{:#}", err);
-        assert!(msg.contains("Unsupported"), "got: {}", msg);
+        assert!(msg.contains("unsupported scheme"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_validate_rpc_url_rejects_missing_scheme() {
+        let err = validate_rpc_url("soroban-testnet.stellar.org", false).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("no scheme"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_validate_rpc_url_rejects_typo_scheme() {
+        let err = validate_rpc_url("htps://soroban-testnet.stellar.org", false).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("unsupported scheme 'htps'"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_validate_rpc_url_rejects_empty_host() {
+        let err = validate_rpc_url("https:///path", false).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("no host"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_validate_rpc_url_rejects_empty_value() {
+        let err = validate_rpc_url("   ", false).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("empty"), "got: {}", msg);
     }
 
     fn dummy_ledger_key() -> LedgerKey {

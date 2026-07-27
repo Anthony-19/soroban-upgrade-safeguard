@@ -84,6 +84,16 @@ pub struct SuppressionConfig {
     /// out from under an existing suppression rule.
     #[serde(default)]
     pub classification: crate::classification::ClassificationConfig,
+    /// The `[severity]` table: per-category severity overrides.
+    ///
+    /// Carried alongside the suppression rules because it is the same file and
+    /// the same layer of policy — both decide how a described change is
+    /// *treated*, neither changes what the diff actually found. Threading it
+    /// here means every existing caller of
+    /// [`crate::report::SafetyReport::with_suppressions`] picks the overrides
+    /// up without a signature change.
+    #[serde(default, rename = "severity")]
+    pub severity_overrides: crate::severity_override::SeverityOverrides,
     /// The `[limits]` table is parsed independently by [`crate::limits`]. We
     /// still declare it here so `deny_unknown_fields` accepts a combined config
     /// carrying both `[[suppress]]` rules and `[limits]`; its contents are
@@ -182,6 +192,11 @@ pub fn compute_fingerprint(finding: &Finding) -> String {
 impl SuppressionConfig {
     /// Validate the configuration for security limits, format correctness, and expiration.
     pub fn validate(&self) -> Result<()> {
+        // Category names in [severity] are checked first: a typo there silently
+        // disables a policy the user believes is active, so it must never be
+        // reachable past load time.
+        self.severity_overrides.validate()?;
+
         let max_allowed = self.max_suppressions.unwrap_or(10);
         if self.rules.len() > max_allowed {
             anyhow::bail!(

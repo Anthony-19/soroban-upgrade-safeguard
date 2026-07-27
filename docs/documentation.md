@@ -174,7 +174,7 @@ docker run --rm \
 
 ### CI example
 
-The image preserves exit code semantics (0 = safe, 1 = unsafe verdict, 3 = tool error). Use it directly as a pipeline step:
+The image preserves exit code semantics (0 = safe, 1 = critical findings). Use it directly as a pipeline step:
 
 ```yaml
 - name: Check upgrade safety
@@ -200,59 +200,7 @@ soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
 
 The first argument should be the build that is currently deployed on chain. The second argument should be the build you intend to deploy. Order matters: the comparison is directional, because removing a field from the old version is treated differently from adding a field in the new version.
 
-Common flags: `--format <text|json|markdown>`, `--explain`, `--strict`, `--config <PATH>`, and the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)).
-
-### Batch Mode
-
-Instead of a single pair, you can compare many contracts in one invocation using a manifest file or a directory scan.
-
-**Manifest mode** — pass a TOML or JSON file listing one or more pairs:
-
-```bash
-soroban-upgrade-safeguard --manifest ci/contracts.toml
-```
-
-Each pair declares its `old` and `new` sides as file paths (or on-chain contract sources). An optional `name` gives the pair a stable display name in the report.
-
-```toml
-[[pairs]]
-old  = "wasm/v1.wasm"
-new  = "wasm/v2.wasm"
-name = "token"
-```
-
-**Directory scan mode** — compare every `.wasm` file that appears under both directories at the same relative path:
-
-```bash
-soroban-upgrade-safeguard --old-dir wasm/old --new-dir wasm/new
-```
-
-#### Manifest path resolution
-
-Relative paths inside a manifest are resolved against the **directory that contains the manifest file**, not the working directory of the process that invoked the tool. Absolute paths are left unchanged.
-
-This means a manifest checked in at `ci/contracts.toml` containing
-
-```toml
-[[pairs]]
-old = "wasm/v1.wasm"
-new = "wasm/v2.wasm"
-```
-
-always refers to `ci/wasm/v1.wasm` and `ci/wasm/v2.wasm`, regardless of which directory you run the command from. You can invoke the tool as:
-
-```bash
-# From the repo root
-soroban-upgrade-safeguard --manifest ci/contracts.toml
-
-# From ci/
-soroban-upgrade-safeguard --manifest contracts.toml
-
-# From anywhere else
-soroban-upgrade-safeguard --manifest /absolute/path/to/ci/contracts.toml
-```
-
-and the same WASM files are loaded every time. Directory-scan paths (`--old-dir`, `--new-dir`) and paths passed directly on the CLI are still resolved against the working directory, as expected.
+Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, and the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)).
 
 ## How the Analysis Works
 
@@ -738,7 +686,7 @@ tooling, so its shape is published as a JSON Schema (Draft 2020-12) under
 - [`schema/report.schema.json`](../schema/report.schema.json) — the single-pair
   document (`--format json` on a contract pair).
 - [`schema/batch-report.schema.json`](../schema/batch-report.schema.json) — the
-  batch document (`--manifest` or `--old-dir`/`--new-dir` with `--format json`),
+  batch document (`--manifest`, `--old-dir`/`--new-dir`, or `--old-glob`/`--new-glob` with `--format json`),
   whose top level differs from the single-pair shape and embeds a single-pair
   report per contract under `results`.
 
@@ -750,31 +698,6 @@ committed files, failing if they diverge. Conditionally omitted fields
 (`suppressed`, `suppression_reason`, `remediation`, the duplicate-name lists, …)
 are marked optional, and the enumerated fields (the `counts` severities and
 `recommended_bump`) are constrained to their allowed values.
-
-### The `remediation` field
-
-Each finding object in `findings_by_category` may carry a `remediation` field:
-
-```json
-{
-  "finding": { "severity": "Critical", "category": "Struct Field Removed", "message": "…" },
-  "suppressed": false,
-  "remediation": "Restore the field or perform a storage migration."
-}
-```
-
-**`remediation` is only populated when `--explain` is passed.** Without the flag
-the field is absent from every finding object. Consumers that want guidance text
-must request it explicitly:
-
-```bash
-soroban-upgrade-safeguard old.wasm new.wasm --format json --explain
-```
-
-When `--explain` is omitted the field is absent, not `null`, so a consumer can
-detect its presence with a simple existence check. The guidance text matches the
-"↳ guidance:" line in the text output and the "↳ guidance:" item in the Markdown
-output — all three surfaces read from the same rule registry.
 
 To regenerate the committed schema after intentionally changing an output type:
 
@@ -925,10 +848,9 @@ Raise a limit only if a legitimate, unusually large contract is rejected.
 ### Behavior when a limit is exceeded
 
 An input that exceeds a limit is rejected with a controlled, typed error and the CLI
-exits with **code 2** — distinct from `1` (unsafe verdict) and `3` (operational error)
-so a pipeline can tell "the input was rejected as adversarial" apart from both "the
-upgrade is unsafe" and "the tool itself failed". The process never aborts with a stack
-overflow or an out-of-memory kill.
+exits with **code 2** — distinct from `1` (breaking changes) so a pipeline can tell
+"the input was rejected as adversarial" apart from "the upgrade is unsafe". The
+process never aborts with a stack overflow or an out-of-memory kill.
 
 In **batch mode**, the policy is enforced **per pair**: a pair that trips a limit (or
 otherwise errors) fails only that pair and is reported as errored — the rest of the
@@ -939,14 +861,9 @@ limit, else `1` if any pair had breaking changes, else `0`.
 
 The tool is designed to drop into a continuous integration pipeline.
 
-| Code | Meaning |
-| :--- | :--- |
-| `0` | **Safe** — no critical findings (or all suppressed). The upgrade is considered safe to deploy. |
-| `1` | **Unsafe** — at least one critical finding (or warning in strict mode). The analysis ran and the verdict is a deliberate block. |
-| `2` | **Resource limit exceeded** — untrusted input was rejected before it could exhaust memory or the stack (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)). Raise the relevant limit to proceed. |
-| `3` | **Operational error** — the tool could not complete the run: missing or malformed file, bad manifest, unreachable RPC endpoint, or any other setup failure. The analysis did not run; this result carries no safety signal. |
-
-Codes `0` and `1` are the normal comparison outcomes. Code `3` is distinct from code `1` so a CI pipeline can tell "the safety gate is working and the upgrade is blocked" (1) from "the tool itself failed and the gate gave no result" (3).
+- Exit code `0`: no critical findings. The upgrade is considered safe to deploy.
+- Exit code `1`: at least one critical finding, a failed `--expect-bump` gate, or a fatal error such as a missing or malformed WASM file.
+- Exit code `2`: a resource limit was exceeded on untrusted input (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)). Raise the relevant limit to proceed.
 
 Because the process exits non-zero on critical findings, you can gate a deployment job on it directly:
 
@@ -954,7 +871,7 @@ Because the process exits non-zero on critical findings, you can gate a deployme
 soroban-upgrade-safeguard ./on-chain.wasm ./candidate.wasm
 ```
 
-If that command exits `1`, the upgrade has breaking changes. If it exits `3`, the invocation was wrong and the pipeline should surface the error rather than treating it as a passing gate.
+If that command fails, the pipeline stops before the upgrade is published.
 
 ## Limitations
 
