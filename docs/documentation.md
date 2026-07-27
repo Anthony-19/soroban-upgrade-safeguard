@@ -751,6 +751,31 @@ committed files, failing if they diverge. Conditionally omitted fields
 are marked optional, and the enumerated fields (the `counts` severities and
 `recommended_bump`) are constrained to their allowed values.
 
+### The `remediation` field
+
+Each finding object in `findings_by_category` may carry a `remediation` field:
+
+```json
+{
+  "finding": { "severity": "Critical", "category": "Struct Field Removed", "message": "…" },
+  "suppressed": false,
+  "remediation": "Restore the field or perform a storage migration."
+}
+```
+
+**`remediation` is only populated when `--explain` is passed.** Without the flag
+the field is absent from every finding object. Consumers that want guidance text
+must request it explicitly:
+
+```bash
+soroban-upgrade-safeguard old.wasm new.wasm --format json --explain
+```
+
+When `--explain` is omitted the field is absent, not `null`, so a consumer can
+detect its presence with a simple existence check. The guidance text matches the
+"↳ guidance:" line in the text output and the "↳ guidance:" item in the Markdown
+output — all three surfaces read from the same rule registry.
+
 To regenerate the committed schema after intentionally changing an output type:
 
 ```bash
