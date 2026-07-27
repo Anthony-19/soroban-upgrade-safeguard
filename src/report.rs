@@ -207,7 +207,7 @@ pub struct ReportedFinding {
 /// Per-build size and interface-count metrics, carried in the report for all
 /// three output formats. These are purely informational and never affect
 /// `is_safe`, the exit code, or the recommended bump.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct BuildMetrics {
     /// Total WASM binary size in bytes for the old build.
     pub old_size_bytes: usize,
@@ -289,6 +289,18 @@ impl BuildMetrics {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReportSettings {
+    pub strict: bool,
+    pub explain: bool,
+    pub max_suppressions: Option<usize>,
+    pub allow_targetless: Option<bool>,
+    pub max_xdr_depth: u32,
+    pub max_xdr_len: usize,
+    pub max_entries: usize,
+    pub max_walk_depth: usize,
+}
+
 /// A structured container for aggregated comparison findings.
 pub struct SafetyReport {
     pub critical_count: usize,
@@ -303,6 +315,7 @@ pub struct SafetyReport {
     pub is_safe: bool,
     pub findings_by_category: HashMap<String, Vec<ReportedFinding>>,
     pub strict: bool,
+    pub settings: ReportSettings,
     /// What this run actually inspected. Drives the scope reporting so a verdict
     /// is never read as broader than the analysis that produced it.
     pub scope: AnalysisScope,
@@ -368,7 +381,7 @@ pub struct SafetyReportJson<'a> {
 }
 
 /// JSON representation of a suppression rule that matched no finding.
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub struct UnmatchedSuppressionJson {
     pub category: String,
     pub target: Option<String>,
@@ -398,16 +411,7 @@ impl SafetyReport {
         strict: bool,
         policy: &ResourcePolicy,
     ) -> Self {
-        let settings = ReportSettings {
-            strict,
-            explain,
-            max_suppressions: suppressions.max_suppressions,
-            allow_targetless: suppressions.allow_targetless,
-            max_xdr_depth: policy.max_xdr_depth,
-            max_xdr_len: policy.max_xdr_len,
-            max_entries: policy.max_entries,
-            max_walk_depth: policy.max_walk_depth,
-        };
+        let _ = policy;
 
         let mut critical_count = 0;
         let mut warning_count = 0;
@@ -492,6 +496,17 @@ impl SafetyReport {
             failing_critical_count == 0
         };
 
+        let settings = ReportSettings {
+            strict,
+            explain,
+            max_suppressions: suppressions.max_suppressions,
+            allow_targetless: suppressions.allow_targetless,
+            max_xdr_depth: policy.max_xdr_depth,
+            max_xdr_len: policy.max_xdr_len,
+            max_entries: policy.max_entries,
+            max_walk_depth: policy.max_walk_depth,
+        };
+
         Self {
             critical_count,
             warning_count,
@@ -503,6 +518,7 @@ impl SafetyReport {
             is_safe,
             findings_by_category,
             strict,
+            settings,
             baseline_source: None,
             verified_code_hash: None,
             category_filter: CategoryFilter::default(),
@@ -1075,12 +1091,6 @@ impl SafetyReport {
         output
     }
 
-    /// Append the informational build-metrics table to Markdown output.
-    /// Full implementation comes from the upstream main branch (BuildMetrics).
-    fn append_metrics_markdown(&self, _output: &mut String) {
-        // Populated by main's BuildMetrics feature; no-op on this branch.
-    }
-
     /// Generate GitHub Actions workflow command output.
     ///
     /// Emits one [workflow command] per non-suppressed finding, levelled to
@@ -1147,10 +1157,6 @@ impl SafetyReport {
 
         output
     }
-}
-
-        output
-    }
 
     /// Append the informational build-metrics table to Markdown output.
     fn append_metrics_markdown(&self, output: &mut String) {
@@ -1192,6 +1198,138 @@ impl SafetyReport {
             ));
             output.push('\n');
         }
+    }
+
+    /// Apply a category filter to the report, removing findings from
+    /// excluded / non-included categories. The original `total_findings`
+    /// count is preserved; the difference is reported via `filtered_count`.
+    /// The safety verdict is recalculated based on remaining findings.
+    pub fn apply_category_filter(&mut self, filter: &CategoryFilter) {
+        let mut new_categories: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
+        let mut filtered = 0usize;
+        let mut critical = 0usize;
+        let mut warning = 0usize;
+        let mut info = 0usize;
+        let mut failing_critical = 0usize;
+        let mut failing_warning = 0usize;
+
+        for (category, findings) in &self.findings_by_category {
+            if filter.should_include(category) {
+                for rf in findings {
+                    match rf.finding.severity {
+                        Severity::Critical => critical += 1,
+                        Severity::Warning => warning += 1,
+                        Severity::Info => info += 1,
+                    }
+                    if !rf.suppressed {
+                        match rf.finding.severity {
+                            Severity::Critical => failing_critical += 1,
+                            Severity::Warning => failing_warning += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                new_categories.insert(category.to_string(), findings.clone());
+            } else {
+                filtered += findings.len();
+            }
+        }
+
+        self.filtered_count = filtered;
+        self.critical_count = critical;
+        self.warning_count = warning;
+        self.info_count = info;
+        self.findings_by_category = new_categories;
+        self.is_safe = if self.strict {
+            failing_critical == 0 && failing_warning == 0
+        } else {
+            failing_critical == 0
+        };
+        self.category_filter = filter.clone();
+    }
+}
+
+/// All known finding categories used by the analysis engine.
+pub const KNOWN_CATEGORIES: &[&str] = &[
+    "Environment",
+    "Function Removed",
+    "Function Documentation Changed",
+    "Function Added",
+    "Function Signature Changed",
+    "Parameter Renamed",
+    "Parameter Reordered",
+    "Parameter Type Changed",
+    "Return Type Changed",
+    "Event Definition Removed",
+    "Struct Removed",
+    "Struct Documentation Changed",
+    "Struct Added",
+    "Struct Field Removed",
+    "Event Field Removed",
+    "Struct Field Reordered",
+    "Event Field Reordered",
+    "Struct Field Type Changed",
+    "Event Field Type Changed",
+    "Struct Field Added",
+    "Event Enum Removed",
+    "Enum Removed",
+    "Enum Documentation Changed",
+    "Enum Added",
+    "Enum Case Removed",
+    "Event Enum Case Removed",
+    "Enum Case Value Changed",
+    "Event Enum Case Value Changed",
+    "Enum Case Added",
+    "Event Enum Case Added",
+    "Union Removed",
+    "Union Added",
+    "Union Case Removed",
+    "Union Case Reordered",
+    "Union Case Type Changed",
+    "Union Case Added",
+    "Error Enum Removed",
+    "Error Enum Added",
+    "Error Enum Case Removed",
+    "Error Enum Case Value Changed",
+    "Error Enum Case Added",
+    "Cascading Layout Break",
+];
+
+/// Validate that the given category name is a known category.
+/// Returns an error message listing unknown categories if any are invalid.
+pub fn validate_categories(categories: &[String]) -> Result<(), Vec<String>> {
+    let known: HashSet<&str> = KNOWN_CATEGORIES.iter().copied().collect();
+    let unknown: Vec<String> = categories
+        .iter()
+        .filter(|c| !known.contains(c.as_str()))
+        .cloned()
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(unknown)
+    }
+}
+
+/// A filter that restricts which finding categories are included in the report.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct CategoryFilter {
+    /// Only include these categories (empty = no inclusion restriction).
+    pub include: Option<HashSet<String>>,
+    /// Exclude these categories.
+    pub exclude: HashSet<String>,
+}
+
+impl CategoryFilter {
+    /// Returns `true` if the category should be included in the report output.
+    pub fn should_include(&self, category: &str) -> bool {
+        if self.exclude.contains(category) {
+            return false;
+        }
+        if let Some(ref include) = self.include {
+            return include.contains(category);
+        }
+        true
     }
 }
 
@@ -1374,6 +1512,16 @@ mod tests {
             old_spec_summary: None,
             new_spec_summary: None,
             metrics: None,
+            settings: ReportSettings {
+                strict: false,
+                explain: false,
+                max_suppressions: None,
+                allow_targetless: None,
+                max_xdr_depth: 0,
+                max_xdr_len: 0,
+                max_entries: 0,
+                max_walk_depth: 0,
+            },
             unmatched_suppressions: Vec::new(),
         };
 

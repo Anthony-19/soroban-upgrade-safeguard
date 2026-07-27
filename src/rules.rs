@@ -323,16 +323,34 @@ pub const RULES: &[RuleDefinition] = &[
         guidance: "A type appears renamed and its layout also changed. Treat the layout change as the breaking part: review the field-level findings and migrate stored data before deploying.",
     },
     RuleDefinition {
-        id: "duplicate_spec_entry",
-        label: "Duplicate Spec Entry",
+        id: "spec_entry_duplicate",
+        label: "Spec Entry Duplicate",
+        severity: Severity::Info,
+        guidance: "The same spec entry appears more than once with an identical definition. The WASM is non-canonical but safe to use; regenerate the contract spec to deduplicate.",
+    },
+    RuleDefinition {
+        id: "spec_entry_conflict",
+        label: "Spec Entry Conflict",
         severity: Severity::Critical,
-        guidance: "The same spec entry is defined more than once. Identical duplicates are harmless but noisy; conflicting definitions break decoding — regenerate the contract spec so each entry appears exactly once.",
+        guidance: "This is a breaking change. A spec entry is defined multiple times with conflicting definitions. The contract spec is ambiguous and must be fixed.",
     },
     RuleDefinition {
         id: "unresolved_storage_reference",
         label: "Unresolved Storage Reference",
         severity: Severity::Warning,
         guidance: "The storage schema references a type that could not be resolved, so coverage is incomplete for it. Add the missing type to the schema or correct the reference.",
+    },
+    RuleDefinition {
+        id: "host_import_added",
+        label: "Host Import Added",
+        severity: Severity::Warning,
+        guidance: "A new host function import is required by the WASM. Verify that the target network environment supports this host function before deploying.",
+    },
+    RuleDefinition {
+        id: "host_import_removed",
+        label: "Host Import Removed",
+        severity: Severity::Info,
+        guidance: "No action required. A host function import is no longer required by the WASM.",
     },
 ];
 
