@@ -36,6 +36,66 @@ enum OutputFormat {
     /// GitHub Actions workflow commands so findings appear as annotations in
     /// the run summary and pull-request checks.
     GithubActions,
+    /// JUnit XML, so CI systems render findings in their existing test-report UI.
+    Junit,
+}
+
+/// A SemVer bump level, ordered `Patch < Minor < Major` so a planned bump can be
+/// compared against the one the analysis recommends.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum BumpLevel {
+    Patch,
+    Minor,
+    Major,
+}
+
+impl BumpLevel {
+    /// Parse the string form produced by [`report::SafetyReport::recommended_bump`].
+    fn from_recommendation(bump: &str) -> Self {
+        match bump {
+            "major" => BumpLevel::Major,
+            "minor" => BumpLevel::Minor,
+            _ => BumpLevel::Patch,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            BumpLevel::Patch => "patch",
+            BumpLevel::Minor => "minor",
+            BumpLevel::Major => "major",
+        }
+    }
+}
+
+/// Evaluate the `--expect-bump` gate.
+///
+/// Returns `true` when the gate *failed* — that is, the recommended bump is
+/// strictly more severe than the expected one — after printing an explanatory
+/// message naming both levels. An expected bump that meets or exceeds the
+/// recommendation passes silently.
+fn check_expect_bump(expected: Option<BumpLevel>, recommended: &str) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    let recommended_level = BumpLevel::from_recommendation(recommended);
+    if recommended_level > expected {
+        eprintln!(
+            "{}",
+            format!(
+                "❌ Version bump gate failed: the analysed changes require a '{}' bump, but \
+                 --expect-bump declared '{}'. Raise the planned release to '{}' (or address the \
+                 findings) before shipping.",
+                recommended_level.label(),
+                expected.label(),
+                recommended_level.label(),
+            )
+            .red()
+            .bold()
+        );
+        return true;
+    }
+    false
 }
 
 #[derive(Parser, Debug)]
@@ -49,10 +109,12 @@ enum OutputFormat {
     //   2. RPC:        soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM> [OPTIONS]
     //   3. Manifest:   soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]
     //   4. Dir Scan:   soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]
+    //   5. Glob:       soroban-upgrade-safeguard --old-glob <PATTERN> --new-glob <PATTERN> [OPTIONS]
     override_usage = "soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM> [OPTIONS]\n       \
                       soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM> [OPTIONS]\n       \
                       soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]\n       \
-                      soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]",
+                      soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]\n       \
+                      soroban-upgrade-safeguard --old-glob <PATTERN> --new-glob <PATTERN> [OPTIONS]",
     // Appended below the options, so the four usage lines above stay untouched.
     after_help = "Subcommands:\n  explain [CATEGORY]  \
                   Look up what a finding category means; lists all when given no argument."
@@ -88,6 +150,18 @@ struct Args {
     #[arg(long)]
     strict: bool,
 
+    /// Assert the release's planned SemVer bump covers what the changes require.
+    ///
+    /// The run fails when the recommended bump is *more severe* than this value
+    /// (ordered patch < minor < major); an expected bump that meets or exceeds
+    /// the recommendation passes. This is an independent gate: it does not
+    /// change the safe/unsafe verdict and is not affected by `--strict`, but a
+    /// gate failure exits `1` just as breaking changes do. A resource-limit
+    /// violation still takes precedence and exits `2`. In batch mode the
+    /// recommendation compared against is the most severe across all pairs.
+    #[arg(long, value_enum, value_name = "LEVEL")]
+    expect_bump: Option<BumpLevel>,
+
     /// Do not color output
     #[arg(long)]
     no_color: bool,
@@ -114,6 +188,20 @@ struct Args {
     /// Directory containing the new versions of the contracts for directory comparison
     #[arg(long, value_name = "NEW_DIR", requires = "old_dir")]
     new_dir: Option<PathBuf>,
+
+    /// Glob pattern selecting the OLD `.wasm` builds for batch comparison,
+    /// e.g. `old/target/wasm32-unknown-unknown/release/*.wasm`.
+    ///
+    /// Supports `*` and `?` within a path segment and `**` for any number of
+    /// directories. Quote the pattern so the shell does not expand it first.
+    /// Matches are paired against `--new-glob` by **file stem** — the same key
+    /// a directory scan derives a pair's name from.
+    #[arg(long, value_name = "PATTERN", requires = "new_glob")]
+    old_glob: Option<String>,
+
+    /// Glob pattern selecting the NEW `.wasm` builds for batch comparison.
+    #[arg(long, value_name = "PATTERN", requires = "old_glob")]
+    new_glob: Option<String>,
 
     /// Only include findings from these categories. Repeatable.
     #[arg(long, value_name = "CATEGORY", num_args = 0..)]
@@ -451,21 +539,38 @@ fn run() -> Result<()> {
     // 1. Identify which mode we are running:
     //    - Batch Manifest Mode
     //    - Batch Directory Mode
+    //    - Batch Glob Mode
     //    - Single Contract Pair Mode
-    let is_batch = args.manifest.is_some() || (args.old_dir.is_some() && args.new_dir.is_some());
+    let is_glob_batch = args.old_glob.is_some() && args.new_glob.is_some();
+    let is_batch = args.manifest.is_some()
+        || (args.old_dir.is_some() && args.new_dir.is_some())
+        || is_glob_batch;
 
     if args.manifest.is_some() && (args.old_dir.is_some() || args.new_dir.is_some()) {
         anyhow::bail!("Cannot specify both --manifest and --old-dir/--new-dir at the same time");
     }
 
+    if args.manifest.is_some() && (args.old_glob.is_some() || args.new_glob.is_some()) {
+        anyhow::bail!("Cannot specify both --manifest and --old-glob/--new-glob at the same time");
+    }
+
+    if (args.old_dir.is_some() || args.new_dir.is_some())
+        && (args.old_glob.is_some() || args.new_glob.is_some())
+    {
+        anyhow::bail!(
+            "Cannot specify both --old-dir/--new-dir and --old-glob/--new-glob at the same time"
+        );
+    }
+
     if is_batch && !args.wasm_paths.is_empty() {
-        anyhow::bail!("Cannot specify positional WASM paths when using batch mode (--manifest or --old-dir/--new-dir)");
+        anyhow::bail!("Cannot specify positional WASM paths when using batch mode (--manifest, --old-dir/--new-dir, or --old-glob/--new-glob)");
     }
 
     if is_batch && args.baseline.is_some() {
         anyhow::bail!(
             "--baseline compares a single contract pair's report and cannot be used with batch \
-             mode (--manifest or --old-dir/--new-dir). Run the pair on its own to use a baseline."
+             mode (--manifest, --old-dir/--new-dir, or --old-glob/--new-glob). Run the pair on \
+             its own to use a baseline."
         );
     }
 
@@ -497,7 +602,8 @@ fn run() -> Result<()> {
     let clean_stdout = args.output.is_some()
         || args.format == OutputFormat::Json
         || args.format == OutputFormat::Markdown
-        || args.format == OutputFormat::Html;
+        || args.format == OutputFormat::Html
+        || args.format == OutputFormat::Junit;
     let progress = |line: String| {
         if clean_stdout {
             eprintln!("{line}");
@@ -538,6 +644,13 @@ fn run() -> Result<()> {
     if is_batch {
         let (pairs, dep_declarations) = if let Some(manifest_path) = &args.manifest {
             parse_manifest(manifest_path)?
+        } else if is_glob_batch {
+            // Glob mode has no dependency declaration mechanism.
+            let pairs = scan_globs(
+                args.old_glob.as_ref().unwrap(),
+                args.new_glob.as_ref().unwrap(),
+            )?;
+            (pairs, vec![])
         } else {
             // Directory scan mode has no dependency declaration mechanism.
             let pairs = scan_directories(
@@ -795,6 +908,16 @@ fn run() -> Result<()> {
             ));
         }
 
+        // Overall recommended bump: the most severe bump across all pairs in the
+        // batch, since batch mode compares a whole set of contracts that ship
+        // together. Computed before rendering so `--expect-bump` gates on the
+        // same value every format reports.
+        let overall_bump = results
+            .values()
+            .map(|report| report.recommended_bump())
+            .max_by_key(|bump| BumpLevel::from_recommendation(bump))
+            .unwrap_or("patch");
+
         match args.format {
             OutputFormat::Json => {
                 let mut results_json = serde_json::Map::new();
@@ -830,20 +953,6 @@ fn run() -> Result<()> {
                     .chain(missing_findings_list.iter())
                     .map(|f| serde_json::to_value(f))
                     .collect::<Result<_, _>>()?;
-
-                // Overall recommended bump: the most severe bump across all
-                // pairs in the batch, since batch mode compares a whole set
-                // of contracts that ship together.
-                let bump_rank = |bump: &str| match bump {
-                    "major" => 2,
-                    "minor" => 1,
-                    _ => 0,
-                };
-                let overall_bump = results
-                    .values()
-                    .map(|report| report.recommended_bump())
-                    .max_by_key(|bump| bump_rank(bump))
-                    .unwrap_or("patch");
 
                 let batch_json = serde_json::json!({
                     "is_safe": overall_safe,
@@ -1195,13 +1304,53 @@ fn run() -> Result<()> {
                     );
                 }
             }
+            OutputFormat::Junit => {
+                use soroban_upgrade_safeguard::report::escape_xml;
+
+                // One test suite per contract, which is the grouping JUnit
+                // already provides and every CI report UI already renders.
+                let mut suites = String::new();
+                for (name, report) in &results {
+                    suites.push_str(&report.generate_summary_junit(Some(name.as_str())));
+                }
+
+                // A pair that could not be analyzed is an <error>, not a
+                // <failure>: the upgrade was never assessed, which is a
+                // different thing from an upgrade assessed as unsafe.
+                for (name, failure) in &failed {
+                    suites.push_str(&format!(
+                        "  <testsuite name=\"{}\" tests=\"1\" failures=\"0\" errors=\"1\" \
+                         skipped=\"0\">\n    <testcase classname=\"soroban-upgrade-safeguard.{}\" \
+                         name=\"analysis\">\n      <error type=\"{}\" message=\"{}\"/>\n    \
+                         </testcase>\n  </testsuite>\n",
+                        escape_xml(name),
+                        escape_xml(name),
+                        if failure.is_limit {
+                            "resource-limit"
+                        } else {
+                            "analysis-error"
+                        },
+                        escape_xml(&failure.message),
+                    ));
+                }
+
+                let rendered = report::junit_document("soroban-upgrade-safeguard", &suites);
+                emit_report_output(&rendered, args.output.as_deref(), &progress)?;
+            }
         } // end match args.format
 
-        // Exit precedence: resource-limit violation (2) > breaking changes (1) > safe (0).
+        // The bump gate is evaluated before exiting so its message is always
+        // printed, even when the run was already going to fail for other
+        // reasons — a pipeline should see every reason it failed, not just the
+        // first one.
+        let bump_gate_failed = check_expect_bump(args.expect_bump, overall_bump);
+
+        // Exit precedence: resource-limit violation (2) > breaking changes or a
+        // failed bump gate (1) > safe (0).
         if any_limit_violation {
             std::process::exit(2);
         }
-        if !overall_safe {
+        if !overall_safe || bump_gate_failed {
             std::process::exit(1);
         }
 
@@ -1268,6 +1417,11 @@ fn run() -> Result<()> {
     // same resource policy as file input.
     let old = if let Some(contract_id) = old_source {
         let rpc_url = args.rpc_url.as_ref().unwrap();
+
+        // Validate the URL's shape and scheme before any request is attempted,
+        // so a typo like `htps://` is reported as a bad URL rather than as an
+        // opaque transport failure from deep inside the HTTP client.
+        loader::validate_rpc_url(rpc_url, args.allow_http_local)?;
 
         // Respect --no-cache / SAFEGUARD_NO_CACHE=1.
         let no_cache = args.no_cache
@@ -1387,6 +1541,10 @@ fn run() -> Result<()> {
         OutputFormat::Html => safety_report.generate_summary_html(),
         OutputFormat::Text => safety_report.generate_summary_text(args.explain),
         OutputFormat::GithubActions => safety_report.generate_summary_github_actions(None),
+        OutputFormat::Junit => report::junit_document(
+            "soroban-upgrade-safeguard",
+            &safety_report.generate_summary_junit(None),
+        ),
     };
 
     // Write the report — either to a file (--output) or to stdout.
@@ -1416,7 +1574,11 @@ fn run() -> Result<()> {
         );
     }
 
-    if !safety_report.is_safe {
+    // Evaluated before the verdict exit so its message is always printed, even
+    // when the run was already going to fail for other reasons.
+    let bump_gate_failed = check_expect_bump(args.expect_bump, safety_report.recommended_bump());
+
+    if !safety_report.is_safe || bump_gate_failed {
         std::process::exit(1);
     } else if safety_report.suppressed_critical_count > 0 {
         eprintln!(
@@ -1907,4 +2069,278 @@ fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>>
     }
 
     Ok(pairs)
+}
+
+/// Match one path segment against one glob segment.
+///
+/// `*` matches any run of characters within the segment (never a `/`, since
+/// matching is applied per segment), `?` matches exactly one character, and
+/// everything else is literal. The backtracking is the standard two-pointer
+/// form: linear in practice and never recursive, so a pathological pattern
+/// cannot blow the stack.
+fn segment_matches(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    // Position of the last `*` seen, and how much of `name` it had consumed.
+    let mut star: Option<usize> = None;
+    let mut resume = 0usize;
+
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            resume = ni;
+            pi += 1;
+        } else if let Some(s) = star {
+            // Backtrack: let the last `*` swallow one more character.
+            pi = s + 1;
+            resume += 1;
+            ni = resume;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Maximum directory depth a `**` segment will descend. Mirrors the cap in
+/// [`collect_wasm_files`] and bounds symlink loops.
+const GLOB_MAX_DEPTH: usize = 32;
+
+/// Walk `dir`, collecting every file matching the remaining glob `segments`.
+fn glob_walk(dir: &Path, segments: &[&str], depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > GLOB_MAX_DEPTH {
+        return;
+    }
+    let Some(seg) = segments.first() else {
+        return;
+    };
+    let rest = &segments[1..];
+
+    // `**` matches zero or more directories, so it has to be tried both as
+    // "consume nothing" and as "descend one level and try again".
+    if *seg == "**" {
+        glob_walk(dir, rest, depth + 1, out);
+        if let Ok(read_dir) = std::fs::read_dir(dir) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    glob_walk(&path, segments, depth + 1, out);
+                }
+            }
+        }
+        return;
+    }
+
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !segment_matches(seg, name) {
+            continue;
+        }
+        if rest.is_empty() {
+            if path.is_file() {
+                out.push(path);
+            }
+        } else if path.is_dir() {
+            glob_walk(&path, rest, depth + 1, out);
+        }
+    }
+}
+
+/// Expand a glob pattern into the list of files it matches, sorted for
+/// deterministic ordering.
+///
+/// The literal prefix of the pattern is used as the walk root, so
+/// `target/wasm32-unknown-unknown/release/*.wasm` only reads that one directory
+/// rather than scanning from the working directory down.
+fn expand_glob(pattern: &str) -> Result<Vec<PathBuf>> {
+    if pattern.trim().is_empty() {
+        anyhow::bail!("Glob pattern is empty");
+    }
+
+    // Accept either separator so a pattern copied from a Windows path still
+    // splits into segments.
+    let normalized = pattern.replace('\\', "/");
+    let absolute = normalized.starts_with('/');
+    let mut segments: Vec<&str> = normalized
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+
+    let mut root = if absolute {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(".")
+    };
+    let mut literal_prefix = 0usize;
+    for seg in &segments {
+        if seg.contains('*') || seg.contains('?') {
+            break;
+        }
+        root.push(seg);
+        literal_prefix += 1;
+    }
+    segments.drain(..literal_prefix);
+
+    // No wildcards at all: the pattern is just a path.
+    if segments.is_empty() {
+        return Ok(if root.is_file() { vec![root] } else { Vec::new() });
+    }
+
+    let mut matches = Vec::new();
+    glob_walk(&root, &segments, 0, &mut matches);
+    matches.sort();
+    matches.dedup();
+    Ok(matches)
+}
+
+/// Index glob matches by file stem, the pairing key for glob mode.
+///
+/// Two files with the same stem on one side make the pairing genuinely
+/// ambiguous. Picking one silently could compare the wrong build, so this fails
+/// and points at the manifest, which names pairs explicitly.
+fn index_by_stem(
+    files: &[PathBuf],
+    pattern: &str,
+) -> Result<std::collections::BTreeMap<String, PathBuf>> {
+    let mut map: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
+    for path in files {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if let Some(existing) = map.insert(stem.clone(), path.clone()) {
+            anyhow::bail!(
+                "Glob pattern '{}' matched two files with the same stem '{}': '{}' and '{}'. \
+                 Pairing is by file stem, so this is ambiguous — narrow the pattern or use \
+                 --manifest to name the pairs explicitly.",
+                pattern,
+                stem,
+                existing.display(),
+                path.display(),
+            );
+        }
+    }
+    Ok(map)
+}
+
+/// Build batch pairs from a pair of glob patterns.
+///
+/// Old and new matches are paired by **file stem**, the same key a directory
+/// scan derives a pair's display name from, so a contract keeps one identity
+/// regardless of which batch mode selected it. A file matched on only one side
+/// is reported with the same unmatched-file warning directory scanning emits,
+/// never silently dropped.
+fn scan_globs(old_pattern: &str, new_pattern: &str) -> Result<Vec<ContractPair>> {
+    let old_files = expand_glob(old_pattern)?;
+    let new_files = expand_glob(new_pattern)?;
+
+    // Only `.wasm` files participate; a pattern like `release/*` would
+    // otherwise sweep in build metadata and rlibs.
+    let is_wasm = |p: &PathBuf| p.extension().and_then(|s| s.to_str()) == Some("wasm");
+    let old_files: Vec<PathBuf> = old_files.into_iter().filter(is_wasm).collect();
+    let new_files: Vec<PathBuf> = new_files.into_iter().filter(is_wasm).collect();
+
+    if old_files.is_empty() {
+        anyhow::bail!("Glob pattern '{}' matched no .wasm files", old_pattern);
+    }
+    if new_files.is_empty() {
+        anyhow::bail!("Glob pattern '{}' matched no .wasm files", new_pattern);
+    }
+
+    let old_index = index_by_stem(&old_files, old_pattern)?;
+    let new_index = index_by_stem(&new_files, new_pattern)?;
+
+    let mut pairs = Vec::new();
+    for (stem, old_path) in &old_index {
+        match new_index.get(stem) {
+            Some(new_path) => pairs.push(ContractPair {
+                old: ContractSource::File(old_path.clone()),
+                new: ContractSource::File(new_path.clone()),
+                name: Some(stem.clone()),
+            }),
+            None => eprintln!(
+                "⚠️  Warning: Match not found for '{}' in new glob '{}'",
+                old_path.display(),
+                new_pattern
+            ),
+        }
+    }
+
+    for (stem, new_path) in &new_index {
+        if !old_index.contains_key(stem) {
+            eprintln!(
+                "⚠️  Warning: No old counterpart found for '{}' in old glob '{}'",
+                new_path.display(),
+                old_pattern
+            );
+        }
+    }
+
+    if pairs.is_empty() {
+        anyhow::bail!(
+            "No matching .wasm contract pairs found between '{}' and '{}'. Pairing is by file \
+             stem: every stem matched by one pattern must also be matched by the other.",
+            old_pattern,
+            new_pattern
+        );
+    }
+
+    Ok(pairs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn segment_matches_literals_and_wildcards() {
+        assert!(segment_matches("*.wasm", "token.wasm"));
+        assert!(segment_matches("*.wasm", ".wasm"));
+        assert!(!segment_matches("*.wasm", "token.wat"));
+        assert!(segment_matches("v?.wasm", "v1.wasm"));
+        assert!(!segment_matches("v?.wasm", "v10.wasm"));
+        assert!(segment_matches("token", "token"));
+        assert!(!segment_matches("token", "tokens"));
+        assert!(segment_matches("*", "anything"));
+        assert!(segment_matches("a*b*c", "azzbzzc"));
+        assert!(!segment_matches("a*b*c", "azzbzz"));
+    }
+
+    #[test]
+    fn bump_levels_are_ordered_patch_minor_major() {
+        assert!(BumpLevel::Patch < BumpLevel::Minor);
+        assert!(BumpLevel::Minor < BumpLevel::Major);
+        assert_eq!(BumpLevel::from_recommendation("major"), BumpLevel::Major);
+        assert_eq!(BumpLevel::from_recommendation("minor"), BumpLevel::Minor);
+        assert_eq!(BumpLevel::from_recommendation("patch"), BumpLevel::Patch);
+    }
+
+    #[test]
+    fn expect_bump_gate_only_fails_when_recommendation_is_more_severe() {
+        // Falls short.
+        assert!(check_expect_bump(Some(BumpLevel::Minor), "major"));
+        assert!(check_expect_bump(Some(BumpLevel::Patch), "minor"));
+        // Matches.
+        assert!(!check_expect_bump(Some(BumpLevel::Major), "major"));
+        // Exceeds.
+        assert!(!check_expect_bump(Some(BumpLevel::Major), "minor"));
+        assert!(!check_expect_bump(Some(BumpLevel::Minor), "patch"));
+        // Not requested.
+        assert!(!check_expect_bump(None, "major"));
+    }
 }
