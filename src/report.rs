@@ -1415,6 +1415,134 @@ impl SafetyReport {
         output
     }
 
+    /// Generate a single JUnit `<testsuite>` element for this report.
+    ///
+    /// Each finding becomes one `<testcase>`, named by its category and target,
+    /// so a CI system's existing test-report UI renders a breaking change as a
+    /// failing test rather than as text buried in a log.
+    ///
+    /// Status mapping:
+    ///
+    /// - `Critical` → `<failure>`.
+    /// - `Warning`  → `<failure>` under `--strict`, otherwise a passing case.
+    /// - `Info`     → a passing case.
+    /// - Suppressed → `<skipped>` carrying the suppression reason, at any
+    ///   severity. A skipped case reads as *acknowledged* in every CI UI, which
+    ///   is exactly what a suppression is; it is never reported as a failure.
+    ///
+    /// `suite_name` names the suite (the contract name in batch mode). A report
+    /// with no findings still emits one passing case so the suite is never empty
+    /// — an empty suite renders as "no tests ran", which reads as a broken job
+    /// rather than as a clean upgrade.
+    pub fn generate_summary_junit(&self, suite_name: Option<&str>) -> String {
+        let suite = suite_name.unwrap_or("soroban-upgrade-safeguard");
+        let classname = format!("soroban-upgrade-safeguard.{}", suite);
+
+        // Sort categories for deterministic output.
+        let mut categories: Vec<&String> = self.findings_by_category.keys().collect();
+        categories.sort();
+
+        let mut cases = String::new();
+        let (mut tests, mut failures, mut skipped) = (0usize, 0usize, 0usize);
+
+        for category in categories {
+            for reported in self.findings_by_category.get(category).unwrap() {
+                let finding = &reported.finding;
+                tests += 1;
+
+                let case_name = match finding.target.as_deref() {
+                    Some(target) if !target.is_empty() => {
+                        format!("{}: {}", finding.category, target)
+                    }
+                    _ => finding.category.clone(),
+                };
+
+                cases.push_str(&format!(
+                    "    <testcase classname=\"{}\" name=\"{}\"",
+                    escape_xml(&classname),
+                    escape_xml(&case_name),
+                ));
+
+                if reported.suppressed {
+                    skipped += 1;
+                    let reason = reported
+                        .suppression_reason
+                        .as_deref()
+                        .unwrap_or("acknowledged by a suppression rule");
+                    cases.push_str(&format!(
+                        ">\n      <skipped message=\"{}\"/>\n    </testcase>\n",
+                        escape_xml(reason),
+                    ));
+                    continue;
+                }
+
+                let fails = match finding.severity {
+                    Severity::Critical => true,
+                    Severity::Warning => self.strict,
+                    Severity::Info => false,
+                };
+
+                if fails {
+                    failures += 1;
+                    cases.push_str(&format!(
+                        ">\n      <failure type=\"{}\" message=\"{}\">{}</failure>\n    </testcase>\n",
+                        escape_xml(finding.severity.label()),
+                        escape_xml(&finding.message),
+                        escape_xml(&Self::junit_case_body(reported)),
+                    ));
+                } else {
+                    // A passing case still carries the message so a reader who
+                    // opens it sees what the tool actually observed.
+                    cases.push_str(&format!(
+                        ">\n      <system-out>{}</system-out>\n    </testcase>\n",
+                        escape_xml(&Self::junit_case_body(reported)),
+                    ));
+                }
+            }
+        }
+
+        if tests == 0 {
+            tests = 1;
+            cases.push_str(&format!(
+                "    <testcase classname=\"{}\" name=\"no breaking changes detected\"/>\n",
+                escape_xml(&classname),
+            ));
+        }
+
+        format!(
+            "  <testsuite name=\"{}\" tests=\"{}\" failures=\"{}\" errors=\"0\" skipped=\"{}\">\n\
+             {}  </testsuite>\n",
+            escape_xml(suite),
+            tests,
+            failures,
+            skipped,
+            cases,
+        )
+    }
+
+    /// The body text of a JUnit `<testcase>`: the finding's message plus the
+    /// stable rule id and any severity-override or remediation context.
+    fn junit_case_body(reported: &ReportedFinding) -> String {
+        let mut body = format!(
+            "[{}] {}\nrule_id: {}\nfingerprint: {}",
+            reported.finding.severity.label(),
+            reported.finding.message,
+            reported.rule_id,
+            reported.fingerprint,
+        );
+        if let Some(ref original) = reported.original_severity {
+            body.push_str(&format!(
+                "\nseverity overridden: {} -> {}",
+                original.label(),
+                reported.finding.severity.label(),
+            ));
+        }
+        if let Some(ref remediation) = reported.remediation {
+            body.push_str(&format!("\nremediation: {}", remediation));
+        }
+        body
+    }
+
     /// Append the informational build-metrics table to Markdown output.
     fn append_metrics_markdown(&self, output: &mut String) {
         if let Some(ref m) = self.metrics {
@@ -1907,6 +2035,43 @@ pub fn escape_html(input: &str) -> String {
         }
     }
     out
+}
+
+/// Escape a string for use as XML text or as an attribute value.
+///
+/// Same five entities as [`escape_html`], plus one thing XML needs that HTML
+/// does not: control characters outside the XML 1.0 legal set are dropped
+/// rather than emitted. Finding messages carry type, field, and function names
+/// read straight out of an untrusted WASM binary, and a stray control byte in
+/// one of those would make the whole document unparseable — which in a CI
+/// test-report UI shows up as a missing report, not as an error.
+pub fn escape_xml(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            '\t' | '\n' | '\r' => out.push(ch),
+            c if (c as u32) < 0x20 => {}
+            c if (0x7f..=0x9f).contains(&(c as u32)) => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Wrap one or more rendered `<testsuite>` elements in a complete JUnit XML
+/// document. Suites carry their own counts, so the root element only names the
+/// run — every common CI ingester reads the per-suite attributes.
+pub fn junit_document(name: &str, suites: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites name=\"{}\">\n{}</testsuites>\n",
+        escape_xml(name),
+        suites,
+    )
 }
 
 /// One `<li>` tile in the counts row.
