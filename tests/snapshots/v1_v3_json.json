@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "is_safe": true,
+  "strict": false,
+  "counts": {
+    "critical": 0,
+    "warning": 2,
+    "info": 0
+  },
+  "suppressed_count": 0,
+  "filtered_count": 0,
+  "total_findings": 2,
+  "recommended_bump": "minor",
+  "findings_by_category": {
+    "Parameter Renamed": [
+      {
+        "severity": "warning",
+        "category": "Parameter Renamed",
+        "message": "Function 'execute_action': parameter 0 renamed from '_config' to '_new_config'.",
+        "type_name": null,
+        "target": "execute_action._config"
+      },
+      {
+        "severity": "warning",
+        "category": "Parameter Renamed",
+        "message": "Function 'initialize': parameter 0 renamed from '_admin' to '_new_admin'.",
+        "type_name": null,
+        "target": "initialize._admin"
+      }
+    ]
+  }
+}

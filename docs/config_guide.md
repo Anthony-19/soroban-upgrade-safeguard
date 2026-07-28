@@ -48,6 +48,8 @@ max_xdr_depth = 128
 max_xdr_len = 1048576
 max_entries = 1000
 max_walk_depth = 128
+max_wasm_size = 26214400  # 25 MiB — reject inputs larger than this before reading
+rpc_timeout_secs = 30    # per-request RPC timeout; set to 0 to disable
 
 # Define one or more reviewed suppression rules
 [[suppress]]
@@ -80,12 +82,15 @@ Each CLI flag and configuration parameter has a corresponding environment variab
 | (Positional) | `wasm_paths` | `SAFEGUARD_WASM_PATHS` | Comma-separated paths |
 | `--contract-id`| `contract_id`| `SAFEGUARD_CONTRACT_ID` | String |
 | `--rpc-url` | `rpc_url` | `SAFEGUARD_RPC_URL` | String (URL) |
+| `--no-cache` | — | `SAFEGUARD_NO_CACHE` | Boolean (`true`/`1` or `false`/`0`) |
 | (TOML-only) | `max_suppressions`| `SAFEGUARD_MAX_SUPPRESSIONS` | Unsigned Integer |
 | (TOML-only) | `allow_targetless`| `SAFEGUARD_ALLOW_TARGETLESS` | Boolean (`true`/`1` or `false`/`0`) |
 | `--max-xdr-depth`| `limits.max_xdr_depth`| `SAFEGUARD_MAX_XDR_DEPTH`| Unsigned 32-bit Integer |
 | `--max-xdr-len`| `limits.max_xdr_len`| `SAFEGUARD_MAX_XDR_LEN` | Unsigned Pointer Integer (usize)|
 | `--max-entries`| `limits.max_entries`| `SAFEGUARD_MAX_ENTRIES` | Unsigned Pointer Integer (usize)|
 | `--max-walk-depth`| `limits.max_walk_depth`| `SAFEGUARD_MAX_WALK_DEPTH`| Unsigned Pointer Integer (usize)|
+| `--max-wasm-size`| `limits.max_wasm_size`| `SAFEGUARD_MAX_WASM_SIZE`| Unsigned Pointer Integer (usize, bytes)|
+| `--rpc-timeout-secs`| `limits.rpc_timeout_secs`| `SAFEGUARD_RPC_TIMEOUT_SECS`| Unsigned 64-bit Integer (seconds)|
 
 ---
 
@@ -94,7 +99,8 @@ Each CLI flag and configuration parameter has a corresponding environment variab
 To prevent fragile paths when running the CLI from subdirectories or in CI pipelines, Safeguard applies context-specific path resolution:
 
 * **Config File Sources**: Paths defined in `.safeguard.toml` (e.g. `manifest`, `old_dir`, `new_dir`, `wasm_paths`) are resolved **relative to the directory containing the configuration file**.
-* **CLI & Environment Sources**: Paths passed on the command line or via environment variables are resolved **relative to the current working directory of the process**.
+* **Manifest pair paths**: Relative `old` and `new` paths inside a `--manifest` file are resolved **relative to the directory that contains that manifest file**, not the working directory. Absolute paths are left unchanged. This means a manifest checked in at `ci/contracts.toml` works correctly regardless of which directory the tool is invoked from.
+* **CLI & Environment Sources**: Paths passed on the command line or via environment variables are resolved **relative to the current working directory of the process**. This includes `--old-dir`, `--new-dir`, and positional WASM arguments.
 
 ---
 
@@ -115,7 +121,9 @@ Every report execution generates a `VerdictSettings` metadata block captured wit
     "max_xdr_depth": 128,
     "max_xdr_len": 1048576,
     "max_entries": 1000,
-    "max_walk_depth": 128
+    "max_walk_depth": 128,
+    "max_wasm_size": 26214400,
+    "rpc_timeout_secs": 30
   }
 }
 ```
@@ -135,7 +143,7 @@ Safeguard provides the following command line options. You can view them by runn
 * **`-f, --format <FORMAT>`**
   Set the output report format. Options: `text` (default, user-friendly terminal output), `json` (for programmatic parsing), `markdown` (ideal for CI/CD job summaries).
 * **`-s, --strict`**
-  Enforces a strict exit policy. If any Warning or Critical breaking changes are detected, Safeguard will exit with code `1`.
+  Enforces a strict exit policy. If any Warning or Critical breaking changes are detected, Safeguard will exit with code `1` (unsafe verdict).
 * **`-e, --explain`**
   Prints concise explanations and remediation guidance for each breaking change category found.
 * **`--no-color`**
@@ -144,6 +152,14 @@ Safeguard provides the following command line options. You can view them by runn
   The target contract ID deployed on the Stellar network (RPC mode only).
 * **`--rpc-url <URL>`**
   The Stellar RPC server URL used to query and fetch the on-chain contract code (RPC mode only).
+* **`--allow-http-local`**
+  Allow plain `http://` RPC URLs when the host is `localhost` or `127.0.0.1`. Without this flag only `https://` URLs are accepted. Applies to both single-pair RPC mode and on-chain pairs declared in a manifest.
+* **`--no-cache`** / `SAFEGUARD_NO_CACHE=1`
+  Skip both reading from and writing to the local WASM cache for this run. By default, WASM fetched from RPC is cached on disk keyed by its code hash so repeat fetches of the same deployed code are served locally. Use this flag (or the environment variable) to force a fresh network fetch.
+
+  To clear the cache entirely without disabling it, delete the platform cache directory:
+  - **Linux / macOS**: `~/.cache/soroban-upgrade-safeguard/wasm/`
+  - **Windows**: `%LOCALAPPDATA%\soroban-upgrade-safeguard\wasm\`
 * **`--manifest <PATH>`**
   Path to a batch manifest configuration TOML file containing multiple contract pairs to compare (Manifest mode).
 * **`--old-dir <PATH>`**
@@ -158,6 +174,10 @@ Safeguard provides the following command line options. You can view them by runn
   Sets the maximum allowed decoded spec entries across all sections.
 * **`--max-walk-depth <N>`**
   Sets the maximum recursion depth for structural type walk evaluations.
+* **`--max-wasm-size <BYTES>`**
+  Sets the maximum raw WASM binary size in bytes (default: 26,214,400 — 25 MiB). For disk files the size is checked via `fs::metadata` before any bytes are read into memory; for RPC-fetched bytes it is checked after receipt. An input exceeding this limit exits with code 2 (resource-limit violation). Settable via `SAFEGUARD_MAX_WASM_SIZE` or `limits.max_wasm_size` in `.safeguard.toml`.
+* **`--rpc-timeout-secs <SECS>`**
+  Sets the overall per-request timeout for RPC calls in seconds (default: 30). The budget covers TCP connect, TLS handshake, sending the request body, and reading the full response. When the endpoint stalls and the timeout fires, the error message names the RPC URL and the configured timeout so the cause is immediately clear. Set to `0` to disable the timeout entirely (not recommended in CI). Settable via `SAFEGUARD_RPC_TIMEOUT_SECS` or `limits.rpc_timeout_secs` in `.safeguard.toml`.
 
 ---
 
@@ -178,6 +198,71 @@ Safeguard resolves its operation mode dynamically based on the set of provided a
 * **Trigger**: `--manifest <PATH>` is specified.
 * **Behavior**: Safeguard reads the manifest file (which lists pairs of contracts) and runs comparisons on all of them in batch.
 * **Restrictions**: No positional arguments are allowed.
+
+#### Manifest pair sources
+
+Each side of a pair can be a **local file path** (string) or an **on-chain contract** (inline table with `contract_id` and `rpc_url`). The two forms can be mixed freely within the same manifest and across pairs.
+
+**File-only pair** — backward-compatible, unchanged from previous versions:
+
+```toml
+[[pairs]]
+old = "wasm/old/my_contract.wasm"
+new = "wasm/new/my_contract.wasm"
+name = "my_contract"
+```
+
+**Old side from RPC, new side from local file** — the primary upgrade-check workflow:
+
+```toml
+[[pairs]]
+old = { contract_id = "CCONTRACT_ID_HERE", rpc_url = "https://soroban-testnet.stellar.org" }
+new  = "target/wasm32-unknown-unknown/release/my_contract.wasm"
+name = "my_contract"
+```
+
+**Both sides from RPC** — compare two deployed versions directly:
+
+```toml
+[[pairs]]
+old = { contract_id = "COLD_CONTRACT_ID", rpc_url = "https://soroban-mainnet.stellar.org" }
+new  = { contract_id = "CNEW_CONTRACT_ID", rpc_url = "https://soroban-mainnet.stellar.org" }
+name = "my_contract"
+```
+
+**Mixed batch** — file and on-chain pairs in a single run:
+
+```toml
+[[pairs]]
+old = "wasm/old/token.wasm"
+new  = "wasm/new/token.wasm"
+name = "token"
+
+[[pairs]]
+old = { contract_id = "CPOOL_CONTRACT_ID", rpc_url = "https://soroban-testnet.stellar.org" }
+new  = "wasm/new/pool.wasm"
+name = "pool"
+```
+
+**JSON manifest** — same syntax, just written as JSON objects:
+
+```json
+{
+  "pairs": [
+    {
+      "old": { "contract_id": "CCONTRACT_ID_HERE", "rpc_url": "https://soroban-testnet.stellar.org" },
+      "new": "target/wasm32-unknown-unknown/release/my_contract.wasm",
+      "name": "my_contract"
+    }
+  ]
+}
+```
+
+> **Derived names for on-chain pairs.** When a pair has no explicit `name`, the name is derived from the `new` side: the WASM file stem for a local file, or the full `contract_id` string for an on-chain source. Provide an explicit `name` to keep reports readable when contract IDs are long.
+
+> **Caching.** WASM fetched from RPC is cached on disk keyed by code hash (see `--no-cache`). A batch is exactly where the cache matters most: if the same deployed contract appears in several pairs, it is fetched only once for the whole run.
+
+> **URL security.** Each on-chain pair's `rpc_url` is validated independently. `https://` is always accepted. Plain `http://` is only permitted for `localhost` / `127.0.0.1` when `--allow-http-local` is passed.
 
 ### 4. Directory Scan Mode
 * **Trigger**: Both `--old-dir <PATH>` and `--new-dir <PATH>` are specified.
@@ -213,7 +298,7 @@ Here are the most common configuration mistakes and how to resolve them:
 * **Remediation**: Re-evaluate the breaking change. If it is still intentional, edit `.safeguard.toml` to update the `expiry` date to a future date.
 
 ### 5. Fingerprint Mismatches
-* **Symptom**: The gate fails (exit code 1) indicating critical breaking changes are present, even though you have a suppression rule for the category and target.
+* **Symptom**: The gate fails (exit code 1 — unsafe verdict) indicating critical breaking changes are present, even though you have a suppression rule for the category and target.
 * **Reason**: When using the strict new-format suppression, the calculated SHA-256 fingerprint of the diff finding must match the `fingerprint` property of the rule exactly.
 * **Remediation**: Check the JSON output or standard error logs for the actual calculated fingerprint of the finding, and verify that the `fingerprint` field in your `.safeguard.toml` matches it exactly (character-for-character).
 
@@ -244,6 +329,30 @@ Safeguard protects your CI runner systems and memory footprints from malicious, 
 * **Purpose**: Restricts recursive structural comparison, formatting, and rendering algorithms.
 * **Symptom**: Validation fails under complex nested structs check.
 * **Remediation**: Raise this limit only if Safeguard explicitly recommends doing so during validation.
+
+#### 5. `max_wasm_size` (CLI: `--max-wasm-size`, Default: `26,214,400` bytes / 25 MiB)
+* **Purpose**: Caps the raw WASM binary size **before** the file is read into memory (disk) or accepted from an RPC response. A legitimate compiled Soroban contract is well under 1 MiB; the 25 MiB default is a wide safety margin that rejects multi-gigabyte adversarial inputs without allocating memory for them. Violations surface as exit code 2 (resource-limit violation), distinct from exit code 1 (breaking changes found).
+* **Symptom**: Error message `WASM input size N bytes exceeds the maximum of M bytes (raise max_wasm_size)`.
+* **Remediation**: If you have a genuinely large contract that exceeds the default, raise the limit via `--max-wasm-size`, `SAFEGUARD_MAX_WASM_SIZE`, or `limits.max_wasm_size` in `.safeguard.toml`. For adversarial inputs the correct response is to reject them rather than raise the limit.
+
+#### 6. `rpc_timeout_secs` (CLI: `--rpc-timeout-secs`, Default: `30` seconds)
+* **Purpose**: Bounds the total time allowed for each RPC round-trip (there are at most two per contract fetch: one to resolve the code hash, one to fetch the code entry). Without this limit an unresponsive endpoint stalls the process indefinitely, burning an entire CI job's time budget with no output.
+* **Behaviour**: When the timeout fires, the error names the RPC URL and the configured limit so the cause is immediately actionable. The overall budget covers TCP connect, TLS handshake, sending the request, and reading the full response body.
+* **Symptom**: Error message `RPC request to '<url>' timed out after N second(s)`.
+* **Remediation**: If your endpoint is legitimately slow, raise the limit via `--rpc-timeout-secs`, `SAFEGUARD_RPC_TIMEOUT_SECS`, or `limits.rpc_timeout_secs` in `.safeguard.toml`. Set to `0` to disable the timeout entirely (not recommended in CI).
+
+---
+
+## Exit Codes
+
+| Code | Meaning | When CI should… |
+| :--- | :--- | :--- |
+| `0` | **Safe** — no critical findings (or all suppressed). | Proceed with deployment. |
+| `1` | **Unsafe** — at least one critical finding (or warning in strict mode). | Block deployment. |
+| `2` | **Resource limit exceeded** — untrusted input rejected before it could exhaust memory/stack. | Investigate the input or raise the relevant limit. |
+| `3` | **Operational error** — missing file, malformed WASM, bad manifest, unreachable RPC endpoint, etc. The tool could not run; the result carries **no safety signal**. | Treat as a broken gate — surface the error and do not proceed. |
+
+Codes `0` and `1` are the normal comparison outcomes. Code `3` is deliberately distinct from code `1` so a pipeline can tell "the safety gate is working and blocked the upgrade" (1) from "the tool itself failed and gave no result" (3).
 
 ---
 

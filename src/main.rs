@@ -7,16 +7,10 @@ use std::path::{Path, PathBuf};
 
 use soroban_upgrade_safeguard::{
     color::should_disable_color,
-    dependency::{
-        cycle_findings, missing_contract_findings, ContractDependency, CrossContractFinding,
-        DependencyGraph,
-    },
-    limits::{find_limit_error, LimitsConfig, ResourcePolicy},
-    loader, report,
+    diff, loader, parser, report,
     report::{validate_categories, CategoryFilter},
-    storage_schema::StorageSchema,
+    spec,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
-    CompareOptions,
 };
 
 /// Output format for the safety report.
@@ -29,9 +23,6 @@ enum OutputFormat {
     Json,
     /// Markdown document suitable for PR descriptions and comments.
     Markdown,
-    /// GitHub Actions workflow commands so findings appear as annotations in
-    /// the run summary and pull-request checks.
-    GithubActions,
 }
 
 #[derive(Parser, Debug)]
@@ -85,6 +76,756 @@ struct Args {
     #[arg(long)]
     no_color: bool,
 
+    /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
+    #[arg(long, value_name = "MANIFEST_PATH")]
+    manifest: Option<PathBuf>,
+
+    /// Directory containing the old versions of the contracts for directory comparison
+    #[arg(long, value_name = "OLD_DIR", requires = "new_dir")]
+    old_dir: Option<PathBuf>,
+
+    /// Directory containing the new versions of the contracts for directory comparison
+    #[arg(long, value_name = "NEW_DIR", requires = "old_dir")]
+    new_dir: Option<PathBuf>,
+
+    /// Only include findings from these categories. Repeatable.
+    #[arg(long, value_name = "CATEGORY", num_args = 0..)]
+    include_category: Vec<String>,
+
+    /// Exclude findings from these categories. Repeatable.
+    #[arg(long, value_name = "CATEGORY", num_args = 0..)]
+    exclude_category: Vec<String>,
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // Validate category filter arguments
+    let all_categories: Vec<String> = args
+        .include_category
+        .iter()
+        .chain(args.exclude_category.iter())
+        .cloned()
+        .collect();
+    if !all_categories.is_empty() {
+        if let Err(unknown) = validate_categories(&all_categories) {
+            anyhow::bail!(
+                "Unknown category name(s): {}. Valid categories are: {}",
+                unknown.join(", "),
+                report::KNOWN_CATEGORIES.join(", ")
+            );
+        }
+    }
+    let category_filter = CategoryFilter {
+        include: if args.include_category.is_empty() {
+            None
+        } else {
+            Some(args.include_category.iter().cloned().collect())
+        },
+        exclude: args.exclude_category.iter().cloned().collect(),
+    };
+
+    if should_disable_color(
+        args.no_color,
+        std::env::var_os("NO_COLOR").is_some(),
+        std::io::stdout().is_terminal(),
+    ) {
+        colored::control::set_override(false);
+    }
+
+    // 1. Identify which mode we are running:
+    //    - Batch Manifest Mode
+    //    - Batch Directory Mode
+    //    - Single Contract Pair Mode
+    let is_batch = args.manifest.is_some() || (args.old_dir.is_some() && args.new_dir.is_some());
+
+    if args.manifest.is_some() && (args.old_dir.is_some() || args.new_dir.is_some()) {
+        anyhow::bail!("Cannot specify both --manifest and --old-dir/--new-dir at the same time");
+    }
+
+    if is_batch && !args.wasm_paths.is_empty() {
+        anyhow::bail!("Cannot specify positional WASM paths when using batch mode (--manifest or --old-dir/--new-dir)");
+    }
+
+    // In JSON or Markdown mode, decorative progress goes to stderr so stdout
+    // stays a single, pristine document. In text mode it stays on stdout
+    // exactly as before.
+    let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
+    let progress = |line: String| {
+        if clean_stdout {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    };
+
+    // Load suppression config: an explicit --config must exist; otherwise fall
+    // back to `.safeguard.toml` in the working directory if it happens to be
+    // present. With neither, an empty config preserves today's behavior.
+    let suppressions = match &args.config {
+        Some(path) => SuppressionConfig::load_from_path(path)?,
+        None => {
+            SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?.unwrap_or_default()
+        }
+    };
+
+    if is_batch {
+        let pairs = if let Some(manifest_path) = &args.manifest {
+            parse_manifest(manifest_path)?
+        } else {
+            scan_directories(
+                args.old_dir.as_ref().unwrap(),
+                args.new_dir.as_ref().unwrap(),
+            )?
+        };
+
+        progress("🔍 Soroban Upgrade Safeguard (Batch Mode)".to_string());
+        progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
+        progress(format!("Loaded {} pair(s) for comparison.\n", pairs.len()));
+
+        let mut results = std::collections::BTreeMap::new();
+        let mut overall_safe = true;
+
+        for (i, pair) in pairs.iter().enumerate() {
+            let default_name = format!("pair_{}", i + 1);
+            let contract_name = pair.name.clone().unwrap_or_else(|| {
+                pair.new
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.to_string())
+                    .unwrap_or(default_name)
+            });
+
+            progress(format!(
+                "📦 [{}/{}] Comparing contract pair: {}",
+                i + 1,
+                pairs.len(),
+                contract_name.bold()
+            ));
+
+            let old_wasm = loader::load_wasm(&pair.old)?;
+            let new_wasm = loader::load_wasm(&pair.new)?;
+
+            let mut report = compare_contracts(
+                &ContractComparison {
+                    old_bytes: &old_wasm.bytes,
+                    old_path: &old_wasm.path,
+                    new_bytes: &new_wasm.bytes,
+                    new_path: &new_wasm.path,
+                    suppressions: &suppressions,
+                    explain: args.explain,
+                    strict: args.strict,
+                },
+                &progress,
+            )?;
+
+            if !all_categories.is_empty() {
+                report.apply_category_filter(&category_filter);
+            }
+
+            if !report.is_safe {
+                overall_safe = false;
+            }
+
+            results.insert(contract_name, report);
+            progress("\n----------------------------------------\n".to_string());
+        }
+
+        match args.format {
+            OutputFormat::Json => {
+                let mut results_json = serde_json::Map::new();
+                for (name, report) in &results {
+                    results_json.insert(name.clone(), serde_json::to_value(report.to_json())?);
+                }
+
+                let batch_json = serde_json::json!({
+                    "is_safe": overall_safe,
+                    "strict": args.strict,
+                    "total_pairs": pairs.len(),
+                    "results": results_json,
+                });
+
+                println!("{}", serde_json::to_string_pretty(&batch_json)?);
+            }
+            OutputFormat::Markdown => {
+                let mut markdown = String::new();
+                markdown.push_str("# Soroban Upgrade Safety Report (Batch Mode)\n\n");
+
+                let status = if overall_safe {
+                    "✅ PASSED (All contracts safe)"
+                } else {
+                    "❌ FAILED (Some contracts have breaking changes)"
+                };
+                markdown.push_str(&format!("## Status: {}\n\n", status));
+                markdown.push_str("### Summary\n\n");
+                markdown
+                    .push_str("| Contract | Status | Critical | Warning | Info | Suppressed |\n");
+                markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
+
+                for (name, report) in &results {
+                    let status_str = if report.is_safe {
+                        "✅ PASSED"
+                    } else {
+                        "❌ FAILED"
+                    };
+                    markdown.push_str(&format!(
+                        "| {} | {} | {} | {} | {} | {} |\n",
+                        name,
+                        status_str,
+                        report.critical_count,
+                        report.warning_count,
+                        report.info_count,
+                        report.suppressed_count
+                    ));
+                }
+
+                markdown.push_str("\n---\n\n");
+
+                for (name, report) in &results {
+                    markdown.push_str(&format!("## Details: {}\n\n", name));
+                    let report_md = report.generate_summary_markdown();
+                    let stripped_md = report_md.replace("# Soroban Upgrade Safety Report\n\n", "");
+                    markdown.push_str(&stripped_md);
+                    markdown.push_str("\n---\n\n");
+                }
+
+                println!("{}", markdown);
+            }
+            OutputFormat::Text => {
+                println!("========================================");
+                println!("    SOROBAN BATCH SAFETY REPORT");
+                println!("========================================");
+
+                let status = if overall_safe {
+                    "✅ PASSED (All contracts safe)".green().bold()
+                } else {
+                    "❌ FAILED (Some contracts have breaking changes)"
+                        .red()
+                        .bold()
+                };
+                println!("Overall Status: {}\n", status);
+
+                println!("Summary of Contracts:");
+                for (name, report) in &results {
+                    let status_str = if report.is_safe {
+                        "✅ PASSED".green()
+                    } else {
+                        "❌ FAILED".red().bold()
+                    };
+                    println!(
+                        "  - {}: {} ({} critical, {} warnings, {} info, {} suppressed)",
+                        name.bold(),
+                        status_str,
+                        report.critical_count,
+                        report.warning_count,
+                        report.info_count,
+                        report.suppressed_count
+                    );
+                }
+
+                println!("\n========================================\n");
+
+                for (name, report) in &results {
+                    println!("=== Contract: {} ===", name.bold().magenta());
+                    println!("{}", report.generate_summary_text(args.explain));
+                    println!("========================================\n");
+                }
+            }
+        }
+
+        if !overall_safe {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // Resolve the two usage modes for single pair:
+    //   - 2 positional args => local-vs-local comparison
+    //   - 1 positional arg  + --contract-id/--rpc-url => RPC-vs-local comparison
+    let (old_source, new_wasm_path) = match (args.wasm_paths.len(), &args.contract_id) {
+        (2, None) => (None, &args.wasm_paths[1]), // local mode
+        (1, Some(_)) => (args.contract_id.as_deref(), &args.wasm_paths[0]), // RPC mode
+        (2, Some(_)) => {
+            anyhow::bail!(
+                "When using --contract-id, provide only the NEW_WASM path as a positional argument"
+            );
+        }
+        (1, None) => {
+            anyhow::bail!(
+                "Missing OLD_WASM path. Provide two WASM files, or use --contract-id and --rpc-url \
+                 to fetch the old contract from chain.\n\n\
+                 Usage: soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>\n       \
+                 soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>\n\n\
+                 Or use batch mode:\n       \
+                 soroban-upgrade-safeguard --manifest <MANIFEST_PATH>\n       \
+                 soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>"
+            );
+        }
+        _ => {
+            anyhow::bail!(
+                "Expected 1 or 2 WASM path arguments.\n\n\
+                 Usage: soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>\n       \
+                 soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>\n\n\
+                 Or use batch mode:\n       \
+                 soroban-upgrade-safeguard --manifest <MANIFEST_PATH>\n       \
+                 soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>"
+            );
+        }
+    };
+
+    progress("🔍 Soroban Upgrade Safeguard".to_string());
+    progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
+
+    progress(format!(
+        "\n{}",
+        "📦 Loading and Parsing contracts...".cyan().bold()
+    ));
+
+    // Old WASM — from file or from RPC
+    let old = if let Some(contract_id) = old_source {
+        let rpc_url = args.rpc_url.as_ref().unwrap();
+        loader::fetch_wasm_from_rpc(contract_id, rpc_url)?
+    } else {
+        loader::load_wasm(&args.wasm_paths[0])?
+    };
+
+    // New WASM
+    let new = loader::load_wasm(new_wasm_path)?;
+
+    if !suppressions.rules.is_empty() {
+        progress(format!(
+            "\n🔕 {} suppression rule(s) loaded",
+            suppressions.rules.len()
+        ));
+    }
+
+    // Generate Safety Report using the factored helper
+    let safety_report = compare_contracts(
+        &ContractComparison {
+            old_bytes: &old.bytes,
+            old_path: &old.path,
+            new_bytes: &new.bytes,
+            new_path: &new.path,
+            suppressions: &suppressions,
+            explain: args.explain,
+            strict: args.strict,
+        },
+        &progress,
+    )?;
+
+    let mut safety_report = safety_report;
+    if !all_categories.is_empty() {
+        safety_report.apply_category_filter(&category_filter);
+    }
+
+    match args.format {
+        OutputFormat::Json => {
+            // Single JSON document to stdout; no decorative text, no ANSI codes.
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&safety_report.to_json())?
+            );
+        }
+        OutputFormat::Markdown => {
+            println!("{}", safety_report.generate_summary_markdown());
+        }
+        OutputFormat::Text => {
+            println!("{}", safety_report.generate_summary_text(args.explain));
+        }
+    }
+
+    if !safety_report.is_safe {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+struct ContractPair {
+    old: PathBuf,
+    new: PathBuf,
+    name: Option<String>,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+struct Manifest {
+    pairs: Vec<ContractPair>,
+}
+
+struct ContractComparison<'a> {
+    old_bytes: &'a [u8],
+    old_path: &'a str,
+    new_bytes: &'a [u8],
+    new_path: &'a str,
+    suppressions: &'a SuppressionConfig,
+    explain: bool,
+    strict: bool,
+}
+
+/// Helper function to run comparison for a single pair.
+fn compare_contracts(
+    comparison: &ContractComparison<'_>,
+    progress: &impl Fn(String),
+) -> Result<report::SafetyReport> {
+    let ContractComparison {
+        old_bytes,
+        old_path,
+        new_bytes,
+        new_path,
+        suppressions,
+        explain,
+        strict,
+    } = comparison;
+    let old_meta = parser::extract_metadata(old_bytes)?;
+    let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
+    progress(format!(
+        "  {} {} ({} bytes)",
+        "✅ Old:".green().bold(),
+        old_path,
+        old_bytes.len()
+    ));
+    progress(format!("     └─ {}", old_spec.summary().dimmed()));
+
+    let new_meta = parser::extract_metadata(new_bytes)?;
+    let new_spec = spec::ContractSpec::from_entries(&new_meta.spec);
+    progress(format!(
+        "  {} {} ({} bytes)",
+        "✅ New:".green().bold(),
+        new_path,
+        new_bytes.len()
+    ));
+    progress(format!("     └─ {}", new_spec.summary().dimmed()));
+
+    progress(format!(
+        "\n{}",
+        "🔬 Analyzing structural compatibility...".cyan().bold()
+    ));
+    let mut diff_report = diff::compare(&old_spec, &new_spec);
+    diff::compare_env_metadata(
+        old_meta.env_meta.as_ref(),
+        new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+    diff_report.sort_findings();
+
+    Ok(report::SafetyReport::with_suppressions(
+        &diff_report,
+        suppressions,
+        *explain,
+        *strict,
+    ))
+}
+
+fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read manifest file: {}", path.display()))?;
+
+    // Try TOML, then JSON
+    if let Ok(manifest) = toml::from_str::<Manifest>(&content) {
+        return Ok(manifest.pairs);
+    }
+    if let Ok(manifest) = serde_json::from_str::<Manifest>(&content) {
+        return Ok(manifest.pairs);
+    }
+
+    anyhow::bail!(
+        "Failed to parse manifest '{}' as either TOML or JSON.",
+        path.display()
+    )
+}
+
+/// Collect all `.wasm` files under `root`, returning their relative paths
+/// (relative to `root`). Protects against symlink loops via a visited-path set
+/// and enforces a maximum recursion depth of 32.
+fn collect_wasm_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut stack: Vec<(PathBuf, usize)> = Vec::new();
+    stack.push((root.to_path_buf(), 0));
+
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 32 {
+            eprintln!(
+                "⚠️  Warning: Exceeded maximum recursion depth at '{}', skipping",
+                dir.display()
+            );
+            continue;
+        }
+
+        // Resolve symlinks before tracking visited paths
+        let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if !visited.insert(canonical) {
+            continue;
+        }
+
+        let read_dir = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                eprintln!(
+                    "⚠️  Warning: Cannot read directory '{}': {}",
+                    dir.display(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        for entry in read_dir {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!(
+                        "⚠️  Warning: Error reading entry in '{}': {}",
+                        dir.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let path = entry.path();
+
+            if path.is_dir() {
+                stack.push((path, depth + 1));
+            } else if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("wasm") {
+                let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                files.push((relative, path));
+            }
+        }
+    }
+
+    // Sort by relative path for deterministic ordering
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    Ok(files)
+}
+
+fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>> {
+    if !old_dir.is_dir() {
+        anyhow::bail!("Old directory '{}' is not a directory", old_dir.display());
+    }
+    if !new_dir.is_dir() {
+        anyhow::bail!("New directory '{}' is not a directory", new_dir.display());
+    }
+
+    let old_files = collect_wasm_files(old_dir)?;
+    let new_files_map: std::collections::HashMap<PathBuf, PathBuf> =
+        collect_wasm_files(new_dir)?.into_iter().collect();
+
+    let mut pairs = Vec::new();
+
+    for (rel_path, old_abs_path) in &old_files {
+        if let Some(new_abs_path) = new_files_map.get(rel_path) {
+            let name = rel_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(String::from);
+            pairs.push(ContractPair {
+                old: old_abs_path.clone(),
+                new: new_abs_path.clone(),
+                name,
+            });
+        } else {
+            eprintln!(
+                "⚠️  Warning: Match not found for '{}' in new directory '{}'",
+                rel_path.display(),
+                new_dir.display()
+            );
+        }
+    }
+
+    // Warn about files in new_dir that have no counterpart in old_dir
+    for (rel_path, _) in &collect_wasm_files(new_dir)? {
+        if !old_files.iter().any(|(r, _)| r == rel_path) {
+            eprintln!(
+                "⚠️  Warning: No old counterpart found for '{}' in old directory '{}'",
+                rel_path.display(),
+                old_dir.display()
+            );
+        }
+    }
+
+    if pairs.is_empty() {
+        anyhow::bail!(
+            "No matching .wasm contract pairs found between '{}' and '{}'",
+            old_dir.display(),
+            new_dir.display()
+        );
+    }
+
+    Ok(pairs)
+}
+use anyhow::{Context, Result};
+use clap::{Parser, ValueEnum};
+use colored::Colorize;
+use rayon::prelude::*;
+use std::collections::HashSet;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
+
+use soroban_upgrade_safeguard::{
+    builder,
+    color::should_disable_color,
+    dependency::{
+        cycle_findings, missing_contract_findings, ContractDependency, CrossContractFinding,
+        DependencyGraph,
+    },
+    limits::{find_limit_error, LimitsConfig, ResourcePolicy},
+    loader, parser, report,
+    report::{validate_categories, CategoryFilter},
+    spec_input,
+    storage_schema::StorageSchema,
+    suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
+    wasm_cache::WasmCache,
+    CompareOptions,
+};
+
+/// Output format for the safety report.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum OutputFormat {
+    /// Colored, human-readable report (default).
+    #[default]
+    Text,
+    /// A single machine-readable JSON document for CI and dashboards.
+    Json,
+    /// Markdown document suitable for PR descriptions and comments.
+    Markdown,
+    /// A single self-contained HTML file for publishing as a build artifact.
+    Html,
+    /// GitHub Actions workflow commands so findings appear as annotations in
+    /// the run summary and pull-request checks.
+    GithubActions,
+    /// JUnit XML, so CI systems render findings in their existing test-report UI.
+    Junit,
+}
+
+/// A SemVer bump level, ordered `Patch < Minor < Major` so a planned bump can be
+/// compared against the one the analysis recommends.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum BumpLevel {
+    Patch,
+    Minor,
+    Major,
+}
+
+impl BumpLevel {
+    /// Parse the string form produced by [`report::SafetyReport::recommended_bump`].
+    fn from_recommendation(bump: &str) -> Self {
+        match bump {
+            "major" => BumpLevel::Major,
+            "minor" => BumpLevel::Minor,
+            _ => BumpLevel::Patch,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            BumpLevel::Patch => "patch",
+            BumpLevel::Minor => "minor",
+            BumpLevel::Major => "major",
+        }
+    }
+}
+
+/// Evaluate the `--expect-bump` gate.
+///
+/// Returns `true` when the gate *failed* — that is, the recommended bump is
+/// strictly more severe than the expected one — after printing an explanatory
+/// message naming both levels. An expected bump that meets or exceeds the
+/// recommendation passes silently.
+fn check_expect_bump(expected: Option<BumpLevel>, recommended: &str) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    let recommended_level = BumpLevel::from_recommendation(recommended);
+    if recommended_level > expected {
+        eprintln!(
+            "{}",
+            format!(
+                "❌ Version bump gate failed: the analysed changes require a '{}' bump, but \
+                 --expect-bump declared '{}'. Raise the planned release to '{}' (or address the \
+                 findings) before shipping.",
+                recommended_level.label(),
+                expected.label(),
+                recommended_level.label(),
+            )
+            .red()
+            .bold()
+        );
+        return true;
+    }
+    false
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    author,
+    version,
+    about,
+    long_about = None,
+    // Four usage modes:
+    //   1. Local:      soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM> [OPTIONS]
+    //   2. RPC:        soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM> [OPTIONS]
+    //   3. Manifest:   soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]
+    //   4. Dir Scan:   soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]
+    //   5. Glob:       soroban-upgrade-safeguard --old-glob <PATTERN> --new-glob <PATTERN> [OPTIONS]
+    override_usage = "soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM> [OPTIONS]\n       \
+                      soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM> [OPTIONS]\n       \
+                      soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]\n       \
+                      soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]\n       \
+                      soroban-upgrade-safeguard --old-glob <PATTERN> --new-glob <PATTERN> [OPTIONS]",
+    // Appended below the options, so the four usage lines above stay untouched.
+    after_help = "Subcommands:\n  explain [CATEGORY]  \
+                  Look up what a finding category means; lists all when given no argument."
+)]
+struct Args {
+    /// WASM paths: <OLD_WASM> <NEW_WASM> in local mode, or just <NEW_WASM> in RPC mode
+    #[arg(value_name = "WASM", num_args = 0..=2)]
+    wasm_paths: Vec<PathBuf>,
+
+    /// Output format
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+
+    /// Stellar/Soroban Contract ID to fetch from on-chain (e.g. C...)
+    #[arg(long, value_name = "CONTRACT_ID", requires = "rpc_url")]
+    contract_id: Option<String>,
+
+    /// Stellar RPC URL (e.g. https://soroban-testnet.stellar.org)
+    #[arg(long, value_name = "RPC_URL", requires = "contract_id")]
+    rpc_url: Option<String>,
+
+    /// Path to a suppression config acknowledging known, intentional breaking
+    /// changes. When omitted, `.safeguard.toml` in the current directory is
+    /// used if present; otherwise no suppressions are applied.
+    #[arg(long, value_name = "CONFIG")]
+    config: Option<PathBuf>,
+
+    /// Print a concise remediation explanation for each finding.
+    #[arg(long)]
+    explain: bool,
+
+    /// Exit with a non-zero code if any Warnings or Critical findings are found
+    #[arg(long)]
+    strict: bool,
+
+    /// Assert the release's planned SemVer bump covers what the changes require.
+    ///
+    /// The run fails when the recommended bump is *more severe* than this value
+    /// (ordered patch < minor < major); an expected bump that meets or exceeds
+    /// the recommendation passes. This is an independent gate: it does not
+    /// change the safe/unsafe verdict and is not affected by `--strict`, but a
+    /// gate failure exits `1` just as breaking changes do. A resource-limit
+    /// violation still takes precedence and exits `2`. In batch mode the
+    /// recommendation compared against is the most severe across all pairs.
+    #[arg(long, value_enum, value_name = "LEVEL")]
+    expect_bump: Option<BumpLevel>,
+
+    /// Do not color output
+    #[arg(long)]
+    no_color: bool,
+
     /// Allow HTTP connections for RPC when the host is localhost/127.0.0.1.
     /// Without this flag only HTTPS URLs are accepted.
     #[arg(long)]
@@ -107,6 +848,20 @@ struct Args {
     /// Directory containing the new versions of the contracts for directory comparison
     #[arg(long, value_name = "NEW_DIR", requires = "old_dir")]
     new_dir: Option<PathBuf>,
+
+    /// Glob pattern selecting the OLD `.wasm` builds for batch comparison,
+    /// e.g. `old/target/wasm32-unknown-unknown/release/*.wasm`.
+    ///
+    /// Supports `*` and `?` within a path segment and `**` for any number of
+    /// directories. Quote the pattern so the shell does not expand it first.
+    /// Matches are paired against `--new-glob` by **file stem** — the same key
+    /// a directory scan derives a pair's name from.
+    #[arg(long, value_name = "PATTERN", requires = "new_glob")]
+    old_glob: Option<String>,
+
+    /// Glob pattern selecting the NEW `.wasm` builds for batch comparison.
+    #[arg(long, value_name = "PATTERN", requires = "old_glob")]
+    new_glob: Option<String>,
 
     /// Only include findings from these categories. Repeatable.
     #[arg(long, value_name = "CATEGORY", num_args = 0..)]
@@ -148,6 +903,13 @@ struct Args {
     #[arg(long, value_name = "N")]
     max_walk_depth: Option<usize>,
 
+    /// Maximum raw WASM binary size in bytes. Overrides `[limits]` and the
+    /// default (25 MiB). The file size is checked via `fs::metadata` before
+    /// any bytes are read into memory; RPC-fetched bytes are checked after
+    /// receipt. Inputs exceeding this limit exit with code 2.
+    #[arg(long, value_name = "BYTES")]
+    max_wasm_size: Option<usize>,
+
     /// Treat identical duplicate spec entries (same name, byte-identical
     /// definition) as informational rather than warnings.
     ///
@@ -166,6 +928,88 @@ struct Args {
     /// destination regardless of this flag.
     #[arg(long, value_name = "PATH")]
     output: Option<PathBuf>,
+
+    /// Disable the local WASM cache for this run.
+    ///
+    /// By default, WASM fetched from RPC is cached on disk keyed by its
+    /// code hash so repeat fetches are served locally. Pass this flag (or set
+    /// `SAFEGUARD_NO_CACHE=1`) to skip both cache reads and writes and always
+    /// perform a fresh network fetch.
+    ///
+    /// To clear the cache entirely, delete the platform cache directory:
+    ///   Linux/macOS: ~/.cache/soroban-upgrade-safeguard/wasm/
+    ///   Windows:     %LOCALAPPDATA%\soroban-upgrade-safeguard\wasm\
+    #[arg(long)]
+    no_cache: bool,
+
+    /// Treat the old side as a spec JSON file instead of a WASM binary.
+    ///
+    /// The file must contain `{ "entries": ["<base64-xdr>", ...] }` where
+    /// each element is a base64-encoded `SCSpecEntry` XDR value. Comparisons
+    /// that require a full WASM binary (env metadata, exports, imports) are
+    /// skipped and recorded in the report scope. Cannot be combined with
+    /// `--contract-id`.
+    #[arg(long, value_name = "PATH", conflicts_with = "contract_id")]
+    old_spec: Option<PathBuf>,
+
+    /// Treat the new side as a spec JSON file instead of a WASM binary.
+    ///
+    /// The file must contain `{ "entries": ["<base64-xdr>", ...] }` where
+    /// each element is a base64-encoded `SCSpecEntry` XDR value. Comparisons
+    /// that require a full WASM binary (env metadata, exports, imports) are
+    /// skipped and recorded in the report scope.
+    #[arg(long, value_name = "PATH")]
+    new_spec: Option<PathBuf>,
+
+    /// Build a local Soroban contract crate and use it as the old side.
+    ///
+    /// Pass a path to a Cargo crate directory (containing `Cargo.toml`). The
+    /// tool runs `cargo build --target wasm32-unknown-unknown --release
+    /// --locked` in that directory and feeds the produced WASM into the
+    /// analysis pipeline. The `wasm32-unknown-unknown` target must be
+    /// installed (`rustup target add wasm32-unknown-unknown`). Cannot be
+    /// combined with `--contract-id` or `--old-spec`.
+    #[arg(
+        long,
+        value_name = "CRATE_PATH",
+        conflicts_with_all = ["contract_id", "old_spec"]
+    )]
+    old_crate: Option<PathBuf>,
+
+    /// Build a local Soroban contract crate and use it as the new side.
+    ///
+    /// Pass a path to a Cargo crate directory (containing `Cargo.toml`). The
+    /// tool runs `cargo build --target wasm32-unknown-unknown --release
+    /// --locked` in that directory and feeds the produced WASM into the
+    /// analysis pipeline. The `wasm32-unknown-unknown` target must be
+    /// installed. Cannot be combined with `--new-spec`.
+    #[arg(long, value_name = "CRATE_PATH", conflicts_with = "new_spec")]
+    new_crate: Option<PathBuf>,
+
+    /// Compare this run against a previously saved `--format json` report.
+    /// Findings are classified as new, persisting, or resolved relative to
+    /// it (shown in all output formats). By default this only labels
+    /// findings — it does not change the pass/fail verdict or exit code; see
+    /// `--baseline-fail-on-new`. Single-contract-pair mode only.
+    #[arg(long, value_name = "PATH")]
+    baseline: Option<PathBuf>,
+
+    /// With `--baseline`, recompute the verdict to consider only findings
+    /// classified as new (a persisting Critical finding no longer fails the
+    /// run on its own). Has no effect without `--baseline`.
+    #[arg(long, requires = "baseline")]
+    baseline_fail_on_new: bool,
+
+    /// Render a highlighted two-line type diff after each type-change finding.
+    ///
+    /// For every finding whose category is a type change (e.g. "Struct Field
+    /// Type Changed"), the old and new signatures are printed aligned with the
+    /// differing portion highlighted in red/green.  The view respects
+    /// `--no-color`: when color is disabled the changed span is wrapped in
+    /// square brackets instead.  Has no effect on `--format json` or
+    /// `--format markdown`.
+    #[arg(long)]
+    diff_types: bool,
 }
 
 /// Resolve the effective [`ResourcePolicy`]: built-in defaults, overlaid by the
@@ -193,6 +1037,20 @@ fn resolve_policy(args: &Args, config_path: Option<&Path>) -> Result<ResourcePol
     }
     if let Some(v) = args.max_walk_depth {
         policy.max_walk_depth = v;
+    }
+    if let Some(v) = args.max_wasm_size {
+        policy.max_wasm_size = v;
+    }
+
+    // Environment variable overrides sit between the config file and CLI flags
+    // in precedence (CLI wins over env, env wins over file).
+    if let Ok(v) = std::env::var("SAFEGUARD_MAX_WASM_SIZE") {
+        if let Ok(n) = v.parse::<usize>() {
+            // Only apply if the CLI flag was not already set.
+            if args.max_wasm_size.is_none() {
+                policy.max_wasm_size = n;
+            }
+        }
     }
 
     Ok(policy)
@@ -247,7 +1105,107 @@ fn emit_report_output(
     Ok(())
 }
 
+/// Usage text for `explain`, kept next to its handler.
+const EXPLAIN_USAGE: &str = "\
+Look up what a finding category means and how to respond to it.
+
+Usage: soroban-upgrade-safeguard explain [CATEGORY]
+
+  explain              List every known category.
+  explain <CATEGORY>   Print the remediation guidance for one category.
+
+CATEGORY accepts either the display name (\"Union Case Reordered\") or the
+stable rule id (\"union_case_reordered\"), in any letter case. These are the
+same names a [[suppress]] rule and the [severity] table match on.";
+
+/// Handle the `explain` subcommand.
+///
+/// This is dispatched from `argv` before clap parses, rather than declared as a
+/// clap subcommand. The root command takes 0..=2 positional WASM paths, and
+/// mixing variadic positionals with subcommands changes how clap resolves the
+/// first argument in all four existing usage modes. Those modes are the tool's
+/// entire interface, so `explain` is routed around that machinery instead of
+/// through it: the parser the four modes rely on is left byte-for-byte
+/// unchanged, and a file genuinely named `explain` is the only cost.
+fn run_explain(rest: &[String]) -> Result<()> {
+    use soroban_upgrade_safeguard::rules::{
+        all_category_labels, all_rules, lookup_rule_lenient, suggest_categories,
+    };
+
+    let name = match rest.first().map(String::as_str) {
+        Some("-h") | Some("--help") => {
+            println!("{EXPLAIN_USAGE}");
+            return Ok(());
+        }
+        // No argument: list every category so the names are discoverable
+        // without a comparison run that happens to produce them.
+        None => {
+            println!("Known finding categories ({}):\n", all_rules().len());
+            let labels = all_category_labels();
+            let width = labels.iter().map(|l| l.len()).max().unwrap_or(0);
+            for label in labels {
+                let rule = lookup_rule_lenient(label).expect("label comes from the registry");
+                println!(
+                    "  {:<width$}  {}  [{}]",
+                    label,
+                    rule.severity.label(),
+                    rule.id,
+                    width = width
+                );
+            }
+            println!(
+                "\nRun `soroban-upgrade-safeguard explain <CATEGORY>` for the guidance on one \
+                 of these."
+            );
+            return Ok(());
+        }
+        Some(name) => name,
+    };
+
+    let Some(rule) = lookup_rule_lenient(name) else {
+        // Matching everywhere else is exact and these names are long, so a
+        // near miss gets corrected rather than merely rejected.
+        let suggestions = suggest_categories(name);
+        if suggestions.is_empty() {
+            anyhow::bail!(
+                "Unknown category '{name}'. Run `soroban-upgrade-safeguard explain` to list \
+                 every known category."
+            );
+        }
+        anyhow::bail!(
+            "Unknown category '{name}'.\n\nDid you mean:\n{}\n\nRun \
+             `soroban-upgrade-safeguard explain` to list every known category.",
+            suggestions
+                .iter()
+                .map(|s| format!("  {s}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    };
+
+    println!("{}", rule.label.bold());
+    println!("  rule id:          {}", rule.id);
+    println!("  default severity: {}", rule.severity.label());
+    println!();
+    println!("{}", rule.guidance);
+    Ok(())
+}
+
 fn run() -> Result<()> {
+    // `explain` is intercepted before clap so the four comparison usage modes
+    // keep parsing exactly as they do today. See `run_explain`.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("explain") {
+        if should_disable_color(
+            false,
+            std::env::var_os("NO_COLOR").is_some(),
+            std::io::stdout().is_terminal(),
+        ) {
+            colored::control::set_override(false);
+        }
+        return run_explain(&argv[2..]);
+    }
+
     let args = Args::parse();
 
     if should_disable_color(
@@ -286,15 +1244,39 @@ fn run() -> Result<()> {
     // 1. Identify which mode we are running:
     //    - Batch Manifest Mode
     //    - Batch Directory Mode
+    //    - Batch Glob Mode
     //    - Single Contract Pair Mode
-    let is_batch = args.manifest.is_some() || (args.old_dir.is_some() && args.new_dir.is_some());
+    let is_glob_batch = args.old_glob.is_some() && args.new_glob.is_some();
+    let is_batch = args.manifest.is_some()
+        || (args.old_dir.is_some() && args.new_dir.is_some())
+        || is_glob_batch;
 
     if args.manifest.is_some() && (args.old_dir.is_some() || args.new_dir.is_some()) {
         anyhow::bail!("Cannot specify both --manifest and --old-dir/--new-dir at the same time");
     }
 
+    if args.manifest.is_some() && (args.old_glob.is_some() || args.new_glob.is_some()) {
+        anyhow::bail!("Cannot specify both --manifest and --old-glob/--new-glob at the same time");
+    }
+
+    if (args.old_dir.is_some() || args.new_dir.is_some())
+        && (args.old_glob.is_some() || args.new_glob.is_some())
+    {
+        anyhow::bail!(
+            "Cannot specify both --old-dir/--new-dir and --old-glob/--new-glob at the same time"
+        );
+    }
+
     if is_batch && !args.wasm_paths.is_empty() {
-        anyhow::bail!("Cannot specify positional WASM paths when using batch mode (--manifest or --old-dir/--new-dir)");
+        anyhow::bail!("Cannot specify positional WASM paths when using batch mode (--manifest, --old-dir/--new-dir, or --old-glob/--new-glob)");
+    }
+
+    if is_batch && args.baseline.is_some() {
+        anyhow::bail!(
+            "--baseline compares a single contract pair's report and cannot be used with batch \
+             mode (--manifest, --old-dir/--new-dir, or --old-glob/--new-glob). Run the pair on \
+             its own to use a baseline."
+        );
     }
 
     // A storage schema describes one specific contract's layout, so a single
@@ -324,7 +1306,9 @@ fn run() -> Result<()> {
     // belongs on stderr rather than alongside it.
     let clean_stdout = args.output.is_some()
         || args.format == OutputFormat::Json
-        || args.format == OutputFormat::Markdown;
+        || args.format == OutputFormat::Markdown
+        || args.format == OutputFormat::Html
+        || args.format == OutputFormat::Junit;
     let progress = |line: String| {
         if clean_stdout {
             eprintln!("{line}");
@@ -365,6 +1349,13 @@ fn run() -> Result<()> {
     if is_batch {
         let (pairs, dep_declarations) = if let Some(manifest_path) = &args.manifest {
             parse_manifest(manifest_path)?
+        } else if is_glob_batch {
+            // Glob mode has no dependency declaration mechanism.
+            let pairs = scan_globs(
+                args.old_glob.as_ref().unwrap(),
+                args.new_glob.as_ref().unwrap(),
+            )?;
+            (pairs, vec![])
         } else {
             // Directory scan mode has no dependency declaration mechanism.
             let pairs = scan_directories(
@@ -390,44 +1381,118 @@ fn run() -> Result<()> {
         //     other.
         let pair_names: Vec<String> = resolve_pair_names(&pairs)?;
 
+        // Open the WASM cache once for the whole batch.  A batch is exactly
+        // where refetching the same deployed contract repeatedly is most
+        // expensive, so caching pays off most here.  The cache is shared
+        // across rayon threads via a reference; `WasmCache` is `Send + Sync`
+        // because it performs only independent, hash-keyed file operations.
+        let no_cache_batch = args.no_cache
+            || std::env::var("SAFEGUARD_NO_CACHE")
+                .ok()
+                .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true"))
+                .unwrap_or(false);
+        let batch_cache: Option<WasmCache> = if no_cache_batch {
+            None
+        } else {
+            match WasmCache::open() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("⚠️  Could not open WASM cache, proceeding without it: {e:#}");
+                    None
+                }
+            }
+        };
+
         let mut results = std::collections::BTreeMap::new();
         let mut failed: std::collections::BTreeMap<String, PairFailure> =
             std::collections::BTreeMap::new();
         let mut overall_safe = true;
         let mut any_limit_violation = false;
 
-        for (i, pair) in pairs.iter().enumerate() {
-            let contract_name = pair_names[i].clone();
+        // Compare all pairs concurrently. Rayon bounds parallelism to the
+        // available CPU count by default (override via RAYON_NUM_THREADS).
+        //
+        // Each pair's progress lines are captured into its own buffer rather
+        // than written straight to stdout/stderr — concurrent writers would
+        // interleave unrelated pairs' output. Buffers are flushed after the
+        // parallel phase completes, one pair at a time, in original
+        // manifest/scan order (not completion order): this keeps the printed
+        // transcript exactly as readable as the old sequential version and
+        // reproducible run-to-run regardless of which pair actually finished
+        // first. The final report results are collected into a `BTreeMap`
+        // keyed by contract name either way, so JSON/Markdown/text rendering
+        // was already independent of completion order before this change.
+        //
+        // A panic partway through one pair's comparison is caught and
+        // recorded as that pair's failure instead of unwinding across the
+        // thread boundary and taking down every other in-flight pair with it.
+        let pair_outcomes: Vec<(String, Vec<String>, Result<report::SafetyReport>)> = pairs
+            .par_iter()
+            .enumerate()
+            .map(|(i, pair)| {
+                let contract_name = pair_names[i].clone();
+                let lines = std::cell::RefCell::new(Vec::new());
+                let capture = |line: String| lines.borrow_mut().push(line);
 
-            progress(format!(
-                "📦 [{}/{}] Comparing contract pair: {}",
-                i + 1,
-                pairs.len(),
-                contract_name.bold()
-            ));
+                capture(format!(
+                    "📦 [{}/{}] Comparing contract pair: {}",
+                    i + 1,
+                    pairs.len(),
+                    contract_name.bold()
+                ));
 
-            // Per-pair policy: a pair that trips a resource limit (or otherwise
-            // errors) fails only that pair — it must not abort the whole batch,
-            // so its result is recorded and the loop continues.
-            let outcome = (|| -> Result<report::SafetyReport> {
-                let old_wasm = loader::load_wasm(&pair.old)?;
-                let new_wasm = loader::load_wasm(&pair.new)?;
-                compare_contracts(
-                    &ContractComparison {
-                        old_bytes: &old_wasm.bytes,
-                        old_path: &old_wasm.path,
-                        new_bytes: &new_wasm.bytes,
-                        new_path: &new_wasm.path,
-                        suppressions: &suppressions,
-                        policy: &policy,
-                        // Storage schemas are contract-specific and rejected in
-                        // batch mode, so no pair carries one.
-                        storage_schemas: None,
+                // Per-pair policy: a pair that trips a resource limit, errors,
+                // or panics fails only that pair — it must not abort the whole
+                // batch, so its result is recorded and every other pair still
+                // runs to completion.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || -> Result<report::SafetyReport> {
+                        let old_wasm = resolve_contract_source(
+                            &pair.old,
+                            &policy,
+                            batch_cache.as_ref(),
+                            args.allow_http_local,
+                        )?;
+                        let new_wasm = resolve_contract_source(
+                            &pair.new,
+                            &policy,
+                            batch_cache.as_ref(),
+                            args.allow_http_local,
+                        )?;
+                        compare_contracts(
+                            &ContractComparison {
+                                old_bytes: &old_wasm.bytes,
+                                old_path: &old_wasm.path,
+                                new_bytes: &new_wasm.bytes,
+                                new_path: &new_wasm.path,
+                                suppressions: &suppressions,
+                                policy: &policy,
+                                // Storage schemas are contract-specific and
+                                // rejected in batch mode, so no pair carries one.
+                                storage_schemas: None,
+                            },
+                            &args,
+                            &capture,
+                        )
                     },
-                    &args,
-                    &progress,
-                )
-            })();
+                ))
+                .unwrap_or_else(|panic_payload| {
+                    let message = panic_payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "panicked with a non-string payload".to_string());
+                    Err(anyhow::anyhow!("Comparison panicked: {message}"))
+                });
+
+                (contract_name, lines.into_inner(), outcome)
+            })
+            .collect();
+
+        for (contract_name, lines, outcome) in pair_outcomes {
+            for line in lines {
+                progress(line);
+            }
 
             match outcome {
                 Ok(mut report) => {
@@ -542,6 +1607,16 @@ fn run() -> Result<()> {
             ));
         }
 
+        // Overall recommended bump: the most severe bump across all pairs in the
+        // batch, since batch mode compares a whole set of contracts that ship
+        // together. Computed before rendering so `--expect-bump` gates on the
+        // same value every format reports.
+        let overall_bump = results
+            .values()
+            .map(|report| report.recommended_bump())
+            .max_by_key(|bump| BumpLevel::from_recommendation(bump))
+            .unwrap_or("patch");
+
         match args.format {
             OutputFormat::Json => {
                 let mut results_json = serde_json::Map::new();
@@ -577,20 +1652,6 @@ fn run() -> Result<()> {
                     .chain(missing_findings_list.iter())
                     .map(|f| serde_json::to_value(f))
                     .collect::<Result<_, _>>()?;
-
-                // Overall recommended bump: the most severe bump across all
-                // pairs in the batch, since batch mode compares a whole set
-                // of contracts that ship together.
-                let bump_rank = |bump: &str| match bump {
-                    "major" => 2,
-                    "minor" => 1,
-                    _ => 0,
-                };
-                let overall_bump = results
-                    .values()
-                    .map(|report| report.recommended_bump())
-                    .max_by_key(|bump| bump_rank(bump))
-                    .unwrap_or("patch");
 
                 let batch_json = serde_json::json!({
                     "is_safe": overall_safe,
@@ -808,6 +1869,123 @@ fn run() -> Result<()> {
                     println!("========================================\n");
                 }
             }
+            OutputFormat::Html => {
+                use soroban_upgrade_safeguard::report::escape_html;
+
+                // Every pair renders into one document: an artifact reader
+                // should open a single file and see the whole batch, not have
+                // to chase one file per contract.
+                let mut body = String::new();
+                body.push_str("<h1>Soroban Upgrade Safety Report (Batch Mode)</h1>\n");
+
+                let (status_class, status_text) = if overall_safe {
+                    ("pass", "✅ PASSED (All contracts safe)")
+                } else {
+                    ("fail", "❌ FAILED (Some contracts have breaking changes)")
+                };
+                body.push_str(&format!(
+                    "<p class=\"banner {status_class}\">{status_text}</p>\n"
+                ));
+
+                body.push_str("<h2>Summary</h2>\n<div class=\"table-scroll\"><table>\n");
+                body.push_str(
+                    "<thead><tr><th>Contract</th><th>Status</th><th>Critical</th>\
+                     <th>Warning</th><th>Info</th><th>Suppressed</th><th>Overridden</th>\
+                     </tr></thead>\n<tbody>\n",
+                );
+                for (name, report) in &results {
+                    body.push_str(&format!(
+                        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
+                         <td>{}</td><td>{}</td></tr>\n",
+                        escape_html(name),
+                        if report.is_safe {
+                            "✅ PASSED"
+                        } else {
+                            "❌ FAILED"
+                        },
+                        report.critical_count,
+                        report.warning_count,
+                        report.info_count,
+                        report.suppressed_count,
+                        report.severity_overridden_count,
+                    ));
+                }
+                for (name, failure) in &failed {
+                    body.push_str(&format!(
+                        "<tr><td>{}</td><td>{}</td><td>—</td><td>—</td><td>—</td>\
+                         <td>—</td><td>—</td></tr>\n",
+                        escape_html(name),
+                        if failure.is_limit {
+                            "⛔ ERROR (limit)"
+                        } else {
+                            "⛔ ERROR"
+                        },
+                    ));
+                }
+                body.push_str("</tbody>\n</table></div>\n");
+
+                if !failed.is_empty() {
+                    body.push_str("<h2>Errored Pairs</h2>\n<ul class=\"findings\">\n");
+                    for (name, failure) in &failed {
+                        body.push_str(&format!(
+                            "<li class=\"finding sev-critical\"><strong>{}</strong>: {}</li>\n",
+                            escape_html(name),
+                            escape_html(&failure.message),
+                        ));
+                    }
+                    body.push_str("</ul>\n");
+                }
+
+                for (name, report) in &results {
+                    body.push_str(&report.html_section(Some(name), false));
+                }
+
+                if !cross_findings.is_empty() {
+                    body.push_str("<h2>Cross-Contract Dependency Findings</h2>\n");
+                    body.push_str("<div class=\"table-scroll\"><table>\n");
+                    body.push_str(
+                        "<thead><tr><th>Affected Contract</th><th>Changed Contract</th>\
+                         <th>Depth</th><th>Severity</th><th>Category</th><th>Target</th>\
+                         </tr></thead>\n<tbody>\n",
+                    );
+                    for cf in &cross_findings {
+                        body.push_str(&format!(
+                            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
+                             <td><code>{}</code></td></tr>\n",
+                            escape_html(&cf.affected_contract),
+                            escape_html(&cf.changed_contract),
+                            cf.propagation_depth,
+                            cf.finding.severity.label(),
+                            escape_html(&cf.finding.category),
+                            escape_html(cf.finding.target.as_deref().unwrap_or("-")),
+                        ));
+                    }
+                    body.push_str("</tbody>\n</table></div>\n");
+                }
+
+                if !cycle_findings_list.is_empty() || !missing_findings_list.is_empty() {
+                    body.push_str("<h2>Dependency Graph Findings</h2>\n<ul class=\"findings\">\n");
+                    for f in cycle_findings_list
+                        .iter()
+                        .chain(missing_findings_list.iter())
+                    {
+                        body.push_str(&format!(
+                            "<li class=\"finding sev-{}\"><span class=\"badge badge-{}\">{}</span> {}</li>\n",
+                            f.severity.label(),
+                            f.severity.label(),
+                            f.severity.label(),
+                            escape_html(&f.message),
+                        ));
+                    }
+                    body.push_str("</ul>\n");
+                }
+
+                let rendered = soroban_upgrade_safeguard::report::html_document(
+                    "Soroban Upgrade Safety Report (Batch Mode)",
+                    &body,
+                );
+                emit_report_output(&rendered, args.output.as_deref(), &progress)?;
+            }
             OutputFormat::GithubActions => {
                 // Each contract pair is wrapped in a log group so the run
                 // summary stays readable when many pairs are compared.
@@ -825,13 +2003,53 @@ fn run() -> Result<()> {
                     );
                 }
             }
+            OutputFormat::Junit => {
+                use soroban_upgrade_safeguard::report::escape_xml;
+
+                // One test suite per contract, which is the grouping JUnit
+                // already provides and every CI report UI already renders.
+                let mut suites = String::new();
+                for (name, report) in &results {
+                    suites.push_str(&report.generate_summary_junit(Some(name.as_str())));
+                }
+
+                // A pair that could not be analyzed is an <error>, not a
+                // <failure>: the upgrade was never assessed, which is a
+                // different thing from an upgrade assessed as unsafe.
+                for (name, failure) in &failed {
+                    suites.push_str(&format!(
+                        "  <testsuite name=\"{}\" tests=\"1\" failures=\"0\" errors=\"1\" \
+                         skipped=\"0\">\n    <testcase classname=\"soroban-upgrade-safeguard.{}\" \
+                         name=\"analysis\">\n      <error type=\"{}\" message=\"{}\"/>\n    \
+                         </testcase>\n  </testsuite>\n",
+                        escape_xml(name),
+                        escape_xml(name),
+                        if failure.is_limit {
+                            "resource-limit"
+                        } else {
+                            "analysis-error"
+                        },
+                        escape_xml(&failure.message),
+                    ));
+                }
+
+                let rendered = report::junit_document("soroban-upgrade-safeguard", &suites);
+                emit_report_output(&rendered, args.output.as_deref(), &progress)?;
+            }
         } // end match args.format
 
-        // Exit precedence: resource-limit violation (2) > breaking changes (1) > safe (0).
+        // The bump gate is evaluated before exiting so its message is always
+        // printed, even when the run was already going to fail for other
+        // reasons — a pipeline should see every reason it failed, not just the
+        // first one.
+        let bump_gate_failed = check_expect_bump(args.expect_bump, overall_bump);
+
+        // Exit precedence: resource-limit violation (2) > breaking changes or a
+        // failed bump gate (1) > safe (0).
         if any_limit_violation {
             std::process::exit(2);
         }
-        if !overall_safe {
+        if !overall_safe || bump_gate_failed {
             std::process::exit(1);
         }
 
@@ -866,13 +2084,20 @@ fn run() -> Result<()> {
         (1, None) => {
             anyhow::bail!(
                 "Missing OLD_WASM path. Provide two WASM files, or use --contract-id and --rpc-url \
-                 to fetch the old contract from chain.\n\n\
+                 to fetch the old contract from chain, or use --old-crate to build from source.\n\n\
                  Usage: soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>\n       \
-                 soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>\n\n\
+                 soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>\n       \
+                 soroban-upgrade-safeguard --old-crate <PATH> <NEW_WASM>\n       \
+                 soroban-upgrade-safeguard --old-crate <PATH> --new-crate <PATH>\n\n\
                  Or use batch mode:\n       \
                  soroban-upgrade-safeguard --manifest <MANIFEST_PATH>\n       \
                  soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>"
             );
+        }
+        (0, None) if args.old_crate.is_some() || args.new_crate.is_some() => {
+            // Both sides are crates — handled below; use a sentinel that the
+            // crate branches override.
+            (None, &PathBuf::new())
         }
         _ => {
             anyhow::bail!(
@@ -898,7 +2123,37 @@ fn run() -> Result<()> {
     // same resource policy as file input.
     let old = if let Some(contract_id) = old_source {
         let rpc_url = args.rpc_url.as_ref().unwrap();
-        let module = loader::fetch_wasm_from_rpc_with_policy(contract_id, rpc_url, &policy)?;
+
+        // Validate the URL's shape and scheme before any request is attempted,
+        // so a typo like `htps://` is reported as a bad URL rather than as an
+        // opaque transport failure from deep inside the HTTP client.
+        loader::validate_rpc_url(rpc_url, args.allow_http_local)?;
+
+        // Respect --no-cache / SAFEGUARD_NO_CACHE=1.
+        let no_cache = args.no_cache
+            || std::env::var("SAFEGUARD_NO_CACHE")
+                .ok()
+                .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true"))
+                .unwrap_or(false);
+
+        let cache = if no_cache {
+            None
+        } else {
+            match WasmCache::open() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("⚠️  Could not open WASM cache, proceeding without it: {e:#}");
+                    None
+                }
+            }
+        };
+
+        let module = loader::fetch_wasm_from_rpc_with_policy_and_cache(
+            contract_id,
+            rpc_url,
+            &policy,
+            cache.as_ref(),
+        )?;
 
         // If the caller pinned an expected hash, verify it now against the hash
         // that was verified on-chain during the RPC fetch.
@@ -923,12 +2178,29 @@ fn run() -> Result<()> {
         }
 
         module
+    } else if let Some(ref crate_path) = args.old_crate {
+        // --old-crate: build from source then load the artifact.
+        progress(format!(
+            "   🔨 Building old side from crate '{}'...",
+            crate_path.display()
+        ));
+        builder::build_contract_crate(crate_path, &policy)
+            .with_context(|| format!("Failed to build old crate '{}'", crate_path.display()))?
     } else {
-        loader::load_wasm(&args.wasm_paths[0])?
+        loader::load_wasm_with_policy(&args.wasm_paths[0], &policy)?
     };
 
-    // New WASM
-    let new = loader::load_wasm(new_wasm_path)?;
+    // New WASM — from file, or built from a local crate.
+    let new = if let Some(ref crate_path) = args.new_crate {
+        progress(format!(
+            "   🔨 Building new side from crate '{}'...",
+            crate_path.display()
+        ));
+        builder::build_contract_crate(crate_path, &policy)
+            .with_context(|| format!("Failed to build new crate '{}'", crate_path.display()))?
+    } else {
+        loader::load_wasm_with_policy(new_wasm_path, &policy)?
+    };
 
     if !suppressions.rules.is_empty() {
         progress(format!(
@@ -940,27 +2212,87 @@ fn run() -> Result<()> {
     // Generate Safety Report using the factored helper
     let baseline_source: Option<&str> = if old_source.is_some() {
         Some("RPC")
+    } else if args.old_crate.is_some() {
+        Some("Local Crate Build")
     } else {
         Some("Local File")
     };
     let verified_hash_hex = old.verified_hash.as_ref().map(hex::encode);
-    let mut safety_report = compare_contracts(
-        &ContractComparison {
-            old_bytes: &old.bytes,
-            old_path: &old.path,
-            new_bytes: &new.bytes,
-            new_path: &new.path,
-            suppressions: &suppressions,
-            policy: &policy,
-            storage_schemas: storage_schemas
-                .as_ref()
-                .map(|(old_schema, new_schema)| (old_schema, new_schema)),
-        },
-        &args,
-        &progress,
-    )?;
+
+    // Route to the right pipeline variant depending on whether either side is
+    // a spec-only JSON file.  Both paths produce a SafetyReport; the spec path
+    // uses run_pipeline_with_metadata directly so it can set wasm_sizes
+    // correctly and skip WASM-only comparisons.
+    let mut safety_report = if args.old_spec.is_some() || args.new_spec.is_some() {
+        // Build SorobanMetadata for the old side.
+        let old_meta = if let Some(ref spec_path) = args.old_spec {
+            progress(format!("   📄 Old side: spec JSON '{}'", spec_path.display()));
+            spec_input::load_spec_json(spec_path, &policy)?
+        } else {
+            parser::extract_metadata_with_policy(&old.bytes, &policy)
+                .context("Failed to extract metadata from the old WASM")?
+        };
+
+        // Build SorobanMetadata for the new side.
+        let new_meta = if let Some(ref spec_path) = args.new_spec {
+            progress(format!("   📄 New side: spec JSON '{}'", spec_path.display()));
+            spec_input::load_spec_json(spec_path, &policy)?
+        } else {
+            parser::extract_metadata_with_policy(&new.bytes, &policy)
+                .context("Failed to extract metadata from the new WASM")?
+        };
+
+        let wasm_sizes = match (args.old_spec.is_some(), args.new_spec.is_some()) {
+            (false, false) => Some((old.bytes.len(), new.bytes.len())),
+            (false, true) => Some((old.bytes.len(), 0)),
+            (true, false) => Some((0, new.bytes.len())),
+            (true, true) => None,
+        };
+
+        soroban_upgrade_safeguard::run_pipeline_with_metadata(
+            old_meta,
+            new_meta,
+            wasm_sizes,
+            &CompareOptions {
+                policy: Some(&policy),
+                suppressions: Some(&suppressions),
+                explain: args.explain,
+                strict: args.strict,
+                compat_duplicates: args.compat_duplicates,
+                storage_schemas: storage_schemas
+                    .as_ref()
+                    .map(|(old_schema, new_schema)| (old_schema, new_schema)),
+            },
+        )?
+    } else {
+        compare_contracts(
+            &ContractComparison {
+                old_bytes: &old.bytes,
+                old_path: &old.path,
+                new_bytes: &new.bytes,
+                new_path: &new.path,
+                suppressions: &suppressions,
+                policy: &policy,
+                storage_schemas: storage_schemas
+                    .as_ref()
+                    .map(|(old_schema, new_schema)| (old_schema, new_schema)),
+            },
+            &args,
+            &progress,
+        )?
+    };
     safety_report.baseline_source = baseline_source.map(|s| s.to_string());
     safety_report.verified_code_hash = verified_hash_hex;
+    safety_report.diff_types = args.diff_types;
+    // use_color is false when color has been globally disabled (which
+    // colored::control::set_override(false) handles for the colored crate
+    // itself), but we need the same decision here to drive our own
+    // render_type_diff call.  Re-derive it from the same inputs main() used.
+    safety_report.use_color = !soroban_upgrade_safeguard::color::should_disable_color(
+        args.no_color,
+        std::env::var_os("NO_COLOR").is_some(),
+        std::io::stdout().is_terminal(),
+    );
 
     if !all_categories.is_empty() {
         safety_report.apply_category_filter(&category_filter);
@@ -970,8 +2302,13 @@ fn run() -> Result<()> {
     let rendered = match args.format {
         OutputFormat::Json => serde_json::to_string_pretty(&safety_report.to_json())?,
         OutputFormat::Markdown => safety_report.generate_summary_markdown(),
+        OutputFormat::Html => safety_report.generate_summary_html(),
         OutputFormat::Text => safety_report.generate_summary_text(args.explain),
         OutputFormat::GithubActions => safety_report.generate_summary_github_actions(None),
+        OutputFormat::Junit => report::junit_document(
+            "soroban-upgrade-safeguard",
+            &safety_report.generate_summary_junit(None),
+        ),
     };
 
     // Write the report — either to a file (--output) or to stdout.
@@ -991,7 +2328,11 @@ fn run() -> Result<()> {
         );
     }
 
-    if !safety_report.is_safe {
+    // Evaluated before the verdict exit so its message is always printed, even
+    // when the run was already going to fail for other reasons.
+    let bump_gate_failed = check_expect_bump(args.expect_bump, safety_report.recommended_bump());
+
+    if !safety_report.is_safe || bump_gate_failed {
         std::process::exit(1);
     } else if safety_report.suppressed_critical_count > 0 {
         eprintln!(
@@ -1008,10 +2349,119 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+/// One side of a manifest contract pair — either a local file or an on-chain
+/// contract fetched via RPC.
+///
+/// # Manifest syntax
+///
+/// **Local file** — a plain string (backward-compatible with existing manifests):
+///
+/// ```toml
+/// [[pairs]]
+/// old = "path/to/old.wasm"
+/// new = "path/to/new.wasm"
+/// ```
+///
+/// **On-chain contract** — an inline table with `contract_id` and `rpc_url`:
+///
+/// ```toml
+/// [[pairs]]
+/// old = { contract_id = "CCONTRACT...", rpc_url = "https://soroban-testnet.stellar.org" }
+/// new = "path/to/new.wasm"
+/// ```
+///
+/// Either or both sides may be on-chain. WASM fetched via RPC is cached by
+/// code hash (see `--no-cache`) so a repeated contract in a large batch only
+/// hits the network once.
+#[derive(Clone, Debug)]
+enum ContractSource {
+    /// A WASM binary on the local filesystem.
+    File(PathBuf),
+    /// A deployed Soroban contract, fetched from Stellar RPC.
+    OnChain {
+        contract_id: String,
+        rpc_url: String,
+    },
+}
+
+impl<'de> serde::Deserialize<'de> for ContractSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+        use std::fmt;
+
+        struct ContractSourceVisitor;
+
+        impl<'de> Visitor<'de> for ContractSourceVisitor {
+            type Value = ContractSource;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(
+                    f,
+                    "a file path string or an on-chain table \
+                     {{ contract_id = \"C...\", rpc_url = \"https://...\" }}"
+                )
+            }
+
+            // Plain string → local file path (backward-compatible).
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<ContractSource, E> {
+                Ok(ContractSource::File(PathBuf::from(v)))
+            }
+
+            fn visit_string<E: de::Error>(self, v: String) -> Result<ContractSource, E> {
+                Ok(ContractSource::File(PathBuf::from(v)))
+            }
+
+            // Inline table → on-chain contract.
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<ContractSource, M::Error> {
+                let mut contract_id: Option<String> = None;
+                let mut rpc_url: Option<String> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "contract_id" => {
+                            if contract_id.is_some() {
+                                return Err(de::Error::duplicate_field("contract_id"));
+                            }
+                            contract_id = Some(map.next_value()?);
+                        }
+                        "rpc_url" => {
+                            if rpc_url.is_some() {
+                                return Err(de::Error::duplicate_field("rpc_url"));
+                            }
+                            rpc_url = Some(map.next_value()?);
+                        }
+                        other => {
+                            return Err(de::Error::unknown_field(
+                                other,
+                                &["contract_id", "rpc_url"],
+                            ))
+                        }
+                    }
+                }
+
+                let contract_id = contract_id
+                    .ok_or_else(|| de::Error::missing_field("contract_id"))?;
+                let rpc_url =
+                    rpc_url.ok_or_else(|| de::Error::missing_field("rpc_url"))?;
+
+                Ok(ContractSource::OnChain {
+                    contract_id,
+                    rpc_url,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(ContractSourceVisitor)
+    }
+}
+
 #[derive(serde::Deserialize, Clone, Debug)]
 struct ContractPair {
-    old: PathBuf,
-    new: PathBuf,
+    old: ContractSource,
+    new: ContractSource,
     name: Option<String>,
 }
 
@@ -1124,6 +2574,35 @@ fn compare_contracts(
     Ok(safety_report)
 }
 
+/// Load a [`loader::WasmModule`] from either a local file or an on-chain
+/// contract, applying `policy`, optional `cache`, and URL-security settings.
+///
+/// This is the single entry-point for source resolution used by both the
+/// single-pair path and the batch loop, so on-chain and file sources behave
+/// consistently regardless of the calling context.
+fn resolve_contract_source(
+    source: &ContractSource,
+    policy: &ResourcePolicy,
+    cache: Option<&WasmCache>,
+    allow_http_local: bool,
+) -> Result<loader::WasmModule> {
+    match source {
+        ContractSource::File(path) => loader::load_wasm_with_policy(path, policy),
+        ContractSource::OnChain {
+            contract_id,
+            rpc_url,
+        } => {
+            loader::validate_rpc_url(rpc_url, allow_http_local)?;
+            loader::fetch_wasm_from_rpc_with_policy_and_cache(
+                contract_id,
+                rpc_url,
+                policy,
+                cache,
+            )
+        }
+    }
+}
+
 /// Assign a stable, unique display name to every pair in the batch.
 ///
 /// Two rules govern the assignment:
@@ -1164,11 +2643,14 @@ fn resolve_pair_names(pairs: &[ContractPair]) -> Result<Vec<String>> {
 
     for (i, pair) in pairs.iter().enumerate() {
         let candidate = pair.name.clone().unwrap_or_else(|| {
-            pair.new
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(String::from)
-                .unwrap_or_else(|| format!("pair_{}", i + 1))
+            match &pair.new {
+                ContractSource::File(path) => path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("pair_{}", i + 1)),
+                ContractSource::OnChain { contract_id, .. } => contract_id.clone(),
+            }
         });
 
         let count = counts.entry(candidate.clone()).or_insert(0);
@@ -1308,8 +2790,8 @@ fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>>
                 .and_then(|s| s.to_str())
                 .map(String::from);
             pairs.push(ContractPair {
-                old: old_abs_path.clone(),
-                new: new_abs_path.clone(),
+                old: ContractSource::File(old_abs_path.clone()),
+                new: ContractSource::File(new_abs_path.clone()),
                 name,
             });
         } else {
@@ -1341,4 +2823,278 @@ fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>>
     }
 
     Ok(pairs)
+}
+
+/// Match one path segment against one glob segment.
+///
+/// `*` matches any run of characters within the segment (never a `/`, since
+/// matching is applied per segment), `?` matches exactly one character, and
+/// everything else is literal. The backtracking is the standard two-pointer
+/// form: linear in practice and never recursive, so a pathological pattern
+/// cannot blow the stack.
+fn segment_matches(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    // Position of the last `*` seen, and how much of `name` it had consumed.
+    let mut star: Option<usize> = None;
+    let mut resume = 0usize;
+
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            resume = ni;
+            pi += 1;
+        } else if let Some(s) = star {
+            // Backtrack: let the last `*` swallow one more character.
+            pi = s + 1;
+            resume += 1;
+            ni = resume;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Maximum directory depth a `**` segment will descend. Mirrors the cap in
+/// [`collect_wasm_files`] and bounds symlink loops.
+const GLOB_MAX_DEPTH: usize = 32;
+
+/// Walk `dir`, collecting every file matching the remaining glob `segments`.
+fn glob_walk(dir: &Path, segments: &[&str], depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > GLOB_MAX_DEPTH {
+        return;
+    }
+    let Some(seg) = segments.first() else {
+        return;
+    };
+    let rest = &segments[1..];
+
+    // `**` matches zero or more directories, so it has to be tried both as
+    // "consume nothing" and as "descend one level and try again".
+    if *seg == "**" {
+        glob_walk(dir, rest, depth + 1, out);
+        if let Ok(read_dir) = std::fs::read_dir(dir) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    glob_walk(&path, segments, depth + 1, out);
+                }
+            }
+        }
+        return;
+    }
+
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !segment_matches(seg, name) {
+            continue;
+        }
+        if rest.is_empty() {
+            if path.is_file() {
+                out.push(path);
+            }
+        } else if path.is_dir() {
+            glob_walk(&path, rest, depth + 1, out);
+        }
+    }
+}
+
+/// Expand a glob pattern into the list of files it matches, sorted for
+/// deterministic ordering.
+///
+/// The literal prefix of the pattern is used as the walk root, so
+/// `target/wasm32-unknown-unknown/release/*.wasm` only reads that one directory
+/// rather than scanning from the working directory down.
+fn expand_glob(pattern: &str) -> Result<Vec<PathBuf>> {
+    if pattern.trim().is_empty() {
+        anyhow::bail!("Glob pattern is empty");
+    }
+
+    // Accept either separator so a pattern copied from a Windows path still
+    // splits into segments.
+    let normalized = pattern.replace('\\', "/");
+    let absolute = normalized.starts_with('/');
+    let mut segments: Vec<&str> = normalized
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+
+    let mut root = if absolute {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(".")
+    };
+    let mut literal_prefix = 0usize;
+    for seg in &segments {
+        if seg.contains('*') || seg.contains('?') {
+            break;
+        }
+        root.push(seg);
+        literal_prefix += 1;
+    }
+    segments.drain(..literal_prefix);
+
+    // No wildcards at all: the pattern is just a path.
+    if segments.is_empty() {
+        return Ok(if root.is_file() { vec![root] } else { Vec::new() });
+    }
+
+    let mut matches = Vec::new();
+    glob_walk(&root, &segments, 0, &mut matches);
+    matches.sort();
+    matches.dedup();
+    Ok(matches)
+}
+
+/// Index glob matches by file stem, the pairing key for glob mode.
+///
+/// Two files with the same stem on one side make the pairing genuinely
+/// ambiguous. Picking one silently could compare the wrong build, so this fails
+/// and points at the manifest, which names pairs explicitly.
+fn index_by_stem(
+    files: &[PathBuf],
+    pattern: &str,
+) -> Result<std::collections::BTreeMap<String, PathBuf>> {
+    let mut map: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
+    for path in files {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if let Some(existing) = map.insert(stem.clone(), path.clone()) {
+            anyhow::bail!(
+                "Glob pattern '{}' matched two files with the same stem '{}': '{}' and '{}'. \
+                 Pairing is by file stem, so this is ambiguous — narrow the pattern or use \
+                 --manifest to name the pairs explicitly.",
+                pattern,
+                stem,
+                existing.display(),
+                path.display(),
+            );
+        }
+    }
+    Ok(map)
+}
+
+/// Build batch pairs from a pair of glob patterns.
+///
+/// Old and new matches are paired by **file stem**, the same key a directory
+/// scan derives a pair's display name from, so a contract keeps one identity
+/// regardless of which batch mode selected it. A file matched on only one side
+/// is reported with the same unmatched-file warning directory scanning emits,
+/// never silently dropped.
+fn scan_globs(old_pattern: &str, new_pattern: &str) -> Result<Vec<ContractPair>> {
+    let old_files = expand_glob(old_pattern)?;
+    let new_files = expand_glob(new_pattern)?;
+
+    // Only `.wasm` files participate; a pattern like `release/*` would
+    // otherwise sweep in build metadata and rlibs.
+    let is_wasm = |p: &PathBuf| p.extension().and_then(|s| s.to_str()) == Some("wasm");
+    let old_files: Vec<PathBuf> = old_files.into_iter().filter(is_wasm).collect();
+    let new_files: Vec<PathBuf> = new_files.into_iter().filter(is_wasm).collect();
+
+    if old_files.is_empty() {
+        anyhow::bail!("Glob pattern '{}' matched no .wasm files", old_pattern);
+    }
+    if new_files.is_empty() {
+        anyhow::bail!("Glob pattern '{}' matched no .wasm files", new_pattern);
+    }
+
+    let old_index = index_by_stem(&old_files, old_pattern)?;
+    let new_index = index_by_stem(&new_files, new_pattern)?;
+
+    let mut pairs = Vec::new();
+    for (stem, old_path) in &old_index {
+        match new_index.get(stem) {
+            Some(new_path) => pairs.push(ContractPair {
+                old: ContractSource::File(old_path.clone()),
+                new: ContractSource::File(new_path.clone()),
+                name: Some(stem.clone()),
+            }),
+            None => eprintln!(
+                "⚠️  Warning: Match not found for '{}' in new glob '{}'",
+                old_path.display(),
+                new_pattern
+            ),
+        }
+    }
+
+    for (stem, new_path) in &new_index {
+        if !old_index.contains_key(stem) {
+            eprintln!(
+                "⚠️  Warning: No old counterpart found for '{}' in old glob '{}'",
+                new_path.display(),
+                old_pattern
+            );
+        }
+    }
+
+    if pairs.is_empty() {
+        anyhow::bail!(
+            "No matching .wasm contract pairs found between '{}' and '{}'. Pairing is by file \
+             stem: every stem matched by one pattern must also be matched by the other.",
+            old_pattern,
+            new_pattern
+        );
+    }
+
+    Ok(pairs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn segment_matches_literals_and_wildcards() {
+        assert!(segment_matches("*.wasm", "token.wasm"));
+        assert!(segment_matches("*.wasm", ".wasm"));
+        assert!(!segment_matches("*.wasm", "token.wat"));
+        assert!(segment_matches("v?.wasm", "v1.wasm"));
+        assert!(!segment_matches("v?.wasm", "v10.wasm"));
+        assert!(segment_matches("token", "token"));
+        assert!(!segment_matches("token", "tokens"));
+        assert!(segment_matches("*", "anything"));
+        assert!(segment_matches("a*b*c", "azzbzzc"));
+        assert!(!segment_matches("a*b*c", "azzbzz"));
+    }
+
+    #[test]
+    fn bump_levels_are_ordered_patch_minor_major() {
+        assert!(BumpLevel::Patch < BumpLevel::Minor);
+        assert!(BumpLevel::Minor < BumpLevel::Major);
+        assert_eq!(BumpLevel::from_recommendation("major"), BumpLevel::Major);
+        assert_eq!(BumpLevel::from_recommendation("minor"), BumpLevel::Minor);
+        assert_eq!(BumpLevel::from_recommendation("patch"), BumpLevel::Patch);
+    }
+
+    #[test]
+    fn expect_bump_gate_only_fails_when_recommendation_is_more_severe() {
+        // Falls short.
+        assert!(check_expect_bump(Some(BumpLevel::Minor), "major"));
+        assert!(check_expect_bump(Some(BumpLevel::Patch), "minor"));
+        // Matches.
+        assert!(!check_expect_bump(Some(BumpLevel::Major), "major"));
+        // Exceeds.
+        assert!(!check_expect_bump(Some(BumpLevel::Major), "minor"));
+        assert!(!check_expect_bump(Some(BumpLevel::Minor), "patch"));
+        // Not requested.
+        assert!(!check_expect_bump(None, "major"));
+    }
 }

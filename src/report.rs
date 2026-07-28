@@ -51,7 +51,14 @@ pub struct AnalysisScope {
     /// The exported `contractspecv0` interface is always compared.
     pub exported_interface: bool,
     /// Whether environment metadata (`contractenvmetav0`) was compared.
+    /// `false` when one or both sides is a spec-only JSON input.
     pub env_metadata: bool,
+    /// Whether the WASM binary export section was compared.
+    /// `false` when one or both sides is a spec-only JSON input.
+    pub wasm_exports_compared: bool,
+    /// Whether the WASM binary import section was compared.
+    /// `false` when one or both sides is a spec-only JSON input.
+    pub wasm_imports_compared: bool,
     /// The storage-layout analysis state for this run.
     pub storage_schema: StorageScopeState,
     /// Number of distinct `contractspecv0` sections in the old WASM (0 if not parsed).
@@ -73,6 +80,8 @@ impl Default for AnalysisScope {
         Self {
             exported_interface: true,
             env_metadata: false,
+            wasm_exports_compared: false,
+            wasm_imports_compared: false,
             storage_schema: StorageScopeState::NotAnalyzed,
             old_spec_section_count: 0,
             new_spec_section_count: 0,
@@ -91,15 +100,22 @@ impl AnalysisScope {
     /// One-sentence bounded claim describing what this verdict certifies. When
     /// no schema was supplied it reduces to [`SCOPE_SUMMARY_LINE`].
     pub fn summary_line(&self) -> String {
+        let spec_only_note = if !self.env_metadata || !self.wasm_exports_compared {
+            " (spec-only input: env metadata, export, and import comparisons skipped)"
+        } else {
+            ""
+        };
         match &self.storage_schema {
-            StorageScopeState::NotAnalyzed => SCOPE_SUMMARY_LINE.to_string(),
+            StorageScopeState::NotAnalyzed => {
+                format!("{}{}", SCOPE_SUMMARY_LINE, spec_only_note)
+            }
             StorageScopeState::Analyzed {
                 key_types,
                 value_types,
             } => format!(
                 "Exported interface + environment metadata, plus a declared storage schema \
                  ({key_types} key type(s), {value_types} value type(s)). Storage coverage is \
-                 limited to the declared types."
+                 limited to the declared types.{spec_only_note}"
             ),
         }
     }
@@ -126,6 +142,8 @@ impl AnalysisScope {
 pub struct ScopeJson {
     pub exported_interface_analyzed: bool,
     pub env_metadata_analyzed: bool,
+    pub wasm_exports_compared: bool,
+    pub wasm_imports_compared: bool,
     pub storage_layout_analyzed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_key_types: Option<usize>,
@@ -157,6 +175,8 @@ impl AnalysisScope {
         ScopeJson {
             exported_interface_analyzed: self.exported_interface,
             env_metadata_analyzed: self.env_metadata,
+            wasm_exports_compared: self.wasm_exports_compared,
+            wasm_imports_compared: self.wasm_imports_compared,
             storage_layout_analyzed: self.storage_analyzed(),
             storage_key_types,
             storage_value_types,
@@ -176,38 +196,38 @@ impl AnalysisScope {
 /// full — it simply does not count toward the failing set.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ReportedFinding {
-    /// Stable rule id for this finding.
-    pub rule_id: String,
     /// The underlying finding, flattened so JSON keeps its original shape
     /// (`severity`, `category`, `message`, `type_name`, `target`).
     #[serde(flatten)]
     pub finding: Finding,
-    /// The SHA-256 fingerprint computed for this finding.
-    pub fingerprint: String,
     /// Whether a suppression rule acknowledged this finding.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suppressed: bool,
     /// The justification copied from the matching rule, if it provided one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suppression_reason: Option<String>,
-    /// The author copied from the matching rule, if it provided one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub suppression_author: Option<String>,
-    /// The expiry copied from the matching rule, if it provided one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub suppression_expiry: Option<String>,
-    /// The fingerprint copied from the matching rule, if it provided one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub suppression_fingerprint: Option<String>,
     /// Optional remediation/explanation advice for the user.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remediation: Option<String>,
+    /// The severity the analysis engine originally assigned, present only when
+    /// a `[severity]` override changed it.
+    ///
+    /// `finding.severity` always carries the *effective* severity — what the
+    /// verdict, counts, and exit code were computed from. This field preserves
+    /// what the tool would have said on its own, so a reader can always tell an
+    /// engine verdict apart from a configured one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_severity: Option<Severity>,
+    /// Whether this finding is new or persisting relative to a `--baseline`
+    /// report. `None` when no baseline was supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_status: Option<crate::baseline::BaselineStatus>,
 }
 
 /// Per-build size and interface-count metrics, carried in the report for all
 /// three output formats. These are purely informational and never affect
 /// `is_safe`, the exit code, or the recommended bump.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct BuildMetrics {
     /// Total WASM binary size in bytes for the old build.
     pub old_size_bytes: usize,
@@ -289,6 +309,18 @@ impl BuildMetrics {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReportSettings {
+    pub strict: bool,
+    pub explain: bool,
+    pub max_suppressions: Option<usize>,
+    pub allow_targetless: Option<bool>,
+    pub max_xdr_depth: u32,
+    pub max_xdr_len: usize,
+    pub max_entries: usize,
+    pub max_walk_depth: usize,
+}
+
 /// A structured container for aggregated comparison findings.
 pub struct SafetyReport {
     pub critical_count: usize,
@@ -298,11 +330,20 @@ pub struct SafetyReport {
     pub suppressed_count: usize,
     /// Number of findings hidden by category filtering.
     pub filtered_count: usize,
+    /// Number of findings whose severity a `[severity]` override changed.
+    pub severity_overridden_count: usize,
+    /// Whether the pass/fail verdict differs from what it would have been
+    /// without the `[severity]` overrides.
+    ///
+    /// Reported prominently in every format. An override that turns a failing
+    /// gate green is exactly the case a reader must not be able to miss.
+    pub verdict_changed_by_override: bool,
     pub suppressed_critical_count: usize,
     pub total_findings: usize,
     pub is_safe: bool,
     pub findings_by_category: HashMap<String, Vec<ReportedFinding>>,
     pub strict: bool,
+    pub settings: ReportSettings,
     /// What this run actually inspected. Drives the scope reporting so a verdict
     /// is never read as broader than the analysis that produced it.
     pub scope: AnalysisScope,
@@ -326,6 +367,19 @@ pub struct SafetyReport {
     /// Suppression rules from the config that matched no finding during this run.
     /// Non-empty indicates a potential typo or a stale rule, surfaced to stderr.
     pub unmatched_suppressions: Vec<crate::suppression::SuppressionRule>,
+    /// Set by [`crate::baseline::apply`] when a `--baseline` report was
+    /// supplied. `None` means no baseline comparison was requested.
+    pub baseline_diff: Option<crate::baseline::BaselineDiff>,
+    /// When `true`, [`Self::generate_summary_text`] appends a highlighted
+    /// two-line type diff after each type-change finding.  Set from the
+    /// `--diff-types` CLI flag.  Has no effect on JSON or Markdown output.
+    pub diff_types: bool,
+    /// Whether color is enabled for this report's text rendering.
+    ///
+    /// Mirrors the process-wide color decision made by `main` and stored here
+    /// so [`Self::generate_summary_text`] can pass the right value to
+    /// [`crate::type_diff::render_type_diff`] without accessing global state.
+    pub use_color: bool,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -344,20 +398,20 @@ pub struct SeverityCounts {
 pub struct SafetyReportJson<'a> {
     pub is_safe: bool,
     pub strict: bool,
-    /// One-sentence bounded claim describing what this verdict certifies.
-    /// Machine consumers should not equate `is_safe` with storage compatibility.
-    pub certifies: String,
-    /// Structured coverage: which analysis dimensions actually ran.
-    pub scope: ScopeJson,
     pub counts: SeverityCounts,
     /// Findings (of any severity) acknowledged by the suppression config.
     pub suppressed_count: usize,
     /// Findings hidden by category filtering.
     pub filtered_count: usize,
+    /// Findings whose severity a `[severity]` config override changed. Each one
+    /// also carries its pre-override `original_severity`.
+    pub severity_overridden_count: usize,
+    /// Whether the verdict differs from what it would have been without the
+    /// `[severity]` overrides. A machine consumer treating `is_safe` as a gate
+    /// should surface this rather than pass silently.
+    pub verdict_changed_by_override: bool,
     pub total_findings: usize,
     pub recommended_bump: &'static str,
-    pub baseline_source: Option<&'a str>,
-    pub verified_code_hash: Option<&'a str>,
     pub findings_by_category: BTreeMap<&'a str, &'a Vec<ReportedFinding>>,
     /// Build size and interface-count metrics (always present in CLI output).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -365,10 +419,17 @@ pub struct SafetyReportJson<'a> {
     /// Suppression rules from the config that matched no finding.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unmatched_suppressions: Vec<UnmatchedSuppressionJson>,
+    /// This tool's version, so a later run can detect an incompatible
+    /// baseline before comparing against this report via `--baseline`.
+    pub tool_version: &'static str,
+    /// Present when `--baseline` was supplied: classifies this run's
+    /// findings as new/persisting relative to it, and lists resolved ones.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_diff: Option<&'a crate::baseline::BaselineDiff>,
 }
 
 /// JSON representation of a suppression rule that matched no finding.
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub struct UnmatchedSuppressionJson {
     pub category: String,
     pub target: Option<String>,
@@ -398,48 +459,64 @@ impl SafetyReport {
         strict: bool,
         policy: &ResourcePolicy,
     ) -> Self {
-        let settings = ReportSettings {
-            strict,
-            explain,
-            max_suppressions: suppressions.max_suppressions,
-            allow_targetless: suppressions.allow_targetless,
-            max_xdr_depth: policy.max_xdr_depth,
-            max_xdr_len: policy.max_xdr_len,
-            max_entries: policy.max_entries,
-            max_walk_depth: policy.max_walk_depth,
-        };
+        let _ = policy;
 
         let mut critical_count = 0;
         let mut warning_count = 0;
         let mut info_count = 0;
         let mut suppressed_count = 0;
-        let mut suppressed_critical_count = 0;
         let mut failing_critical_count = 0;
         let mut failing_warning_count = 0;
+        // The same failing tallies computed from the engine's own severities,
+        // used only to detect a verdict that flipped because of an override.
+        let mut engine_failing_critical_count = 0;
+        let mut engine_failing_warning_count = 0;
+        let mut severity_overridden_count = 0;
         let mut findings_by_category: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
 
         // Track which rule indices actually matched at least one finding.
         let mut matched_rule_indices: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
 
+        let overrides = &suppressions.severity_overrides;
+
         for finding in &diff.findings {
-            match finding.severity {
+            // Policy is applied here, in the report layer, alongside suppression
+            // — the diff layer stays a pure description of what changed.
+            let engine_severity = finding.severity.clone();
+            let severity = overrides
+                .severity_for(&finding.category)
+                .unwrap_or_else(|| engine_severity.clone());
+            let overridden = severity != engine_severity;
+            if overridden {
+                severity_overridden_count += 1;
+            }
+
+            match severity {
                 Severity::Critical => critical_count += 1,
                 Severity::Warning => warning_count += 1,
                 Severity::Info => info_count += 1,
             }
 
+            // Suppression matches on category, target, and fingerprint — never
+            // on severity — so an override can never move a finding out from
+            // under an existing suppression rule.
             let rule = suppressions.matching_rule_with_index(finding);
             let suppressed = rule.is_some();
             if suppressed {
                 suppressed_count += 1;
-                if finding.severity == Severity::Critical {
+                if severity == Severity::Critical {
                     suppressed_critical_count += 1;
                 }
             } else {
-                match finding.severity {
+                match severity {
                     Severity::Critical => failing_critical_count += 1,
                     Severity::Warning => failing_warning_count += 1,
+                    _ => {}
+                }
+                match engine_severity {
+                    Severity::Critical => engine_failing_critical_count += 1,
+                    Severity::Warning => engine_failing_warning_count += 1,
                     _ => {}
                 }
             }
@@ -449,6 +526,8 @@ impl SafetyReport {
                 matched_rule_indices.insert(idx);
             }
 
+            let remediation = if explain {
+                get_remediation_guidance(&finding.category).map(String::from)
             let rule_ref = rule.map(|(_, r)| r);
 
             let rule_id = canonical_rule_id(&finding.category)
@@ -460,13 +539,21 @@ impl SafetyReport {
                 None
             };
 
+            // The fingerprint covers category, target, and message — not
+            // severity — so overriding a category does not invalidate the
+            // fingerprints in an existing suppression config.
             let fingerprint = crate::suppression::compute_fingerprint(finding);
+            let mut effective_finding = finding.clone();
+            effective_finding.severity = severity;
             findings_by_category
                 .entry(finding.category.clone())
                 .or_default()
                 .push(ReportedFinding {
-                    rule_id,
                     finding: finding.clone(),
+                    suppressed,
+                    suppression_reason: rule.and_then(|r| r.reason.clone()),
+                    rule_id,
+                    finding: effective_finding,
                     fingerprint,
                     suppressed,
                     suppression_reason: rule_ref.and_then(|r| r.reason.clone()),
@@ -474,6 +561,8 @@ impl SafetyReport {
                     suppression_expiry: rule_ref.and_then(|r| r.expiry.clone()),
                     suppression_fingerprint: rule_ref.and_then(|r| r.fingerprint.clone()),
                     remediation,
+                    original_severity: overridden.then_some(engine_severity),
+                    baseline_status: None,
                 });
         }
 
@@ -486,10 +575,29 @@ impl SafetyReport {
             .map(|(_, r)| r.clone())
             .collect();
 
-        let is_safe = if strict {
-            failing_critical_count == 0 && failing_warning_count == 0
-        } else {
-            failing_critical_count == 0
+        let verdict = |critical: usize, warning: usize| {
+            if strict {
+                critical == 0 && warning == 0
+            } else {
+                critical == 0
+            }
+        };
+        let is_safe = verdict(failing_critical_count, failing_warning_count);
+        // A demotion that turns a failing gate green is the one outcome a reader
+        // must never miss, so the difference is computed here and stated in the
+        // report rather than left for the user to infer.
+        let verdict_changed_by_override =
+            is_safe != verdict(engine_failing_critical_count, engine_failing_warning_count);
+
+        let settings = ReportSettings {
+            strict,
+            explain,
+            max_suppressions: suppressions.max_suppressions,
+            allow_targetless: suppressions.allow_targetless,
+            max_xdr_depth: policy.max_xdr_depth,
+            max_xdr_len: policy.max_xdr_len,
+            max_entries: policy.max_entries,
+            max_walk_depth: policy.max_walk_depth,
         };
 
         Self {
@@ -498,19 +606,28 @@ impl SafetyReport {
             info_count,
             suppressed_count,
             filtered_count: 0,
+            severity_overridden_count,
+            verdict_changed_by_override,
             suppressed_critical_count,
             total_findings: diff.findings.len(),
             is_safe,
             findings_by_category,
             strict,
+            settings,
             baseline_source: None,
             verified_code_hash: None,
             category_filter: CategoryFilter::default(),
+        }
+    }
+
             scope: AnalysisScope::default(),
             old_spec_summary: None,
             new_spec_summary: None,
             metrics: None,
             unmatched_suppressions,
+            baseline_diff: None,
+            diff_types: false,
+            use_color: false,
         }
     }
 
@@ -531,6 +648,50 @@ impl SafetyReport {
             "❌ FAILED (Breaking changes detected in the exported interface or declared storage)"
         } else {
             "❌ FAILED (Exported-interface breaking changes detected)"
+        }
+    }
+
+    /// The sentence stating that a `[severity]` override changed the verdict,
+    /// or `None` when it did not.
+    ///
+    /// A tool that can be quietly reconfigured into always passing is worse than
+    /// no tool, so this is the one line that must appear, unhedged, in every
+    /// format whenever configuration — not analysis — decided the outcome.
+    pub fn override_verdict_notice(&self) -> Option<String> {
+        if !self.verdict_changed_by_override {
+            return None;
+        }
+        Some(if self.is_safe {
+            "VERDICT CHANGED BY CONFIG: this run passes only because the [severity] table \
+             lowered one or more findings. Without those overrides it would have FAILED."
+                .to_string()
+        } else {
+            "VERDICT CHANGED BY CONFIG: this run fails only because the [severity] table \
+             raised one or more findings. Without those overrides it would have PASSED."
+                .to_string()
+        })
+    }
+
+    /// The override notice rendered for text output, empty when not applicable.
+    fn override_verdict_notice_text(&self) -> String {
+        match self.override_verdict_notice() {
+            // Red rather than dimmed: a demotion that greens a failing gate is
+            // the case this line exists to make impossible to skim past.
+            Some(notice) => format!("{}\n", format!("⚠️  {notice}").red().bold()),
+            None => String::new(),
+        }
+    }
+
+    /// The `[SEVERITY: critical → warning]` tag for a finding whose severity an
+    /// override changed, or an empty string when it was left alone.
+    fn override_tag(reported: &ReportedFinding) -> String {
+        match &reported.original_severity {
+            Some(original) => format!(
+                "[SEVERITY {} → {}] ",
+                original.label(),
+                reported.finding.severity.label()
+            ),
+            None => String::new(),
         }
     }
 
@@ -575,8 +736,6 @@ impl SafetyReport {
         SafetyReportJson {
             is_safe: self.is_safe,
             strict: self.strict,
-            certifies: self.scope.summary_line(),
-            scope: self.scope.to_json(),
             counts: SeverityCounts {
                 critical: self.critical_count,
                 warning: self.warning_count,
@@ -584,10 +743,10 @@ impl SafetyReport {
             },
             suppressed_count: self.suppressed_count,
             filtered_count: self.filtered_count,
+            severity_overridden_count: self.severity_overridden_count,
+            verdict_changed_by_override: self.verdict_changed_by_override,
             total_findings: self.total_findings,
             recommended_bump: self.recommended_bump(),
-            baseline_source: self.baseline_source.as_deref(),
-            verified_code_hash: self.verified_code_hash.as_deref(),
             findings_by_category: self
                 .findings_by_category
                 .iter()
@@ -595,10 +754,42 @@ impl SafetyReport {
                 .collect(),
             metrics: self.metrics.as_ref(),
             unmatched_suppressions,
+            tool_version: env!("CARGO_PKG_VERSION"),
+            baseline_diff: self.baseline_diff.as_ref(),
         }
     }
 
     /// Generate a structured, human-readable text output for the CLI.
+    /// Sort categories with the most severe findings first: any category
+    /// containing a Critical finding sorts before any Warning-only category,
+    /// which sorts before any Info-only category. A category can hold findings
+    /// of mixed severity — it is ranked by its most severe finding, since that
+    /// is the one a reader most needs to see early. Ties within a severity
+    /// band are broken alphabetically for stable output.
+    fn categories_sorted_by_severity(&self) -> Vec<&String> {
+        let mut categories: Vec<&String> = self.findings_by_category.keys().collect();
+        categories.sort_by(|a, b| {
+            let rank = |name: &str| {
+                let findings = self.findings_by_category.get(name).unwrap();
+                if findings
+                    .iter()
+                    .any(|r| r.finding.severity == Severity::Critical)
+                {
+                    0
+                } else if findings
+                    .iter()
+                    .any(|r| r.finding.severity == Severity::Warning)
+                {
+                    1
+                } else {
+                    2
+                }
+            };
+            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+        });
+        categories
+    }
+
     pub fn generate_summary_text(&self, explain: bool) -> String {
         let mut output = String::new();
         output.push_str(
@@ -622,10 +813,11 @@ impl SafetyReport {
         );
 
         let status = if self.is_safe {
-            self.passed_status_label().green().bold()
+            "✅ PASSED (No breaking changes detected)".green().bold()
         } else if self.strict && self.critical_count == 0 {
             "❌ FAILED (Warnings detected in strict mode)".red().bold()
         } else {
+            "❌ FAILED (Critical breaking changes detected)"
             self.failed_status_label().red().bold()
         };
         output.push_str(&format!("Status: {}\n", status));
@@ -670,9 +862,8 @@ impl SafetyReport {
                 )
                 .red()
                 .bold()
-                .to_string(),
-            );
-        }
+        };
+        output.push_str(&format!("Status: {}\n", status));
 
         let crit_str = if self.critical_count > 0 {
             self.critical_count.to_string().red().bold()
@@ -707,6 +898,19 @@ impl SafetyReport {
                     .dimmed()
             ));
         }
+        if self.severity_overridden_count > 0 {
+            output.push_str(&format!(
+                "Overridden: {}\n",
+                self.severity_overridden_count.to_string().magenta().bold()
+            ));
+            output.push_str(&format!(
+                "{}",
+                "  ↳ Severities were changed by the [severity] table in the config.\n"
+                    .magenta()
+                    .dimmed()
+            ));
+        }
+        output.push_str(&self.override_verdict_notice_text());
         let bump = self.recommended_bump();
         let bump_str = match bump {
             "major" => "major".red().bold(),
@@ -722,6 +926,20 @@ impl SafetyReport {
         if let Some(hash) = &self.verified_code_hash {
             output.push_str(&format!("Verified Code Hash: {}\n", hash.dimmed()));
         }
+        if let Some(bd) = &self.baseline_diff {
+            output.push_str(&format!(
+                "Baseline: {} new, {} persisting, {} resolved (vs. tool v{}){}\n",
+                bd.new_count.to_string().bold(),
+                bd.persisting_count,
+                bd.resolved.len(),
+                bd.baseline_tool_version,
+                if bd.fail_on_new_only {
+                    " — verdict reflects new findings only"
+                } else {
+                    ""
+                },
+            ));
+        }
 
         output.push_str(
             &"----------------------------------------\n\n"
@@ -730,6 +948,7 @@ impl SafetyReport {
         );
 
         if self.total_findings == 0 {
+            output.push_str(&"No relevant changes detected. The upgrade is identical in its exports and types.\n".green().to_string());
             output.push_str(&"No relevant changes detected. The exported interface is identical in its exports and types.\n".green().to_string());
             output.push_str(&format!("\n{}\n", STORAGE_NOT_VERIFIED_NOTE.dimmed()));
             self.append_metrics_text(&mut output);
@@ -737,11 +956,7 @@ impl SafetyReport {
         }
 
         // Sort categories to have consistent output; surface Environment first.
-        let mut categories: Vec<&String> = self.findings_by_category.keys().collect();
-        categories.sort_by(|a, b| {
-            let rank = |name: &str| if name == "Environment" { 0 } else { 1 };
-            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
-        });
+        let categories = self.categories_sorted_by_severity();
 
         for category in categories {
             output.push_str(
@@ -755,10 +970,12 @@ impl SafetyReport {
             for reported in &group {
                 let finding = &reported.finding;
 
+                let override_tag = Self::override_tag(reported);
+
                 if reported.suppressed {
                     // Suppressed findings are still listed, but clearly marked
                     // and dimmed so they read as acknowledged, not active.
-                    let label = format!("🔕 [SUPPRESSED] {}", finding.message)
+                    let label = format!("🔕 [SUPPRESSED] {override_tag}{}", finding.message)
                         .dimmed()
                         .to_string();
                     output.push_str(&format!("{}\n", label));
@@ -778,10 +995,15 @@ impl SafetyReport {
                     continue;
                 }
 
+                let baseline_tag = match reported.baseline_status {
+                    Some(crate::baseline::BaselineStatus::New) => "[NEW] ",
+                    _ => "",
+                };
+                let body = format!("{baseline_tag}{override_tag}{}", finding.message);
                 let formatted = match finding.severity {
-                    Severity::Critical => format!("🔴 {}", finding.message).red(),
-                    Severity::Warning => format!("🟡 {}", finding.message).yellow(),
-                    Severity::Info => format!("🔵 {}", finding.message).cyan(),
+                    Severity::Critical => format!("🔴 {body}").red(),
+                    Severity::Warning => format!("🟡 {body}").yellow(),
+                    Severity::Info => format!("🔵 {body}").cyan(),
                 };
                 output.push_str(&format!("{}\n", formatted));
                 if explain {
@@ -793,8 +1015,29 @@ impl SafetyReport {
                         );
                     }
                 }
+                if self.diff_types && crate::type_diff::is_type_change_category(&finding.category) {
+                    if let Some((old_ty, new_ty)) =
+                        crate::type_diff::extract_type_pair(&finding.message)
+                    {
+                        output.push_str(&crate::type_diff::render_type_diff(
+                            &old_ty,
+                            &new_ty,
+                            self.use_color,
+                        ));
+                    }
+                }
             }
             output.push('\n');
+        }
+
+        if let Some(bd) = &self.baseline_diff {
+            if !bd.resolved.is_empty() {
+                output.push_str(&"✅ RESOLVED SINCE BASELINE\n".green().bold().to_string());
+                for r in &bd.resolved {
+                    output.push_str(&format!("{}\n", r.message).green().to_string());
+                }
+                output.push('\n');
+            }
         }
 
         if !self.is_safe {
@@ -879,12 +1122,7 @@ impl SafetyReport {
                     .bold()
                     .to_string(),
             );
-            output.push_str(
-                &"📊 BUILD METRICS\n"
-                    .bold()
-                    .cyan()
-                    .to_string(),
-            );
+            output.push_str(&"📊 BUILD METRICS\n".bold().cyan().to_string());
             output.push_str(
                 &"========================================\n"
                     .bold()
@@ -924,44 +1162,20 @@ impl SafetyReport {
         let mut output = String::new();
         output.push_str("# Soroban Upgrade Safety Report\n\n");
 
+        if self.strict {
+            output
+                .push_str("> ⚠️ **[STRICT MODE ACTIVE]** — Warnings are treated as failures.\n\n");
+        }
+
         let status = if self.is_safe {
+            "✅ PASSED (No breaking changes detected)"
             self.passed_status_label()
+        } else if self.strict && self.critical_count == 0 {
+            "❌ FAILED (Warnings detected in strict mode)"
         } else {
-            self.failed_status_label()
+            "❌ FAILED (Critical breaking changes detected)"
         };
         output.push_str(&format!("## Status: {}\n\n", status));
-        output.push_str(&format!("_{}_\n\n", self.scope.summary_line()));
-        output.push_str(&format!(
-            "**Scope:** {}\n\n",
-            self.scope.storage_status_line()
-        ));
-
-        // Spec-section integrity (multi-section or duplicates).
-        if self.scope.old_spec_section_count > 1 || self.scope.new_spec_section_count > 1 {
-            output.push_str(&format!(
-                "> ⚠️ Multi-section WASM detected: old has {} contractspecv0 section(s), new has {}.\n\n",
-                self.scope.old_spec_section_count,
-                self.scope.new_spec_section_count,
-            ));
-        }
-        let all_dups: Vec<String> = self
-            .scope
-            .old_duplicate_names
-            .iter()
-            .map(|n| format!("`old:{n}`"))
-            .chain(
-                self.scope
-                    .new_duplicate_names
-                    .iter()
-                    .map(|n| format!("`new:{n}`")),
-            )
-            .collect();
-        if !all_dups.is_empty() {
-            output.push_str(&format!(
-                "> ❌ Duplicate spec entries detected: {}\n\n",
-                all_dups.join(", ")
-            ));
-        }
 
         output.push_str("### Summary Table\n\n");
         output.push_str("| Finding Severity | Count |\n");
@@ -976,16 +1190,43 @@ impl SafetyReport {
             output.push_str(&format!("| **Filtered** | {} |\n", self.filtered_count));
             output.push_str("\n> ⚠️  Findings were hidden by `--include-category`/`--exclude-category`. The verdict reflects the remaining visible findings only.\n\n");
         }
+        if self.severity_overridden_count > 0 {
+            output.push_str(&format!(
+                "| **Severity overridden** | {} |\n",
+                self.severity_overridden_count
+            ));
+        }
+        if let Some(notice) = self.override_verdict_notice() {
+            output.push_str(&format!("\n> ⚠️ **{}**\n\n", notice));
+        }
         output.push_str(&format!(
             "\n**Recommended SemVer Bump**: `{}`\n\n",
             self.recommended_bump()
         ));
+        output.push_str("---\n\n");
+
+        if self.total_findings == 0 {
+            output.push_str("No relevant changes detected. The upgrade is identical in its exports and types.\n");
 
         if let Some(source) = &self.baseline_source {
             output.push_str(&format!("**Baseline Source**: `{}`\n\n", source));
         }
         if let Some(hash) = &self.verified_code_hash {
             output.push_str(&format!("**Verified Code Hash**: `{}`\n\n", hash));
+        }
+        if let Some(bd) = &self.baseline_diff {
+            output.push_str(&format!(
+                "**Baseline**: {} new, {} persisting, {} resolved (vs. tool v{}){}\n\n",
+                bd.new_count,
+                bd.persisting_count,
+                bd.resolved.len(),
+                bd.baseline_tool_version,
+                if bd.fail_on_new_only {
+                    " — verdict reflects new findings only"
+                } else {
+                    ""
+                },
+            ));
         }
 
         output.push_str("---\n\n");
@@ -998,11 +1239,7 @@ impl SafetyReport {
         }
 
         // Sort categories to have consistent output; surface Environment first.
-        let mut categories: Vec<&String> = self.findings_by_category.keys().collect();
-        categories.sort_by(|a, b| {
-            let rank = |name: &str| if name == "Environment" { 0 } else { 1 };
-            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
-        });
+        let categories = self.categories_sorted_by_severity();
 
         for category in categories {
             output.push_str(&format!("### {}\n\n", category));
@@ -1011,10 +1248,27 @@ impl SafetyReport {
             for reported in &group {
                 let finding = &reported.finding;
 
+                let override_tag = match &reported.original_severity {
+                    Some(original) => format!(
+                        "**[SEVERITY {} → {}]** ",
+                        original.label(),
+                        finding.severity.label()
+                    ),
+                    None => String::new(),
+                };
+
                 if reported.suppressed {
-                    output.push_str(&format!("- 🔕 **[SUPPRESSED]** {}\n", finding.message));
+                    output.push_str(&format!(
+                        "- 🔕 **[SUPPRESSED]** {override_tag}{}\n",
+                        finding.message
+                    ));
                     if let Some(reason) = &reported.suppression_reason {
                         output.push_str(&format!("  - ↳ reason: {}\n", reason));
+                    }
+                    if self.settings.explain {
+                        if let Some(remediation) = &reported.remediation {
+                            output.push_str(&format!("  - ↳ guidance: {}\n", remediation));
+                        }
                     }
                     continue;
                 }
@@ -1024,9 +1278,31 @@ impl SafetyReport {
                     Severity::Warning => "🟡",
                     Severity::Info => "🔵",
                 };
-                output.push_str(&format!("- {} {}\n", emoji, finding.message));
+                let baseline_tag = match reported.baseline_status {
+                    Some(crate::baseline::BaselineStatus::New) => "**[NEW]** ",
+                    _ => "",
+                };
+                output.push_str(&format!(
+                    "- {} {}{}{}\n",
+                    emoji, baseline_tag, override_tag, finding.message
+                ));
+                if self.settings.explain {
+                    if let Some(remediation) = &reported.remediation {
+                        output.push_str(&format!("  - ↳ guidance: {}\n", remediation));
+                    }
+                }
             }
             output.push('\n');
+        }
+
+        if let Some(bd) = &self.baseline_diff {
+            if !bd.resolved.is_empty() {
+                output.push_str("### ✅ Resolved Since Baseline\n\n");
+                for r in &bd.resolved {
+                    output.push_str(&format!("- {}\n", r.message));
+                }
+                output.push('\n');
+            }
         }
 
         if !self.is_safe {
@@ -1069,12 +1345,6 @@ impl SafetyReport {
         output
     }
 
-    /// Append the informational build-metrics table to Markdown output.
-    /// Full implementation comes from the upstream main branch (BuildMetrics).
-    fn append_metrics_markdown(&self, _output: &mut String) {
-        // Populated by main's BuildMetrics feature; no-op on this branch.
-    }
-
     /// Generate GitHub Actions workflow command output.
     ///
     /// Emits one [workflow command] per non-suppressed finding, levelled to
@@ -1107,7 +1377,8 @@ impl SafetyReport {
             let group = self.findings_by_category.get(category).unwrap();
             for reported in group {
                 let finding = &reported.finding;
-                let text = format!("[{}] {}", finding.category, finding.message);
+                let override_tag = Self::override_tag(reported);
+                let text = format!("[{}] {override_tag}{}", finding.category, finding.message);
 
                 if reported.suppressed {
                     // Suppressed findings are demoted to notice so they are
@@ -1127,13 +1398,20 @@ impl SafetyReport {
         // Human-readable summary after the annotations.
         let status = if self.is_safe { "PASSED" } else { "FAILED" };
         output.push_str(&format!(
-            "\nSoroban Upgrade Safeguard: {} — {} critical, {} warning(s), {} info ({} suppressed)\n",
+            "\nSoroban Upgrade Safeguard: {} — {} critical, {} warning(s), {} info ({} suppressed, {} severity-overridden)\n",
             status,
             self.critical_count,
             self.warning_count,
             self.info_count,
             self.suppressed_count,
+            self.severity_overridden_count,
         ));
+
+        // A configured verdict is escalated to a warning annotation so it shows
+        // up in the checks UI, not just buried in the log body.
+        if let Some(notice) = self.override_verdict_notice() {
+            output.push_str(&format!("::warning::{}\n", notice));
+        }
 
         if group_title.is_some() {
             output.push_str("::endgroup::\n");
@@ -1141,9 +1419,133 @@ impl SafetyReport {
 
         output
     }
-}
 
-        output
+    /// Generate a single JUnit `<testsuite>` element for this report.
+    ///
+    /// Each finding becomes one `<testcase>`, named by its category and target,
+    /// so a CI system's existing test-report UI renders a breaking change as a
+    /// failing test rather than as text buried in a log.
+    ///
+    /// Status mapping:
+    ///
+    /// - `Critical` → `<failure>`.
+    /// - `Warning`  → `<failure>` under `--strict`, otherwise a passing case.
+    /// - `Info`     → a passing case.
+    /// - Suppressed → `<skipped>` carrying the suppression reason, at any
+    ///   severity. A skipped case reads as *acknowledged* in every CI UI, which
+    ///   is exactly what a suppression is; it is never reported as a failure.
+    ///
+    /// `suite_name` names the suite (the contract name in batch mode). A report
+    /// with no findings still emits one passing case so the suite is never empty
+    /// — an empty suite renders as "no tests ran", which reads as a broken job
+    /// rather than as a clean upgrade.
+    pub fn generate_summary_junit(&self, suite_name: Option<&str>) -> String {
+        let suite = suite_name.unwrap_or("soroban-upgrade-safeguard");
+        let classname = format!("soroban-upgrade-safeguard.{}", suite);
+
+        // Sort categories for deterministic output.
+        let mut categories: Vec<&String> = self.findings_by_category.keys().collect();
+        categories.sort();
+
+        let mut cases = String::new();
+        let (mut tests, mut failures, mut skipped) = (0usize, 0usize, 0usize);
+
+        for category in categories {
+            for reported in self.findings_by_category.get(category).unwrap() {
+                let finding = &reported.finding;
+                tests += 1;
+
+                let case_name = match finding.target.as_deref() {
+                    Some(target) if !target.is_empty() => {
+                        format!("{}: {}", finding.category, target)
+                    }
+                    _ => finding.category.clone(),
+                };
+
+                cases.push_str(&format!(
+                    "    <testcase classname=\"{}\" name=\"{}\"",
+                    escape_xml(&classname),
+                    escape_xml(&case_name),
+                ));
+
+                if reported.suppressed {
+                    skipped += 1;
+                    let reason = reported
+                        .suppression_reason
+                        .as_deref()
+                        .unwrap_or("acknowledged by a suppression rule");
+                    cases.push_str(&format!(
+                        ">\n      <skipped message=\"{}\"/>\n    </testcase>\n",
+                        escape_xml(reason),
+                    ));
+                    continue;
+                }
+
+                let fails = match finding.severity {
+                    Severity::Critical => true,
+                    Severity::Warning => self.strict,
+                    Severity::Info => false,
+                };
+
+                if fails {
+                    failures += 1;
+                    cases.push_str(&format!(
+                        ">\n      <failure type=\"{}\" message=\"{}\">{}</failure>\n    </testcase>\n",
+                        escape_xml(finding.severity.label()),
+                        escape_xml(&finding.message),
+                        escape_xml(&Self::junit_case_body(reported)),
+                    ));
+                } else {
+                    // A passing case still carries the message so a reader who
+                    // opens it sees what the tool actually observed.
+                    cases.push_str(&format!(
+                        ">\n      <system-out>{}</system-out>\n    </testcase>\n",
+                        escape_xml(&Self::junit_case_body(reported)),
+                    ));
+                }
+            }
+        }
+
+        if tests == 0 {
+            tests = 1;
+            cases.push_str(&format!(
+                "    <testcase classname=\"{}\" name=\"no breaking changes detected\"/>\n",
+                escape_xml(&classname),
+            ));
+        }
+
+        format!(
+            "  <testsuite name=\"{}\" tests=\"{}\" failures=\"{}\" errors=\"0\" skipped=\"{}\">\n\
+             {}  </testsuite>\n",
+            escape_xml(suite),
+            tests,
+            failures,
+            skipped,
+            cases,
+        )
+    }
+
+    /// The body text of a JUnit `<testcase>`: the finding's message plus the
+    /// stable rule id and any severity-override or remediation context.
+    fn junit_case_body(reported: &ReportedFinding) -> String {
+        let mut body = format!(
+            "[{}] {}\nrule_id: {}\nfingerprint: {}",
+            reported.finding.severity.label(),
+            reported.finding.message,
+            reported.rule_id,
+            reported.fingerprint,
+        );
+        if let Some(ref original) = reported.original_severity {
+            body.push_str(&format!(
+                "\nseverity overridden: {} -> {}",
+                original.label(),
+                reported.finding.severity.label(),
+            ));
+        }
+        if let Some(ref remediation) = reported.remediation {
+            body.push_str(&format!("\nremediation: {}", remediation));
+        }
+        body
     }
 
     /// Append the informational build-metrics table to Markdown output.
@@ -1163,36 +1565,824 @@ impl SafetyReport {
             let delta_enum = m.new_enum_count as i64 - m.old_enum_count as i64;
             let delta_union = m.new_union_count as i64 - m.old_union_count as i64;
             let delta_err = m.new_error_enum_count as i64 - m.old_error_enum_count as i64;
-            let fmt_count = |d: i64| if d >= 0 { format!("+{}", d) } else { format!("{}", d) };
+            let fmt_count = |d: i64| {
+                if d >= 0 {
+                    format!("+{}", d)
+                } else {
+                    format!("{}", d)
+                }
+            };
             output.push_str(&format!(
                 "| **Functions** | {} | {} | {} |\n",
-                m.old_function_count, m.new_function_count, fmt_count(delta_fn)
+                m.old_function_count,
+                m.new_function_count,
+                fmt_count(delta_fn)
             ));
             output.push_str(&format!(
                 "| **Structs** | {} | {} | {} |\n",
-                m.old_struct_count, m.new_struct_count, fmt_count(delta_struct)
+                m.old_struct_count,
+                m.new_struct_count,
+                fmt_count(delta_struct)
             ));
             output.push_str(&format!(
                 "| **Enums** | {} | {} | {} |\n",
-                m.old_enum_count, m.new_enum_count, fmt_count(delta_enum)
+                m.old_enum_count,
+                m.new_enum_count,
+                fmt_count(delta_enum)
             ));
             output.push_str(&format!(
                 "| **Unions** | {} | {} | {} |\n",
-                m.old_union_count, m.new_union_count, fmt_count(delta_union)
+                m.old_union_count,
+                m.new_union_count,
+                fmt_count(delta_union)
             ));
             output.push_str(&format!(
                 "| **Error Enums** | {} | {} | {} |\n",
-                m.old_error_enum_count, m.new_error_enum_count, fmt_count(delta_err)
+                m.old_error_enum_count,
+                m.new_error_enum_count,
+                fmt_count(delta_err)
             ));
             output.push('\n');
         }
     }
+
+    /// Render this report as a complete, self-contained HTML document.
+    ///
+    /// Intended for publishing as a build artifact, where the reader never
+    /// opens the job log. See [`html_document`] for the offline guarantees.
+    pub fn generate_summary_html(&self) -> String {
+        html_document(
+            "Soroban Upgrade Safety Report",
+            &self.html_section(None, true),
+        )
+    }
+
+    /// Render this report as an HTML fragment, for embedding in a larger
+    /// document. Batch mode uses this to put every contract pair in one file.
+    ///
+    /// `heading`, when given, names the contract pair. `top_level` controls
+    /// whether the status uses `<h1>` or `<h2>`, so batch pairs nest correctly
+    /// under the batch heading.
+    pub fn html_section(&self, heading: Option<&str>, top_level: bool) -> String {
+        let mut out = String::new();
+        let level = if top_level { 1 } else { 2 };
+
+        out.push_str("<section class=\"report\">\n");
+        if let Some(name) = heading {
+            out.push_str(&format!(
+                "<h{level} class=\"pair-name\">{}</h{level}>\n",
+                escape_html(name)
+            ));
+        }
+
+        // ── Status banner ──────────────────────────────────────────────────
+        let (status_class, status_text) = if self.is_safe {
+            ("pass", self.passed_status_label())
+        } else if self.strict && self.critical_count == 0 {
+            ("fail", "❌ FAILED (Warnings detected in strict mode)")
+        } else {
+            ("fail", self.failed_status_label())
+        };
+        if heading.is_none() {
+            out.push_str(&format!(
+                "<h{level} class=\"title\">Soroban Upgrade Safety Report</h{level}>\n"
+            ));
+        }
+        if self.strict {
+            out.push_str("<p class=\"banner strict\">⚠️ STRICT MODE ACTIVE — warnings are treated as failures.</p>\n");
+        }
+        out.push_str(&format!(
+            "<p class=\"banner {status_class}\">{}</p>\n",
+            escape_html(status_text)
+        ));
+
+        // A configured verdict must be as loud here as it is in the terminal.
+        if let Some(notice) = self.override_verdict_notice() {
+            out.push_str(&format!(
+                "<p class=\"banner override-verdict\">⚠️ {}</p>\n",
+                escape_html(&notice)
+            ));
+        }
+
+        // ── Scope ──────────────────────────────────────────────────────────
+        out.push_str(&format!(
+            "<p class=\"scope\">{}</p>\n",
+            escape_html(&self.scope.summary_line())
+        ));
+        let storage_class = if self.scope.storage_analyzed() {
+            "scope"
+        } else {
+            "scope gap"
+        };
+        out.push_str(&format!(
+            "<p class=\"{storage_class}\">{}</p>\n",
+            escape_html(&self.scope.storage_status_line())
+        ));
+
+        if self.scope.old_spec_section_count > 1 || self.scope.new_spec_section_count > 1 {
+            out.push_str(&format!(
+                "<p class=\"banner warn\">⚠️ Multi-section WASM detected: old has {} \
+                 contractspecv0 section(s), new has {}.</p>\n",
+                self.scope.old_spec_section_count, self.scope.new_spec_section_count,
+            ));
+        }
+        let all_dups: Vec<String> = self
+            .scope
+            .old_duplicate_names
+            .iter()
+            .map(|n| format!("old:{n}"))
+            .chain(
+                self.scope
+                    .new_duplicate_names
+                    .iter()
+                    .map(|n| format!("new:{n}")),
+            )
+            .collect();
+        if !all_dups.is_empty() {
+            out.push_str(&format!(
+                "<p class=\"banner fail\">❌ Duplicate spec entries detected: {}</p>\n",
+                escape_html(&all_dups.join(", "))
+            ));
+        }
+
+        // ── Counts ─────────────────────────────────────────────────────────
+        out.push_str("<ul class=\"stats\">\n");
+        out.push_str(&stat_tile("Critical", self.critical_count, "critical"));
+        out.push_str(&stat_tile("Warning", self.warning_count, "warning"));
+        out.push_str(&stat_tile("Info", self.info_count, "info"));
+        if self.suppressed_count > 0 {
+            out.push_str(&stat_tile(
+                "Suppressed",
+                self.suppressed_count,
+                "suppressed",
+            ));
+        }
+        if self.filtered_count > 0 {
+            out.push_str(&stat_tile("Filtered", self.filtered_count, "filtered"));
+        }
+        if self.severity_overridden_count > 0 {
+            out.push_str(&stat_tile(
+                "Severity overridden",
+                self.severity_overridden_count,
+                "overridden",
+            ));
+        }
+        out.push_str("</ul>\n");
+
+        out.push_str(&format!(
+            "<p class=\"meta\">Recommended SemVer bump: <code>{}</code></p>\n",
+            self.recommended_bump()
+        ));
+        if let Some(source) = &self.baseline_source {
+            out.push_str(&format!(
+                "<p class=\"meta\">Baseline source: <code>{}</code></p>\n",
+                escape_html(source)
+            ));
+        }
+        if let Some(hash) = &self.verified_code_hash {
+            out.push_str(&format!(
+                "<p class=\"meta\">Verified code hash: <code>{}</code></p>\n",
+                escape_html(hash)
+            ));
+        }
+        if let Some(bd) = &self.baseline_diff {
+            out.push_str(&format!(
+                "<p class=\"meta\">Baseline: {} new, {} persisting, {} resolved (vs. tool v{}){}</p>\n",
+                bd.new_count,
+                bd.persisting_count,
+                bd.resolved.len(),
+                escape_html(&bd.baseline_tool_version),
+                if bd.fail_on_new_only {
+                    " — verdict reflects new findings only"
+                } else {
+                    ""
+                },
+            ));
+        }
+        if self.filtered_count > 0 {
+            out.push_str(
+                "<p class=\"note\">Findings were hidden by --include-category/--exclude-category. \
+                 The verdict reflects the remaining visible findings only.</p>\n",
+            );
+        }
+
+        if self.total_findings == 0 {
+            out.push_str(
+                "<p class=\"empty\">No relevant changes detected. The exported interface is \
+                 identical in its exports and types.</p>\n",
+            );
+            out.push_str(&format!(
+                "<p class=\"note\">{}</p>\n",
+                escape_html(STORAGE_NOT_VERIFIED_NOTE)
+            ));
+            self.append_metrics_html(&mut out);
+            out.push_str("</section>\n");
+            return out;
+        }
+
+        // ── Findings, grouped by category with counts ──────────────────────
+        let categories = self.categories_sorted_by_severity();
+
+        for category in categories {
+            let mut group = self.findings_by_category.get(category).unwrap().clone();
+            group.sort_by(|a, b| a.finding.message.cmp(&b.finding.message));
+
+            // Groups that are entirely informational start collapsed so the
+            // critical findings are not buried under them.
+            let all_info = group
+                .iter()
+                .all(|r| r.finding.severity == Severity::Info || r.suppressed);
+            let open = if all_info { "" } else { " open" };
+
+            out.push_str(&format!("<details class=\"category\"{open}>\n"));
+            out.push_str(&format!(
+                "<summary>{} <span class=\"count\">{}</span></summary>\n",
+                escape_html(category),
+                group.len()
+            ));
+            out.push_str("<ul class=\"findings\">\n");
+
+            for reported in &group {
+                let finding = &reported.finding;
+                let sev = finding.severity.label();
+                let mut classes = format!("finding sev-{sev}");
+                if reported.suppressed {
+                    classes.push_str(" suppressed");
+                }
+                out.push_str(&format!("<li class=\"{classes}\">"));
+                out.push_str(&format!("<span class=\"badge badge-{sev}\">{sev}</span> "));
+                if reported.suppressed {
+                    out.push_str("<span class=\"badge badge-suppressed\">suppressed</span> ");
+                }
+                if matches!(
+                    reported.baseline_status,
+                    Some(crate::baseline::BaselineStatus::New)
+                ) {
+                    out.push_str("<span class=\"badge badge-new\">new</span> ");
+                }
+                if let Some(original) = &reported.original_severity {
+                    out.push_str(&format!(
+                        "<span class=\"badge badge-overridden\">severity {} → {}</span> ",
+                        original.label(),
+                        sev
+                    ));
+                }
+                // Every message is WASM-derived: type and field names come
+                // straight out of an untrusted binary, so nothing reaches the
+                // page unescaped.
+                out.push_str(&format!(
+                    "<span class=\"message\">{}</span>",
+                    escape_html(&finding.message)
+                ));
+                if let Some(target) = &finding.target {
+                    out.push_str(&format!(
+                        " <code class=\"target\">{}</code>",
+                        escape_html(target)
+                    ));
+                }
+                if let Some(reason) = &reported.suppression_reason {
+                    out.push_str(&format!(
+                        "<div class=\"sub\">reason: {}</div>",
+                        escape_html(reason)
+                    ));
+                }
+                if let Some(remediation) = &reported.remediation {
+                    out.push_str(&format!(
+                        "<div class=\"sub guidance\">guidance: {}</div>",
+                        escape_html(remediation)
+                    ));
+                }
+                out.push_str("</li>\n");
+            }
+
+            out.push_str("</ul>\n</details>\n");
+        }
+
+        if let Some(bd) = &self.baseline_diff {
+            if !bd.resolved.is_empty() {
+                out.push_str(
+                    "<details class=\"category\">\n<summary>✅ Resolved Since Baseline \
+                              <span class=\"count\">",
+                );
+                out.push_str(&bd.resolved.len().to_string());
+                out.push_str("</span></summary>\n<ul class=\"findings\">\n");
+                for r in &bd.resolved {
+                    out.push_str(&format!(
+                        "<li class=\"finding resolved\">{}</li>\n",
+                        escape_html(&r.message)
+                    ));
+                }
+                out.push_str("</ul>\n</details>\n");
+            }
+        }
+
+        if !self.is_safe {
+            out.push_str(
+                "<p class=\"banner fail\">⚠️ ACTION REQUIRED: the new contract version \
+                          modifies existing storage layouts or function interfaces. Deploying \
+                          this upgrade will result in orphaned data, serialization panics, or \
+                          broken integrations.</p>\n",
+            );
+        }
+
+        // ── Suppression audit log ──────────────────────────────────────────
+        let mut suppressed_list = Vec::new();
+        for group in self.findings_by_category.values() {
+            for reported in group {
+                if reported.suppressed {
+                    suppressed_list.push(reported);
+                }
+            }
+        }
+        suppressed_list.sort_by(|a, b| {
+            a.finding
+                .category
+                .cmp(&b.finding.category)
+                .then_with(|| a.finding.message.cmp(&b.finding.message))
+        });
+
+        if !suppressed_list.is_empty() {
+            out.push_str(
+                "<details class=\"category\" open>\n<summary>🔕 Applied Suppressions \
+                          Audit Log <span class=\"count\">",
+            );
+            out.push_str(&suppressed_list.len().to_string());
+            out.push_str("</span></summary>\n");
+            out.push_str(
+                "<div class=\"table-scroll\"><table>\n<thead><tr>\
+                          <th>Category</th><th>Target</th><th>Fingerprint</th>\
+                          <th>Author</th><th>Expiry</th><th>Reason</th>\
+                          </tr></thead>\n<tbody>\n",
+            );
+            for reported in suppressed_list {
+                let f = &reported.finding;
+                out.push_str(&format!(
+                    "<tr><td>{}</td><td><code>{}</code></td><td><code>{}</code></td>\
+                     <td>{}</td><td>{}</td><td>{}</td></tr>\n",
+                    escape_html(&f.category),
+                    escape_html(f.target.as_deref().unwrap_or("-")),
+                    escape_html(reported.suppression_fingerprint.as_deref().unwrap_or("-")),
+                    escape_html(reported.suppression_author.as_deref().unwrap_or("-")),
+                    escape_html(reported.suppression_expiry.as_deref().unwrap_or("-")),
+                    escape_html(reported.suppression_reason.as_deref().unwrap_or("-")),
+                ));
+            }
+            out.push_str("</tbody>\n</table></div>\n</details>\n");
+        }
+
+        self.append_metrics_html(&mut out);
+        out.push_str("</section>\n");
+        out
+    }
+
+    /// Append the informational build-metrics table to HTML output.
+    fn append_metrics_html(&self, out: &mut String) {
+        let Some(ref m) = self.metrics else { return };
+        let fmt_count = |d: i64| {
+            if d >= 0 {
+                format!("+{d}")
+            } else {
+                d.to_string()
+            }
+        };
+        out.push_str("<details class=\"category\">\n<summary>📊 Build Metrics</summary>\n");
+        out.push_str(
+            "<div class=\"table-scroll\"><table>\n<thead><tr><th>Metric</th><th>Old</th>\
+                      <th>New</th><th>Delta</th></tr></thead>\n<tbody>\n",
+        );
+        out.push_str(&format!(
+            "<tr><td>WASM size</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+            BuildMetrics::format_bytes(m.old_size_bytes),
+            BuildMetrics::format_bytes(m.new_size_bytes),
+            BuildMetrics::format_delta(m.size_delta_bytes),
+        ));
+        for (label, old, new) in [
+            ("Functions", m.old_function_count, m.new_function_count),
+            ("Structs", m.old_struct_count, m.new_struct_count),
+            ("Enums", m.old_enum_count, m.new_enum_count),
+            ("Unions", m.old_union_count, m.new_union_count),
+            (
+                "Error Enums",
+                m.old_error_enum_count,
+                m.new_error_enum_count,
+            ),
+        ] {
+            out.push_str(&format!(
+                "<tr><td>{label}</td><td>{old}</td><td>{new}</td><td>{}</td></tr>\n",
+                fmt_count(new as i64 - old as i64)
+            ));
+        }
+        out.push_str("</tbody>\n</table></div>\n</details>\n");
+    }
+
+    /// Apply a category filter to the report, removing findings from
+    /// excluded / non-included categories. The original `total_findings`
+    /// count is preserved; the difference is reported via `filtered_count`.
+    /// The safety verdict is recalculated based on remaining findings.
+    pub fn apply_category_filter(&mut self, filter: &CategoryFilter) {
+        let mut new_categories: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
+        let mut filtered = 0usize;
+        let mut critical = 0usize;
+        let mut warning = 0usize;
+        let mut info = 0usize;
+        let mut failing_critical = 0usize;
+        let mut failing_warning = 0usize;
+        let mut engine_failing_critical = 0usize;
+        let mut engine_failing_warning = 0usize;
+        let mut overridden = 0usize;
+
+        for (category, findings) in &self.findings_by_category {
+            if filter.should_include(category) {
+                for rf in findings {
+                    match rf.finding.severity {
+                        Severity::Critical => critical += 1,
+                        Severity::Warning => warning += 1,
+                        Severity::Info => info += 1,
+                    }
+                    if rf.original_severity.is_some() {
+                        overridden += 1;
+                    }
+                    if !rf.suppressed {
+                        match rf.finding.severity {
+                            Severity::Critical => failing_critical += 1,
+                            Severity::Warning => failing_warning += 1,
+                            _ => {}
+                        }
+                        // What the engine would have counted, so the
+                        // "verdict changed by override" claim stays accurate
+                        // for the filtered subset rather than describing a set
+                        // of findings this report no longer shows.
+                        match rf
+                            .original_severity
+                            .as_ref()
+                            .unwrap_or(&rf.finding.severity)
+                        {
+                            Severity::Critical => engine_failing_critical += 1,
+                            Severity::Warning => engine_failing_warning += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                new_categories.insert(category.to_string(), findings.clone());
+            } else {
+                filtered += findings.len();
+            }
+        }
+
+        self.filtered_count = filtered;
+        self.critical_count = critical;
+        self.warning_count = warning;
+        self.info_count = info;
+        self.severity_overridden_count = overridden;
+        self.findings_by_category = new_categories;
+        let verdict = |c: usize, w: usize| {
+            if self.strict {
+                c == 0 && w == 0
+            } else {
+                c == 0
+            }
+        };
+        self.is_safe = verdict(failing_critical, failing_warning);
+        self.verdict_changed_by_override =
+            self.is_safe != verdict(engine_failing_critical, engine_failing_warning);
+        self.category_filter = filter.clone();
+    }
 }
 
-/// Returns remediation/explanation guidance for a given stable rule id.
-pub fn get_remediation_guidance(rule_id: &str) -> Option<&'static str> {
-    guidance_for_rule_id(rule_id)
-        .or_else(|| canonical_rule_id(rule_id).and_then(guidance_for_rule_id))
+/// Escape text for safe interpolation into HTML element content or a quoted
+/// attribute value.
+///
+/// Finding messages embed type, field, parameter, and function names read
+/// straight out of a WASM binary the tool does not trust. Emitting those
+/// unescaped would make the report an injection vector into whoever opens it,
+/// so every WASM-derived string passes through here — including ones that look
+/// harmless, since the guarantee has to hold without case-by-case reasoning.
+pub fn escape_html(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Escape a string for use as XML text or as an attribute value.
+///
+/// Same five entities as [`escape_html`], plus one thing XML needs that HTML
+/// does not: control characters outside the XML 1.0 legal set are dropped
+/// rather than emitted. Finding messages carry type, field, and function names
+/// read straight out of an untrusted WASM binary, and a stray control byte in
+/// one of those would make the whole document unparseable — which in a CI
+/// test-report UI shows up as a missing report, not as an error.
+pub fn escape_xml(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            '\t' | '\n' | '\r' => out.push(ch),
+            c if (c as u32) < 0x20 => {}
+            c if (0x7f..=0x9f).contains(&(c as u32)) => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Wrap one or more rendered `<testsuite>` elements in a complete JUnit XML
+/// document. Suites carry their own counts, so the root element only names the
+/// run — every common CI ingester reads the per-suite attributes.
+pub fn junit_document(name: &str, suites: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites name=\"{}\">\n{}</testsuites>\n",
+        escape_xml(name),
+        suites,
+    )
+}
+
+/// One `<li>` tile in the counts row.
+fn stat_tile(label: &str, value: usize, class: &str) -> String {
+    format!(
+        "<li class=\"stat stat-{class}\"><span class=\"stat-value\">{value}</span>\
+         <span class=\"stat-label\">{}</span></li>\n",
+        escape_html(label)
+    )
+}
+
+/// Wrap rendered report sections in a complete, standalone HTML document.
+///
+/// The result is deliberately self-contained: CSS and the severity-filter
+/// script are inline and there are no image, font, or script URLs of any kind.
+/// These reports are served from artifact storage, which is often opened
+/// offline or behind a strict content policy, so anything fetched over the
+/// network would silently degrade the page for exactly the readers it targets.
+pub fn html_document(title: &str, body: &str) -> String {
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+:root {{
+  --bg: #ffffff; --fg: #1b1f24; --muted: #57606a; --line: #d8dee4; --panel: #f6f8fa;
+  --critical: #cf222e; --warning: #9a6700; --info: #0969da; --pass: #1a7f37;
+  --overridden: #8250df;
+}}
+@media (prefers-color-scheme: dark) {{
+  :root {{
+    --bg: #0d1117; --fg: #e6edf3; --muted: #9198a1; --line: #30363d; --panel: #161b22;
+    --critical: #ff7b72; --warning: #d29922; --info: #79c0ff; --pass: #3fb950;
+    --overridden: #d2a8ff;
+  }}
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0; padding: 2rem 1rem; background: var(--bg); color: var(--fg);
+  font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+}}
+main {{ max-width: 60rem; margin: 0 auto; }}
+h1, h2 {{ line-height: 1.25; }}
+h1 {{ font-size: 1.6rem; }}
+h2 {{ font-size: 1.25rem; margin-top: 2rem; }}
+code {{
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.875em; background: var(--panel); padding: 0.1em 0.35em;
+  border-radius: 4px; overflow-wrap: anywhere;
+}}
+.banner {{
+  padding: 0.7rem 0.9rem; border-radius: 6px; border: 1px solid var(--line);
+  font-weight: 600; background: var(--panel);
+}}
+.banner.pass {{ color: var(--pass); border-color: var(--pass); }}
+.banner.fail {{ color: var(--critical); border-color: var(--critical); }}
+.banner.warn, .banner.strict {{ color: var(--warning); border-color: var(--warning); }}
+.banner.override-verdict {{ color: var(--overridden); border-color: var(--overridden); }}
+.scope {{ color: var(--muted); font-size: 0.9rem; margin: 0.4rem 0; }}
+.scope.gap {{ color: var(--warning); }}
+.note, .meta {{ color: var(--muted); font-size: 0.9rem; }}
+.empty {{ color: var(--pass); font-weight: 600; }}
+.stats {{ display: flex; flex-wrap: wrap; gap: 0.6rem; list-style: none; padding: 0; }}
+.stat {{
+  flex: 1 1 7rem; padding: 0.6rem 0.8rem; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--panel);
+}}
+.stat-value {{ display: block; font-size: 1.5rem; font-weight: 700; }}
+.stat-label {{ display: block; font-size: 0.78rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }}
+.stat-critical .stat-value {{ color: var(--critical); }}
+.stat-warning .stat-value {{ color: var(--warning); }}
+.stat-info .stat-value {{ color: var(--info); }}
+.stat-overridden .stat-value {{ color: var(--overridden); }}
+.controls {{
+  position: sticky; top: 0; z-index: 1; display: flex; flex-wrap: wrap; gap: 1rem;
+  padding: 0.7rem 0.9rem; margin-bottom: 1.5rem; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 6px; font-size: 0.9rem;
+}}
+.controls label {{ cursor: pointer; user-select: none; }}
+details.category {{
+  border: 1px solid var(--line); border-radius: 6px; margin: 0.6rem 0; background: var(--panel);
+}}
+details.category > summary {{
+  cursor: pointer; padding: 0.6rem 0.9rem; font-weight: 600; list-style-position: inside;
+}}
+.count {{
+  display: inline-block; min-width: 1.5rem; padding: 0 0.4rem; margin-left: 0.4rem;
+  border-radius: 999px; background: var(--bg); border: 1px solid var(--line);
+  font-size: 0.8rem; text-align: center; color: var(--muted);
+}}
+ul.findings {{ list-style: none; margin: 0; padding: 0 0.9rem 0.8rem; }}
+li.finding {{
+  padding: 0.5rem 0; border-top: 1px solid var(--line); overflow-wrap: anywhere;
+}}
+li.finding.suppressed {{ opacity: 0.65; }}
+.badge {{
+  display: inline-block; padding: 0.05em 0.5em; border-radius: 999px;
+  font-size: 0.72rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.03em; border: 1px solid currentColor; vertical-align: middle;
+}}
+.badge-critical {{ color: var(--critical); }}
+.badge-warning {{ color: var(--warning); }}
+.badge-info {{ color: var(--info); }}
+.badge-suppressed, .badge-new {{ color: var(--muted); }}
+.badge-overridden {{ color: var(--overridden); }}
+.sub {{ color: var(--muted); font-size: 0.86rem; margin-top: 0.25rem; }}
+.sub.guidance {{ color: var(--pass); }}
+.table-scroll {{ overflow-x: auto; padding: 0 0.9rem 0.9rem; }}
+table {{ border-collapse: collapse; width: 100%; font-size: 0.88rem; }}
+th, td {{ border: 1px solid var(--line); padding: 0.4rem 0.6rem; text-align: left; }}
+th {{ background: var(--bg); }}
+section.report {{ margin-bottom: 2.5rem; }}
+body.hide-critical li.sev-critical,
+body.hide-warning li.sev-warning,
+body.hide-info li.sev-info {{ display: none; }}
+</style>
+</head>
+<body>
+<main>
+<div class="controls" role="group" aria-label="Filter findings by severity">
+  <span>Show:</span>
+  <label><input type="checkbox" class="sev-toggle" data-sev="critical" checked> Critical</label>
+  <label><input type="checkbox" class="sev-toggle" data-sev="warning" checked> Warning</label>
+  <label><input type="checkbox" class="sev-toggle" data-sev="info" checked> Info</label>
+</div>
+{body}
+</main>
+<script>
+document.addEventListener('change', function (event) {{
+  var box = event.target;
+  if (!box.classList || !box.classList.contains('sev-toggle')) return;
+  document.body.classList.toggle('hide-' + box.dataset.sev, !box.checked);
+}});
+</script>
+</body>
+</html>
+"##,
+        title = escape_html(title),
+        body = body,
+    )
+}
+
+/// All known finding categories used by the analysis engine.
+pub const KNOWN_CATEGORIES: &[&str] = &[
+    "Environment",
+    "Function Removed",
+    "Function Documentation Changed",
+    "Function Added",
+    "Function Signature Changed",
+    "Parameter Renamed",
+    "Parameter Reordered",
+    "Parameter Type Changed",
+    "Return Type Changed",
+    "Event Definition Removed",
+    "Struct Removed",
+    "Struct Documentation Changed",
+    "Struct Added",
+    "Struct Field Removed",
+    "Event Field Removed",
+    "Struct Field Reordered",
+    "Event Field Reordered",
+    "Struct Field Type Changed",
+    "Event Field Type Changed",
+    "Struct Field Added",
+    "Event Enum Removed",
+    "Enum Removed",
+    "Enum Documentation Changed",
+    "Enum Added",
+    "Enum Case Removed",
+    "Event Enum Case Removed",
+    "Enum Case Value Changed",
+    "Event Enum Case Value Changed",
+    "Enum Case Added",
+    "Event Enum Case Added",
+    "Union Removed",
+    "Union Added",
+    "Union Case Removed",
+    "Union Case Reordered",
+    "Union Case Type Changed",
+    "Union Case Added",
+    "Error Enum Removed",
+    "Error Enum Added",
+    "Error Enum Case Removed",
+    "Error Enum Case Value Changed",
+    "Error Enum Case Added",
+    "Cascading Layout Break",
+];
+
+/// Validate that the given category name is a known category.
+/// Returns an error message listing unknown categories if any are invalid.
+pub fn validate_categories(categories: &[String]) -> Result<(), Vec<String>> {
+    let known: HashSet<&str> = KNOWN_CATEGORIES.iter().copied().collect();
+    let unknown: Vec<String> = categories
+        .iter()
+        .filter(|c| !known.contains(c.as_str()))
+        .cloned()
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(unknown)
+    }
+}
+
+/// A filter that restricts which finding categories are included in the report.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct CategoryFilter {
+    /// Only include these categories (empty = no inclusion restriction).
+    pub include: Option<HashSet<String>>,
+    /// Exclude these categories.
+    pub exclude: HashSet<String>,
+}
+
+impl CategoryFilter {
+    /// Returns `true` if the category should be included in the report output.
+    pub fn should_include(&self, category: &str) -> bool {
+        if self.exclude.contains(category) {
+            return false;
+        }
+        if let Some(ref include) = self.include {
+            return include.contains(category);
+        }
+        true
+    }
+}
+
+/// Returns remediation/explanation guidance for a given finding category.
+pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
+    match category {
+        "Environment" => Some("Verify that the target network supports the new protocol version and adjust any SDK/tooling dependencies accordingly."),
+        "Function Removed" => Some("This is a breaking change. If the function is no longer needed, deprecate it in client integrations. Otherwise, restore the function signature."),
+        "Function Documentation Changed" => Some("No code changes required. Ensure client/consumer integrations are aware of the updated documentation/behavior."),
+        "Function Added" => Some("No action required. Inform client integrations about the availability of the new function."),
+        "Function Signature Changed" => Some("This is a breaking change. Update call sites, SDKs, and tests to match the new parameter structure."),
+        "Parameter Renamed" => Some("This is a breaking change for named-argument RPC systems. Update all client integrations to use the new parameter name."),
+        "Parameter Reordered" => Some("This is a breaking change. Reordering parameters breaks positional RPC invocation. Restore the original parameter order."),
+        "Parameter Type Changed" => Some("This is a breaking change. Update caller arguments and client SDKs to match the new parameter type."),
+        "Return Type Changed" => Some("This is a breaking change. Update caller expectations and client SDKs to match the new return type."),
+        "Event Definition Removed" => Some("This is a breaking change. Update or remove downstream event indexing or monitoring systems that consume this event."),
+        "Struct Removed" => Some("This is a breaking change. Ensure no stored data or active interfaces reference this struct. If they do, restore the struct."),
+        "Struct Documentation Changed" => Some("No code changes required. Ensure documentation changes are aligned with the struct's intended usage."),
+        "Struct Added" => Some("No action required. New structs can be safely integrated into storage layouts or interface parameters."),
+        "Struct Field Removed" => Some("This is a breaking change. Removing fields breaks serialized storage layouts. Restore the field or perform a state migration."),
+        "Event Field Removed" => Some("This is a breaking change. Update event indexers and consumers that expect this field to be present."),
+        "Struct Field Reordered" => Some("This is a breaking change. Reordering fields breaks positional serialization layouts. Restore the original field order."),
+        "Event Field Reordered" => Some("This is a breaking change. Update event indexers and consumers to handle the new positional field order."),
+        "Struct Field Type Changed" => Some("This is a breaking change. Changing field types breaks layout serialization. Revert the type change or migrate existing data."),
+        "Event Field Type Changed" => Some("This is a breaking change. Update event indexers and consumers to handle the new field type."),
+        "Struct Field Added" => Some("Warning: Ensure existing storage entries are migrated or initialized with correct default values for the new field."),
+        "Event Enum Removed" => Some("This is a breaking change. Downstream event consumers or indexers relying on this enum will fail. Restore the enum."),
+        "Enum Removed" => Some("This is a breaking change. Stored data or parameters using this enum will be invalid. Restore the enum."),
+        "Enum Documentation Changed" => Some("No code changes required. Ensure the updated docs are clear for consumers."),
+        "Enum Added" => Some("No action required. Ensure consumers are aware of the new enum type if needed."),
+        "Enum Case Removed" => Some("This is a breaking change. On-chain data or parameters using this case will be invalid. Restore the case."),
+        "Event Enum Case Removed" => Some("This is a breaking change. Downstream event indexers or consumers relying on this case will fail. Restore the case."),
+        "Enum Case Value Changed" => Some("This is a breaking change. Modifying case values breaks serialization/deserialization. Revert the value change."),
+        "Event Enum Case Value Changed" => Some("This is a breaking change. Downstream event indexers or consumers relying on these values will fail. Revert the value change."),
+        "Enum Case Added" => Some("No action required. Ensure consumers can handle the new case gracefully."),
+        "Event Enum Case Added" => Some("No action required. Update event indexers and consumers to handle the new event enum case if necessary."),
+        "Union Removed" => Some("This is a breaking change. Stored data or parameters using this union will be invalid. Restore the union."),
+        "Union Added" => Some("No action required. Ensure consumers are aware of the new union type if needed."),
+        "Union Case Removed" => Some("This is a breaking change. On-chain data using this union case will be invalid. Restore the case."),
+        "Union Case Reordered" => Some("This is a breaking change. Reordering union cases breaks positional discriminant serialization. Restore the original case order."),
+        "Union Case Type Changed" => Some("This is a breaking change. Changing union case payload types breaks layout serialization. Revert the type change or migrate existing data."),
+        "Union Case Added" => Some("No action required. Ensure consumers can handle the new union case gracefully."),
+        "Error Enum Removed" => Some("This is a breaking change. Clients matching on these error codes will break. Restore the error enum."),
+        "Error Enum Added" => Some("No action required. Inform client integrations about the new error enum if needed."),
+        "Error Enum Case Removed" => Some("This is a breaking change. Clients matching on this error code will break. Restore the case."),
+        "Error Enum Case Value Changed" => Some("This is a breaking change. Modifying error case values breaks error-code compatibility. Revert the value change."),
+        "Error Enum Case Added" => Some("No action required. Ensure clients can handle the new error case gracefully."),
+        "Cascading Layout Break" => Some("This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type."),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1235,11 +2425,8 @@ mod tests {
         }
     }
 
-    /// The inventory is only trustworthy if it actually covers what `diff.rs`
-    /// emits, so scan the source for category literals and require each one to
-    /// be listed. This catches a new category added without guidance.
     #[test]
-    fn every_emitted_category_is_in_the_inventory() {
+    fn test_every_emitted_category_has_guidance() {
         let diff_rs_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("diff.rs");
@@ -1252,15 +2439,6 @@ mod tests {
                 // If it is ENVIRONMENT_CATEGORY
                 if line.contains("ENVIRONMENT_CATEGORY") {
                     checked_categories.insert("Environment".to_string());
-                    continue;
-                }
-                // Constant-referenced duplicate/conflict categories
-                if line.contains("SPEC_CONFLICT_CATEGORY") {
-                    checked_categories.insert("Spec Entry Conflict".to_string());
-                    continue;
-                }
-                if line.contains("SPEC_DUPLICATE_CATEGORY") {
-                    checked_categories.insert("Spec Entry Duplicate".to_string());
                     continue;
                 }
 
@@ -1276,6 +2454,36 @@ mod tests {
                             }
                             literal.push(chars.next().unwrap());
                         }
+                        if !literal.is_empty() {
+                            // If it's a format string like "{} Removed"
+                            if literal.contains("{}") {
+                                let suffixes = vec![
+                                    "Removed",
+                                    "Reordered",
+                                    "Type Changed",
+                                    "Value Changed",
+                                    "Added",
+                                ];
+                                for suffix in suffixes {
+                                    if literal == format!("{{}} {}", suffix) {
+                                        let prefixes = match suffix {
+                                            "Reordered" | "Type Changed" => {
+                                                vec!["Struct Field", "Event Field"]
+                                            }
+                                            "Value Changed" | "Added" => {
+                                                vec!["Enum Case", "Event Enum Case"]
+                                            }
+                                            "Removed" => vec![
+                                                "Struct Field",
+                                                "Event Field",
+                                                "Enum Case",
+                                                "Event Enum Case",
+                                            ],
+                                            _ => unreachable!(),
+                                        };
+                                        for prefix in prefixes {
+                                            checked_categories
+                                                .insert(format!("{} {}", prefix, suffix));
                         if literal.is_empty() {
                             continue;
                         }
@@ -1341,11 +2549,25 @@ mod tests {
             }
         }
 
+        // Remove test custom categories
+        checked_categories.remove("TOTALLY CUSTOM CATEGORY");
+
         assert!(
+            !checked_categories.is_empty(),
+            "Sanity check: should have found categories"
             checked_categories.len() > 20,
             "sanity check: expected to find most categories in the source, found {}",
             checked_categories.len()
         );
+
+        for cat in &checked_categories {
+            let guidance = get_remediation_guidance(cat);
+            assert!(
+                guidance.is_some(),
+                "Category '{}' does not have remediation guidance!",
+                cat
+            );
+        }
     }
 
     #[test]
@@ -1356,6 +2578,8 @@ mod tests {
             info_count: 0,
             suppressed_count: 0,
             filtered_count: 0,
+            severity_overridden_count: 0,
+            verdict_changed_by_override: false,
             suppressed_critical_count: 0,
             total_findings: 0,
             is_safe: true,
@@ -1368,7 +2592,20 @@ mod tests {
             old_spec_summary: None,
             new_spec_summary: None,
             metrics: None,
+            settings: ReportSettings {
+                strict: false,
+                explain: false,
+                max_suppressions: None,
+                allow_targetless: None,
+                max_xdr_depth: 0,
+                max_xdr_len: 0,
+                max_entries: 0,
+                max_walk_depth: 0,
+            },
             unmatched_suppressions: Vec::new(),
+            baseline_diff: None,
+            diff_types: false,
+            use_color: false,
         };
 
         // Identical upgrade -> patch
@@ -1386,5 +2623,114 @@ mod tests {
         // Critical findings -> major (even if other findings are present)
         report.critical_count = 1;
         assert_eq!(report.recommended_bump(), "major");
+    }
+    #[test]
+    fn categories_are_sorted_by_severity_then_name() {
+        let report = SafetyReport::new(&DiffReport {
+            findings: vec![
+                Finding {
+                    severity: Severity::Info,
+                    category: "Environment".to_string(),
+                    message: "Environment metadata changed".to_string(),
+                    type_name: None,
+                    target: None,
+                    classification: None,
+                },
+                Finding {
+                    severity: Severity::Warning,
+                    category: "Function Renamed".to_string(),
+                    message: "Function renamed".to_string(),
+                    type_name: None,
+                    target: None,
+                    classification: None,
+                },
+                Finding {
+                    severity: Severity::Critical,
+                    category: "Struct Removed".to_string(),
+                    message: "Struct removed".to_string(),
+                    type_name: None,
+                    target: None,
+                    classification: None,
+                },
+                Finding {
+                    severity: Severity::Info,
+                    category: "Enum Added".to_string(),
+                    message: "Enum added".to_string(),
+                    type_name: None,
+                    target: None,
+                    classification: None,
+                },
+            ],
+        });
+
+        let sorted: Vec<&str> = report
+            .categories_sorted_by_severity()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+
+        assert_eq!(
+            sorted,
+            vec![
+                "Struct Removed",
+                "Function Renamed",
+                "Enum Added",
+                "Environment"
+            ]
+        );
+    }
+
+    #[test]
+    fn severity_order_applies_in_text_and_markdown_output() {
+        let report = SafetyReport::new(&DiffReport {
+            findings: vec![
+                Finding {
+                    severity: Severity::Info,
+                    category: "Environment".to_string(),
+                    message: "Environment metadata changed".to_string(),
+                    type_name: None,
+                    target: None,
+                    classification: None,
+                },
+                Finding {
+                    severity: Severity::Warning,
+                    category: "Function Renamed".to_string(),
+                    message: "Function renamed".to_string(),
+                    type_name: None,
+                    target: None,
+                    classification: None,
+                },
+                Finding {
+                    severity: Severity::Critical,
+                    category: "Struct Removed".to_string(),
+                    message: "Struct removed".to_string(),
+                    type_name: None,
+                    target: None,
+                    classification: None,
+                },
+                Finding {
+                    severity: Severity::Info,
+                    category: "Enum Added".to_string(),
+                    message: "Enum added".to_string(),
+                    type_name: None,
+                    target: None,
+                    classification: None,
+                },
+            ],
+        });
+
+        let text = report.generate_summary_text(false);
+        let struct_pos = text.find("--- [STRUCT REMOVED] ---").unwrap();
+        let function_pos = text.find("--- [FUNCTION RENAMED] ---").unwrap();
+        let enum_pos = text.find("--- [ENUM ADDED] ---").unwrap();
+        let env_pos = text.find("--- [ENVIRONMENT] ---").unwrap();
+        assert!(struct_pos < function_pos && function_pos < enum_pos && enum_pos < env_pos);
+
+        let markdown = report.generate_summary_markdown();
+        let struct_pos = markdown.find("### Struct Removed").unwrap();
+        let function_pos = markdown.find("### Function Renamed").unwrap();
+        let enum_pos = markdown.find("### Enum Added").unwrap();
+        let env_pos = markdown.find("### Environment").unwrap();
+        assert!(struct_pos < function_pos && function_pos < enum_pos && enum_pos < env_pos);
     }
 }

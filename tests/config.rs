@@ -671,6 +671,7 @@ fn test_suppressions_expired_rule_validation() {
         target = "ConfigData.threshold"
         author = "Alice"
         expiry = "2020-01-01" # expired long ago
+        fingerprint = "0000000000000000000000000000000000000000000000000000000000000000"
         reason = "Legacy deprecation"
         "#,
     )
@@ -733,6 +734,7 @@ fn test_suppressions_fingerprint_mismatch_validation() {
         target: Some("ConfigData.threshold".to_string()),
         message: "Field threshold removed".to_string(),
         severity: soroban_upgrade_safeguard::diff::Severity::Critical,
+        classification: None,
     };
 
     let matching_rule = resolved.suppressions.matching_rule(&finding);
@@ -908,6 +910,7 @@ fn test_suppressions_expiry_date_bounds() {
         target = "ConfigData.threshold"
         author = "Alice"
         expiry = "not-a-date"
+        fingerprint = "0000000000000000000000000000000000000000000000000000000000000000"
         reason = "Invalid format"
         "#,
     )
@@ -931,6 +934,7 @@ fn test_suppressions_expiry_date_bounds() {
         target = "ConfigData.threshold"
         author = "Alice"
         expiry = "2028-02-29" # Leap year day
+        fingerprint = "0000000000000000000000000000000000000000000000000000000000000000"
         reason = "Valid leap day"
         "#,
     )

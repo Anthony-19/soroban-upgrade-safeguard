@@ -34,6 +34,7 @@ fn make_finding(severity: Severity, category: &str, target: &str) -> Finding {
         } else {
             Some(target.to_string())
         },
+        classification: None,
     }
 }
 
@@ -41,6 +42,7 @@ fn critical(category: &str, target: &str) -> Finding {
     make_finding(Severity::Critical, category, target)
 }
 
+#[allow(dead_code)]
 fn warning(category: &str, target: &str) -> Finding {
     make_finding(Severity::Warning, category, target)
 }

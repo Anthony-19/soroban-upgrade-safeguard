@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::limits::{LimitsConfig, ResourcePolicy};
+use crate::severity_override::SeverityOverrides;
 use crate::suppression::{SuppressionConfig, SuppressionRule};
 
 /// Output format for the safety report.
@@ -13,6 +14,7 @@ pub enum OutputFormat {
     Text,
     Json,
     Markdown,
+    Html,
 }
 
 #[derive(clap::Parser, Debug, Clone, Default)]
@@ -116,6 +118,19 @@ pub struct Args {
     /// detection). Overrides `[limits]` and the default.
     #[arg(long, value_name = "N")]
     pub max_walk_depth: Option<usize>,
+
+    /// Maximum raw WASM binary size in bytes. Overrides `[limits]` and the
+    /// default (25 MiB). Checked via `fs::metadata` before reading disk files
+    /// and against the decoded length for RPC-fetched bytes.
+    #[arg(long, value_name = "BYTES")]
+    pub max_wasm_size: Option<usize>,
+
+    /// Overall timeout in seconds for each RPC request. Overrides `[limits]`
+    /// and the default (30 s). Covers TCP connect, TLS handshake, sending the
+    /// request body, and reading the full response. Set to `0` to disable the
+    /// timeout entirely (not recommended in CI).
+    #[arg(long, value_name = "SECS")]
+    pub rpc_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -136,6 +151,9 @@ pub struct FileConfig {
     pub limits: Option<LimitsConfig>,
     #[serde(default, rename = "suppress")]
     pub suppress: Vec<SuppressionRule>,
+    /// The `[severity]` table: per-category severity overrides.
+    #[serde(default)]
+    pub severity: SeverityOverrides,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -275,6 +293,12 @@ impl ResolvedConfig {
         if let Some(v) = env_usize("SAFEGUARD_MAX_WALK_DEPTH") {
             policy.max_walk_depth = v;
         }
+        if let Some(v) = env_usize("SAFEGUARD_MAX_WASM_SIZE") {
+            policy.max_wasm_size = v;
+        }
+        if let Some(v) = env_u64("SAFEGUARD_RPC_TIMEOUT_SECS") {
+            policy.rpc_timeout_secs = v;
+        }
         if let Some(v) = args.max_xdr_depth {
             policy.max_xdr_depth = v;
         }
@@ -287,6 +311,12 @@ impl ResolvedConfig {
         if let Some(v) = args.max_walk_depth {
             policy.max_walk_depth = v;
         }
+        if let Some(v) = args.max_wasm_size {
+            policy.max_wasm_size = v;
+        }
+        if let Some(v) = args.rpc_timeout_secs {
+            policy.rpc_timeout_secs = v;
+        }
 
         // Suppressions config resolution
         let mut suppressions = SuppressionConfig::default();
@@ -294,6 +324,7 @@ impl ResolvedConfig {
             suppressions.max_suppressions = fc.max_suppressions;
             suppressions.allow_targetless = fc.allow_targetless;
             suppressions.rules = fc.suppress.clone();
+            suppressions.severity_overrides = fc.severity.clone();
         }
         if let Some(v) = env_usize("SAFEGUARD_MAX_SUPPRESSIONS") {
             suppressions.max_suppressions = Some(v);
@@ -423,6 +454,10 @@ fn env_u32(var_name: &str) -> Option<u32> {
     std::env::var(var_name).ok().and_then(|val| val.parse().ok())
 }
 
+fn env_u64(var_name: &str) -> Option<u64> {
+    std::env::var(var_name).ok().and_then(|val| val.parse().ok())
+}
+
 fn env_string(var_name: &str) -> Option<String> {
     std::env::var(var_name).ok().filter(|s| !s.is_empty())
 }
@@ -447,6 +482,7 @@ fn env_format(var_name: &str) -> Option<OutputFormat> {
             "text" => Some(OutputFormat::Text),
             "json" => Some(OutputFormat::Json),
             "markdown" => Some(OutputFormat::Markdown),
+            "html" => Some(OutputFormat::Html),
             _ => None,
         }
     })
@@ -459,7 +495,11 @@ mod tests {
     #[test]
     fn test_resolve_path_absolute() {
         let base = Path::new("/base");
-        let abs = PathBuf::from("c:/absolute/path.toml");
+        let abs = if cfg!(windows) {
+            PathBuf::from("c:/absolute/path.toml")
+        } else {
+            PathBuf::from("/absolute/path.toml")
+        };
         assert_eq!(resolve_path(base, abs.clone()), abs);
     }
 

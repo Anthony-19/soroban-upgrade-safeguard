@@ -1,11 +1,9 @@
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::io::Cursor;
+use stellar_xdr::curr::{Limited, Limits, ReadXdr, ScEnvMetaEntry, ScSpecEntry};
 use stellar_xdr::curr::{Limited, ReadXdr, ScEnvMetaEntry, ScMetaEntry, ScSpecEntry};
 use wasmparser::{Parser, Payload};
-
-use crate::limits::{find_limit_error, EntryKind, LimitError, ResourcePolicy};
-use crate::spec::TaggedSpecEntry;
 
 /// Decoded contents of a contract's `contractenvmetav0` custom section.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,10 +112,7 @@ impl ContractMeta {
 /// Represents the extracted Soroban-specific custom sections from a WASM module.
 #[derive(Debug, Default)]
 pub struct SorobanMetadata {
-    /// Decoded spec entries in order, each tagged with their source section index.
-    pub spec: Vec<TaggedSpecEntry>,
-    /// Number of distinct `contractspecv0` custom sections found.
-    pub spec_section_count: usize,
+    pub spec: Vec<ScSpecEntry>,
     pub env_meta: Option<ContractEnvMeta>,
     /// Decoded `contractmetav0` key/value metadata, when the section is present
     /// and well-formed. Absence or corruption leaves this `None` (see
@@ -134,6 +129,7 @@ pub struct SorobanMetadata {
     pub exported_function_names: std::collections::BTreeSet<String>,
 }
 
+/// Decodes concatenated ScSpecEntry XDR objects from raw bytes.
 /// Decodes concatenated ScSpecEntry XDR objects from raw bytes using the default
 /// [`ResourcePolicy`]. Production paths call [`decode_spec_entries_with_policy`]
 /// so limits can be configured; this convenience wrapper exists for tests and
@@ -148,90 +144,42 @@ pub fn decode_spec_entries(data: &[u8]) -> Result<Vec<ScSpecEntry>> {
 /// Soroban custom sections contain multiple XDR-encoded entries back to back.
 /// We wrap the data in a `Limited<Cursor>` and call `read_xdr` in a loop,
 /// checking the cursor position to detect when all bytes are consumed.
-///
-/// The decoder is built with `policy.xdr_limits()`, so a section that declares an
-/// oversized vector/map length fails with [`LimitError::XdrLengthExceeded`] before
-/// any allocation, and a type nested past the depth limit fails with
-/// [`LimitError::XdrDepthExceeded`] rather than overflowing the stack.
-///
-/// `prior_count` is the number of spec entries already decoded from earlier
-/// sections of the same module; the entry-count cap is checked incrementally
-/// against it so many small sections cannot collectively exceed
-/// `policy.max_entries` (and a single huge section cannot over-allocate before
-/// the cap trips).
-fn decode_spec_entries_with_policy(
-    data: &[u8],
-    policy: &ResourcePolicy,
-    prior_count: usize,
-) -> Result<Vec<ScSpecEntry>> {
+fn decode_spec_entries(data: &[u8]) -> Result<Vec<ScSpecEntry>> {
     let cursor = Cursor::new(data);
-    let mut limited = Limited::new(cursor, policy.xdr_limits());
+    let mut limited = Limited::new(cursor, Limits::none());
     let mut entries = Vec::new();
 
     while (limited.inner.position() as usize) < data.len() {
-        // Reject before decoding another entry so the accepted count never
-        // exceeds the cap, across all sections of this module.
-        if prior_count + entries.len() >= policy.max_entries {
-            return Err(LimitError::EntryCountExceeded {
-                limit: policy.max_entries,
-                kind: EntryKind::Spec,
-            }
-            .into());
-        }
-
         let entry_index = entries.len();
         let byte_offset = limited.inner.position();
-        let entry = match ScSpecEntry::read_xdr(&mut limited) {
-            Ok(entry) => entry,
-            Err(err) => {
-                // A depth/length violation is an adversarial-input signal, not a
-                // corrupt-file signal: surface it as a typed LimitError so the
-                // CLI can exit with its dedicated code.
-                if let Some(limit_err) = LimitError::from_xdr_error(&err, policy) {
-                    return Err(limit_err.into());
-                }
-                return Err(anyhow::Error::new(err).context(format!(
-                    "Failed to decode ScSpecEntry XDR at entry index {} (byte offset {})",
-                    entry_index, byte_offset
-                )));
-            }
-        };
+        let entry = ScSpecEntry::read_xdr(&mut limited).with_context(|| {
+            format!(
+                "Failed to decode ScSpecEntry XDR at entry index {} (byte offset {})",
+                entry_index, byte_offset
+            )
+        })?;
         entries.push(entry);
     }
 
     Ok(entries)
 }
 
-/// Decodes concatenated ScEnvMetaEntry XDR objects from raw bytes under `policy`.
-fn decode_env_meta_entries(data: &[u8], policy: &ResourcePolicy) -> Result<Vec<ScEnvMetaEntry>> {
+/// Decodes concatenated ScEnvMetaEntry XDR objects from raw bytes.
+fn decode_env_meta_entries(data: &[u8]) -> Result<Vec<ScEnvMetaEntry>> {
     let cursor = Cursor::new(data);
-    let mut limited = Limited::new(cursor, policy.xdr_limits());
+    let mut limited = Limited::new(cursor, Limits::none());
     let mut entries = Vec::new();
 
     while (limited.inner.position() as usize) < data.len() {
-        if entries.len() >= policy.max_entries {
-            return Err(LimitError::EntryCountExceeded {
-                limit: policy.max_entries,
-                kind: EntryKind::EnvMeta,
-            }
-            .into());
-        }
-
-        let entry = match ScEnvMetaEntry::read_xdr(&mut limited) {
-            Ok(entry) => entry,
-            Err(err) => {
-                if let Some(limit_err) = LimitError::from_xdr_error(&err, policy) {
-                    return Err(limit_err.into());
-                }
-                return Err(anyhow::Error::new(err).context("Failed to decode ScEnvMetaEntry XDR"));
-            }
-        };
+        let entry = ScEnvMetaEntry::read_xdr(&mut limited)
+            .context("Failed to decode ScEnvMetaEntry XDR")?;
         entries.push(entry);
     }
 
     Ok(entries)
 }
 
+/// Decodes a `contractenvmetav0` section into a comparable representation.
 /// Decodes concatenated ScMetaEntry XDR objects from raw bytes under `policy`.
 ///
 /// Follows the same cursor-driven loop as [`decode_env_meta_entries`]: the
@@ -286,41 +234,35 @@ pub fn decode_contract_meta_with_policy(
 /// Decodes a `contractenvmetav0` section into a comparable representation using
 /// the default [`ResourcePolicy`].
 pub fn decode_env_meta(data: &[u8]) -> Result<ContractEnvMeta> {
-    decode_env_meta_with_policy(data, &ResourcePolicy::default())
-}
-
-/// Decodes a `contractenvmetav0` section into a comparable representation under
-/// `policy`.
-pub fn decode_env_meta_with_policy(
-    data: &[u8],
-    policy: &ResourcePolicy,
-) -> Result<ContractEnvMeta> {
-    let entries = decode_env_meta_entries(data, policy)?;
+    let entries = decode_env_meta_entries(data)?;
     Ok(ContractEnvMeta { entries })
 }
 
-/// Parses the WASM bytes to extract Soroban-specific custom sections and decodes
-/// them using the default [`ResourcePolicy`].
+/// Parses the WASM bytes to extract Soroban-specific custom sections and decodes them.
 pub fn extract_metadata(bytes: &[u8]) -> Result<SorobanMetadata> {
-    extract_metadata_with_policy(bytes, &ResourcePolicy::default())
-}
-
-/// Parses the WASM bytes to extract Soroban-specific custom sections and decodes
-/// them under `policy`.
-///
-/// The `policy.max_entries` cap is enforced across *all* `contractspecv0`
-/// sections combined (a module may carry more than one), so their entry counts
-/// cannot be summed to exhaust memory. Env-metadata is budgeted separately.
-pub fn extract_metadata_with_policy(
-    bytes: &[u8],
-    policy: &ResourcePolicy,
-) -> Result<SorobanMetadata> {
     let mut metadata = SorobanMetadata::default();
     let parser = Parser::new(0);
 
     let mut spec_section_index = 0usize;
 
     for payload in parser.parse_all(bytes) {
+        if let Payload::CustomSection(section) = payload.context("Failed to parse WASM payload")? {
+            match section.name() {
+                "contractspecv0" => {
+                    let section_index = spec_section_index;
+                    spec_section_index += 1;
+
+                    let entries = decode_spec_entries(section.data()).with_context(|| {
+                        format!(
+                            "Failed to decode contractspecv0 section {} at byte offset {}",
+                            section_index,
+                            section.data_offset()
+                        )
+                    })?;
+                    metadata.spec.extend(entries);
+                }
+                "contractenvmetav0" => {
+                    metadata.env_meta = decode_env_meta(section.data()).ok();
         match payload.context("Failed to parse WASM payload")? {
             Payload::CustomSection(section) => {
                 match section.name() {
@@ -382,6 +324,14 @@ pub fn extract_metadata_with_policy(
                     }
                 }
             }
+            Payload::ExportSection(reader) => {
+                for export in reader {
+                    let export = export.context("Failed to parse WASM export")?;
+                    if matches!(export.kind, wasmparser::ExternalKind::Func) {
+                        metadata.exported_function_names.insert(export.name.to_string());
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -399,7 +349,7 @@ mod tests {
         let version = ((protocol as u64) << 32) | (pre_release as u64);
         let entry = ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(version);
         let cursor = Cursor::new(Vec::new());
-        let mut limited = Limited::new(cursor, ResourcePolicy::default().xdr_limits());
+        let mut limited = Limited::new(cursor, Limits::none());
         entry.write_xdr(&mut limited).unwrap();
         limited.inner.into_inner()
     }
