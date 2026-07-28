@@ -1,0 +1,13 @@
+# Pinned toolchain for this fixture contract.
+#
+# soroban-sdk 21.x pulls in serde_with 3.20+ and darling 0.23+, both of which
+# require rustc >= 1.88. This file pins the exact version that produced the
+# committed WASM in tests/wasm/, so any machine with rustup reproduces the same
+# binary from the committed Cargo.lock.
+#
+# To upgrade: bump `channel`, delete Cargo.lock, run
+#   cargo +<new-channel> build --target wasm32-unknown-unknown --release
+# then commit updated Cargo.lock + rebuilt WASM + updated checksums.sha256.
+[toolchain]
+channel = "1.91.0"
+targets = ["wasm32-unknown-unknown"]

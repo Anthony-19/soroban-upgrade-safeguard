@@ -10,6 +10,10 @@ on:
   schedule:
     - cron: "0 6 * * *"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   ci:
     runs-on: ubuntu-latest
@@ -35,6 +39,9 @@ jobs:
       - run: cargo clippy -- -D warnings
       - run: cargo build
       - run: cargo test
+
+      - name: Verify fixture WASM checksums
+        run: tests/build_fixtures.sh --verify
 
   coverage:
     name: Code coverage
