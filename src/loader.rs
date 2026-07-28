@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use stellar_xdr::curr::{
     ContractExecutable, Hash, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyContractCode,
@@ -34,13 +35,40 @@ pub fn load_wasm(path: &Path) -> Result<WasmModule, Error> {
         source: Some(Box::new(e)),
     })?;
 
+    wasm_module_from_bytes(
+        bytes,
+        path.to_path_buf(),
+        path.to_string_lossy().into_owned(),
+    )
+}
+
+/// Reads a WASM binary from stdin, validates it like a file input, and labels
+/// the source as `-` in diagnostics and reports.
+pub fn load_wasm_from_stdin(stdin: &mut impl Read) -> Result<WasmModule, Error> {
+    let mut bytes = Vec::new();
+    stdin
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::FileAccess {
+            path: PathBuf::from("-"),
+            details: "Failed to read stdin".to_string(),
+            source: Some(Box::new(e)),
+        })?;
+
+    wasm_module_from_bytes(bytes, PathBuf::from("-"), "-".to_string())
+}
+
+fn wasm_module_from_bytes(
+    bytes: Vec<u8>,
+    validation_path: PathBuf,
+    display_path: String,
+) -> Result<WasmModule, Error> {
     // 3. Validate the WASM magic header (0x00 0x61 0x73 0x6d)
     if bytes.len() < 4 || &bytes[0..4] != b"\0asm" {
         return Err(Error::WasmValidation {
-            path: Some(path.to_path_buf()),
+            path: Some(validation_path),
             details: format!(
                 "'{}' does not appear to be a valid WASM binary (bad magic bytes)",
-                path.display()
+                display_path
             ),
             byte_offset: None,
             source: None,
@@ -49,14 +77,14 @@ pub fn load_wasm(path: &Path) -> Result<WasmModule, Error> {
 
     // 4. Do a full structural parse to detect any deeper format errors
     validate_wasm_structure(&bytes).map_err(|e| Error::WasmValidation {
-        path: Some(path.to_path_buf()),
-        details: format!("WASM validation failed for '{}'", path.display()),
+        path: Some(validation_path),
+        details: format!("WASM validation failed for '{}'", display_path),
         byte_offset: None,
         source: Some(Box::new(e)),
     })?;
 
     Ok(WasmModule {
-        path: path.to_string_lossy().into_owned(),
+        path: display_path,
         bytes,
     })
 }

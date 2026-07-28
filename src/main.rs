@@ -48,7 +48,7 @@ enum OutputFormat {
                       soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]"
 )]
 struct Args {
-    /// WASM paths: <OLD_WASM> <NEW_WASM> in local mode, or just <NEW_WASM> in RPC mode
+    /// WASM paths: <OLD_WASM> <NEW_WASM> in local mode, or just <NEW_WASM> in RPC mode. Use - to read one WASM from stdin.
     #[arg(value_name = "WASM", num_args = 0..=2)]
     wasm_paths: Vec<PathBuf>,
 
@@ -368,6 +368,16 @@ fn main() -> Result<()> {
         }
     };
 
+    if old_source.is_none()
+        && is_stdin_wasm_path(&args.wasm_paths[0])
+        && is_stdin_wasm_path(new_wasm_path)
+    {
+        anyhow::bail!(
+            "Cannot use '-' for both OLD_WASM and NEW_WASM because stdin can only be read once. \
+             Provide one side as a file path."
+        );
+    }
+
     progress("🔍 Soroban Upgrade Safeguard".to_string());
     progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
 
@@ -381,11 +391,11 @@ fn main() -> Result<()> {
         let rpc_url = args.rpc_url.as_ref().unwrap();
         loader::fetch_wasm_from_rpc(contract_id, rpc_url)?
     } else {
-        loader::load_wasm(&args.wasm_paths[0])?
+        load_positional_wasm(&args.wasm_paths[0])?
     };
 
     // New WASM
-    let new = loader::load_wasm(new_wasm_path)?;
+    let new = load_positional_wasm(new_wasm_path)?;
 
     if !suppressions.rules.is_empty() {
         progress(format!(
@@ -429,6 +439,19 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn is_stdin_wasm_path(path: &Path) -> bool {
+    path == Path::new("-")
+}
+
+fn load_positional_wasm(path: &Path) -> Result<loader::WasmModule> {
+    if is_stdin_wasm_path(path) {
+        let mut stdin = std::io::stdin().lock();
+        Ok(loader::load_wasm_from_stdin(&mut stdin)?)
+    } else {
+        Ok(loader::load_wasm(path)?)
+    }
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]

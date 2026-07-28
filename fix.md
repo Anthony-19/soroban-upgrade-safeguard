@@ -1,27 +1,29 @@
-Add a --quiet flag to suppress decorative and progress output
+Support reading a WASM input from stdin
 Repo Avatar
 ShippedLabs/soroban-upgrade-safeguard
 Description
-There is no way to silence the decorative output. Every run prints the banner, the
-loading lines, the per-spec summaries, and in batch mode the per-pair progress,
-through the progress closure in src/main.rs.
+load_wasm in src/loader.rs only reads from a filesystem path. There is no way
+to stream a WASM binary in on stdin, which is the natural thing to do when the
+build artifact is produced by an earlier pipeline stage and never written to disk,
+or when it is piped out of another tool.
 
-For scripting and for CI logs that only care about the verdict and the findings,
-that is noise. In text mode it is mixed into stdout with the report itself, so it
-cannot even be filtered out by discarding stderr.
+Supporting stdin, conventionally spelled as a - argument, removes a forced round
+trip through a temporary file in exactly the CI setting this tool targets.
 
 Suggested approach
-Add a --quiet flag that suppresses the decorative and progress output while still
-emitting the report and preserving the exit code. In text mode the report itself
-must still reach stdout; only the progress and banner lines are suppressed. Make
-sure it composes sensibly with the JSON and Markdown formats, which already route
-progress to stderr, so --quiet there simply silences that stderr chatter.
+Treat a - positional path as stdin and read the bytes from there, then run the
+same validation the file path already runs. Because the tool takes up to two
+positional paths, decide and document what happens if - is given for both, since
+stdin can only be consumed once. The RPC mode already supplies the old side from
+elsewhere, so - for the single new-side path is the most useful case to get
+right.
 
 Acceptance criteria
- --quiet suppresses the banner and progress lines in all formats.
- The report and the exit code are unchanged by the flag.
- In text mode the report still reaches stdout with the decoration removed.
- The flag is documented and covered by a test.
+ A - argument reads a WASM binary from stdin and validates it like a file.
+ Using - for both positions is either handled clearly or rejected with a
+helpful message.
+ Invalid data on stdin produces the same class of error as an invalid file.
+ The behaviour is documented and covered by a test.
 Getting started
 Fork this repository, clone your fork, and add this repo as upstream:
 
@@ -30,10 +32,10 @@ cd soroban-upgrade-safeguard
 git remote add upstream https://github.com/ShippedLabs/soroban-upgrade-safeguard.git
 Create a branch for this issue:
 
-git checkout -b feat/quiet-flag
+git checkout -b feat/read-wasm-from-stdin
 Suggested commit message:
 
-feat: add a --quiet flag
+feat: support reading a wasm input from stdin
 Run cargo fmt --check, cargo clippy, and cargo test before pushing, then
 open a pull request from your fork against main and link this issue. See
 docs/contributing.md for the full contribution guide.
