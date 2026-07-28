@@ -1,0 +1,29 @@
+# Fixture v7 — warning-only upgrade of v6.
+#
+# Rules exercised by v6→v7 (all Warning, no Critical):
+#   union_case_type_widened   Transfer payload: u32 → u64
+#   struct_field_added        Inner gains metadata field
+#   struct_field_type_widened Ledger.balance: u32 → u64
+#   error_enum_case_added     VaultError gains Frozen = 30
+#
+# Must exit 0 without --strict; must exit 1 with --strict.
+[package]
+name = "mock-contract-v7"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+soroban-sdk = "21.0.0"
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true

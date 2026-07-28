@@ -1,0 +1,25 @@
+# SHA-256 checksums for committed fixture WASMs.
+#
+# These hashes are the ground truth for reproducibility verification.
+# `tests/build_fixtures.sh --verify` re-hashes every file and fails if any
+# hash does not match. CI runs this check on every pull request so a silent
+# binary change cannot reach main.
+#
+# Provenance
+# ----------
+# toolchain : 1.91.0 (tests/fixtures/v*/rust-toolchain.toml)
+# soroban-sdk: 21.7.7 (tests/fixtures/v*/Cargo.lock)
+# profile   : release (opt-level=z, lto=true, strip=symbols, panic=abort)
+#
+# To regenerate after an intentional change:
+#   tests/build_fixtures.sh --regen
+# Then review the diff, commit the updated WASMs + this file together.
+#
+# Format: sha256sum(1) output — "<hash>  <filename>"
+31fc0a23f04c6fc647ac44ba791228d8f0f12308685f0ac3798d37c79518906b  v1.wasm
+ff031957a9285c6e09795e6516aaa758be0a3f2827d9ae23332e067351ae6c49  v2.wasm
+233ffba698601fdd255e8731b64000a71ac8bb7dcd158c4c87686a4e51b8924f  v3.wasm
+0d53102b0c5d8f5cb8a553269a0df26396e1b618ae1ddca617162f3b1701e3ea  v4.wasm
+dd75d7a4cc00c94afd55762fe782948f6ce8fa2db7371b90052eecc483e5b2e6  v5.wasm
+243eb48f486bdcd31c67f1d720c359df9a0892f05a1ff442b8981fa2cf05a510  v6.wasm
+4fa822d9a7e27abb0091f8a2ebe61439ca2ef534ad8f70664c019a2956a61963  v7.wasm

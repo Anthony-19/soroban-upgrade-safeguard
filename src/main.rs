@@ -290,6 +290,7 @@ fn main() -> Result<()> {
                 }
 
                 println!("{}", markdown);
+                append_step_summary(&markdown);
             }
             OutputFormat::Text => {
                 println!("========================================");
@@ -1083,6 +1084,7 @@ fn main() {
         }
     }
 }
+
 /// Write `content` to a file if `output_path` is `Some`, otherwise print it
 /// to stdout. Writing to a file is atomic: the full string is rendered before
 /// any file is opened, so a failed comparison never leaves a partial file.
@@ -1102,6 +1104,24 @@ fn emit_report_output(
         println!("{}", content);
     }
     Ok(())
+}
+
+/// Append the given Markdown content to `$GITHUB_STEP_SUMMARY` when the
+/// environment variable is set. This makes the report appear as a job summary
+/// in GitHub Actions. Silently does nothing when the variable is absent.
+fn append_step_summary(content: &str) {
+    let path = match std::env::var("GITHUB_STEP_SUMMARY") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => return,
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", content);
+    }
 }
 
 /// Usage text for `explain`, kept next to its handler.
@@ -1360,6 +1380,7 @@ fn run() -> Result<()> {
             let pairs = scan_directories(
                 args.old_dir.as_ref().unwrap(),
                 args.new_dir.as_ref().unwrap(),
+                &progress,
             )?;
             (pairs, vec![])
         };
@@ -1553,8 +1574,7 @@ fn run() -> Result<()> {
         }
 
         // Detect dependencies on contracts absent from this batch.
-        let known_contracts: std::collections::HashSet<String> =
-            results.keys().cloned().collect();
+        let known_contracts: std::collections::HashSet<String> = results.keys().cloned().collect();
         let missing = dep_graph.missing_contracts(&known_contracts);
         let missing_findings_list = missing_contract_findings(&missing);
         if !missing_findings_list.is_empty() {
@@ -1582,21 +1602,16 @@ fn run() -> Result<()> {
             per_contract_findings.insert(name.clone(), all);
         }
 
-        let cross_findings: Vec<CrossContractFinding> =
-            dep_graph.propagate(&per_contract_findings);
+        let cross_findings: Vec<CrossContractFinding> = dep_graph.propagate(&per_contract_findings);
 
         // Cross-contract criticals always fail; warnings only fail under --strict.
         let cross_critical_count = cross_findings
             .iter()
-            .filter(|f| {
-                f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Critical
-            })
+            .filter(|f| f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Critical)
             .count();
         let cross_warning_count = cross_findings
             .iter()
-            .filter(|f| {
-                f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Warning
-            })
+            .filter(|f| f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Warning)
             .count();
         if cross_critical_count > 0 {
             overall_safe = false;
@@ -1771,6 +1786,7 @@ fn run() -> Result<()> {
                 }
 
                 println!("{}", markdown);
+                append_step_summary(&markdown);
             }
             OutputFormat::Text => {
                 println!("========================================");
@@ -2231,7 +2247,10 @@ fn run() -> Result<()> {
     let mut safety_report = if args.old_spec.is_some() || args.new_spec.is_some() {
         // Build SorobanMetadata for the old side.
         let old_meta = if let Some(ref spec_path) = args.old_spec {
-            progress(format!("   📄 Old side: spec JSON '{}'", spec_path.display()));
+            progress(format!(
+                "   📄 Old side: spec JSON '{}'",
+                spec_path.display()
+            ));
             spec_input::load_spec_json(spec_path, &policy)?
         } else {
             parser::extract_metadata_with_policy(&old.bytes, &policy)
@@ -2240,7 +2259,10 @@ fn run() -> Result<()> {
 
         // Build SorobanMetadata for the new side.
         let new_meta = if let Some(ref spec_path) = args.new_spec {
-            progress(format!("   📄 New side: spec JSON '{}'", spec_path.display()));
+            progress(format!(
+                "   📄 New side: spec JSON '{}'",
+                spec_path.display()
+            ));
             spec_input::load_spec_json(spec_path, &policy)?
         } else {
             parser::extract_metadata_with_policy(&new.bytes, &policy)
@@ -2303,15 +2325,6 @@ fn run() -> Result<()> {
         safety_report.apply_category_filter(&category_filter);
     }
 
-    if let Some(baseline_path) = &args.baseline {
-        soroban_upgrade_safeguard::baseline::apply(
-            &mut safety_report,
-            baseline_path,
-            args.baseline_fail_on_new,
-        )
-        .with_context(|| format!("Failed to apply baseline '{}'", baseline_path.display()))?;
-    }
-
     // Render the report to a string first so --output can write it atomically.
     let rendered = match args.format {
         OutputFormat::Json => serde_json::to_string_pretty(&safety_report.to_json())?,
@@ -2326,16 +2339,19 @@ fn run() -> Result<()> {
     };
 
     // Write the report — either to a file (--output) or to stdout.
+    emit_report_output(&rendered, args.output.as_deref(), &progress)?;
     if let Some(ref output_path) = args.output {
-        std::fs::write(output_path, &rendered).with_context(|| {
-            format!("Failed to write report to '{}'", output_path.display())
-        })?;
-        progress(format!(
-            "✅ Report written to: {}",
-            output_path.display()
-        ));
+        std::fs::write(output_path, &rendered)
+            .with_context(|| format!("Failed to write report to '{}'", output_path.display()))?;
+        progress(format!("✅ Report written to: {}", output_path.display()));
     } else {
         println!("{}", rendered);
+    }
+
+    // When running inside GitHub Actions, append the Markdown report to the
+    // step summary file so it appears in the Actions UI automatically.
+    if args.format == OutputFormat::Markdown {
+        append_step_summary(&rendered);
     }
 
     // Warn about suppression rules that never matched any finding.
@@ -2466,10 +2482,9 @@ impl<'de> serde::Deserialize<'de> for ContractSource {
                     }
                 }
 
-                let contract_id = contract_id
-                    .ok_or_else(|| de::Error::missing_field("contract_id"))?;
-                let rpc_url =
-                    rpc_url.ok_or_else(|| de::Error::missing_field("rpc_url"))?;
+                let contract_id =
+                    contract_id.ok_or_else(|| de::Error::missing_field("contract_id"))?;
+                let rpc_url = rpc_url.ok_or_else(|| de::Error::missing_field("rpc_url"))?;
 
                 Ok(ContractSource::OnChain {
                     contract_id,
@@ -2617,12 +2632,7 @@ fn resolve_contract_source(
             rpc_url,
         } => {
             loader::validate_rpc_url(rpc_url, allow_http_local)?;
-            loader::fetch_wasm_from_rpc_with_policy_and_cache(
-                contract_id,
-                rpc_url,
-                policy,
-                cache,
-            )
+            loader::fetch_wasm_from_rpc_with_policy_and_cache(contract_id, rpc_url, policy, cache)
         }
     }
 }
@@ -2666,15 +2676,13 @@ fn resolve_pair_names(pairs: &[ContractPair]) -> Result<Vec<String>> {
     let mut names: Vec<String> = Vec::with_capacity(pairs.len());
 
     for (i, pair) in pairs.iter().enumerate() {
-        let candidate = pair.name.clone().unwrap_or_else(|| {
-            match &pair.new {
-                ContractSource::File(path) => path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| format!("pair_{}", i + 1)),
-                ContractSource::OnChain { contract_id, .. } => contract_id.clone(),
-            }
+        let candidate = pair.name.clone().unwrap_or_else(|| match &pair.new {
+            ContractSource::File(path) => path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(String::from)
+                .unwrap_or_else(|| format!("pair_{}", i + 1)),
+            ContractSource::OnChain { contract_id, .. } => contract_id.clone(),
         });
 
         let count = counts.entry(candidate.clone()).or_insert(0);
@@ -2793,7 +2801,11 @@ fn collect_wasm_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
     Ok(files)
 }
 
-fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>> {
+fn scan_directories(
+    old_dir: &Path,
+    new_dir: &Path,
+    progress: &impl Fn(String),
+) -> Result<Vec<ContractPair>> {
     if !old_dir.is_dir() {
         anyhow::bail!("Old directory '{}' is not a directory", old_dir.display());
     }
@@ -2819,22 +2831,22 @@ fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>>
                 name,
             });
         } else {
-            eprintln!(
+            progress(format!(
                 "⚠️  Warning: Match not found for '{}' in new directory '{}'",
                 rel_path.display(),
                 new_dir.display()
-            );
+            ));
         }
     }
 
     // Warn about files in new_dir that have no counterpart in old_dir
     for (rel_path, _) in &collect_wasm_files(new_dir)? {
         if !old_files.iter().any(|(r, _)| r == rel_path) {
-            eprintln!(
+            progress(format!(
                 "⚠️  Warning: No old counterpart found for '{}' in old directory '{}'",
                 rel_path.display(),
                 old_dir.display()
-            );
+            ));
         }
     }
 
@@ -2975,7 +2987,11 @@ fn expand_glob(pattern: &str) -> Result<Vec<PathBuf>> {
 
     // No wildcards at all: the pattern is just a path.
     if segments.is_empty() {
-        return Ok(if root.is_file() { vec![root] } else { Vec::new() });
+        return Ok(if root.is_file() {
+            vec![root]
+        } else {
+            Vec::new()
+        });
     }
 
     let mut matches = Vec::new();
