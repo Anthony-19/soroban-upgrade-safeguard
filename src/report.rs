@@ -165,6 +165,33 @@ fn contract_identity_label(name: Option<&str>, version: Option<&str>) -> String 
     }
 }
 
+/// Rewrite the report's emoji markers as bracketed ASCII text markers.
+///
+/// The report leans on emoji to carry meaning — `🔴`/`🟡`/`🔵` for severity,
+/// `✅`/`❌` for the verdict, and `🔕` for suppressed findings. On a terminal,
+/// CI log viewer, or font that cannot render them, that signal degrades to
+/// boxes, question marks, or nothing. When the `--ascii` flag is set, every
+/// rendered format is passed through this function so the severity stays legible
+/// with both color and emoji disabled.
+///
+/// The replacements are chosen so the severity remains distinguishable without
+/// color: each severity keeps a distinct word (`[CRITICAL]`, `[WARN]`, `[INFO]`).
+pub fn asciify_markers(text: &str) -> String {
+    text
+        // Suppressed lines already contain the literal "[SUPPRESSED]" text, so
+        // strip the bell emoji and its trailing space rather than duplicate it.
+        .replace("🔕 ", "")
+        .replace('🔕', "[SUPPRESSED]")
+        .replace('🔴', "[CRITICAL]")
+        .replace('🟡', "[WARN]")
+        .replace('🔵', "[INFO]")
+        .replace('✅', "[PASS]")
+        .replace('❌', "[FAIL]")
+        // The warning sign renders as U+26A0 optionally followed by U+FE0F.
+        .replace("⚠️", "[WARNING]")
+        .replace('⚠', "[WARNING]")
+}
+
 impl SafetyReport {
     /// Compute a safety report from a raw DiffReport, with no suppressions.
     ///
@@ -425,7 +452,12 @@ impl SafetyReport {
     }
 
     /// Generate a structured, human-readable text output for the CLI.
-    pub fn generate_summary_text(&self, explain: bool) -> String {
+    ///
+    /// When `ascii` is `true` (the `--ascii` flag), emoji severity/verdict
+    /// markers are replaced with bracketed text equivalents via
+    /// [`asciify_markers`] so the report stays legible on terminals that cannot
+    /// render emoji.
+    pub fn generate_summary_text(&self, explain: bool, ascii: bool) -> String {
         let mut output = String::new();
         output.push_str(
             &"\n========================================\n"
@@ -561,7 +593,7 @@ impl SafetyReport {
             output.push_str(&format!("\n{}\n", STORAGE_NOT_VERIFIED_NOTE.dimmed()));
             self.append_metrics_text(&mut output);
             output.push_str(&"No relevant changes detected. The upgrade is identical in its exports and types.\n".green().to_string());
-            return output;
+            return if ascii { asciify_markers(&output) } else { output };
         }
 
         // Sort categories to have consistent output; surface Environment first.
@@ -643,11 +675,18 @@ impl SafetyReport {
             }
         }
 
-        output
+        if ascii {
+            asciify_markers(&output)
+        } else {
+            output
+        }
     }
 
     /// Generate a structured Markdown output.
-    pub fn generate_summary_markdown(&self) -> String {
+    ///
+    /// When `ascii` is `true` (the `--ascii` flag), emoji markers are replaced
+    /// with bracketed text equivalents via [`asciify_markers`].
+    pub fn generate_summary_markdown(&self, ascii: bool) -> String {
         let mut output = String::new();
         output.push_str("# Soroban Upgrade Safety Report\n\n");
 
@@ -725,7 +764,7 @@ impl SafetyReport {
             output.push_str(&format!("> {}\n", STORAGE_NOT_VERIFIED_NOTE));
             self.append_metrics_markdown(&mut output);
             output.push_str("No relevant changes detected. The upgrade is identical in its exports and types.\n");
-            return output;
+            return if ascii { asciify_markers(&output) } else { output };
         }
 
         // Sort categories to have consistent output; surface Environment first.
@@ -765,7 +804,11 @@ impl SafetyReport {
             output.push_str("- Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n");
         }
 
-        output
+        if ascii {
+            asciify_markers(&output)
+        } else {
+            output
+        }
     }
 }
 
@@ -821,6 +864,33 @@ pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asciify_markers_replaces_every_emoji_with_text() {
+        // Every emoji the report emits maps to a bracketed text marker, and no
+        // emoji survives the conversion.
+        let input = "🔴 crit\n🟡 warn\n🔵 info\n✅ PASSED\n❌ FAILED\n🔕 [SUPPRESSED] x\n⚠️  ACTION";
+        let out = asciify_markers(input);
+
+        assert!(out.contains("[CRITICAL] crit"));
+        assert!(out.contains("[WARN] warn"));
+        assert!(out.contains("[INFO] info"));
+        assert!(out.contains("[PASS] PASSED"));
+        assert!(out.contains("[FAIL] FAILED"));
+        // The bell emoji is stripped so the existing "[SUPPRESSED]" text is not
+        // duplicated.
+        assert!(out.contains("[SUPPRESSED] x"));
+        assert!(!out.contains("[SUPPRESSED] [SUPPRESSED]"));
+        assert!(out.contains("[WARNING]"));
+
+        // Severity stays distinguishable and no emoji remains.
+        for emoji in ['🔴', '🟡', '🔵', '✅', '❌', '🔕', '⚠'] {
+            assert!(
+                !out.contains(emoji),
+                "emoji {emoji:?} should have been replaced"
+            );
+        }
+    }
 
     #[test]
     fn test_every_emitted_category_has_guidance() {

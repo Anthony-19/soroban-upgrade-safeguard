@@ -132,6 +132,27 @@ soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
 
 The first argument should be the build that is currently deployed on chain. The second argument should be the build you intend to deploy. Order matters: the comparison is directional, because removing a field from the old version is treated differently from adding a field in the new version.
 
+### ASCII-only output
+
+The report normally uses emoji to carry meaning: 🔴 🟡 🔵 for severity, ✅ and ❌ for the verdict, and 🔕 for suppressed findings. On a terminal, CI log viewer, or font that cannot render them, those markers degrade to boxes, question marks, or nothing, taking the severity signal with them.
+
+Pass `--ascii` to replace every emoji with a bracketed text marker instead:
+
+```bash
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --ascii
+```
+
+| Emoji | ASCII marker |
+| :--- | :--- |
+| 🔴 | `[CRITICAL]` |
+| 🟡 | `[WARN]` |
+| 🔵 | `[INFO]` |
+| ✅ | `[PASS]` |
+| ❌ | `[FAIL]` |
+| 🔕 | `[SUPPRESSED]` |
+
+Each severity keeps a distinct word, so findings stay distinguishable even with both color and emoji disabled. The flag applies consistently to text and Markdown output, in both single and batch mode. It is independent of `--no-color`: use `--no-color --ascii` together for a report that is legible on the most limited terminals.
+
 ## How the Analysis Works
 
 The analysis runs as a short pipeline. Each stage lives in its own module under `src/`.

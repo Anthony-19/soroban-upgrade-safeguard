@@ -73,6 +73,12 @@ struct Args {
     #[arg(long)]
     no_color: bool,
 
+    /// Use ASCII-only markers instead of emoji ([CRITICAL], [WARN], [INFO],
+    /// [PASS], [FAIL], [SUPPRESSED]) for terminals and log viewers that cannot
+    /// render emoji. Applies to text and Markdown output, single and batch.
+    #[arg(long)]
+    ascii: bool,
+
     /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
     #[arg(long, value_name = "MANIFEST_PATH")]
     manifest: Option<PathBuf>,
@@ -243,12 +249,17 @@ fn main() -> Result<()> {
 
                 for (name, report) in &results {
                     markdown.push_str(&format!("## Details: {}\n\n", name));
-                    let report_md = report.generate_summary_markdown();
+                    let report_md = report.generate_summary_markdown(args.ascii);
                     let stripped_md = report_md.replace("# Soroban Upgrade Safety Report\n\n", "");
                     markdown.push_str(&stripped_md);
                     markdown.push_str("\n---\n\n");
                 }
 
+                // Convert the summary status markers this arm added directly
+                // (the inner detail sections were already rendered ASCII above).
+                if args.ascii {
+                    markdown = report::asciify_markers(&markdown);
+                }
                 println!("{}", markdown);
             }
             OutputFormat::Text => {
@@ -256,10 +267,19 @@ fn main() -> Result<()> {
                 println!("    SOROBAN BATCH SAFETY REPORT");
                 println!("========================================");
 
-                let status = if overall_safe {
-                    "✅ PASSED (All contracts safe)".green().bold()
+                // ASCII-only verdict markers when emoji cannot be rendered.
+                let (pass_mark, fail_mark) = if args.ascii {
+                    ("[PASS]", "[FAIL]")
                 } else {
-                    "❌ FAILED (Some contracts have breaking changes)"
+                    ("✅", "❌")
+                };
+
+                let status = if overall_safe {
+                    format!("{pass_mark} PASSED (All contracts safe)")
+                        .green()
+                        .bold()
+                } else {
+                    format!("{fail_mark} FAILED (Some contracts have breaking changes)")
                         .red()
                         .bold()
                 };
@@ -268,9 +288,9 @@ fn main() -> Result<()> {
                 println!("Summary of Contracts:");
                 for (name, report) in &results {
                     let status_str = if report.is_safe {
-                        "✅ PASSED".green()
+                        format!("{pass_mark} PASSED").green()
                     } else {
-                        "❌ FAILED".red().bold()
+                        format!("{fail_mark} FAILED").red().bold()
                     };
                     println!(
                         "  - {}: {} ({} critical, {} warnings, {} info, {} suppressed)",
@@ -287,7 +307,7 @@ fn main() -> Result<()> {
 
                 for (name, report) in &results {
                     println!("=== Contract: {} ===", name.bold().magenta());
-                    println!("{}", report.generate_summary_text(args.explain));
+                    println!("{}", report.generate_summary_text(args.explain, args.ascii));
                     println!("========================================\n");
                 }
             }
@@ -382,10 +402,13 @@ fn main() -> Result<()> {
             );
         }
         OutputFormat::Markdown => {
-            println!("{}", safety_report.generate_summary_markdown());
+            println!("{}", safety_report.generate_summary_markdown(args.ascii));
         }
         OutputFormat::Text => {
-            println!("{}", safety_report.generate_summary_text(args.explain));
+            println!(
+                "{}",
+                safety_report.generate_summary_text(args.explain, args.ascii)
+            );
         }
     }
 
