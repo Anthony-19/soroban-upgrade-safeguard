@@ -42,6 +42,7 @@
 //! ```
 
 pub mod baseline;
+pub mod builder;
 pub mod classification;
 pub mod color;
 pub mod config;
@@ -56,6 +57,7 @@ pub mod report;
 pub mod rules;
 pub mod severity_override;
 pub mod spec;
+pub mod spec_input;
 pub mod storage_schema;
 pub mod suppression;
 pub mod type_diff;
@@ -279,6 +281,8 @@ pub fn compare_wasm_bytes_with_options(
     let mut scope = report::AnalysisScope {
         exported_interface: true,
         env_metadata: true,
+        wasm_exports_compared: true,
+        wasm_imports_compared: true,
         storage_schema: report::StorageScopeState::NotAnalyzed,
         old_spec_section_count: old_meta.spec_section_count,
         new_spec_section_count: new_meta.spec_section_count,
@@ -463,4 +467,155 @@ pub fn compare_wasm_files_with_storage_schemas(
             ..Default::default()
         },
     )
+}
+
+/// Run the full analysis pipeline starting from pre-extracted [`parser::SorobanMetadata`].
+///
+/// This is the variant the CLI uses when one or both sides is a spec-only JSON
+/// file (via `--old-spec` / `--new-spec`): spec loading happens before this
+/// call, so the WASM bytes are not available here. When both sides are WASM
+/// files the caller should prefer [`compare_wasm_bytes_with_options`] instead.
+///
+/// `wasm_sizes` carries `(old_bytes, new_bytes)` for the build-metrics block.
+/// Pass `None` when byte sizes are unavailable (spec-only on both sides).
+///
+/// # Errors
+///
+/// Returns an error if either metadata cannot be decoded into a valid spec, if
+/// the structural diff exceeds a resource limit from `options.policy`, or if a
+/// storage schema contradicts its associated spec.
+pub fn run_pipeline_with_metadata(
+    old_meta: parser::SorobanMetadata,
+    new_meta: parser::SorobanMetadata,
+    wasm_sizes: Option<(usize, usize)>,
+    options: &CompareOptions<'_>,
+) -> Result<SafetyReport> {
+    let default_policy = ResourcePolicy::default();
+    let policy = options.policy.unwrap_or(&default_policy);
+
+    let empty_suppressions = SuppressionConfig::default();
+    let suppressions = options.suppressions.unwrap_or(&empty_suppressions);
+
+    // Determine whether the inputs were real WASM (exports/imports comparable)
+    // or spec-only JSON (no binary sections).
+    let (old_size, new_size) = wasm_sizes.unwrap_or((0, 0));
+    let is_wasm = wasm_sizes.is_some();
+
+    let (old_spec, old_dups) = ContractSpec::from_entries_checked(&old_meta.spec);
+    let (new_spec, new_dups) = ContractSpec::from_entries_checked(&new_meta.spec);
+
+    let old_spec_summary = old_spec.summary();
+    let new_spec_summary = new_spec.summary();
+
+    let mut diff_report = diff::compare_with_policy(&old_spec, &new_spec, policy)?;
+
+    diff::report_duplicate_spec_entries(
+        "old",
+        &old_dups,
+        old_meta.spec_section_count,
+        &mut diff_report,
+        options.compat_duplicates,
+    );
+    diff::report_duplicate_spec_entries(
+        "new",
+        &new_dups,
+        new_meta.spec_section_count,
+        &mut diff_report,
+        options.compat_duplicates,
+    );
+
+    diff::compare_env_metadata(
+        old_meta.env_meta.as_ref(),
+        new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+
+    diff::compare_contract_metadata(
+        old_meta.meta.as_ref(),
+        new_meta.meta.as_ref(),
+        &mut diff_report,
+    );
+
+    if is_wasm {
+        diff::compare_exports(
+            &old_meta.exported_function_names,
+            &new_meta.exported_function_names,
+            &old_spec.functions.keys().cloned().collect(),
+            &new_spec.functions.keys().cloned().collect(),
+            &mut diff_report,
+        );
+        diff::compare_wasm_imports(&old_meta.imports, &new_meta.imports, &mut diff_report);
+    }
+
+    let mut scope = report::AnalysisScope {
+        exported_interface: true,
+        env_metadata: true,
+        wasm_exports_compared: is_wasm,
+        wasm_imports_compared: is_wasm,
+        storage_schema: report::StorageScopeState::NotAnalyzed,
+        old_spec_section_count: old_meta.spec_section_count,
+        new_spec_section_count: new_meta.spec_section_count,
+        old_duplicate_names: {
+            let mut names: Vec<String> = old_dups.iter().map(|d| d.name.clone()).collect();
+            names.sort();
+            names.dedup();
+            names
+        },
+        new_duplicate_names: {
+            let mut names: Vec<String> = new_dups.iter().map(|d| d.name.clone()).collect();
+            names.sort();
+            names.dedup();
+            names
+        },
+    };
+
+    if let Some((old_schema, new_schema)) = options.storage_schemas {
+        old_schema.reconcile_with_spec(&old_spec, "old")?;
+        new_schema.reconcile_with_spec(&new_spec, "new")?;
+
+        let old_resolved = old_schema.resolve()?;
+        let new_resolved = new_schema.resolve()?;
+
+        let storage_findings = diff::compare_storage_schemas(&old_resolved, &new_resolved);
+        diff_report.findings.extend(storage_findings.findings);
+
+        let mut unresolved = old_schema.unresolved_references(Some(&old_spec));
+        unresolved.extend(new_schema.unresolved_references(Some(&new_spec)));
+        unresolved.sort();
+        unresolved.dedup();
+        diff::report_unresolved_storage_references(&unresolved, &mut diff_report);
+
+        scope.storage_schema = report::StorageScopeState::Analyzed {
+            key_types: new_resolved.key_type_count(),
+            value_types: new_resolved.value_type_count(),
+        };
+    }
+
+    let mut safety_report = report::SafetyReport::with_suppressions(
+        &diff_report,
+        suppressions,
+        options.explain,
+        options.strict,
+        policy,
+    );
+    safety_report.old_spec_summary = Some(old_spec_summary);
+    safety_report.new_spec_summary = Some(new_spec_summary);
+    safety_report.scope = scope;
+
+    safety_report.metrics = Some(report::BuildMetrics::new(
+        old_size,
+        new_size,
+        old_spec.functions.len(),
+        new_spec.functions.len(),
+        old_spec.structs.len(),
+        new_spec.structs.len(),
+        old_spec.enums.len(),
+        new_spec.enums.len(),
+        old_spec.unions.len(),
+        new_spec.unions.len(),
+        old_spec.error_enums.len(),
+        new_spec.error_enums.len(),
+    ));
+
+    Ok(safety_report)
 }

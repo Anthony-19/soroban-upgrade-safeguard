@@ -1,0 +1,30 @@
+# Fixture v6 — clean baseline for warning-only type changes.
+#
+# v6→v7 exercises:
+#   union_case_type_widened   (Transfer payload: u32 → u64, widening only)
+#   struct_field_added        (Inner gains a new optional field)
+#   struct_field_type_widened (Ledger.balance: u32 → u64, widening only)
+#   error_enum_case_added     (VaultError gains a new case)
+#
+# All of these are Warning severity — the pair passes without --strict and
+# fails with --strict, exactly mirroring the v1→v3 pattern for the simpler types.
+[package]
+name = "mock-contract-v6"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+soroban-sdk = "21.0.0"
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
