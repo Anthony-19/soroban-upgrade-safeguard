@@ -1,0 +1,30 @@
+# Fixture v5 — breaking upgrade of v4.
+#
+# Rules exercised by v4→v5:
+#   union_case_removed            (Cancel removed)
+#   union_case_reordered          (cases reordered after removal)
+#   union_case_type_changed       (Transfer payload u32 → u64)
+#   error_enum_case_value_changed (InsufficientFunds 10 → 99)
+#   error_enum_case_removed       (NotAuthorized removed)
+#   struct_field_type_changed     (Inner.amount u32 → bool)
+#   cascading_layout_break        (Outer embeds Inner; process_outer() accepts Outer)
+[package]
+name = "mock-contract-v5"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+soroban-sdk = "21.0.0"
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true

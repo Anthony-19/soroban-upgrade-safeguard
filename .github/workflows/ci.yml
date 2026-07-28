@@ -40,6 +40,9 @@ jobs:
       - run: cargo build
       - run: cargo test
 
+      - name: Verify fixture WASM checksums
+        run: tests/build_fixtures.sh --verify
+
   coverage:
     name: Code coverage
     runs-on: ubuntu-latest
