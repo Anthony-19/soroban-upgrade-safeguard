@@ -415,7 +415,7 @@ pub const RULES: &[RuleDefinition] = &[
     RuleDefinition {
         id: "type_renamed",
         label: "Type Renamed",
-        severity: Severity::Info,
+        severity: Severity::Warning,
         guidance: "A type was renamed but its layout is identical, so stored data stays compatible. Update client code and bindings to use the new type name.",
     },
     RuleDefinition {
@@ -423,6 +423,36 @@ pub const RULES: &[RuleDefinition] = &[
         label: "Type Renamed With Changes",
         severity: Severity::Warning,
         guidance: "A type appears renamed and its layout also changed. Treat the layout change as the breaking part: review the field-level findings and migrate stored data before deploying.",
+    },
+    RuleDefinition {
+        id: "parameter_added",
+        label: "Parameter Added",
+        severity: Severity::Critical,
+        guidance: "This is a breaking change. Adding parameters breaks positional/named RPC invocation. Restore the original parameter structure or update all client integrations.",
+    },
+    RuleDefinition {
+        id: "parameter_removed",
+        label: "Parameter Removed",
+        severity: Severity::Critical,
+        guidance: "This is a breaking change. Removing parameters breaks positional/named RPC invocation. Restore the parameter or update all client integrations.",
+    },
+    RuleDefinition {
+        id: "function_renamed",
+        label: "Function Renamed",
+        severity: Severity::Critical,
+        guidance: "This is a breaking change. A function was renamed which breaks existing callers. Update client integrations to use the new function name.",
+    },
+    RuleDefinition {
+        id: "return_type_success_arm_changed",
+        label: "Return Type Success Arm Changed",
+        severity: Severity::Critical,
+        guidance: "This is a breaking change. Update caller expectations and client SDKs to match the new success return type.",
+    },
+    RuleDefinition {
+        id: "return_type_error_arm_changed",
+        label: "Return Type Error Arm Changed",
+        severity: Severity::Critical,
+        guidance: "This is a breaking change. Update error handling code and client SDKs to handle the new return error type.",
     },
     RuleDefinition {
         id: "spec_entry_duplicate",
