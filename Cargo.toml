@@ -30,3 +30,6 @@ colored = "2.1"
 indicatif = "0.17"
 hex = "0.4"
 ureq = { version = "2.9", features = ["json"] }
+# SHA-256 provenance hashing of analyzed WASM. Reuses `ring`, already present
+# in the dependency tree via the TLS stack, rather than adding a new hasher.
+ring = "0.17"

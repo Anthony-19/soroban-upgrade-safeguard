@@ -203,6 +203,29 @@ The report begins with an overall status line that is either passed or failed, f
 
 If the two contracts have identical exports and types, the report states that no relevant changes were detected and the run passes.
 
+### WASM fingerprint (SHA-256)
+
+Each analyzed build is fingerprinted with the SHA-256 of its exact bytes, so a report can be tied back to the precise WASM it was produced from. This is the same hash Soroban uses as the on-chain contract code hash, so in RPC mode it connects the report directly to the deployed code.
+
+In the text report, the hash appears in the per-contract loading header, kept out of the summary so it does not clutter the verdict:
+
+```
+✅ Old: ./wasm/v1.wasm (1234 bytes)
+     ├─ 3 fns, 2 structs
+     └─ sha256: 31fc0a23…18906b
+```
+
+In `--format json`, the hashes are carried as structured fields under a top-level `wasm` object, one per side, where tooling consumes them:
+
+```json
+"wasm": {
+  "old": { "source": "./wasm/v1.wasm", "sha256": "31fc0a23…18906b" },
+  "new": { "source": "./wasm/v2.wasm", "sha256": "ff031957…ae6c49" }
+}
+```
+
+The fingerprint is present in both local and RPC modes, and in batch mode each pair's result carries its own `wasm` hashes.
+
 ## Suppressing Known Breaking Changes
 
 Sometimes a breaking change is deliberate and already accounted for — a planned

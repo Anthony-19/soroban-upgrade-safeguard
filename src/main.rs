@@ -148,6 +148,10 @@ fn main() -> Result<()> {
         progress(format!("Loaded {} pair(s) for comparison.\n", pairs.len()));
 
         let mut results = std::collections::BTreeMap::new();
+        // Per-pair WASM fingerprints, keyed by contract name, so batch JSON can
+        // carry the same provenance hashes the single-contract path does.
+        let mut hashes: std::collections::BTreeMap<String, (String, String)> =
+            std::collections::BTreeMap::new();
         let mut overall_safe = true;
 
         for (i, pair) in pairs.iter().enumerate() {
@@ -187,6 +191,10 @@ fn main() -> Result<()> {
                 overall_safe = false;
             }
 
+            hashes.insert(
+                contract_name.clone(),
+                (old_wasm.sha256.clone(), new_wasm.sha256.clone()),
+            );
             results.insert(contract_name, report);
             progress("\n----------------------------------------\n".to_string());
         }
@@ -195,7 +203,19 @@ fn main() -> Result<()> {
             OutputFormat::Json => {
                 let mut results_json = serde_json::Map::new();
                 for (name, report) in &results {
-                    results_json.insert(name.clone(), serde_json::to_value(report.to_json())?);
+                    let mut value = serde_json::to_value(report.to_json())?;
+                    if let (Some(obj), Some((old_h, new_h))) =
+                        (value.as_object_mut(), hashes.get(name))
+                    {
+                        obj.insert(
+                            "wasm".to_string(),
+                            serde_json::json!({
+                                "old": { "sha256": old_h },
+                                "new": { "sha256": new_h },
+                            }),
+                        );
+                    }
+                    results_json.insert(name.clone(), value);
                 }
 
                 let batch_json = serde_json::json!({
@@ -376,10 +396,19 @@ fn main() -> Result<()> {
     match args.format {
         OutputFormat::Json => {
             // Single JSON document to stdout; no decorative text, no ANSI codes.
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&safety_report.to_json())?
-            );
+            // Attach the content fingerprint of each analyzed WASM so tooling can
+            // tie the verdict to the exact bytes it was produced from.
+            let mut value = serde_json::to_value(safety_report.to_json())?;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "wasm".to_string(),
+                    serde_json::json!({
+                        "old": { "source": old.path, "sha256": old.sha256 },
+                        "new": { "source": new.path, "sha256": new.sha256 },
+                    }),
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&value)?);
         }
         OutputFormat::Markdown => {
             println!("{}", safety_report.generate_summary_markdown());
@@ -440,7 +469,11 @@ fn compare_contracts(
         old_path,
         old_bytes.len()
     ));
-    progress(format!("     └─ {}", old_spec.summary().dimmed()));
+    progress(format!("     ├─ {}", old_spec.summary().dimmed()));
+    progress(format!(
+        "     └─ {}",
+        format!("sha256: {}", loader::sha256_hex(old_bytes)).dimmed()
+    ));
 
     let new_meta = parser::extract_metadata(new_bytes)?;
     let new_spec = spec::ContractSpec::from_entries(&new_meta.spec);
@@ -450,7 +483,11 @@ fn compare_contracts(
         new_path,
         new_bytes.len()
     ));
-    progress(format!("     └─ {}", new_spec.summary().dimmed()));
+    progress(format!("     ├─ {}", new_spec.summary().dimmed()));
+    progress(format!(
+        "     └─ {}",
+        format!("sha256: {}", loader::sha256_hex(new_bytes)).dimmed()
+    ));
 
     progress(format!(
         "\n{}",
