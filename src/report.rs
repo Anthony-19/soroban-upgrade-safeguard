@@ -359,6 +359,16 @@ pub struct SafetyReport {
     /// Human-readable summary of the new contract spec.
     /// Populated by the canonical pipeline so callers don't need to re-extract metadata.
     pub new_spec_summary: Option<String>,
+    /// Contract name extracted from the old build's `contractmetav0` metadata,
+    /// when present. `None` when the metadata is absent or contains no
+    /// recognizable name key.
+    pub old_contract_name: Option<String>,
+    /// Contract version extracted from the old build's `contractmetav0` metadata.
+    pub old_contract_version: Option<String>,
+    /// Contract name extracted from the new build's `contractmetav0` metadata.
+    pub new_contract_name: Option<String>,
+    /// Contract version extracted from the new build's `contractmetav0` metadata.
+    pub new_contract_version: Option<String>,
     /// Build size and interface-count metrics. `None` when the pipeline did not
     /// supply byte sizes (e.g. in some library callers that use `compare_wasm_bytes`
     /// without access to the original slices' lengths — though in practice the
@@ -426,6 +436,18 @@ pub struct SafetyReportJson<'a> {
     /// findings as new/persisting relative to it, and lists resolved ones.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_diff: Option<&'a crate::baseline::BaselineDiff>,
+    /// Contract name from the old build's metadata (if present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_contract_name: Option<&'a str>,
+    /// Contract version from the old build's metadata (if present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_contract_version: Option<&'a str>,
+    /// Contract name from the new build's metadata (if present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_contract_name: Option<&'a str>,
+    /// Contract version from the new build's metadata (if present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_contract_version: Option<&'a str>,
 }
 
 /// JSON representation of a suppression rule that matched no finding.
@@ -433,6 +455,19 @@ pub struct SafetyReportJson<'a> {
 pub struct UnmatchedSuppressionJson {
     pub category: String,
     pub target: Option<String>,
+}
+
+/// Format a contract identity label from optional name and version strings.
+///
+/// Used in both text and Markdown report headers to display which contract
+/// is being compared. Falls back to `<unknown>` when both are absent.
+fn contract_identity_label(name: Option<&str>, version: Option<&str>) -> String {
+    match (name, version) {
+        (Some(n), Some(v)) => format!("{} v{}", n, v),
+        (Some(n), None) => n.to_string(),
+        (None, Some(v)) => format!("v{}", v),
+        (None, None) => "<unknown>".to_string(),
+    }
 }
 
 impl SafetyReport {
@@ -614,15 +649,16 @@ impl SafetyReport {
             findings_by_category,
             strict,
             settings,
+            scope: AnalysisScope::default(),
             baseline_source: None,
             verified_code_hash: None,
             category_filter: CategoryFilter::default(),
-        }
-    }
-
-            scope: AnalysisScope::default(),
             old_spec_summary: None,
             new_spec_summary: None,
+            old_contract_name: None,
+            old_contract_version: None,
+            new_contract_name: None,
+            new_contract_version: None,
             metrics: None,
             unmatched_suppressions,
             baseline_diff: None,
@@ -631,7 +667,7 @@ impl SafetyReport {
         }
     }
 
-    /// The passing status label, widened only as far as the analysis actually
+/// The passing status label, widened only as far as the analysis actually
     /// went. Without a storage schema the claim stays bounded to the exported
     /// interface; with one it may also speak to the declared storage types.
     pub fn passed_status_label(&self) -> &'static str {
@@ -756,6 +792,10 @@ impl SafetyReport {
             unmatched_suppressions,
             tool_version: env!("CARGO_PKG_VERSION"),
             baseline_diff: self.baseline_diff.as_ref(),
+            old_contract_name: self.old_contract_name.as_deref(),
+            old_contract_version: self.old_contract_version.as_deref(),
+            new_contract_name: self.new_contract_name.as_deref(),
+            new_contract_version: self.new_contract_version.as_deref(),
         }
     }
 
@@ -821,6 +861,22 @@ impl SafetyReport {
             self.failed_status_label().red().bold()
         };
         output.push_str(&format!("Status: {}\n", status));
+        // Show contract identity when available.
+        if self.old_contract_name.is_some()
+            || self.new_contract_name.is_some()
+            || self.old_contract_version.is_some()
+            || self.new_contract_version.is_some()
+        {
+            let old_label = contract_identity_label(
+                self.old_contract_name.as_deref(),
+                self.old_contract_version.as_deref(),
+            );
+            let new_label = contract_identity_label(
+                self.new_contract_name.as_deref(),
+                self.new_contract_version.as_deref(),
+            );
+            output.push_str(&format!("Contract: {} → {}\n", old_label, new_label));
+        }
         output.push_str(&format!("Scope:  {}\n", self.scope.summary_line().dimmed()));
         let storage_status = self.scope.storage_status_line();
         let storage_status = if self.scope.storage_analyzed() {
@@ -1176,6 +1232,22 @@ impl SafetyReport {
             "❌ FAILED (Critical breaking changes detected)"
         };
         output.push_str(&format!("## Status: {}\n\n", status));
+
+        if self.old_contract_name.is_some()
+            || self.new_contract_name.is_some()
+            || self.old_contract_version.is_some()
+            || self.new_contract_version.is_some()
+        {
+            let old_label = contract_identity_label(
+                self.old_contract_name.as_deref(),
+                self.old_contract_version.as_deref(),
+            );
+            let new_label = contract_identity_label(
+                self.new_contract_name.as_deref(),
+                self.new_contract_version.as_deref(),
+            );
+            output.push_str(&format!("**Contract**: {} → {}\n\n", old_label, new_label));
+        }
 
         output.push_str("### Summary Table\n\n");
         output.push_str("| Finding Severity | Count |\n");

@@ -320,6 +320,12 @@ pub fn compare_wasm_bytes_with_options(
     let new_meta = parser::extract_metadata_with_policy(new_wasm, policy)
         .context("Failed to extract metadata from the new WASM")?;
 
+    // Extract contract identity from contractmetav0 metadata.
+    // Soroban contracts may declare name/version via the contractmeta! macro.
+    // We look for common key names; absence leaves the fields `None`.
+    let (old_name, old_version) = extract_contract_identity(old_meta.meta.as_ref());
+    let (new_name, new_version) = extract_contract_identity(new_meta.meta.as_ref());
+
     // Build specs with duplicate detection. Conflicting duplicates are wired
     // into the diff report as Critical findings so they affect the exit code
     // and appear in JSON output; identical duplicates become Info findings.
@@ -431,6 +437,10 @@ pub fn compare_wasm_bytes_with_options(
     );
     safety_report.old_spec_summary = Some(old_spec_summary);
     safety_report.new_spec_summary = Some(new_spec_summary);
+    safety_report.old_contract_name = old_name;
+    safety_report.old_contract_version = old_version;
+    safety_report.new_contract_name = new_name;
+    safety_report.new_contract_version = new_version;
     safety_report.scope = scope;
 
     // Populate build metrics so all output formats can report size and
@@ -451,6 +461,24 @@ pub fn compare_wasm_bytes_with_options(
     ));
 
     Ok(safety_report)
+}
+
+/// Try to extract a human-readable contract name and version from the
+/// `contractmetav0` section. Soroban contracts set these via the
+/// `contractmeta!` macro; common key names are checked in order.
+/// Returns `(None, None)` when neither key is present.
+fn extract_contract_identity(
+    meta: Option<&parser::ContractMeta>,
+) -> (Option<String>, Option<String>) {
+    let Some(meta) = meta else {
+        return (None, None);
+    };
+    let pairs = meta.pairs();
+    let name_keys = ["contract_name", "name", "contract"];
+    let version_keys = ["contract_version", "version"];
+    let name = name_keys.iter().find_map(|k| pairs.get(*k).cloned());
+    let version = version_keys.iter().find_map(|k| pairs.get(*k).cloned());
+    (name, version)
 }
 
 /// Compare two Soroban contract builds read from WASM files on disk.
