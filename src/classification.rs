@@ -39,13 +39,14 @@
 
 use std::collections::BTreeSet;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// How a user-defined type is classified for reporting purposes.
 ///
 /// This is metadata attached to a [`crate::diff::Finding`]; it never affects
 /// the structural category used for suppression matching.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "class", rename_all = "lowercase")]
 pub enum TypeClass {
     /// An ordinary storage or interface type.
@@ -78,7 +79,7 @@ impl TypeClass {
 /// The default classifies *everything* as [`TypeClass::Storage`]: with no
 /// configuration the tool makes no event claims at all, so a name that merely
 /// contains "event" is never treated as one.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ClassificationConfig {
     /// Exact type names to treat as events.

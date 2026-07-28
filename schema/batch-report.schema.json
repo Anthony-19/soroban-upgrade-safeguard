@@ -1,0 +1,499 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "BaselineDiff": {
+      "description": "Summary of a run compared against a baseline report, attached to [`SafetyReport::baseline_diff`] and rendered in every output format.",
+      "properties": {
+        "baseline_tool_version": {
+          "description": "The `tool_version` recorded in the baseline JSON.",
+          "type": "string"
+        },
+        "fail_on_new_only": {
+          "description": "Whether the verdict was recomputed to consider only new findings.",
+          "type": "boolean"
+        },
+        "new_count": {
+          "description": "Count of current findings not present in the baseline.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "persisting_count": {
+          "description": "Count of current findings also present in the baseline.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "resolved": {
+          "description": "Findings present in the baseline but absent from the current run.",
+          "items": {
+            "$ref": "#/definitions/ResolvedFinding"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "baseline_tool_version",
+        "fail_on_new_only",
+        "new_count",
+        "persisting_count",
+        "resolved"
+      ],
+      "type": "object"
+    },
+    "BaselineStatus": {
+      "description": "Whether a finding in the current run was already present in the baseline.",
+      "enum": [
+        "new",
+        "persisting"
+      ],
+      "type": "string"
+    },
+    "FailedPair": {
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "limit_violation": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "error",
+        "limit_violation"
+      ],
+      "type": "object"
+    },
+    "ReportedFinding": {
+      "description": "A finding as it appears in the report, augmented with suppression state.\n\nThe raw [`Finding`] from the diff layer is left untouched; suppression is a report-time concern layered on top. A suppressed finding is still listed in full — it simply does not count toward the failing set.",
+      "properties": {
+        "baseline_status": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BaselineStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whether this finding is new or persisting relative to a `--baseline` report. `None` when no baseline was supplied."
+        },
+        "category": {
+          "type": "string"
+        },
+        "classification": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TypeClass"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How the affected user-defined type was classified (event vs. ordinary storage/interface type), when this finding is about a UDT.\n\nThis is *display metadata only*. It never appears in [`Self::category`] and is never part of the suppression key, so a suppression rule keeps matching even if the classification later changes. `None` for findings not tied to a UDT (functions, parameters, environment metadata)."
+        },
+        "fingerprint": {
+          "description": "The SHA-256 fingerprint computed for this finding.",
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "remediation": {
+          "description": "Optional remediation/explanation advice for the user.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rule_id": {
+          "description": "Stable rule id for this finding.",
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/definitions/Severity"
+        },
+        "suppressed": {
+          "description": "Whether a suppression rule acknowledged this finding.",
+          "type": "boolean"
+        },
+        "suppression_author": {
+          "description": "The author copied from the matching rule, if it provided one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "suppression_expiry": {
+          "description": "The expiry copied from the matching rule, if it provided one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "suppression_fingerprint": {
+          "description": "The fingerprint copied from the matching rule, if it provided one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "suppression_reason": {
+          "description": "The justification copied from the matching rule, if it provided one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "description": "A stable, structured identifier for the exact entity this finding is about, independent of the human-readable `message`. It is the key used by the suppression config to match a finding precisely:\n\n- functions: the function name (e.g. `transfer`) - function parameters: `function.param` (e.g. `transfer.to`) - types (struct/enum removed/added, cascades): the type name (e.g. `Data`) - struct fields: `Type.field` (e.g. `Data.amount`) - enum cases: `Enum.case` (e.g. `Status.Active`)\n\n`None` for findings that are not tied to a single named entity (for example environment-metadata changes).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type_name": {
+          "description": "The name of the affected UDT (struct/enum/union), if this finding relates to a specific type.  Used by cascade-detection so it never needs to re-parse `message`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "category",
+        "fingerprint",
+        "message",
+        "rule_id",
+        "severity"
+      ],
+      "type": "object"
+    },
+    "ResolvedFinding": {
+      "description": "A finding that was present in the baseline but is absent from the current run — i.e. it appears to have been fixed.",
+      "properties": {
+        "category": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "target": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "category",
+        "message"
+      ],
+      "type": "object"
+    },
+    "SafetyReportJson": {
+      "description": "A machine-readable view of a [`SafetyReport`] for `--format json`.\n\nBorrows from the owning report. Categories are stored in a [`BTreeMap`] so the emitted JSON has a stable, diffable key order.",
+      "properties": {
+        "baseline_diff": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BaselineDiff"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Present when `--baseline` was supplied: classifies this run's findings as new/persisting relative to it, and lists resolved ones."
+        },
+        "baseline_source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "certifies": {
+          "description": "One-sentence bounded claim describing what this verdict certifies. Machine consumers should not equate `is_safe` with storage compatibility.",
+          "type": "string"
+        },
+        "counts": {
+          "$ref": "#/definitions/SeverityCounts"
+        },
+        "filtered_count": {
+          "description": "Findings hidden by category filtering.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "findings_by_category": {
+          "additionalProperties": {
+            "items": {
+              "$ref": "#/definitions/ReportedFinding"
+            },
+            "type": "array"
+          },
+          "type": "object"
+        },
+        "is_safe": {
+          "type": "boolean"
+        },
+        "recommended_bump": {
+          "enum": [
+            "major",
+            "minor",
+            "patch"
+          ],
+          "type": "string"
+        },
+        "scope": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ScopeJson"
+            }
+          ],
+          "description": "Structured coverage: which analysis dimensions actually ran."
+        },
+        "strict": {
+          "type": "boolean"
+        },
+        "suppressed_count": {
+          "description": "Findings (of any severity) acknowledged by the suppression config.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tool_version": {
+          "description": "This tool's version, so a later run can detect an incompatible baseline before comparing against this report via `--baseline`.",
+          "type": "string"
+        },
+        "total_findings": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "verified_code_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "certifies",
+        "counts",
+        "filtered_count",
+        "findings_by_category",
+        "is_safe",
+        "recommended_bump",
+        "scope",
+        "strict",
+        "suppressed_count",
+        "tool_version",
+        "total_findings"
+      ],
+      "type": "object"
+    },
+    "ScopeJson": {
+      "description": "A machine-readable view of an [`AnalysisScope`] for `--format json`.",
+      "properties": {
+        "env_metadata_analyzed": {
+          "type": "boolean"
+        },
+        "exported_interface_analyzed": {
+          "type": "boolean"
+        },
+        "new_duplicate_names": {
+          "description": "Names of duplicate entries detected in the new WASM (empty when clean).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "new_spec_section_count": {
+          "description": "Number of `contractspecv0` sections found in the new WASM.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "old_duplicate_names": {
+          "description": "Names of duplicate entries detected in the old WASM (empty when clean).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "old_spec_section_count": {
+          "description": "Number of `contractspecv0` sections found in the old WASM.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "storage_key_types": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "storage_layout_analyzed": {
+          "type": "boolean"
+        },
+        "storage_value_types": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "env_metadata_analyzed",
+        "exported_interface_analyzed",
+        "new_spec_section_count",
+        "old_spec_section_count",
+        "storage_layout_analyzed",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "Severity": {
+      "description": "Severity of a detected issue.",
+      "enum": [
+        "critical",
+        "warning",
+        "info"
+      ],
+      "type": "string"
+    },
+    "SeverityCounts": {
+      "description": "Severity counts, serialized as a nested `counts` object.",
+      "properties": {
+        "critical": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "info": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "warning": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "critical",
+        "info",
+        "warning"
+      ],
+      "type": "object"
+    },
+    "TypeClass": {
+      "description": "How a user-defined type is classified for reporting purposes.\n\nThis is metadata attached to a [`crate::diff::Finding`]; it never affects the structural category used for suppression matching.",
+      "oneOf": [
+        {
+          "description": "An ordinary storage or interface type.",
+          "properties": {
+            "class": {
+              "enum": [
+                "storage"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "class"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A type classified as an event. `heuristic` records *how* it was classified so the report can flag heuristic guesses as such.",
+          "properties": {
+            "class": {
+              "enum": [
+                "event"
+              ],
+              "type": "string"
+            },
+            "heuristic": {
+              "description": "`true` when the classification came from the opt-in name heuristic rather than an explicit `events` entry. Surfaced in the report so a reviewer can tell a guess from a declaration.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "class",
+            "heuristic"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "cross_contract_findings": {
+      "additionalProperties": {
+        "items": true,
+        "type": "array"
+      },
+      "type": "object"
+    },
+    "dependency_findings": {
+      "items": true,
+      "type": "array"
+    },
+    "failed": {
+      "additionalProperties": {
+        "$ref": "#/definitions/FailedPair"
+      },
+      "type": "object"
+    },
+    "is_safe": {
+      "type": "boolean"
+    },
+    "limit_violation": {
+      "type": "boolean"
+    },
+    "recommended_bump": {
+      "enum": [
+        "major",
+        "minor",
+        "patch"
+      ],
+      "type": "string"
+    },
+    "results": {
+      "additionalProperties": {
+        "$ref": "#/definitions/SafetyReportJson"
+      },
+      "type": "object"
+    },
+    "strict": {
+      "type": "boolean"
+    },
+    "total_pairs": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "cross_contract_findings",
+    "dependency_findings",
+    "failed",
+    "is_safe",
+    "limit_violation",
+    "recommended_bump",
+    "results",
+    "strict",
+    "total_pairs"
+  ],
+  "title": "BatchReport",
+  "type": "object"
+}

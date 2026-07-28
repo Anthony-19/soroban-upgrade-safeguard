@@ -1,0 +1,116 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/docker.yml'
+
+jobs:
+  docker:
+    name: Build, verify, and publish Docker image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=short
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: |
+            soroban-upgrade-safeguard:test
+            ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify Docker image against test fixtures
+        shell: bash
+        run: |
+          set -eo pipefail
+          echo "Running verification tests against soroban-upgrade-safeguard:test..."
+          
+          # 1. Clean pair (v1 vs v1) must pass (exit 0)
+          echo "Test 1: Clean pair (v1 vs v1)"
+          docker run --rm -v "${{ github.workspace }}/tests/wasm:/wasms" \
+            soroban-upgrade-safeguard:test /wasms/v1.wasm /wasms/v1.wasm
+          
+          # 2. Breaking pair (v1 vs v2) must fail (exit 1)
+          echo "Test 2: Breaking pair (v1 vs v2)"
+          if docker run --rm -v "${{ github.workspace }}/tests/wasm:/wasms" \
+            soroban-upgrade-safeguard:test /wasms/v1.wasm /wasms/v2.wasm; then
+            echo "ERROR: Expected breaking pair (v1 vs v2) to fail, but it passed!"
+            exit 1
+          else
+            echo "Successfully detected breaking changes (expected failure)."
+          fi
+          
+          # 3. Warning-only pair (v1 vs v3) must pass without --strict (exit 0)
+          echo "Test 3: Warning pair (v1 vs v3) without strict mode"
+          docker run --rm -v "${{ github.workspace }}/tests/wasm:/wasms" \
+            soroban-upgrade-safeguard:test /wasms/v1.wasm /wasms/v3.wasm
+            
+          # 4. Warning-only pair (v1 vs v3) must fail with --strict (exit 1)
+          echo "Test 4: Warning pair (v1 vs v3) with strict mode"
+          if docker run --rm -v "${{ github.workspace }}/tests/wasm:/wasms" \
+            soroban-upgrade-safeguard:test /wasms/v1.wasm /wasms/v3.wasm --strict; then
+            echo "ERROR: Expected strict mode on warning pair (v1 vs v3) to fail, but it passed!"
+            exit 1
+          else
+            echo "Successfully detected strict mode failure on warnings (expected failure)."
+          fi
+          
+          # 5. JSON output format check
+          echo "Test 5: JSON output format check"
+          OUTPUT=$(docker run --rm -v "${{ github.workspace }}/tests/wasm:/wasms" \
+            soroban-upgrade-safeguard:test /wasms/v1.wasm /wasms/v1.wasm --format json)
+          echo "$OUTPUT" | grep -q '"is_safe": true'
+          
+          echo "All Docker image verification checks passed!"
+
+      - name: Push Docker image to GHCR
+        if: github.event_name != 'pull_request'
+        run: |
+          for tag in $(echo "${{ steps.meta.outputs.tags }}"); do
+            if [[ -n "$tag" ]]; then
+              echo "Pushing $tag..."
+              docker push "$tag"
+            fi
+          done

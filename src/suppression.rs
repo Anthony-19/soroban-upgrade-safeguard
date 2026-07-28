@@ -38,7 +38,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::diff::Finding;
 
@@ -47,6 +47,12 @@ pub const DEFAULT_CONFIG_FILE: &str = ".safeguard.toml";
 
 /// A parsed suppression config: a flat list of reviewed acknowledgements.
 #[derive(Debug, Clone, Default, Deserialize)]
+///
+/// `deny_unknown_fields` is deliberate: this is the one config file that can
+/// turn the safety gate off, so a mistyped key (`targets`, `[[suppression]]`)
+/// must be a loud parse error rather than a silently dropped rule.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SuppressionConfig {
     /// The acknowledged findings, one `[[suppress]]` table per entry.
     #[serde(default, rename = "suppress")]
@@ -55,6 +61,39 @@ pub struct SuppressionConfig {
 
 /// A single whitelisted finding, keyed by category and (optionally) target.
 #[derive(Debug, Clone, Deserialize)]
+    /// Explicit event/storage classification (the `[classification]` table).
+    ///
+    /// Classification only affects a finding's wording, remediation, and
+    /// `classification` metadata — never the structural `category` used for
+    /// suppression matching — so changing it can never silently move a finding
+    /// out from under an existing suppression rule.
+    #[serde(default)]
+    pub classification: crate::classification::ClassificationConfig,
+    /// The `[severity]` table: per-category severity overrides.
+    ///
+    /// Carried alongside the suppression rules because it is the same file and
+    /// the same layer of policy — both decide how a described change is
+    /// *treated*, neither changes what the diff actually found. Threading it
+    /// here means every existing caller of
+    /// [`crate::report::SafetyReport::with_suppressions`] picks the overrides
+    /// up without a signature change.
+    #[serde(default, rename = "severity")]
+    pub severity_overrides: crate::severity_override::SeverityOverrides,
+    /// The `[limits]` table is parsed independently by [`crate::limits`]. We
+    /// still declare it here so `deny_unknown_fields` accepts a combined config
+    /// carrying both `[[suppress]]` rules and `[limits]`; its contents are
+    /// ignored by this parser.
+    #[serde(default)]
+    #[allow(dead_code)] // Present only so deny_unknown_fields accepts `[limits]`.
+    limits: Option<toml::Value>,
+}
+
+/// A single whitelisted finding, keyed by category and (optionally) target.
+///
+/// `deny_unknown_fields` guards against a typo (e.g. `targets` for `target`)
+/// silently changing what the rule matches.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SuppressionRule {
     /// The finding category to match exactly (e.g. `"Struct Field Type Changed"`).
     pub category: String,
@@ -71,10 +110,99 @@ impl SuppressionRule {
     /// Whether this rule matches `finding` exactly on both category and target.
     fn matches(&self, finding: &Finding) -> bool {
         self.category == finding.category && self.target.as_deref() == finding.target.as_deref()
+        self.canonical_rule_id().is_some_and(|rule_id| {
+            canonical_rule_id(stable_category(&finding.category))
+                .is_some_and(|finding_rule_id| rule_id == finding_rule_id)
+                && self.target.as_deref() == finding.target.as_deref()
+                && self.fingerprint.as_ref().map_or(true, |fp| {
+                    fp.eq_ignore_ascii_case(&compute_fingerprint(finding))
+                })
+        })
+    }
+
+    fn canonical_rule_id(&self) -> Option<&'static str> {
+        canonical_rule_id(stable_category(&self.rule_id))
     }
 }
 
 impl SuppressionConfig {
+    /// Validate the configuration for security limits, format correctness, and expiration.
+    pub fn validate(&self) -> Result<()> {
+        // Category names in [severity] are checked first: a typo there silently
+        // disables a policy the user believes is active, so it must never be
+        // reachable past load time.
+        self.severity_overrides.validate()?;
+
+        let max_allowed = self.max_suppressions.unwrap_or(10);
+        if self.rules.len() > max_allowed {
+            anyhow::bail!(
+                "Configured suppressions ({}) exceed the maximum limit of {}.",
+                self.rules.len(),
+                max_allowed
+            );
+        }
+
+        let mut targetless_count = 0;
+        for rule in &self.rules {
+            if rule.target.is_none() {
+                targetless_count += 1;
+            }
+        }
+
+        if targetless_count > 0 {
+            if !self.allow_targetless.unwrap_or(false) {
+                anyhow::bail!(
+                    "Targetless wildcard suppressions are disabled. Set 'allow_targetless = true' in config to enable."
+                );
+            }
+            if targetless_count > 3 {
+                anyhow::bail!(
+                    "Number of targetless wildcard suppressions ({}) exceeds the ceiling of 3.",
+                    targetless_count
+                );
+            }
+        }
+
+        for rule in &self.rules {
+            if let Some(expiry_str) = &rule.expiry {
+                if is_expired(expiry_str)? {
+                    anyhow::bail!(
+                        "Suppression rule for category '{}' has expired on {}.",
+                        rule.rule_id,
+                        expiry_str
+                    );
+                }
+            }
+
+            let is_new_format =
+                rule.fingerprint.is_some() || rule.author.is_some() || rule.expiry.is_some();
+            if is_new_format {
+                if rule.author.is_none() {
+                    anyhow::bail!(
+                        "Missing 'author' for suppression rule under category '{}' (target: '{:?}').",
+                        rule.rule_id,
+                        rule.target
+                    );
+                }
+                if rule.expiry.is_none() {
+                    anyhow::bail!(
+                        "Missing 'expiry' for suppression rule under category '{}' (target: '{:?}').",
+                        rule.rule_id,
+                        rule.target
+                    );
+                }
+                if rule.fingerprint.is_none() {
+                    anyhow::bail!(
+                        "Missing 'fingerprint' for suppression rule under category '{}' (target: '{:?}').",
+                        rule.rule_id,
+                        rule.target
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Parse a config from a TOML string.
     pub fn from_toml_str(contents: &str) -> Result<Self> {
         toml::from_str(contents).context("Failed to parse suppression config as TOML")
@@ -103,6 +231,15 @@ impl SuppressionConfig {
     /// Return the first rule that matches `finding`, if any.
     pub fn matching_rule(&self, finding: &Finding) -> Option<&SuppressionRule> {
         self.rules.iter().find(|rule| rule.matches(finding))
+    }
+
+    /// Return the first rule that matches `finding` together with its index, if any.
+    /// The index is used by the report layer to track which rules were used.
+    pub fn matching_rule_with_index(&self, finding: &Finding) -> Option<(usize, &SuppressionRule)> {
+        self.rules
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| rule.matches(finding))
     }
 
     /// Whether any rule matches `finding`.
@@ -210,5 +347,119 @@ mod tests {
 
         assert!(config.is_suppressed(&finding("Function Removed", Some("legacy_init"))));
         assert!(!config.is_suppressed(&finding("Function Removed", Some("transfer"))));
+    }
+
+    #[test]
+    fn test_compute_fingerprint() {
+        let f = Finding {
+            severity: Severity::Critical,
+            category: "Struct Field Removed".to_string(),
+            message: "Struct field threshold of type ConfigData was removed".to_string(),
+            type_name: Some("ConfigData".to_string()),
+            target: Some("ConfigData.threshold".to_string()),
+            classification: None,
+        };
+        let fp = compute_fingerprint(&f);
+        let expected_input = "category:Struct Field Removed\ntarget:ConfigData.threshold\nmessage:Struct field threshold of type ConfigData was removed";
+        let expected_hash = sha256(expected_input.as_bytes());
+        let expected_fp = hex::encode(expected_hash);
+        assert_eq!(fp, expected_fp);
+    }
+
+    #[test]
+    fn test_seconds_to_ymd_and_is_expired() {
+        assert_eq!(seconds_to_ymd(0), (1970, 1, 1));
+        assert_eq!(seconds_to_ymd(1709164800), (2024, 2, 29));
+
+        assert!(is_expired("1970-01-01").unwrap());
+        assert!(!is_expired("2099-12-31").unwrap());
+
+        // Exact today must not be expired
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let (y, m, d) = seconds_to_ymd(now_secs);
+        let today_str = format!("{:04}-{:02}-{:02}", y, m, d);
+        assert!(!is_expired(&today_str).unwrap());
+
+        assert!(is_expired("invalid-date").is_err());
+    }
+
+    #[test]
+    fn test_config_validation_limits() {
+        let toml_exceed = r#"
+            max_suppressions = 1
+            [[suppress]]
+            category = "CatA"
+            [[suppress]]
+            category = "CatB"
+        "#;
+        assert!(SuppressionConfig::from_toml_str(toml_exceed).is_err());
+
+        let toml_wildcard_disabled = r#"
+            [[suppress]]
+            category = "Environment"
+        "#;
+        assert!(SuppressionConfig::from_toml_str(toml_wildcard_disabled).is_err());
+
+        let toml_wildcard_exceed = r#"
+            allow_targetless = true
+            [[suppress]]
+            category = "Env1"
+            [[suppress]]
+            category = "Env2"
+            [[suppress]]
+            category = "Env3"
+            [[suppress]]
+            category = "Env4"
+        "#;
+        assert!(SuppressionConfig::from_toml_str(toml_wildcard_exceed).is_err());
+
+        let toml_missing_new_format = r#"
+            [[suppress]]
+            category = "Struct Field Removed"
+            target = "ConfigData.threshold"
+            fingerprint = "8a3f..."
+        "#;
+        assert!(SuppressionConfig::from_toml_str(toml_missing_new_format).is_err());
+    }
+
+    #[test]
+    fn test_fingerprint_matching() {
+        let f = Finding {
+            severity: Severity::Critical,
+            category: "Struct Field Removed".to_string(),
+            message: "Struct field threshold of type ConfigData was removed".to_string(),
+            type_name: Some("ConfigData".to_string()),
+            target: Some("ConfigData.threshold".to_string()),
+            classification: None,
+        };
+        let fp = compute_fingerprint(&f);
+
+        let toml_str = format!(
+            r#"
+            [[suppress]]
+            category = "Struct Field Removed"
+            target = "ConfigData.threshold"
+            author = "Alice"
+            expiry = "2099-12-31"
+            fingerprint = "{}"
+            "#,
+            fp.to_uppercase()
+        );
+        let config = SuppressionConfig::from_toml_str(&toml_str).unwrap();
+        assert!(config.is_suppressed(&f));
+
+        let toml_mismatch = r#"
+            [[suppress]]
+            category = "Struct Field Removed"
+            target = "ConfigData.threshold"
+            author = "Alice"
+            expiry = "2099-12-31"
+            fingerprint = "incorrectfingerprint"
+        "#;
+        let config_mismatch = SuppressionConfig::from_toml_str(toml_mismatch).unwrap();
+        assert!(!config_mismatch.is_suppressed(&f));
     }
 }
