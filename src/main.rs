@@ -70,6 +70,10 @@ struct Args {
     #[arg(long, value_name = "CONFIG")]
     config: Option<PathBuf>,
 
+    /// Do not load any suppression config, including the default .safeguard.toml.
+    #[arg(long, conflicts_with = "config")]
+    no_config: bool,
+
     /// Print a concise remediation explanation for each finding.
     #[arg(long)]
     explain: bool,
@@ -158,13 +162,17 @@ fn main() -> Result<()> {
         }
     };
 
-    // Load suppression config: an explicit --config must exist; otherwise fall
-    // back to `.safeguard.toml` in the working directory if it happens to be
-    // present. With neither, an empty config preserves today's behavior.
-    let suppressions = match &args.config {
-        Some(path) => SuppressionConfig::load_from_path(path)?,
-        None => {
-            SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?.unwrap_or_default()
+    // Load suppression config: --no-config means a clean run with no
+    // suppressions; otherwise an explicit --config must exist, and with neither
+    // flag we fall back to `.safeguard.toml` if present.
+    let suppressions = if args.no_config {
+        SuppressionConfig::default()
+    } else {
+        match &args.config {
+            Some(path) => SuppressionConfig::load_from_path(path)?,
+            None => {
+                SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?.unwrap_or_default()
+            }
         }
     };
 
