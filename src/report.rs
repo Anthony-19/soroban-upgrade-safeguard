@@ -37,6 +37,53 @@ pub struct SafetyReport {
     pub is_safe: bool,
     pub findings_by_category: HashMap<String, Vec<ReportedFinding>>,
     pub strict: bool,
+    pub settings: ReportSettings,
+    /// What this run actually inspected. Drives the scope reporting so a verdict
+    /// is never read as broader than the analysis that produced it.
+    pub scope: AnalysisScope,
+    /// Where the baseline (old) contract was sourced from (e.g. "RPC", "Local File").
+    pub baseline_source: Option<String>,
+    /// Verified SHA-256 hash of the baseline WASM bytecode (hex), if verified.
+    pub verified_code_hash: Option<String>,
+    /// Active category filter, if any.
+    pub category_filter: CategoryFilter,
+    /// Human-readable summary of the old contract spec (e.g. "3 fns, 2 types").
+    /// Populated by the canonical pipeline so callers don't need to re-extract metadata.
+    pub old_spec_summary: Option<String>,
+    /// Human-readable summary of the new contract spec.
+    /// Populated by the canonical pipeline so callers don't need to re-extract metadata.
+    pub new_spec_summary: Option<String>,
+    /// Contract name extracted from the old build's `contractmetav0` metadata,
+    /// when present. `None` when the metadata is absent or contains no
+    /// recognizable name key.
+    pub old_contract_name: Option<String>,
+    /// Contract version extracted from the old build's `contractmetav0` metadata.
+    pub old_contract_version: Option<String>,
+    /// Contract name extracted from the new build's `contractmetav0` metadata.
+    pub new_contract_name: Option<String>,
+    /// Contract version extracted from the new build's `contractmetav0` metadata.
+    pub new_contract_version: Option<String>,
+    /// Build size and interface-count metrics. `None` when the pipeline did not
+    /// supply byte sizes (e.g. in some library callers that use `compare_wasm_bytes`
+    /// without access to the original slices' lengths — though in practice the
+    /// canonical pipeline always populates this).
+    pub metrics: Option<BuildMetrics>,
+    /// Suppression rules from the config that matched no finding during this run.
+    /// Non-empty indicates a potential typo or a stale rule, surfaced to stderr.
+    pub unmatched_suppressions: Vec<crate::suppression::SuppressionRule>,
+    /// Set by [`crate::baseline::apply`] when a `--baseline` report was
+    /// supplied. `None` means no baseline comparison was requested.
+    pub baseline_diff: Option<crate::baseline::BaselineDiff>,
+    /// When `true`, [`Self::generate_summary_text`] appends a highlighted
+    /// two-line type diff after each type-change finding.  Set from the
+    /// `--diff-types` CLI flag.  Has no effect on JSON or Markdown output.
+    pub diff_types: bool,
+    /// Whether color is enabled for this report's text rendering.
+    ///
+    /// Mirrors the process-wide color decision made by `main` and stored here
+    /// so [`Self::generate_summary_text`] can pass the right value to
+    /// [`crate::type_diff::render_type_diff`] without accessing global state.
+    pub use_color: bool,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -61,6 +108,51 @@ pub struct SafetyReportJson<'a> {
     pub total_findings: usize,
     pub recommended_bump: &'static str,
     pub findings_by_category: BTreeMap<&'a str, &'a Vec<ReportedFinding>>,
+    /// Build size and interface-count metrics (always present in CLI output).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<&'a BuildMetrics>,
+    /// Suppression rules from the config that matched no finding.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unmatched_suppressions: Vec<UnmatchedSuppressionJson>,
+    /// This tool's version, so a later run can detect an incompatible
+    /// baseline before comparing against this report via `--baseline`.
+    pub tool_version: &'static str,
+    /// Present when `--baseline` was supplied: classifies this run's
+    /// findings as new/persisting relative to it, and lists resolved ones.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_diff: Option<&'a crate::baseline::BaselineDiff>,
+    /// Contract name from the old build's metadata (if present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_contract_name: Option<&'a str>,
+    /// Contract version from the old build's metadata (if present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_contract_version: Option<&'a str>,
+    /// Contract name from the new build's metadata (if present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_contract_name: Option<&'a str>,
+    /// Contract version from the new build's metadata (if present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_contract_version: Option<&'a str>,
+}
+
+/// JSON representation of a suppression rule that matched no finding.
+#[derive(Serialize, JsonSchema)]
+pub struct UnmatchedSuppressionJson {
+    pub category: String,
+    pub target: Option<String>,
+}
+
+/// Format a contract identity label from optional name and version strings.
+///
+/// Used in both text and Markdown report headers to display which contract
+/// is being compared. Falls back to `<unknown>` when both are absent.
+fn contract_identity_label(name: Option<&str>, version: Option<&str>) -> String {
+    match (name, version) {
+        (Some(n), Some(v)) => format!("{} v{}", n, v),
+        (Some(n), None) => n.to_string(),
+        (None, Some(v)) => format!("v{}", v),
+        (None, None) => "<unknown>".to_string(),
+    }
 }
 
 impl SafetyReport {
@@ -143,6 +235,86 @@ impl SafetyReport {
             is_safe,
             findings_by_category,
             strict,
+            settings,
+            scope: AnalysisScope::default(),
+            baseline_source: None,
+            verified_code_hash: None,
+            category_filter: CategoryFilter::default(),
+            old_spec_summary: None,
+            new_spec_summary: None,
+            old_contract_name: None,
+            old_contract_version: None,
+            new_contract_name: None,
+            new_contract_version: None,
+            metrics: None,
+            unmatched_suppressions,
+            baseline_diff: None,
+            diff_types: false,
+            use_color: false,
+        }
+    }
+
+/// The passing status label, widened only as far as the analysis actually
+    /// went. Without a storage schema the claim stays bounded to the exported
+    /// interface; with one it may also speak to the declared storage types.
+    pub fn passed_status_label(&self) -> &'static str {
+        if self.scope.storage_analyzed() {
+            "✅ PASSED (No exported-interface or declared-storage breaks)"
+        } else {
+            "✅ PASSED (No exported-interface breaking changes)"
+        }
+    }
+
+    /// The failing status label, naming the scopes a break could have come from.
+    pub fn failed_status_label(&self) -> &'static str {
+        if self.scope.storage_analyzed() {
+            "❌ FAILED (Breaking changes detected in the exported interface or declared storage)"
+        } else {
+            "❌ FAILED (Exported-interface breaking changes detected)"
+        }
+    }
+
+    /// The sentence stating that a `[severity]` override changed the verdict,
+    /// or `None` when it did not.
+    ///
+    /// A tool that can be quietly reconfigured into always passing is worse than
+    /// no tool, so this is the one line that must appear, unhedged, in every
+    /// format whenever configuration — not analysis — decided the outcome.
+    pub fn override_verdict_notice(&self) -> Option<String> {
+        if !self.verdict_changed_by_override {
+            return None;
+        }
+        Some(if self.is_safe {
+            "VERDICT CHANGED BY CONFIG: this run passes only because the [severity] table \
+             lowered one or more findings. Without those overrides it would have FAILED."
+                .to_string()
+        } else {
+            "VERDICT CHANGED BY CONFIG: this run fails only because the [severity] table \
+             raised one or more findings. Without those overrides it would have PASSED."
+                .to_string()
+        })
+    }
+
+    /// The override notice rendered for text output, empty when not applicable.
+    fn override_verdict_notice_text(&self) -> String {
+        match self.override_verdict_notice() {
+            // Red rather than dimmed: a demotion that greens a failing gate is
+            // the case this line exists to make impossible to skim past.
+            Some(notice) => format!("{}\n", format!("⚠️  {notice}").red().bold()),
+            None => String::new(),
+        }
+    }
+
+    /// The `[SEVERITY: critical → warning]` tag for a finding whose severity an
+    /// override changed, or an empty string when it was left alone.
+    fn override_tag(reported: &ReportedFinding) -> String {
+        match &reported.original_severity {
+            Some(original) => format!(
+                "[SEVERITY {} → {}] ",
+                original.label(),
+                reported.finding.severity.label()
+            ),
+            None => String::new(),
         }
     }
 
@@ -182,6 +354,14 @@ impl SafetyReport {
                 .iter()
                 .map(|(k, v)| (k.as_str(), v))
                 .collect(),
+            metrics: self.metrics.as_ref(),
+            unmatched_suppressions,
+            tool_version: env!("CARGO_PKG_VERSION"),
+            baseline_diff: self.baseline_diff.as_ref(),
+            old_contract_name: self.old_contract_name.as_deref(),
+            old_contract_version: self.old_contract_version.as_deref(),
+            new_contract_name: self.new_contract_name.as_deref(),
+            new_contract_version: self.new_contract_version.as_deref(),
         }
     }
 
@@ -214,6 +394,64 @@ impl SafetyReport {
             "❌ FAILED (Warnings detected in strict mode)".red().bold()
         } else {
             "❌ FAILED (Critical breaking changes detected)"
+            self.failed_status_label().red().bold()
+        };
+        output.push_str(&format!("Status: {}\n", status));
+        // Show contract identity when available.
+        if self.old_contract_name.is_some()
+            || self.new_contract_name.is_some()
+            || self.old_contract_version.is_some()
+            || self.new_contract_version.is_some()
+        {
+            let old_label = contract_identity_label(
+                self.old_contract_name.as_deref(),
+                self.old_contract_version.as_deref(),
+            );
+            let new_label = contract_identity_label(
+                self.new_contract_name.as_deref(),
+                self.new_contract_version.as_deref(),
+            );
+            output.push_str(&format!("Contract: {} → {}\n", old_label, new_label));
+        }
+        output.push_str(&format!("Scope:  {}\n", self.scope.summary_line().dimmed()));
+        let storage_status = self.scope.storage_status_line();
+        let storage_status = if self.scope.storage_analyzed() {
+            storage_status.dimmed()
+        } else {
+            // No schema: make the "not analyzed" gap visible rather than dim.
+            storage_status.yellow()
+        };
+        output.push_str(&format!("        {}\n", storage_status));
+
+        // Spec-section integrity summary (non-zero section count or duplicates).
+        if self.scope.old_spec_section_count > 1 || self.scope.new_spec_section_count > 1 {
+            output.push_str(
+                &format!(
+                    "        Spec sections: old={}, new={} (multi-section WASMs detected)\n",
+                    self.scope.old_spec_section_count, self.scope.new_spec_section_count,
+                )
+                .yellow()
+                .to_string(),
+            );
+        }
+        let all_dups: Vec<String> = self
+            .scope
+            .old_duplicate_names
+            .iter()
+            .map(|n| format!("old:{n}"))
+            .chain(
+                self.scope
+                    .new_duplicate_names
+                    .iter()
+                    .map(|n| format!("new:{n}")),
+            )
+            .collect();
+        if !all_dups.is_empty() {
+            output.push_str(
+                &format!(
+                    "        Duplicate entries detected: {}\n",
+                    all_dups.join(", ")
+                )
                 .red()
                 .bold()
         };
@@ -352,6 +590,22 @@ impl SafetyReport {
             "❌ FAILED (Critical breaking changes detected)"
         };
         output.push_str(&format!("## Status: {}\n\n", status));
+
+        if self.old_contract_name.is_some()
+            || self.new_contract_name.is_some()
+            || self.old_contract_version.is_some()
+            || self.new_contract_version.is_some()
+        {
+            let old_label = contract_identity_label(
+                self.old_contract_name.as_deref(),
+                self.old_contract_version.as_deref(),
+            );
+            let new_label = contract_identity_label(
+                self.new_contract_name.as_deref(),
+                self.new_contract_version.as_deref(),
+            );
+            output.push_str(&format!("**Contract**: {} → {}\n\n", old_label, new_label));
+        }
 
         output.push_str("### Summary Table\n\n");
         output.push_str("| Finding Severity | Count |\n");
