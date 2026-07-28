@@ -260,6 +260,7 @@ pub fn compare_wasm_bytes_with_options(
         new_meta.meta.as_ref(),
         &mut diff_report,
     );
+
     // Compare exported function names from the binary export sections.
     // This catches a removed export that callers depend on, and also any
     // mismatch between what the binary actually exports and what its spec claims.

@@ -1083,6 +1083,7 @@ fn main() {
         }
     }
 }
+
 /// Write `content` to a file if `output_path` is `Some`, otherwise print it
 /// to stdout. Writing to a file is atomic: the full string is rendered before
 /// any file is opened, so a failed comparison never leaves a partial file.
@@ -2303,15 +2304,6 @@ fn run() -> Result<()> {
         safety_report.apply_category_filter(&category_filter);
     }
 
-    if let Some(baseline_path) = &args.baseline {
-        soroban_upgrade_safeguard::baseline::apply(
-            &mut safety_report,
-            baseline_path,
-            args.baseline_fail_on_new,
-        )
-        .with_context(|| format!("Failed to apply baseline '{}'", baseline_path.display()))?;
-    }
-
     // Render the report to a string first so --output can write it atomically.
     let rendered = match args.format {
         OutputFormat::Json => serde_json::to_string_pretty(&safety_report.to_json())?,
@@ -2326,6 +2318,7 @@ fn run() -> Result<()> {
     };
 
     // Write the report — either to a file (--output) or to stdout.
+    emit_report_output(&rendered, args.output.as_deref(), &progress)?;
     if let Some(ref output_path) = args.output {
         std::fs::write(output_path, &rendered)
             .with_context(|| format!("Failed to write report to '{}'", output_path.display()))?;
