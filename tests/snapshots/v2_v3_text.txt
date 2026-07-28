@@ -1,0 +1,28 @@
+
+========================================
+    SOROBAN UPGRADE SAFETY REPORT
+========================================
+Status: ❌ FAILED (Critical breaking changes detected)
+Critical: 3
+Warnings: 2
+Info:     0
+Recommended Bump: major
+----------------------------------------
+
+--- [EVENT ENUM CASE REMOVED] ---
+🔴 Event enum 'StatusEvent': case 'Archived' (value: 4) was removed. On-chain data or events relying on this value will be invalid.
+
+--- [EVENT ENUM CASE VALUE CHANGED] ---
+🔴 Event enum 'StatusEvent': case 'Paused' value changed from 3 to 2. This breaks data serialization.
+
+--- [FUNCTION SIGNATURE CHANGED] ---
+🔴 Function 'initialize': parameter count changed from 2 to 1.
+
+--- [PARAMETER RENAMED] ---
+🟡 Function 'execute_action': parameter 0 renamed from '_config' to '_new_config'.
+
+--- [STRUCT FIELD ADDED] ---
+🟡 Struct 'ConfigData': new field 'threshold' appended. Existing storage entries won't have this field — ensure migration handles defaults.
+
+⚠️  ACTION REQUIRED: The new contract version modifies existing storage layouts or function interfaces.
+Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.
