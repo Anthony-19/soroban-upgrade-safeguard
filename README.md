@@ -1,27 +1,18 @@
 # Soroban Upgrade Safeguard 🛡️
 
-[![CI](https://github.com/ShippedLabs/soroban-upgrade-safeguard/actions/workflows/ci.yml/badge.svg)](https://github.com/ShippedLabs/soroban-upgrade-safeguard/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-
 ![Soroban Upgrade Safeguard Demo](assets/demo.png)
 
 A powerful CLI tool to analyze and validate Soroban smart contract upgrades on the Stellar network. It detects breaking changes in storage layout, function signatures, and event schemas before you deploy.
 
-> **What a pass means.** By default the tool analyzes the exported `contractspecv0` interface and environment metadata. A passing run certifies that the callable surface did not break. It does **not** by itself certify storage compatibility, because internal storage types and storage-key discriminants need not appear in the exported spec. To cover those, supply a [storage schema](#storage-layout-analysis). Every report states which scope it actually analyzed.
-
 ## Features
 
-- **Bounded, Honest Verdicts**: The report says exactly what was analyzed and what was not, in text, JSON, and Markdown, so a green result is never mistaken for a broader guarantee than it is.
-- **Storage Schema Analysis**: Declare your storage-key types and internal value types in a manifest, and they are diffed with the same engine and severities as exported types, catching layout breaks that are invisible in the public interface.
 - **Storage Layout Protection**: Detects field removals, reorderings, and type changes in structs and enums that would corrupt on-chain data.
 - **Function Signature Validation**: Flags changes in function names, parameters, and return types that break integration with existing clients/contracts.
-- **Rename Detection**: Matches types structurally, not just by name, so renaming a type is reported as a rename rather than a spurious delete-plus-add — and an unrelated type reusing an old name is not mistaken for it.
-- **Event Schema Analysis**: Types you declare as events in `[classification]` get indexer-focused findings and remediation. Classification is explicit, never inferred from the name, and never affects suppression keys.
+- **Event Schema Analysis**: Heuristically identifies event-related types and ensures their structure remains backwards compatible for indexers.
 - **Cascading Break Detection**: Uses dependency graphing to track how a change in a low-level type affects all parent structures.
 - **Rich CLI Output**: Beautiful, color-coded reports with actionable severity levels (Critical, Warning, Info).
 - **CI/CD Friendly**: Exits with a non-zero code if critical breaking changes are detected.
 - **Suppression Config**: Acknowledge known, intentional breaking changes (e.g. a planned migration) in a `.safeguard.toml` so they no longer fail the run — while still listing them in the report.
-- **Hardened Against Malicious Input**: The WASM and its embedded XDR are treated as untrusted. Configurable resource limits bound decode depth, decoded byte length, entry count, and type-walk depth, so a crafted contract cannot crash the gate with an out-of-memory allocation or a stack overflow.
 
 ## Installation
 
@@ -96,25 +87,21 @@ soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
 ### Suppressing known breaking changes
 
 If a breaking change is deliberate and already accounted for, list it in a
-`.safeguard.toml` so it no longer fails the run. Matching is exact (by the
-stable `rule_id` and `target`), and suppressed findings are still shown in the
-report, marked `[SUPPRESSED]`:
+`.safeguard.toml` so it no longer fails the run. Matching is exact (by
+`category` and `target`), and suppressed findings are still shown in the report,
+marked `[SUPPRESSED]`:
 
 ```toml
-max_suppressions = 10
-allow_targetless = false
-
 [[suppress]]
-rule_id = "struct_field_removed"
-target  = "ConfigData.threshold"
-reason  = "Planned storage migration in v2."
+category = "Struct Field Removed"
+target   = "ConfigData.threshold"
+reason   = "Planned storage migration in v2."
 ```
 
-Existing configs that still use `category = "..."` continue to work through a
-compatibility mapping, but `rule_id` is the stable key going forward. The tool
-auto-loads `.safeguard.toml` from the current directory, or use `--config <PATH>`
-to point at another file. See [`.safeguard.example.toml`](.safeguard.example.toml)
-for a documented template and the [documentation](docs/documentation.md#suppressing-known-breaking-changes)
+The tool auto-loads `.safeguard.toml` from the current directory, or use
+`--config <PATH>` to point at another file. See
+[`.safeguard.example.toml`](.safeguard.example.toml) for a documented template
+and the [documentation](docs/documentation.md#suppressing-known-breaking-changes)
 for the full `target` convention.
 
 ## Limitations
@@ -361,6 +348,9 @@ jobs:
     format: json
 ```
 
+## How it Works
+
+The tool parses the `contractspecv0` custom sections from both WASM files, decodes the XDR representations of the contract's interface, and performs a deep structural comparison. It builds a type dependency map to identify when a simple change in a shared struct might cascade into breaking multiple storage entries.
 ### Storage layout analysis
 
 The exported spec describes a contract's callable surface, not what it writes to storage. A contract can keep its public interface byte-identical while reordering the fields of an internal struct or shifting a storage-key discriminant, which corrupts every existing entry on upgrade.
@@ -481,7 +471,7 @@ The tool parses the `contractspecv0` and `contractenvmetav0` custom sections fro
 
 More detailed guides live in the [docs](docs/) folder:
 
-- [Documentation](docs/documentation.md): full explanation of how the analysis pipeline works, [what a passing verdict guarantees](docs/documentation.md#what-a-passing-verdict-guarantees), the [storage-schema format](docs/documentation.md#storage-schema-analysis), every detection category, severity levels, cascading layout breaks, CI integration, and a [migration note](docs/documentation.md#migration-note) for the verdict wording change.
+- [Documentation](docs/documentation.md): full explanation of how the analysis pipeline works, every detection category, severity levels, cascading layout breaks, and CI integration.
 - [Contributing](docs/contributing.md): development setup, project structure, testing, and how to add new detection rules.
 
 ## License

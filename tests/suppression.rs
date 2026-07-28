@@ -3,19 +3,11 @@
 //! These drive the compiled binary with `--config` against the checked-in
 //! `v1 -> v2` fixtures, which produce three Critical findings:
 //!
-//! - `Enum Case Value Changed`    on `StatusEvent.Paused`
-//! - `Function Signature Changed` on `initialize`
-//! - `Struct Field Removed`       on `ConfigData.threshold`
+//! - `Event Enum Case Value Changed` on `StatusEvent.Paused`
+//! - `Function Signature Changed`     on `initialize`
+//! - `Struct Field Removed`           on `ConfigData.threshold`
 //!
 //! and assert that suppressions flip the failing set without hiding findings.
-//!
-//! Note the category for `StatusEvent.Paused` is the structural
-//! `Enum Case Value Changed`, not an event-specific key. Categories (and thus
-//! suppression keys) are purely structural; whether a type reads as an "event"
-//! is separate classification metadata that never changes the category. So even
-//! though `StatusEvent` contains the substring "event", with the default
-//! classification (no `[classification]` table, name heuristic off) it is a
-//! plain storage type and its suppression key is the structural one.
 
 use serde_json::Value;
 use soroban_upgrade_safeguard::suppression::SuppressionConfig;
@@ -38,31 +30,22 @@ fn write_config(name: &str, contents: &str) -> PathBuf {
     path
 }
 
-/// Run the binary, optionally with a config.
-/// Returns (stdout, stderr, exit code).
-fn run_raw(config: Option<&PathBuf>, format_json: bool) -> (String, String, i32) {
+/// Run the binary in JSON mode comparing `v1 -> v2`, optionally with a config.
+/// Returns (parsed JSON, exit code).
+fn run(config: Option<&PathBuf>) -> (Value, i32) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"));
-    cmd.arg(wasm("v1.wasm")).arg(wasm("v2.wasm"));
-    if format_json {
-        cmd.args(["--format", "json"]);
-    }
+    cmd.arg(wasm("v1.wasm"))
+        .arg(wasm("v2.wasm"))
+        .args(["--format", "json"]);
     if let Some(path) = config {
         cmd.args(["--config".as_ref(), path.as_os_str()]);
     }
 
     let output = cmd.output().expect("failed to run binary");
     let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
-    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
-    let code = output.status.code().expect("process terminated by signal");
-    (stdout, stderr, code)
-}
-
-/// Run the binary in JSON mode comparing `v1 -> v2`, optionally with a config.
-/// Returns (parsed JSON, exit code).
-fn run(config: Option<&PathBuf>) -> (Value, i32) {
-    let (stdout, _, code) = run_raw(config, true);
     let json: Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("stdout was not valid JSON: {e}\n---stdout---\n{stdout}"));
+    let code = output.status.code().expect("process terminated by signal");
     (json, code)
 }
 
@@ -141,7 +124,7 @@ fn suppressing_all_criticals_passes_but_still_lists_them() {
         "all",
         r#"
         [[suppress]]
-        category = "Enum Case Value Changed"
+        category = "Event Enum Case Value Changed"
         target   = "StatusEvent.Paused"
         reason   = "Reviewed: indexers already updated."
 
@@ -207,7 +190,7 @@ fn partial_suppression_still_fails_on_remaining_critical() {
         "partial",
         r#"
         [[suppress]]
-        category = "Enum Case Value Changed"
+        category = "Event Enum Case Value Changed"
         target   = "StatusEvent.Paused"
 
         [[suppress]]

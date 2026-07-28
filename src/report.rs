@@ -196,29 +196,16 @@ impl AnalysisScope {
 /// full — it simply does not count toward the failing set.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ReportedFinding {
-    /// Stable rule id for this finding.
-    pub rule_id: String,
     /// The underlying finding, flattened so JSON keeps its original shape
     /// (`severity`, `category`, `message`, `type_name`, `target`).
     #[serde(flatten)]
     pub finding: Finding,
-    /// The SHA-256 fingerprint computed for this finding.
-    pub fingerprint: String,
     /// Whether a suppression rule acknowledged this finding.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suppressed: bool,
     /// The justification copied from the matching rule, if it provided one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suppression_reason: Option<String>,
-    /// The author copied from the matching rule, if it provided one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub suppression_author: Option<String>,
-    /// The expiry copied from the matching rule, if it provided one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub suppression_expiry: Option<String>,
-    /// The fingerprint copied from the matching rule, if it provided one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub suppression_fingerprint: Option<String>,
     /// Optional remediation/explanation advice for the user.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remediation: Option<String>,
@@ -411,11 +398,6 @@ pub struct SeverityCounts {
 pub struct SafetyReportJson<'a> {
     pub is_safe: bool,
     pub strict: bool,
-    /// One-sentence bounded claim describing what this verdict certifies.
-    /// Machine consumers should not equate `is_safe` with storage compatibility.
-    pub certifies: String,
-    /// Structured coverage: which analysis dimensions actually ran.
-    pub scope: ScopeJson,
     pub counts: SeverityCounts,
     /// Findings (of any severity) acknowledged by the suppression config.
     pub suppressed_count: usize,
@@ -430,8 +412,6 @@ pub struct SafetyReportJson<'a> {
     pub verdict_changed_by_override: bool,
     pub total_findings: usize,
     pub recommended_bump: &'static str,
-    pub baseline_source: Option<&'a str>,
-    pub verified_code_hash: Option<&'a str>,
     pub findings_by_category: BTreeMap<&'a str, &'a Vec<ReportedFinding>>,
     /// Build size and interface-count metrics (always present in CLI output).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -485,7 +465,6 @@ impl SafetyReport {
         let mut warning_count = 0;
         let mut info_count = 0;
         let mut suppressed_count = 0;
-        let mut suppressed_critical_count = 0;
         let mut failing_critical_count = 0;
         let mut failing_warning_count = 0;
         // The same failing tallies computed from the engine's own severities,
@@ -547,6 +526,8 @@ impl SafetyReport {
                 matched_rule_indices.insert(idx);
             }
 
+            let remediation = if explain {
+                get_remediation_guidance(&finding.category).map(String::from)
             let rule_ref = rule.map(|(_, r)| r);
 
             let rule_id = canonical_rule_id(&finding.category)
@@ -568,6 +549,9 @@ impl SafetyReport {
                 .entry(finding.category.clone())
                 .or_default()
                 .push(ReportedFinding {
+                    finding: finding.clone(),
+                    suppressed,
+                    suppression_reason: rule.and_then(|r| r.reason.clone()),
                     rule_id,
                     finding: effective_finding,
                     fingerprint,
@@ -633,6 +617,9 @@ impl SafetyReport {
             baseline_source: None,
             verified_code_hash: None,
             category_filter: CategoryFilter::default(),
+        }
+    }
+
             scope: AnalysisScope::default(),
             old_spec_summary: None,
             new_spec_summary: None,
@@ -749,8 +736,6 @@ impl SafetyReport {
         SafetyReportJson {
             is_safe: self.is_safe,
             strict: self.strict,
-            certifies: self.scope.summary_line(),
-            scope: self.scope.to_json(),
             counts: SeverityCounts {
                 critical: self.critical_count,
                 warning: self.warning_count,
@@ -762,8 +747,6 @@ impl SafetyReport {
             verdict_changed_by_override: self.verdict_changed_by_override,
             total_findings: self.total_findings,
             recommended_bump: self.recommended_bump(),
-            baseline_source: self.baseline_source.as_deref(),
-            verified_code_hash: self.verified_code_hash.as_deref(),
             findings_by_category: self
                 .findings_by_category
                 .iter()
@@ -830,10 +813,11 @@ impl SafetyReport {
         );
 
         let status = if self.is_safe {
-            self.passed_status_label().green().bold()
+            "✅ PASSED (No breaking changes detected)".green().bold()
         } else if self.strict && self.critical_count == 0 {
             "❌ FAILED (Warnings detected in strict mode)".red().bold()
         } else {
+            "❌ FAILED (Critical breaking changes detected)"
             self.failed_status_label().red().bold()
         };
         output.push_str(&format!("Status: {}\n", status));
@@ -878,9 +862,8 @@ impl SafetyReport {
                 )
                 .red()
                 .bold()
-                .to_string(),
-            );
-        }
+        };
+        output.push_str(&format!("Status: {}\n", status));
 
         let crit_str = if self.critical_count > 0 {
             self.critical_count.to_string().red().bold()
@@ -965,6 +948,7 @@ impl SafetyReport {
         );
 
         if self.total_findings == 0 {
+            output.push_str(&"No relevant changes detected. The upgrade is identical in its exports and types.\n".green().to_string());
             output.push_str(&"No relevant changes detected. The exported interface is identical in its exports and types.\n".green().to_string());
             output.push_str(&format!("\n{}\n", STORAGE_NOT_VERIFIED_NOTE.dimmed()));
             self.append_metrics_text(&mut output);
@@ -1184,45 +1168,14 @@ impl SafetyReport {
         }
 
         let status = if self.is_safe {
+            "✅ PASSED (No breaking changes detected)"
             self.passed_status_label()
         } else if self.strict && self.critical_count == 0 {
             "❌ FAILED (Warnings detected in strict mode)"
         } else {
-            self.failed_status_label()
+            "❌ FAILED (Critical breaking changes detected)"
         };
         output.push_str(&format!("## Status: {}\n\n", status));
-        output.push_str(&format!("_{}_\n\n", self.scope.summary_line()));
-        output.push_str(&format!(
-            "**Scope:** {}\n\n",
-            self.scope.storage_status_line()
-        ));
-
-        // Spec-section integrity (multi-section or duplicates).
-        if self.scope.old_spec_section_count > 1 || self.scope.new_spec_section_count > 1 {
-            output.push_str(&format!(
-                "> ⚠️ Multi-section WASM detected: old has {} contractspecv0 section(s), new has {}.\n\n",
-                self.scope.old_spec_section_count,
-                self.scope.new_spec_section_count,
-            ));
-        }
-        let all_dups: Vec<String> = self
-            .scope
-            .old_duplicate_names
-            .iter()
-            .map(|n| format!("`old:{n}`"))
-            .chain(
-                self.scope
-                    .new_duplicate_names
-                    .iter()
-                    .map(|n| format!("`new:{n}`")),
-            )
-            .collect();
-        if !all_dups.is_empty() {
-            output.push_str(&format!(
-                "> ❌ Duplicate spec entries detected: {}\n\n",
-                all_dups.join(", ")
-            ));
-        }
 
         output.push_str("### Summary Table\n\n");
         output.push_str("| Finding Severity | Count |\n");
@@ -1250,6 +1203,10 @@ impl SafetyReport {
             "\n**Recommended SemVer Bump**: `{}`\n\n",
             self.recommended_bump()
         ));
+        output.push_str("---\n\n");
+
+        if self.total_findings == 0 {
+            output.push_str("No relevant changes detected. The upgrade is identical in its exports and types.\n");
 
         if let Some(source) = &self.baseline_source {
             output.push_str(&format!("**Baseline Source**: `{}`\n\n", source));
@@ -2379,10 +2336,53 @@ impl CategoryFilter {
     }
 }
 
-/// Returns remediation/explanation guidance for a given stable rule id.
-pub fn get_remediation_guidance(rule_id: &str) -> Option<&'static str> {
-    guidance_for_rule_id(rule_id)
-        .or_else(|| canonical_rule_id(rule_id).and_then(guidance_for_rule_id))
+/// Returns remediation/explanation guidance for a given finding category.
+pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
+    match category {
+        "Environment" => Some("Verify that the target network supports the new protocol version and adjust any SDK/tooling dependencies accordingly."),
+        "Function Removed" => Some("This is a breaking change. If the function is no longer needed, deprecate it in client integrations. Otherwise, restore the function signature."),
+        "Function Documentation Changed" => Some("No code changes required. Ensure client/consumer integrations are aware of the updated documentation/behavior."),
+        "Function Added" => Some("No action required. Inform client integrations about the availability of the new function."),
+        "Function Signature Changed" => Some("This is a breaking change. Update call sites, SDKs, and tests to match the new parameter structure."),
+        "Parameter Renamed" => Some("This is a breaking change for named-argument RPC systems. Update all client integrations to use the new parameter name."),
+        "Parameter Reordered" => Some("This is a breaking change. Reordering parameters breaks positional RPC invocation. Restore the original parameter order."),
+        "Parameter Type Changed" => Some("This is a breaking change. Update caller arguments and client SDKs to match the new parameter type."),
+        "Return Type Changed" => Some("This is a breaking change. Update caller expectations and client SDKs to match the new return type."),
+        "Event Definition Removed" => Some("This is a breaking change. Update or remove downstream event indexing or monitoring systems that consume this event."),
+        "Struct Removed" => Some("This is a breaking change. Ensure no stored data or active interfaces reference this struct. If they do, restore the struct."),
+        "Struct Documentation Changed" => Some("No code changes required. Ensure documentation changes are aligned with the struct's intended usage."),
+        "Struct Added" => Some("No action required. New structs can be safely integrated into storage layouts or interface parameters."),
+        "Struct Field Removed" => Some("This is a breaking change. Removing fields breaks serialized storage layouts. Restore the field or perform a state migration."),
+        "Event Field Removed" => Some("This is a breaking change. Update event indexers and consumers that expect this field to be present."),
+        "Struct Field Reordered" => Some("This is a breaking change. Reordering fields breaks positional serialization layouts. Restore the original field order."),
+        "Event Field Reordered" => Some("This is a breaking change. Update event indexers and consumers to handle the new positional field order."),
+        "Struct Field Type Changed" => Some("This is a breaking change. Changing field types breaks layout serialization. Revert the type change or migrate existing data."),
+        "Event Field Type Changed" => Some("This is a breaking change. Update event indexers and consumers to handle the new field type."),
+        "Struct Field Added" => Some("Warning: Ensure existing storage entries are migrated or initialized with correct default values for the new field."),
+        "Event Enum Removed" => Some("This is a breaking change. Downstream event consumers or indexers relying on this enum will fail. Restore the enum."),
+        "Enum Removed" => Some("This is a breaking change. Stored data or parameters using this enum will be invalid. Restore the enum."),
+        "Enum Documentation Changed" => Some("No code changes required. Ensure the updated docs are clear for consumers."),
+        "Enum Added" => Some("No action required. Ensure consumers are aware of the new enum type if needed."),
+        "Enum Case Removed" => Some("This is a breaking change. On-chain data or parameters using this case will be invalid. Restore the case."),
+        "Event Enum Case Removed" => Some("This is a breaking change. Downstream event indexers or consumers relying on this case will fail. Restore the case."),
+        "Enum Case Value Changed" => Some("This is a breaking change. Modifying case values breaks serialization/deserialization. Revert the value change."),
+        "Event Enum Case Value Changed" => Some("This is a breaking change. Downstream event indexers or consumers relying on these values will fail. Revert the value change."),
+        "Enum Case Added" => Some("No action required. Ensure consumers can handle the new case gracefully."),
+        "Event Enum Case Added" => Some("No action required. Update event indexers and consumers to handle the new event enum case if necessary."),
+        "Union Removed" => Some("This is a breaking change. Stored data or parameters using this union will be invalid. Restore the union."),
+        "Union Added" => Some("No action required. Ensure consumers are aware of the new union type if needed."),
+        "Union Case Removed" => Some("This is a breaking change. On-chain data using this union case will be invalid. Restore the case."),
+        "Union Case Reordered" => Some("This is a breaking change. Reordering union cases breaks positional discriminant serialization. Restore the original case order."),
+        "Union Case Type Changed" => Some("This is a breaking change. Changing union case payload types breaks layout serialization. Revert the type change or migrate existing data."),
+        "Union Case Added" => Some("No action required. Ensure consumers can handle the new union case gracefully."),
+        "Error Enum Removed" => Some("This is a breaking change. Clients matching on these error codes will break. Restore the error enum."),
+        "Error Enum Added" => Some("No action required. Inform client integrations about the new error enum if needed."),
+        "Error Enum Case Removed" => Some("This is a breaking change. Clients matching on this error code will break. Restore the case."),
+        "Error Enum Case Value Changed" => Some("This is a breaking change. Modifying error case values breaks error-code compatibility. Revert the value change."),
+        "Error Enum Case Added" => Some("No action required. Ensure clients can handle the new error case gracefully."),
+        "Cascading Layout Break" => Some("This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type."),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2425,11 +2425,8 @@ mod tests {
         }
     }
 
-    /// The inventory is only trustworthy if it actually covers what `diff.rs`
-    /// emits, so scan the source for category literals and require each one to
-    /// be listed. This catches a new category added without guidance.
     #[test]
-    fn every_emitted_category_is_in_the_inventory() {
+    fn test_every_emitted_category_has_guidance() {
         let diff_rs_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("diff.rs");
@@ -2442,15 +2439,6 @@ mod tests {
                 // If it is ENVIRONMENT_CATEGORY
                 if line.contains("ENVIRONMENT_CATEGORY") {
                     checked_categories.insert("Environment".to_string());
-                    continue;
-                }
-                // Constant-referenced duplicate/conflict categories
-                if line.contains("SPEC_CONFLICT_CATEGORY") {
-                    checked_categories.insert("Spec Entry Conflict".to_string());
-                    continue;
-                }
-                if line.contains("SPEC_DUPLICATE_CATEGORY") {
-                    checked_categories.insert("Spec Entry Duplicate".to_string());
                     continue;
                 }
 
@@ -2466,6 +2454,36 @@ mod tests {
                             }
                             literal.push(chars.next().unwrap());
                         }
+                        if !literal.is_empty() {
+                            // If it's a format string like "{} Removed"
+                            if literal.contains("{}") {
+                                let suffixes = vec![
+                                    "Removed",
+                                    "Reordered",
+                                    "Type Changed",
+                                    "Value Changed",
+                                    "Added",
+                                ];
+                                for suffix in suffixes {
+                                    if literal == format!("{{}} {}", suffix) {
+                                        let prefixes = match suffix {
+                                            "Reordered" | "Type Changed" => {
+                                                vec!["Struct Field", "Event Field"]
+                                            }
+                                            "Value Changed" | "Added" => {
+                                                vec!["Enum Case", "Event Enum Case"]
+                                            }
+                                            "Removed" => vec![
+                                                "Struct Field",
+                                                "Event Field",
+                                                "Enum Case",
+                                                "Event Enum Case",
+                                            ],
+                                            _ => unreachable!(),
+                                        };
+                                        for prefix in prefixes {
+                                            checked_categories
+                                                .insert(format!("{} {}", prefix, suffix));
                         if literal.is_empty() {
                             continue;
                         }
@@ -2531,11 +2549,25 @@ mod tests {
             }
         }
 
+        // Remove test custom categories
+        checked_categories.remove("TOTALLY CUSTOM CATEGORY");
+
         assert!(
+            !checked_categories.is_empty(),
+            "Sanity check: should have found categories"
             checked_categories.len() > 20,
             "sanity check: expected to find most categories in the source, found {}",
             checked_categories.len()
         );
+
+        for cat in &checked_categories {
+            let guidance = get_remediation_guidance(cat);
+            assert!(
+                guidance.is_some(),
+                "Category '{}' does not have remediation guidance!",
+                cat
+            );
+        }
     }
 
     #[test]

@@ -18,26 +18,16 @@
 #   - enum cases ........... "Enum.case"              e.g. "StatusEvent.Paused"
 #
 # Omit `target` to match only findings that have no target (e.g. "Environment").
-#
-# `category` is always STRUCTURAL — "Enum Case Value Changed", never
-# "Event Enum Case Value Changed". Whether a type is an event is reported
-# separately (see [classification] below) and never affects the suppression
-# key, so reclassifying a type cannot silently change what a rule matches.
-# Pre-1.0 event-flavored category names still work and are mapped onto their
-# structural equivalents.
-
-max_suppressions = 10
-allow_targetless = false
 
 [[suppress]]
-category    = "Struct Field Removed"
-target      = "ConfigData.threshold"
-author      = "Alice <alice@example.com>"
-reason      = "Planned storage migration in v2 drops the unused threshold field."
-expiry      = "2026-12-31"
-fingerprint = "8a3f..."
+category = "Struct Field Removed"
+target   = "ConfigData.threshold"
+reason   = "Planned storage migration in v2 drops the unused threshold field."
 
 [[suppress]]
+category = "Function Signature Changed"
+target   = "initialize"
+reason   = "Re-init is intentional and gated behind the migration admin call."
 category    = "Function Signature Changed"
 target      = "initialize"
 author      = "Bob <bob@example.com>"
