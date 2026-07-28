@@ -10,12 +10,12 @@ use soroban_upgrade_safeguard::{
         cycle_findings, missing_contract_findings, ContractDependency, CrossContractFinding,
         DependencyGraph,
     },
+    diff,
     limits::{find_limit_error, LimitsConfig, ResourcePolicy},
-    loader, report,
-    report::{validate_categories, CategoryFilter},
+    loader, parser,
+    report::{self, validate_categories, CategoryFilter},
+    spec,
     storage_schema::StorageSchema,
-    color::should_disable_color,
-    diff, loader, parser, report, spec,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
 
@@ -82,6 +82,10 @@ struct Args {
     #[arg(long)]
     no_color: bool,
 
+    /// Suppress decorative and progress output; the report and exit code are unchanged.
+    #[arg(long)]
+    quiet: bool,
+
     /// Control when ANSI color is used. --no-color overrides this option.
     #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
     color: ColorMode,
@@ -140,9 +144,13 @@ fn main() -> Result<()> {
 
     // In JSON or Markdown mode, decorative progress goes to stderr so stdout
     // stays a single, pristine document. In text mode it stays on stdout
-    // exactly as before.
+    // exactly as before. --quiet suppresses progress in every format.
     let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
     let progress = |line: String| {
+        if args.quiet {
+            return;
+        }
+
         if clean_stdout {
             eprintln!("{line}");
         } else {

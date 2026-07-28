@@ -1,30 +1,27 @@
-Add a --color flag with auto, always, and never so color can be forced when piping
+Add a --quiet flag to suppress decorative and progress output
 Repo Avatar
 ShippedLabs/soroban-upgrade-safeguard
 Description
-Color control today is binary. should_disable_color in src/lib.rs turns color
-off when --no-color is passed, when NO_COLOR is set, or when stdout is not a
-terminal.
+There is no way to silence the decorative output. Every run prints the banner, the
+loading lines, the per-spec summaries, and in batch mode the per-pair progress,
+through the progress closure in src/main.rs.
 
-That last rule means there is no way to keep color when the output is piped or
-redirected. A user capturing a text report into a file for later viewing, or
-feeding it to a pager or a CI log viewer that renders ANSI, cannot get colored
-output at all, because the not-a-terminal check overrides everything.
+For scripting and for CI logs that only care about the verdict and the findings,
+that is noise. In text mode it is mixed into stdout with the report itself, so it
+cannot even be filtered out by discarding stderr.
 
 Suggested approach
-Add a --color flag with auto, always, and never, following the
-convention used by common CLI tools. auto preserves today's behaviour including
-the NO_COLOR and terminal checks, always forces color even when piped, and
-never disables it. Decide how --color and the existing --no-color interact,
-keeping --no-color working so nothing breaks, and reflect the resolution in
-should_disable_color, which is already the unit-tested seam for this decision.
+Add a --quiet flag that suppresses the decorative and progress output while still
+emitting the report and preserving the exit code. In text mode the report itself
+must still reach stdout; only the progress and banner lines are suppressed. Make
+sure it composes sensibly with the JSON and Markdown formats, which already route
+progress to stderr, so --quiet there simply silences that stderr chatter.
 
 Acceptance criteria
- --color always produces colored output even when stdout is not a terminal.
- --color never disables color, and --color auto matches today's default
-behaviour including NO_COLOR.
- The interaction between --color and --no-color is defined and documented.
- The resolution logic is covered by tests through should_disable_color.
+ --quiet suppresses the banner and progress lines in all formats.
+ The report and the exit code are unchanged by the flag.
+ In text mode the report still reaches stdout with the decoration removed.
+ The flag is documented and covered by a test.
 Getting started
 Fork this repository, clone your fork, and add this repo as upstream:
 
@@ -33,10 +30,12 @@ cd soroban-upgrade-safeguard
 git remote add upstream https://github.com/ShippedLabs/soroban-upgrade-safeguard.git
 Create a branch for this issue:
 
-git checkout -b feat/tri-state-color-flag
+git checkout -b feat/quiet-flag
 Suggested commit message:
 
-feat: add a tri-state --color flag
+feat: add a --quiet flag
 Run cargo fmt --check, cargo clippy, and cargo test before pushing, then
 open a pull request from your fork against main and link this issue. See
 docs/contributing.md for the full contribution guide.
+
+
