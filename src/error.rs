@@ -155,8 +155,12 @@ impl Error {
     pub fn file_path(&self) -> Option<&std::path::Path> {
         match self {
             Error::FileAccess { path, .. } => Some(path),
-            Error::WasmValidation { path: Some(path), .. } => Some(path),
-            Error::SuppressionConfig { path: Some(path), .. } => Some(path),
+            Error::WasmValidation {
+                path: Some(path), ..
+            } => Some(path),
+            Error::SuppressionConfig {
+                path: Some(path), ..
+            } => Some(path),
             _ => None,
         }
     }
@@ -168,9 +172,17 @@ impl fmt::Display for Error {
             Error::FileAccess { path, details, .. } => {
                 write!(f, "File access error for '{}': {}", path.display(), details)
             }
-            Error::WasmValidation { path, details, byte_offset, .. } => {
+            Error::WasmValidation {
+                path,
+                details,
+                byte_offset,
+                ..
+            } => {
                 if let Some(offset) = byte_offset {
-                    write!(f, "WASM validation error at byte offset {offset}: {details}")
+                    write!(
+                        f,
+                        "WASM validation error at byte offset {offset}: {details}"
+                    )
                 } else {
                     write!(f, "WASM validation error: {details}")
                 }?;
@@ -179,26 +191,42 @@ impl fmt::Display for Error {
                 }
                 Ok(())
             }
-            Error::SectionExtraction { section_name, section_index, byte_offset, details, .. } => {
+            Error::SectionExtraction {
+                section_name,
+                section_index,
+                byte_offset,
+                ..
+            } => {
                 write!(
                     f,
-                    "Failed to decode section '{section_name}' [{section_index}] at byte offset {byte_offset}: {details}"
+                    "Failed to decode {section_name} section {section_index} at byte offset {byte_offset}"
                 )
             }
-            Error::XdrDecoding { entry_index, byte_offset, details, .. } => {
-                write!(f, "XDR decoding error")?;
+            Error::XdrDecoding {
+                entry_index,
+                byte_offset,
+                details,
+                ..
+            } => {
+                write!(f, "{details}")?;
                 if let Some(idx) = entry_index {
                     write!(f, " at entry index {idx}")?;
                 }
                 if let Some(offset) = byte_offset {
                     write!(f, " (byte offset {offset})")?;
                 }
-                write!(f, ": {details}")
+                Ok(())
             }
-            Error::RpcTransport { rpc_url, details, .. } => {
+            Error::RpcTransport {
+                rpc_url, details, ..
+            } => {
                 write!(f, "RPC transport error for '{rpc_url}': {details}")
             }
-            Error::RpcProtocol { rpc_url, code, message } => {
+            Error::RpcProtocol {
+                rpc_url,
+                code,
+                message,
+            } => {
                 write!(f, "RPC error (code {code}) from '{rpc_url}': {message}")
             }
             Error::UnsupportedContract { contract_id, kind } => {
@@ -206,7 +234,11 @@ impl fmt::Display for Error {
             }
             Error::SuppressionConfig { path, details, .. } => {
                 if let Some(path) = path {
-                    write!(f, "Suppression config error for '{}': {details}", path.display())
+                    write!(
+                        f,
+                        "Suppression config error for '{}': {details}",
+                        path.display()
+                    )
                 } else {
                     write!(f, "Suppression config error: {details}")
                 }
@@ -230,18 +262,36 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::FileAccess { source, .. } => source.as_ref().map(|s| s.as_ref() as &dyn std::error::Error),
-            Error::WasmValidation { source, .. } => source.as_ref().map(|s| s.as_ref() as &dyn std::error::Error),
-            Error::SectionExtraction { source, .. } => source.as_ref().map(|s| s.as_ref() as &dyn std::error::Error),
-            Error::XdrDecoding { source, .. } => source.as_ref().map(|s| s.as_ref() as &dyn std::error::Error),
-            Error::RpcTransport { source, .. } => source.as_ref().map(|s| s.as_ref() as &dyn std::error::Error),
+            Error::FileAccess { source, .. } => source
+                .as_ref()
+                .map(|s| s.as_ref() as &dyn std::error::Error),
+            Error::WasmValidation { source, .. } => source
+                .as_ref()
+                .map(|s| s.as_ref() as &dyn std::error::Error),
+            Error::SectionExtraction { source, .. } => source
+                .as_ref()
+                .map(|s| s.as_ref() as &dyn std::error::Error),
+            Error::XdrDecoding { source, .. } => source
+                .as_ref()
+                .map(|s| s.as_ref() as &dyn std::error::Error),
+            Error::RpcTransport { source, .. } => source
+                .as_ref()
+                .map(|s| s.as_ref() as &dyn std::error::Error),
             Error::RpcProtocol { .. } => None,
             Error::UnsupportedContract { .. } => None,
-            Error::SuppressionConfig { source, .. } => source.as_ref().map(|s| s.as_ref() as &dyn std::error::Error),
-            Error::BatchBoundary { source, .. } => source.as_ref().map(|s| s.as_ref() as &dyn std::error::Error),
-            Error::Integrity { source, .. } => source.as_ref().map(|s| s.as_ref() as &dyn std::error::Error),
+            Error::SuppressionConfig { source, .. } => source
+                .as_ref()
+                .map(|s| s.as_ref() as &dyn std::error::Error),
+            Error::BatchBoundary { source, .. } => source
+                .as_ref()
+                .map(|s| s.as_ref() as &dyn std::error::Error),
+            Error::Integrity { source, .. } => source
+                .as_ref()
+                .map(|s| s.as_ref() as &dyn std::error::Error),
             Error::InvalidInput { .. } => None,
-            Error::LimitExceeded { source, .. } => source.as_ref().map(|s| s.as_ref() as &dyn std::error::Error),
+            Error::LimitExceeded { source, .. } => source
+                .as_ref()
+                .map(|s| s.as_ref() as &dyn std::error::Error),
         }
     }
 }

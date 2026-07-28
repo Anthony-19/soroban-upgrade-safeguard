@@ -108,31 +108,29 @@ pub fn extract_metadata(bytes: &[u8]) -> Result<SorobanMetadata, Error> {
     let mut spec_section_index = 0usize;
 
     for payload in parser.parse_all(bytes) {
-        let section =
-            match payload.map_err(|e| Error::WasmValidation {
-                path: None,
-                details: "Failed to parse WASM payload".to_string(),
-                byte_offset: None,
-                source: Some(Box::new(e)),
-            })? {
-                Payload::CustomSection(section) => section,
-                _ => continue,
-            };
+        let section = match payload.map_err(|e| Error::WasmValidation {
+            path: None,
+            details: "Failed to parse WASM payload".to_string(),
+            byte_offset: None,
+            source: Some(Box::new(e)),
+        })? {
+            Payload::CustomSection(section) => section,
+            _ => continue,
+        };
 
         match section.name() {
             "contractspecv0" => {
                 let section_index = spec_section_index;
                 spec_section_index += 1;
 
-                let entries = decode_spec_entries(section.data()).map_err(|e| {
-                    Error::SectionExtraction {
+                let entries =
+                    decode_spec_entries(section.data()).map_err(|e| Error::SectionExtraction {
                         section_name: "contractspecv0".to_string(),
                         section_index,
                         byte_offset: section.data_offset() as u64,
                         details: String::new(),
                         source: Some(Box::new(e)),
-                    }
-                })?;
+                    })?;
                 metadata.spec.extend(entries);
             }
             "contractenvmetav0" => {

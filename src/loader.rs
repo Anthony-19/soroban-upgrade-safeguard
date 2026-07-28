@@ -78,11 +78,10 @@ fn validate_wasm_structure(bytes: &[u8]) -> Result<(), Error> {
 /// Fetches a deployed Soroban contract's WASM bytes from Stellar RPC by contract ID.
 pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModule, Error> {
     // 1. Parse contract_id using stellar_strkey
-    let strkey = stellar_strkey::Strkey::from_string(contract_id).map_err(|e| {
-        Error::InvalidInput {
+    let strkey =
+        stellar_strkey::Strkey::from_string(contract_id).map_err(|e| Error::InvalidInput {
             details: format!("Invalid contract ID '{}': {}", contract_id, e),
-        }
-    })?;
+        })?;
 
     let contract_bytes = match strkey {
         stellar_strkey::Strkey::Contract(c) => c.0,
@@ -101,14 +100,14 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
     });
 
     // 3. Serialize LedgerKey to Base64
-    let key_b64 = ledger_key.to_xdr_base64(Limits::none()).map_err(|e| {
-        Error::XdrDecoding {
+    let key_b64 = ledger_key
+        .to_xdr_base64(Limits::none())
+        .map_err(|e| Error::XdrDecoding {
             entry_index: None,
             byte_offset: None,
             details: format!("Failed to serialize LedgerKey to base64: {}", e),
             source: Some(Box::new(e)),
-        }
-    })?;
+        })?;
 
     // 4. Query getLedgerEntries RPC
     let response = query_rpc(
@@ -193,14 +192,18 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
         hash: wasm_hash.clone(),
     });
 
-    let code_key_b64 = code_ledger_key.to_xdr_base64(Limits::none()).map_err(|e| {
-        Error::XdrDecoding {
-            entry_index: None,
-            byte_offset: None,
-            details: format!("Failed to serialize ContractCode LedgerKey to base64: {}", e),
-            source: Some(Box::new(e)),
-        }
-    })?;
+    let code_key_b64 =
+        code_ledger_key
+            .to_xdr_base64(Limits::none())
+            .map_err(|e| Error::XdrDecoding {
+                entry_index: None,
+                byte_offset: None,
+                details: format!(
+                    "Failed to serialize ContractCode LedgerKey to base64: {}",
+                    e
+                ),
+                source: Some(Box::new(e)),
+            })?;
 
     let code_response = query_rpc(
         rpc_url,
