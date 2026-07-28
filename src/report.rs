@@ -390,6 +390,13 @@ pub struct SafetyReport {
     /// so [`Self::generate_summary_text`] can pass the right value to
     /// [`crate::type_diff::render_type_diff`] without accessing global state.
     pub use_color: bool,
+    /// Whether the old and new WASM binaries were byte-identical.
+    ///
+    /// When `true`, the full analysis pipeline was skipped because there is
+    /// literally nothing to compare. Reported as an explicit "no-op upgrade"
+    /// in every output format so a reader cannot mistake an empty finding
+    /// set for a clean diff of different builds.
+    pub is_noop: bool,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -448,6 +455,9 @@ pub struct SafetyReportJson<'a> {
     /// Contract version from the new build's metadata (if present).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_contract_version: Option<&'a str>,
+    /// Whether the old and new WASM binaries were byte-identical (no-op).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_noop: bool,
 }
 
 /// JSON representation of a suppression rule that matched no finding.
@@ -479,6 +489,53 @@ impl SafetyReport {
             false,
             &ResourcePolicy::default(),
         )
+    }
+
+    /// Build a no-op report: the old and new WASM binaries were byte-identical
+    /// so the full analysis pipeline was skipped.
+    pub fn noop(old_wasm_size: usize, new_wasm_size: usize) -> Self {
+        use crate::suppression::SuppressionConfig;
+
+        Self {
+            critical_count: 0,
+            warning_count: 0,
+            info_count: 0,
+            suppressed_count: 0,
+            filtered_count: 0,
+            severity_overridden_count: 0,
+            verdict_changed_by_override: false,
+            suppressed_critical_count: 0,
+            total_findings: 0,
+            is_safe: true,
+            findings_by_category: HashMap::new(),
+            strict: false,
+            settings: ReportSettings {
+                strict: false,
+                explain: false,
+                max_suppressions: None,
+                allow_targetless: None,
+                max_xdr_depth: ResourcePolicy::default().max_xdr_depth,
+                max_xdr_len: ResourcePolicy::default().max_xdr_len,
+                max_entries: ResourcePolicy::default().max_entries,
+                max_walk_depth: ResourcePolicy::default().max_walk_depth,
+            },
+            scope: AnalysisScope::default(),
+            baseline_source: None,
+            verified_code_hash: None,
+            category_filter: CategoryFilter::default(),
+            old_spec_summary: None,
+            new_spec_summary: None,
+            metrics: Some(BuildMetrics::new(
+                old_wasm_size,
+                new_wasm_size,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            )),
+            unmatched_suppressions: Vec::new(),
+            baseline_diff: None,
+            diff_types: false,
+            use_color: false,
+            is_noop: true,
+        }
     }
 
     /// Compute a safety report, applying a suppression config.
@@ -664,6 +721,7 @@ impl SafetyReport {
             baseline_diff: None,
             diff_types: false,
             use_color: false,
+            is_noop: false,
         }
     }
 
@@ -796,6 +854,7 @@ impl SafetyReport {
             old_contract_version: self.old_contract_version.as_deref(),
             new_contract_name: self.new_contract_name.as_deref(),
             new_contract_version: self.new_contract_version.as_deref(),
+            is_noop: self.is_noop,
         }
     }
 
@@ -1004,8 +1063,12 @@ impl SafetyReport {
         );
 
         if self.total_findings == 0 {
-            output.push_str(&"No relevant changes detected. The upgrade is identical in its exports and types.\n".green().to_string());
-            output.push_str(&"No relevant changes detected. The exported interface is identical in its exports and types.\n".green().to_string());
+            if self.is_noop {
+                output.push_str(&"No-op upgrade detected: the old and new WASM binaries are byte-identical.\n".green().bold().to_string());
+                output.push_str(&"The full analysis pipeline was skipped because there are no differences to report.\n".green().to_string());
+            } else {
+                output.push_str(&"No relevant changes detected. The exported interface is identical in its exports and types.\n".green().to_string());
+            }
             output.push_str(&format!("\n{}\n", STORAGE_NOT_VERIFIED_NOTE.dimmed()));
             self.append_metrics_text(&mut output);
             return output;
@@ -1278,7 +1341,12 @@ impl SafetyReport {
         output.push_str("---\n\n");
 
         if self.total_findings == 0 {
-            output.push_str("No relevant changes detected. The upgrade is identical in its exports and types.\n");
+            if self.is_noop {
+                output.push_str("**No-op upgrade detected**: the old and new WASM binaries are byte-identical.\n\n");
+                output.push_str("The full analysis pipeline was skipped because there are no differences to report.\n");
+            } else {
+                output.push_str("No relevant changes detected. The exported interface is identical in its exports and types.\n");
+            }
 
         if let Some(source) = &self.baseline_source {
             output.push_str(&format!("**Baseline Source**: `{}`\n\n", source));
