@@ -310,6 +310,15 @@ pub fn compare_wasm_bytes_with_options(
     new_wasm: &[u8],
     options: &CompareOptions<'_>,
 ) -> Result<SafetyReport> {
+    // ── No-op fast path ─────────────────────────────────────────────────
+    // When the two binaries are byte-identical there is nothing to analyse:
+    // every spec, export, import, and env-metadata entry is necessarily
+    // the same. Skip the full pipeline and return a terse "no-op" report
+    // immediately.
+    if old_wasm == new_wasm {
+        return Ok(SafetyReport::noop(old_wasm.len(), new_wasm.len()));
+    }
+
     let default_policy = ResourcePolicy::default();
     let policy = options.policy.unwrap_or(&default_policy);
 
