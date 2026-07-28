@@ -1,6 +1,664 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use colored::Colorize;
+use std::collections::HashSet;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
+
+use soroban_upgrade_safeguard::{
+    color::should_disable_color,
+    diff, loader, parser, report,
+    report::{validate_categories, CategoryFilter},
+    spec,
+    suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
+};
+
+/// Output format for the safety report.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum OutputFormat {
+    /// Colored, human-readable report (default).
+    #[default]
+    Text,
+    /// A single machine-readable JSON document for CI and dashboards.
+    Json,
+    /// Markdown document suitable for PR descriptions and comments.
+    Markdown,
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    author,
+    version,
+    about,
+    long_about = None,
+    // Four usage modes:
+    //   1. Local:      soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM> [OPTIONS]
+    //   2. RPC:        soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM> [OPTIONS]
+    //   3. Manifest:   soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]
+    //   4. Dir Scan:   soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]
+    override_usage = "soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM> [OPTIONS]\n       \
+                      soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM> [OPTIONS]\n       \
+                      soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]\n       \
+                      soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]"
+)]
+struct Args {
+    /// WASM paths: <OLD_WASM> <NEW_WASM> in local mode, or just <NEW_WASM> in RPC mode
+    #[arg(value_name = "WASM", num_args = 0..=2)]
+    wasm_paths: Vec<PathBuf>,
+
+    /// Output format
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+
+    /// Stellar/Soroban Contract ID to fetch from on-chain (e.g. C...)
+    #[arg(long, value_name = "CONTRACT_ID", requires = "rpc_url")]
+    contract_id: Option<String>,
+
+    /// Stellar RPC URL (e.g. https://soroban-testnet.stellar.org)
+    #[arg(long, value_name = "RPC_URL", requires = "contract_id")]
+    rpc_url: Option<String>,
+
+    /// Path to a suppression config acknowledging known, intentional breaking
+    /// changes. When omitted, `.safeguard.toml` in the current directory is
+    /// used if present; otherwise no suppressions are applied.
+    #[arg(long, value_name = "CONFIG")]
+    config: Option<PathBuf>,
+
+    /// Print a concise remediation explanation for each finding.
+    #[arg(long)]
+    explain: bool,
+
+    /// Exit with a non-zero code if any Warnings or Critical findings are found
+    #[arg(long)]
+    strict: bool,
+
+    /// Do not color output
+    #[arg(long)]
+    no_color: bool,
+
+    /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
+    #[arg(long, value_name = "MANIFEST_PATH")]
+    manifest: Option<PathBuf>,
+
+    /// Directory containing the old versions of the contracts for directory comparison
+    #[arg(long, value_name = "OLD_DIR", requires = "new_dir")]
+    old_dir: Option<PathBuf>,
+
+    /// Directory containing the new versions of the contracts for directory comparison
+    #[arg(long, value_name = "NEW_DIR", requires = "old_dir")]
+    new_dir: Option<PathBuf>,
+
+    /// Only include findings from these categories. Repeatable.
+    #[arg(long, value_name = "CATEGORY", num_args = 0..)]
+    include_category: Vec<String>,
+
+    /// Exclude findings from these categories. Repeatable.
+    #[arg(long, value_name = "CATEGORY", num_args = 0..)]
+    exclude_category: Vec<String>,
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // Validate category filter arguments
+    let all_categories: Vec<String> = args
+        .include_category
+        .iter()
+        .chain(args.exclude_category.iter())
+        .cloned()
+        .collect();
+    if !all_categories.is_empty() {
+        if let Err(unknown) = validate_categories(&all_categories) {
+            anyhow::bail!(
+                "Unknown category name(s): {}. Valid categories are: {}",
+                unknown.join(", "),
+                report::KNOWN_CATEGORIES.join(", ")
+            );
+        }
+    }
+    let category_filter = CategoryFilter {
+        include: if args.include_category.is_empty() {
+            None
+        } else {
+            Some(args.include_category.iter().cloned().collect())
+        },
+        exclude: args.exclude_category.iter().cloned().collect(),
+    };
+
+    if should_disable_color(
+        args.no_color,
+        std::env::var_os("NO_COLOR").is_some(),
+        std::io::stdout().is_terminal(),
+    ) {
+        colored::control::set_override(false);
+    }
+
+    // 1. Identify which mode we are running:
+    //    - Batch Manifest Mode
+    //    - Batch Directory Mode
+    //    - Single Contract Pair Mode
+    let is_batch = args.manifest.is_some() || (args.old_dir.is_some() && args.new_dir.is_some());
+
+    if args.manifest.is_some() && (args.old_dir.is_some() || args.new_dir.is_some()) {
+        anyhow::bail!("Cannot specify both --manifest and --old-dir/--new-dir at the same time");
+    }
+
+    if is_batch && !args.wasm_paths.is_empty() {
+        anyhow::bail!("Cannot specify positional WASM paths when using batch mode (--manifest or --old-dir/--new-dir)");
+    }
+
+    // In JSON or Markdown mode, decorative progress goes to stderr so stdout
+    // stays a single, pristine document. In text mode it stays on stdout
+    // exactly as before.
+    let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
+    let progress = |line: String| {
+        if clean_stdout {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    };
+
+    // Load suppression config: an explicit --config must exist; otherwise fall
+    // back to `.safeguard.toml` in the working directory if it happens to be
+    // present. With neither, an empty config preserves today's behavior.
+    let suppressions = match &args.config {
+        Some(path) => SuppressionConfig::load_from_path(path)?,
+        None => {
+            SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?.unwrap_or_default()
+        }
+    };
+
+    if is_batch {
+        let pairs = if let Some(manifest_path) = &args.manifest {
+            parse_manifest(manifest_path)?
+        } else {
+            scan_directories(
+                args.old_dir.as_ref().unwrap(),
+                args.new_dir.as_ref().unwrap(),
+            )?
+        };
+
+        progress("🔍 Soroban Upgrade Safeguard (Batch Mode)".to_string());
+        progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
+        progress(format!("Loaded {} pair(s) for comparison.\n", pairs.len()));
+
+        let mut results = std::collections::BTreeMap::new();
+        let mut overall_safe = true;
+
+        for (i, pair) in pairs.iter().enumerate() {
+            let default_name = format!("pair_{}", i + 1);
+            let contract_name = pair.name.clone().unwrap_or_else(|| {
+                pair.new
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.to_string())
+                    .unwrap_or(default_name)
+            });
+
+            progress(format!(
+                "📦 [{}/{}] Comparing contract pair: {}",
+                i + 1,
+                pairs.len(),
+                contract_name.bold()
+            ));
+
+            let old_wasm = loader::load_wasm(&pair.old)?;
+            let new_wasm = loader::load_wasm(&pair.new)?;
+
+            let mut report = compare_contracts(
+                &ContractComparison {
+                    old_bytes: &old_wasm.bytes,
+                    old_path: &old_wasm.path,
+                    new_bytes: &new_wasm.bytes,
+                    new_path: &new_wasm.path,
+                    suppressions: &suppressions,
+                    explain: args.explain,
+                    strict: args.strict,
+                },
+                &progress,
+            )?;
+
+            if !all_categories.is_empty() {
+                report.apply_category_filter(&category_filter);
+            }
+
+            if !report.is_safe {
+                overall_safe = false;
+            }
+
+            results.insert(contract_name, report);
+            progress("\n----------------------------------------\n".to_string());
+        }
+
+        match args.format {
+            OutputFormat::Json => {
+                let mut results_json = serde_json::Map::new();
+                for (name, report) in &results {
+                    results_json.insert(name.clone(), serde_json::to_value(report.to_json())?);
+                }
+
+                let batch_json = serde_json::json!({
+                    "is_safe": overall_safe,
+                    "strict": args.strict,
+                    "total_pairs": pairs.len(),
+                    "results": results_json,
+                });
+
+                println!("{}", serde_json::to_string_pretty(&batch_json)?);
+            }
+            OutputFormat::Markdown => {
+                let mut markdown = String::new();
+                markdown.push_str("# Soroban Upgrade Safety Report (Batch Mode)\n\n");
+
+                let status = if overall_safe {
+                    "✅ PASSED (All contracts safe)"
+                } else {
+                    "❌ FAILED (Some contracts have breaking changes)"
+                };
+                markdown.push_str(&format!("## Status: {}\n\n", status));
+                markdown.push_str("### Summary\n\n");
+                markdown
+                    .push_str("| Contract | Status | Critical | Warning | Info | Suppressed |\n");
+                markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
+
+                for (name, report) in &results {
+                    let status_str = if report.is_safe {
+                        "✅ PASSED"
+                    } else {
+                        "❌ FAILED"
+                    };
+                    markdown.push_str(&format!(
+                        "| {} | {} | {} | {} | {} | {} |\n",
+                        name,
+                        status_str,
+                        report.critical_count,
+                        report.warning_count,
+                        report.info_count,
+                        report.suppressed_count
+                    ));
+                }
+
+                markdown.push_str("\n---\n\n");
+
+                for (name, report) in &results {
+                    markdown.push_str(&format!("## Details: {}\n\n", name));
+                    let report_md = report.generate_summary_markdown();
+                    let stripped_md = report_md.replace("# Soroban Upgrade Safety Report\n\n", "");
+                    markdown.push_str(&stripped_md);
+                    markdown.push_str("\n---\n\n");
+                }
+
+                println!("{}", markdown);
+            }
+            OutputFormat::Text => {
+                println!("========================================");
+                println!("    SOROBAN BATCH SAFETY REPORT");
+                println!("========================================");
+
+                let status = if overall_safe {
+                    "✅ PASSED (All contracts safe)".green().bold()
+                } else {
+                    "❌ FAILED (Some contracts have breaking changes)"
+                        .red()
+                        .bold()
+                };
+                println!("Overall Status: {}\n", status);
+
+                println!("Summary of Contracts:");
+                for (name, report) in &results {
+                    let status_str = if report.is_safe {
+                        "✅ PASSED".green()
+                    } else {
+                        "❌ FAILED".red().bold()
+                    };
+                    println!(
+                        "  - {}: {} ({} critical, {} warnings, {} info, {} suppressed)",
+                        name.bold(),
+                        status_str,
+                        report.critical_count,
+                        report.warning_count,
+                        report.info_count,
+                        report.suppressed_count
+                    );
+                }
+
+                println!("\n========================================\n");
+
+                for (name, report) in &results {
+                    println!("=== Contract: {} ===", name.bold().magenta());
+                    println!("{}", report.generate_summary_text(args.explain));
+                    println!("========================================\n");
+                }
+            }
+        }
+
+        if !overall_safe {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // Resolve the two usage modes for single pair:
+    //   - 2 positional args => local-vs-local comparison
+    //   - 1 positional arg  + --contract-id/--rpc-url => RPC-vs-local comparison
+    let (old_source, new_wasm_path) = match (args.wasm_paths.len(), &args.contract_id) {
+        (2, None) => (None, &args.wasm_paths[1]), // local mode
+        (1, Some(_)) => (args.contract_id.as_deref(), &args.wasm_paths[0]), // RPC mode
+        (2, Some(_)) => {
+            anyhow::bail!(
+                "When using --contract-id, provide only the NEW_WASM path as a positional argument"
+            );
+        }
+        (1, None) => {
+            anyhow::bail!(
+                "Missing OLD_WASM path. Provide two WASM files, or use --contract-id and --rpc-url \
+                 to fetch the old contract from chain.\n\n\
+                 Usage: soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>\n       \
+                 soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>\n\n\
+                 Or use batch mode:\n       \
+                 soroban-upgrade-safeguard --manifest <MANIFEST_PATH>\n       \
+                 soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>"
+            );
+        }
+        _ => {
+            anyhow::bail!(
+                "Expected 1 or 2 WASM path arguments.\n\n\
+                 Usage: soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>\n       \
+                 soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>\n\n\
+                 Or use batch mode:\n       \
+                 soroban-upgrade-safeguard --manifest <MANIFEST_PATH>\n       \
+                 soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>"
+            );
+        }
+    };
+
+    progress("🔍 Soroban Upgrade Safeguard".to_string());
+    progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
+
+    progress(format!(
+        "\n{}",
+        "📦 Loading and Parsing contracts...".cyan().bold()
+    ));
+
+    // Old WASM — from file or from RPC
+    let old = if let Some(contract_id) = old_source {
+        let rpc_url = args.rpc_url.as_ref().unwrap();
+        loader::fetch_wasm_from_rpc(contract_id, rpc_url)?
+    } else {
+        loader::load_wasm(&args.wasm_paths[0])?
+    };
+
+    // New WASM
+    let new = loader::load_wasm(new_wasm_path)?;
+
+    if !suppressions.rules.is_empty() {
+        progress(format!(
+            "\n🔕 {} suppression rule(s) loaded",
+            suppressions.rules.len()
+        ));
+    }
+
+    // Generate Safety Report using the factored helper
+    let safety_report = compare_contracts(
+        &ContractComparison {
+            old_bytes: &old.bytes,
+            old_path: &old.path,
+            new_bytes: &new.bytes,
+            new_path: &new.path,
+            suppressions: &suppressions,
+            explain: args.explain,
+            strict: args.strict,
+        },
+        &progress,
+    )?;
+
+    let mut safety_report = safety_report;
+    if !all_categories.is_empty() {
+        safety_report.apply_category_filter(&category_filter);
+    }
+
+    match args.format {
+        OutputFormat::Json => {
+            // Single JSON document to stdout; no decorative text, no ANSI codes.
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&safety_report.to_json())?
+            );
+        }
+        OutputFormat::Markdown => {
+            println!("{}", safety_report.generate_summary_markdown());
+        }
+        OutputFormat::Text => {
+            println!("{}", safety_report.generate_summary_text(args.explain));
+        }
+    }
+
+    if !safety_report.is_safe {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+struct ContractPair {
+    old: PathBuf,
+    new: PathBuf,
+    name: Option<String>,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+struct Manifest {
+    pairs: Vec<ContractPair>,
+}
+
+struct ContractComparison<'a> {
+    old_bytes: &'a [u8],
+    old_path: &'a str,
+    new_bytes: &'a [u8],
+    new_path: &'a str,
+    suppressions: &'a SuppressionConfig,
+    explain: bool,
+    strict: bool,
+}
+
+/// Helper function to run comparison for a single pair.
+fn compare_contracts(
+    comparison: &ContractComparison<'_>,
+    progress: &impl Fn(String),
+) -> Result<report::SafetyReport> {
+    let ContractComparison {
+        old_bytes,
+        old_path,
+        new_bytes,
+        new_path,
+        suppressions,
+        explain,
+        strict,
+    } = comparison;
+    let old_meta = parser::extract_metadata(old_bytes)?;
+    let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
+    progress(format!(
+        "  {} {} ({} bytes)",
+        "✅ Old:".green().bold(),
+        old_path,
+        old_bytes.len()
+    ));
+    progress(format!("     └─ {}", old_spec.summary().dimmed()));
+
+    let new_meta = parser::extract_metadata(new_bytes)?;
+    let new_spec = spec::ContractSpec::from_entries(&new_meta.spec);
+    progress(format!(
+        "  {} {} ({} bytes)",
+        "✅ New:".green().bold(),
+        new_path,
+        new_bytes.len()
+    ));
+    progress(format!("     └─ {}", new_spec.summary().dimmed()));
+
+    progress(format!(
+        "\n{}",
+        "🔬 Analyzing structural compatibility...".cyan().bold()
+    ));
+    let mut diff_report = diff::compare(&old_spec, &new_spec);
+    diff::compare_env_metadata(
+        old_meta.env_meta.as_ref(),
+        new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+    diff_report.sort_findings();
+
+    Ok(report::SafetyReport::with_suppressions(
+        &diff_report,
+        suppressions,
+        *explain,
+        *strict,
+    ))
+}
+
+fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read manifest file: {}", path.display()))?;
+
+    // Try TOML, then JSON
+    if let Ok(manifest) = toml::from_str::<Manifest>(&content) {
+        return Ok(manifest.pairs);
+    }
+    if let Ok(manifest) = serde_json::from_str::<Manifest>(&content) {
+        return Ok(manifest.pairs);
+    }
+
+    anyhow::bail!(
+        "Failed to parse manifest '{}' as either TOML or JSON.",
+        path.display()
+    )
+}
+
+/// Collect all `.wasm` files under `root`, returning their relative paths
+/// (relative to `root`). Protects against symlink loops via a visited-path set
+/// and enforces a maximum recursion depth of 32.
+fn collect_wasm_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut stack: Vec<(PathBuf, usize)> = Vec::new();
+    stack.push((root.to_path_buf(), 0));
+
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 32 {
+            eprintln!(
+                "⚠️  Warning: Exceeded maximum recursion depth at '{}', skipping",
+                dir.display()
+            );
+            continue;
+        }
+
+        // Resolve symlinks before tracking visited paths
+        let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if !visited.insert(canonical) {
+            continue;
+        }
+
+        let read_dir = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                eprintln!(
+                    "⚠️  Warning: Cannot read directory '{}': {}",
+                    dir.display(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        for entry in read_dir {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!(
+                        "⚠️  Warning: Error reading entry in '{}': {}",
+                        dir.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let path = entry.path();
+
+            if path.is_dir() {
+                stack.push((path, depth + 1));
+            } else if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("wasm") {
+                let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                files.push((relative, path));
+            }
+        }
+    }
+
+    // Sort by relative path for deterministic ordering
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    Ok(files)
+}
+
+fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>> {
+    if !old_dir.is_dir() {
+        anyhow::bail!("Old directory '{}' is not a directory", old_dir.display());
+    }
+    if !new_dir.is_dir() {
+        anyhow::bail!("New directory '{}' is not a directory", new_dir.display());
+    }
+
+    let old_files = collect_wasm_files(old_dir)?;
+    let new_files_map: std::collections::HashMap<PathBuf, PathBuf> =
+        collect_wasm_files(new_dir)?.into_iter().collect();
+
+    let mut pairs = Vec::new();
+
+    for (rel_path, old_abs_path) in &old_files {
+        if let Some(new_abs_path) = new_files_map.get(rel_path) {
+            let name = rel_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(String::from);
+            pairs.push(ContractPair {
+                old: old_abs_path.clone(),
+                new: new_abs_path.clone(),
+                name,
+            });
+        } else {
+            eprintln!(
+                "⚠️  Warning: Match not found for '{}' in new directory '{}'",
+                rel_path.display(),
+                new_dir.display()
+            );
+        }
+    }
+
+    // Warn about files in new_dir that have no counterpart in old_dir
+    for (rel_path, _) in &collect_wasm_files(new_dir)? {
+        if !old_files.iter().any(|(r, _)| r == rel_path) {
+            eprintln!(
+                "⚠️  Warning: No old counterpart found for '{}' in old directory '{}'",
+                rel_path.display(),
+                old_dir.display()
+            );
+        }
+    }
+
+    if pairs.is_empty() {
+        anyhow::bail!(
+            "No matching .wasm contract pairs found between '{}' and '{}'",
+            old_dir.display(),
+            new_dir.display()
+        );
+    }
+
+    Ok(pairs)
+}
+use anyhow::{Context, Result};
+use clap::{Parser, ValueEnum};
+use colored::Colorize;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::io::IsTerminal;
@@ -425,6 +1083,7 @@ fn main() {
         }
     }
 }
+
 /// Write `content` to a file if `output_path` is `Some`, otherwise print it
 /// to stdout. Writing to a file is atomic: the full string is rendered before
 /// any file is opened, so a failed comparison never leaves a partial file.
@@ -702,6 +1361,7 @@ fn run() -> Result<()> {
             let pairs = scan_directories(
                 args.old_dir.as_ref().unwrap(),
                 args.new_dir.as_ref().unwrap(),
+                &progress,
             )?;
             (pairs, vec![])
         };
@@ -895,8 +1555,7 @@ fn run() -> Result<()> {
         }
 
         // Detect dependencies on contracts absent from this batch.
-        let known_contracts: std::collections::HashSet<String> =
-            results.keys().cloned().collect();
+        let known_contracts: std::collections::HashSet<String> = results.keys().cloned().collect();
         let missing = dep_graph.missing_contracts(&known_contracts);
         let missing_findings_list = missing_contract_findings(&missing);
         if !missing_findings_list.is_empty() {
@@ -924,21 +1583,16 @@ fn run() -> Result<()> {
             per_contract_findings.insert(name.clone(), all);
         }
 
-        let cross_findings: Vec<CrossContractFinding> =
-            dep_graph.propagate(&per_contract_findings);
+        let cross_findings: Vec<CrossContractFinding> = dep_graph.propagate(&per_contract_findings);
 
         // Cross-contract criticals always fail; warnings only fail under --strict.
         let cross_critical_count = cross_findings
             .iter()
-            .filter(|f| {
-                f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Critical
-            })
+            .filter(|f| f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Critical)
             .count();
         let cross_warning_count = cross_findings
             .iter()
-            .filter(|f| {
-                f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Warning
-            })
+            .filter(|f| f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Warning)
             .count();
         if cross_critical_count > 0 {
             overall_safe = false;
@@ -1573,7 +2227,10 @@ fn run() -> Result<()> {
     let mut safety_report = if args.old_spec.is_some() || args.new_spec.is_some() {
         // Build SorobanMetadata for the old side.
         let old_meta = if let Some(ref spec_path) = args.old_spec {
-            progress(format!("   📄 Old side: spec JSON '{}'", spec_path.display()));
+            progress(format!(
+                "   📄 Old side: spec JSON '{}'",
+                spec_path.display()
+            ));
             spec_input::load_spec_json(spec_path, &policy)?
         } else {
             parser::extract_metadata_with_policy(&old.bytes, &policy)
@@ -1582,7 +2239,10 @@ fn run() -> Result<()> {
 
         // Build SorobanMetadata for the new side.
         let new_meta = if let Some(ref spec_path) = args.new_spec {
-            progress(format!("   📄 New side: spec JSON '{}'", spec_path.display()));
+            progress(format!(
+                "   📄 New side: spec JSON '{}'",
+                spec_path.display()
+            ));
             spec_input::load_spec_json(spec_path, &policy)?
         } else {
             parser::extract_metadata_with_policy(&new.bytes, &policy)
@@ -1645,15 +2305,6 @@ fn run() -> Result<()> {
         safety_report.apply_category_filter(&category_filter);
     }
 
-    if let Some(baseline_path) = &args.baseline {
-        soroban_upgrade_safeguard::baseline::apply(
-            &mut safety_report,
-            baseline_path,
-            args.baseline_fail_on_new,
-        )
-        .with_context(|| format!("Failed to apply baseline '{}'", baseline_path.display()))?;
-    }
-
     // Render the report to a string first so --output can write it atomically.
     let rendered = match args.format {
         OutputFormat::Json => serde_json::to_string_pretty(&safety_report.to_json())?,
@@ -1668,14 +2319,11 @@ fn run() -> Result<()> {
     };
 
     // Write the report — either to a file (--output) or to stdout.
+    emit_report_output(&rendered, args.output.as_deref(), &progress)?;
     if let Some(ref output_path) = args.output {
-        std::fs::write(output_path, &rendered).with_context(|| {
-            format!("Failed to write report to '{}'", output_path.display())
-        })?;
-        progress(format!(
-            "✅ Report written to: {}",
-            output_path.display()
-        ));
+        std::fs::write(output_path, &rendered)
+            .with_context(|| format!("Failed to write report to '{}'", output_path.display()))?;
+        progress(format!("✅ Report written to: {}", output_path.display()));
     } else {
         println!("{}", rendered);
     }
@@ -1808,10 +2456,9 @@ impl<'de> serde::Deserialize<'de> for ContractSource {
                     }
                 }
 
-                let contract_id = contract_id
-                    .ok_or_else(|| de::Error::missing_field("contract_id"))?;
-                let rpc_url =
-                    rpc_url.ok_or_else(|| de::Error::missing_field("rpc_url"))?;
+                let contract_id =
+                    contract_id.ok_or_else(|| de::Error::missing_field("contract_id"))?;
+                let rpc_url = rpc_url.ok_or_else(|| de::Error::missing_field("rpc_url"))?;
 
                 Ok(ContractSource::OnChain {
                     contract_id,
@@ -1959,12 +2606,7 @@ fn resolve_contract_source(
             rpc_url,
         } => {
             loader::validate_rpc_url(rpc_url, allow_http_local)?;
-            loader::fetch_wasm_from_rpc_with_policy_and_cache(
-                contract_id,
-                rpc_url,
-                policy,
-                cache,
-            )
+            loader::fetch_wasm_from_rpc_with_policy_and_cache(contract_id, rpc_url, policy, cache)
         }
     }
 }
@@ -2008,15 +2650,13 @@ fn resolve_pair_names(pairs: &[ContractPair]) -> Result<Vec<String>> {
     let mut names: Vec<String> = Vec::with_capacity(pairs.len());
 
     for (i, pair) in pairs.iter().enumerate() {
-        let candidate = pair.name.clone().unwrap_or_else(|| {
-            match &pair.new {
-                ContractSource::File(path) => path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| format!("pair_{}", i + 1)),
-                ContractSource::OnChain { contract_id, .. } => contract_id.clone(),
-            }
+        let candidate = pair.name.clone().unwrap_or_else(|| match &pair.new {
+            ContractSource::File(path) => path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(String::from)
+                .unwrap_or_else(|| format!("pair_{}", i + 1)),
+            ContractSource::OnChain { contract_id, .. } => contract_id.clone(),
         });
 
         let count = counts.entry(candidate.clone()).or_insert(0);
@@ -2135,7 +2775,11 @@ fn collect_wasm_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
     Ok(files)
 }
 
-fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>> {
+fn scan_directories(
+    old_dir: &Path,
+    new_dir: &Path,
+    progress: &impl Fn(String),
+) -> Result<Vec<ContractPair>> {
     if !old_dir.is_dir() {
         anyhow::bail!("Old directory '{}' is not a directory", old_dir.display());
     }
@@ -2161,22 +2805,22 @@ fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>>
                 name,
             });
         } else {
-            eprintln!(
+            progress(format!(
                 "⚠️  Warning: Match not found for '{}' in new directory '{}'",
                 rel_path.display(),
                 new_dir.display()
-            );
+            ));
         }
     }
 
     // Warn about files in new_dir that have no counterpart in old_dir
     for (rel_path, _) in &collect_wasm_files(new_dir)? {
         if !old_files.iter().any(|(r, _)| r == rel_path) {
-            eprintln!(
+            progress(format!(
                 "⚠️  Warning: No old counterpart found for '{}' in old directory '{}'",
                 rel_path.display(),
                 old_dir.display()
-            );
+            ));
         }
     }
 
@@ -2317,7 +2961,11 @@ fn expand_glob(pattern: &str) -> Result<Vec<PathBuf>> {
 
     // No wildcards at all: the pattern is just a path.
     if segments.is_empty() {
-        return Ok(if root.is_file() { vec![root] } else { Vec::new() });
+        return Ok(if root.is_file() {
+            vec![root]
+        } else {
+            Vec::new()
+        });
     }
 
     let mut matches = Vec::new();

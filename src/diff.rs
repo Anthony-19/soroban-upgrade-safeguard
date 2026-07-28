@@ -5,12 +5,94 @@ use crate::rename::{match_renames, Rename};
 use crate::spec::ContractSpec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use stellar_xdr::curr::{
     ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef, ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0,
     ScSpecUdtErrorEnumCaseV0, ScSpecUdtErrorEnumV0, ScSpecUdtStructFieldV0, ScSpecUdtStructV0,
     ScSpecUdtUnionCaseV0, ScSpecUdtUnionV0,
 };
+
+thread_local! {
+    static RENAME_MAP: RefCell<std::collections::HashMap<String, String>> = RefCell::new(std::collections::HashMap::new());
+}
+
+fn build_rename_map(
+    old: &ContractSpec,
+    new: &ContractSpec,
+) -> std::collections::HashMap<String, String> {
+    let mut rename_map = std::collections::HashMap::new();
+
+    // Structs
+    let old_structs: BTreeMap<String, &ScSpecUdtStructV0> = old
+        .structs
+        .iter()
+        .filter(|(n, _)| !new.structs.contains_key(*n))
+        .map(|(n, s)| (n.clone(), s))
+        .collect();
+    let new_structs: BTreeMap<String, &ScSpecUdtStructV0> = new
+        .structs
+        .iter()
+        .filter(|(n, _)| !old.structs.contains_key(*n))
+        .map(|(n, s)| (n.clone(), s))
+        .collect();
+    for r in match_renames(&old_structs, &new_structs) {
+        rename_map.insert(r.old_name, r.new_name);
+    }
+
+    // Enums
+    let old_enums: BTreeMap<String, &ScSpecUdtEnumV0> = old
+        .enums
+        .iter()
+        .filter(|(n, _)| !new.enums.contains_key(*n))
+        .map(|(n, s)| (n.clone(), s))
+        .collect();
+    let new_enums: BTreeMap<String, &ScSpecUdtEnumV0> = new
+        .enums
+        .iter()
+        .filter(|(n, _)| !old.enums.contains_key(*n))
+        .map(|(n, s)| (n.clone(), s))
+        .collect();
+    for r in match_renames(&old_enums, &new_enums) {
+        rename_map.insert(r.old_name, r.new_name);
+    }
+
+    // Unions
+    let old_unions: BTreeMap<String, &ScSpecUdtUnionV0> = old
+        .unions
+        .iter()
+        .filter(|(n, _)| !new.unions.contains_key(*n))
+        .map(|(n, s)| (n.clone(), s))
+        .collect();
+    let new_unions: BTreeMap<String, &ScSpecUdtUnionV0> = new
+        .unions
+        .iter()
+        .filter(|(n, _)| !old.unions.contains_key(*n))
+        .map(|(n, s)| (n.clone(), s))
+        .collect();
+    for r in match_renames(&old_unions, &new_unions) {
+        rename_map.insert(r.old_name, r.new_name);
+    }
+
+    // Error Enums
+    let old_err_enums: BTreeMap<String, &ScSpecUdtErrorEnumV0> = old
+        .error_enums
+        .iter()
+        .filter(|(n, _)| !new.error_enums.contains_key(*n))
+        .map(|(n, s)| (n.clone(), s))
+        .collect();
+    let new_err_enums: BTreeMap<String, &ScSpecUdtErrorEnumV0> = new
+        .error_enums
+        .iter()
+        .filter(|(n, _)| !old.error_enums.contains_key(*n))
+        .map(|(n, s)| (n.clone(), s))
+        .collect();
+    for r in match_renames(&old_err_enums, &new_err_enums) {
+        rename_map.insert(r.old_name, r.new_name);
+    }
+
+    rename_map
+}
 
 /// Severity of a detected issue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -117,6 +199,9 @@ pub fn compare_with_classification(
     new: &ContractSpec,
     classification: &ClassificationConfig,
 ) -> DiffReport {
+    let rename_map = build_rename_map(old, new);
+    RENAME_MAP.with(|m| *m.borrow_mut() = rename_map);
+
     let mut report = DiffReport::default();
 
     compare_functions(old, new, &mut report);
@@ -126,6 +211,8 @@ pub fn compare_with_classification(
     compare_error_enums(old, new, classification, &mut report);
 
     detect_cascading_layout_breaks(old, &mut report);
+
+    RENAME_MAP.with(|m| m.borrow_mut().clear());
 
     report
 }
@@ -142,6 +229,9 @@ pub fn compare_with_policy(
     new: &ContractSpec,
     policy: &crate::limits::ResourcePolicy,
 ) -> Result<DiffReport, crate::limits::LimitError> {
+    let rename_map = build_rename_map(old, new);
+    RENAME_MAP.with(|m| *m.borrow_mut() = rename_map);
+
     let mut report = DiffReport::default();
 
     compare_functions(old, new, &mut report);
@@ -153,7 +243,11 @@ pub fn compare_with_policy(
     // Cascade detection uses the LayoutMapper which enforces the walk-depth
     // limit. If the graph exceeds it we surface a LimitError rather than
     // overflowing the stack.
-    detect_cascading_layout_breaks_with_policy(old, &mut report, policy)?;
+    let cascade_res = detect_cascading_layout_breaks_with_policy(old, &mut report, policy);
+
+    RENAME_MAP.with(|m| m.borrow_mut().clear());
+
+    cascade_res?;
 
     Ok(report)
 }
@@ -231,10 +325,7 @@ pub fn compare_storage_schemas(
 /// Inject `Info` findings for schema references the resolver could not match
 /// against the exported spec. These are not errors — they just cap the coverage
 /// claim so the report cannot overstate what was verified.
-pub fn report_unresolved_storage_references(
-    unresolved: &[String],
-    report: &mut DiffReport,
-) {
+pub fn report_unresolved_storage_references(unresolved: &[String], report: &mut DiffReport) {
     for name in unresolved {
         report.findings.push(Finding {
             severity: Severity::Info,
@@ -274,9 +365,12 @@ pub const ALL_CATEGORIES: &[&str] = &[
     ENVIRONMENT_CATEGORY,
     // Functions and their signatures.
     "Function Removed",
+    "Function Renamed",
     "Function Added",
     "Function Documentation Changed",
     "Function Signature Changed",
+    "Parameter Added",
+    "Parameter Removed",
     "Parameter Renamed",
     "Parameter Reordered",
     "Parameter Type Changed",
@@ -285,6 +379,8 @@ pub const ALL_CATEGORIES: &[&str] = &[
     "Parameter Type Signedness Changed",
     "Parameter Documentation Changed",
     "Return Type Changed",
+    "Return Type Success Arm Changed",
+    "Return Type Error Arm Changed",
     "Return Type Widened",
     "Return Type Narrowed",
     "Return Type Signedness Changed",
@@ -684,7 +780,7 @@ fn rename_name_sets(renames: &[Rename]) -> (BTreeSet<&str>, BTreeSet<&str>) {
 fn emit_rename_finding(rename: &Rename, kind: &str, class: TypeClass, report: &mut DiffReport) {
     let (severity, category, detail) = if rename.identical {
         (
-            Severity::Info,
+            Severity::Warning,
             "Type Renamed",
             "the layout is identical, so stored data stays compatible",
         )
@@ -727,52 +823,131 @@ fn capitalize(s: &str) -> String {
 
 /// Compare function signatures between old and new contract specs.
 fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport) {
-    // Check for removed or changed functions
+    // 1. Identify removed or candidate removed functions (in old, not in new)
+    let mut removed_candidates: BTreeMap<String, &ScSpecFunctionV0> = BTreeMap::new();
     for (name, old_fn) in &old.functions {
-        match new.functions.get(name) {
-            None => {
-                report.findings.push(Finding {
-                    severity: Severity::Critical,
-                    category: "Function Removed".to_string(),
-                    message: format!(
-                        "Function '{}' was removed. Existing callers will break.",
-                        name
-                    ),
-                    type_name: None,
-                    target: Some(name.clone()),
-                    classification: None,
-                });
+        if !new.functions.contains_key(name) {
+            removed_candidates.insert(name.clone(), old_fn);
+        }
+    }
+
+    // 2. Identify added or candidate added functions (in new, not in old)
+    let mut added_candidates: BTreeMap<String, &ScSpecFunctionV0> = BTreeMap::new();
+    for (name, new_fn) in &new.functions {
+        if !old.functions.contains_key(name) {
+            added_candidates.insert(name.clone(), new_fn);
+        }
+    }
+
+    // 3. Match renames deterministically
+    let mut renames: Vec<(String, String)> = Vec::new();
+    let mut used_added: BTreeSet<String> = BTreeSet::new();
+
+    for (old_name, old_fn) in &removed_candidates {
+        for (added_name, added_fn) in &added_candidates {
+            if used_added.contains(added_name) {
+                continue;
             }
-            Some(new_fn) => {
-                check_function_signature(name, old_fn, new_fn, report);
-                // Compare function doc-strings and emit informational findings
-                push_doc_finding(
-                    report,
-                    "Function Documentation Changed",
-                    &format!("Function '{}'", name),
-                    &old_fn.doc.to_string(),
-                    &new_fn.doc.to_string(),
-                    None,
-                    Some(name.clone()),
-                    None,
-                );
+            if functions_signatures_equal(old_fn, added_fn) {
+                renames.push((old_name.clone(), added_name.clone()));
+                used_added.insert(added_name.clone());
+                break;
             }
         }
     }
 
-    // Check for newly added functions (informational)
-    for name in new.functions.keys() {
-        if !old.functions.contains_key(name) {
-            report.findings.push(Finding {
-                severity: Severity::Info,
-                category: "Function Added".to_string(),
-                message: format!("New function '{}' added.", name),
-                type_name: None,
-                target: Some(name.clone()),
-                classification: None,
-            });
+    let renamed_old: BTreeSet<String> = renames.iter().map(|(o, _)| o.clone()).collect();
+    let renamed_new: BTreeSet<String> = renames.iter().map(|(_, n)| n.clone()).collect();
+
+    // 4. Report matched renames
+    for (old_name, new_name) in &renames {
+        report.findings.push(Finding {
+            severity: Severity::Critical,
+            category: "Function Renamed".to_string(),
+            message: format!(
+                "Function '{}' was likely renamed to '{}'.",
+                old_name, new_name
+            ),
+            type_name: None,
+            target: Some(new_name.clone()),
+            classification: None,
+        });
+    }
+
+    // 5. Compare functions present in both sides by name
+    for (name, old_fn) in &old.functions {
+        if let Some(new_fn) = new.functions.get(name) {
+            check_function_signature(name, old_fn, new_fn, report);
+            // Compare function doc-strings and emit informational findings
+            push_doc_finding(
+                report,
+                "Function Documentation Changed",
+                &format!("Function '{}'", name),
+                &old_fn.doc.to_string(),
+                &new_fn.doc.to_string(),
+                None,
+                Some(name.clone()),
+                None,
+            );
         }
     }
+
+    // 6. Report genuinely removed functions (excluding renames)
+    for (name, _) in &removed_candidates {
+        if renamed_old.contains(name) {
+            continue;
+        }
+        report.findings.push(Finding {
+            severity: Severity::Critical,
+            category: "Function Removed".to_string(),
+            message: format!(
+                "Function '{}' was removed. Existing callers will break.",
+                name
+            ),
+            type_name: None,
+            target: Some(name.clone()),
+            classification: None,
+        });
+    }
+
+    // 7. Report genuinely added functions (excluding renames)
+    for (name, _) in &added_candidates {
+        if renamed_new.contains(name) {
+            continue;
+        }
+        report.findings.push(Finding {
+            severity: Severity::Info,
+            category: "Function Added".to_string(),
+            message: format!("New function '{}' added.", name),
+            type_name: None,
+            target: Some(name.clone()),
+            classification: None,
+        });
+    }
+}
+
+fn functions_signatures_equal(a: &ScSpecFunctionV0, b: &ScSpecFunctionV0) -> bool {
+    let a_inputs: &[ScSpecFunctionInputV0] = a.inputs.as_ref();
+    let b_inputs: &[ScSpecFunctionInputV0] = b.inputs.as_ref();
+    if a_inputs.len() != b_inputs.len() {
+        return false;
+    }
+    for (i, j) in a_inputs.iter().zip(b_inputs.iter()) {
+        if i.name != j.name || i.type_ != j.type_ {
+            return false;
+        }
+    }
+    let a_outputs: &[ScSpecTypeDef] = a.outputs.as_ref();
+    let b_outputs: &[ScSpecTypeDef] = b.outputs.as_ref();
+    if a_outputs.len() != b_outputs.len() {
+        return false;
+    }
+    for (o1, o2) in a_outputs.iter().zip(b_outputs.iter()) {
+        if o1 != o2 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Compare signatures of two functions with the same name.
@@ -782,7 +957,6 @@ fn check_function_signature(
     new_fn: &ScSpecFunctionV0,
     report: &mut DiffReport,
 ) {
-    // Check input count
     let old_inputs: &[ScSpecFunctionInputV0] = old_fn.inputs.as_ref();
     let new_inputs: &[ScSpecFunctionInputV0] = new_fn.inputs.as_ref();
 
@@ -800,44 +974,52 @@ fn check_function_signature(
             target: Some(name.to_string()),
             classification: None,
         });
-        return; // No point comparing individual params if count differs
-    }
 
-    // Check each input parameter
-    let old_names: Vec<String> = old_inputs
-        .iter()
-        .map(|input| input.name.to_string())
-        .collect();
-    let new_names: Vec<String> = new_inputs
-        .iter()
-        .map(|input| input.name.to_string())
-        .collect();
+        // Align parameters by name
+        let old_by_name: std::collections::HashMap<String, (usize, &ScSpecFunctionInputV0)> =
+            old_inputs
+                .iter()
+                .enumerate()
+                .map(|(i, input)| (input.name.to_string(), (i, input)))
+                .collect();
 
-    let old_names_set: std::collections::HashSet<String> = old_names.iter().cloned().collect();
-    let new_names_set: std::collections::HashSet<String> = new_names.iter().cloned().collect();
-
-    let is_reordered = old_names_set == new_names_set && old_names != new_names;
-
-    if is_reordered {
-        report.findings.push(Finding {
-            severity: Severity::Critical,
-            category: "Parameter Reordered".to_string(),
-            message: format!(
-                "Function '{}': parameters reordered. The set of parameter names is unchanged but their order differs.",
-                name
-            ),
-            type_name: None,
-            target: Some(name.to_string()),
-            classification: None,
-        });
-
-        // Check for genuine type changes by matching parameter name.
         let new_by_name: std::collections::HashMap<String, &ScSpecFunctionInputV0> = new_inputs
             .iter()
             .map(|input| (input.name.to_string(), input))
             .collect();
 
-        for (i, old_input) in old_inputs.iter().enumerate() {
+        // 1. Report removed parameters
+        for old_input in old_inputs {
+            let p_name = old_input.name.to_string();
+            if !new_by_name.contains_key(&p_name) {
+                report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category: "Parameter Removed".to_string(),
+                    message: format!("Function '{}': parameter '{}' was removed.", name, p_name),
+                    type_name: None,
+                    target: Some(format!("{}.{}", name, p_name)),
+                    classification: None,
+                });
+            }
+        }
+
+        // 2. Report added parameters
+        for new_input in new_inputs {
+            let p_name = new_input.name.to_string();
+            if !old_by_name.contains_key(&p_name) {
+                report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category: "Parameter Added".to_string(),
+                    message: format!("Function '{}': parameter '{}' was added.", name, p_name),
+                    type_name: None,
+                    target: Some(format!("{}.{}", name, p_name)),
+                    classification: None,
+                });
+            }
+        }
+
+        // 3. Report type and doc changes on surviving parameters
+        for (old_idx, old_input) in old_inputs.iter().enumerate() {
             let p_name = old_input.name.to_string();
             if let Some(new_input) = new_by_name.get(&p_name) {
                 if !types_equal(&old_input.type_, &new_input.type_) {
@@ -849,7 +1031,7 @@ fn check_function_signature(
                         format!(
                             "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
                             name,
-                            i,
+                            old_idx,
                             p_name,
                             crate::mapper::type_to_string(&old_input.type_),
                             crate::mapper::type_to_string(&new_input.type_)
@@ -872,55 +1054,126 @@ fn check_function_signature(
             }
         }
     } else {
-        // Fall back to original positional check
-        for (i, (old_input, new_input)) in old_inputs.iter().zip(new_inputs.iter()).enumerate() {
-            let old_name = old_input.name.to_string();
-            let new_name = new_input.name.to_string();
+        // Check each input parameter
+        let old_names: Vec<String> = old_inputs
+            .iter()
+            .map(|input| input.name.to_string())
+            .collect();
+        let new_names: Vec<String> = new_inputs
+            .iter()
+            .map(|input| input.name.to_string())
+            .collect();
 
-            if old_name != new_name {
-                report.findings.push(Finding {
-                    severity: Severity::Warning,
-                    category: "Parameter Renamed".to_string(),
-                    message: format!(
-                        "Function '{}': parameter {} renamed from '{}' to '{}'.",
-                        name, i, old_name, new_name
-                    ),
-                    type_name: None,
-                    target: Some(format!("{}.{}", name, old_name)),
-                    classification: None,
-                });
+        let old_names_set: std::collections::HashSet<String> = old_names.iter().cloned().collect();
+        let new_names_set: std::collections::HashSet<String> = new_names.iter().cloned().collect();
+
+        let is_reordered = old_names_set == new_names_set && old_names != new_names;
+
+        if is_reordered {
+            report.findings.push(Finding {
+                severity: Severity::Critical,
+                category: "Parameter Reordered".to_string(),
+                message: format!(
+                    "Function '{}': parameters reordered. The set of parameter names is unchanged but their order differs.",
+                    name
+                ),
+                type_name: None,
+                target: Some(name.to_string()),
+                classification: None,
+            });
+
+            // Check for genuine type changes by matching parameter name.
+            let new_by_name: std::collections::HashMap<String, &ScSpecFunctionInputV0> = new_inputs
+                .iter()
+                .map(|input| (input.name.to_string(), input))
+                .collect();
+
+            for (i, old_input) in old_inputs.iter().enumerate() {
+                let p_name = old_input.name.to_string();
+                if let Some(new_input) = new_by_name.get(&p_name) {
+                    if !types_equal(&old_input.type_, &new_input.type_) {
+                        push_type_change_finding(
+                            report,
+                            &old_input.type_,
+                            &new_input.type_,
+                            "Parameter Type",
+                            format!(
+                                "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
+                                name,
+                                i,
+                                p_name,
+                                crate::mapper::type_to_string(&old_input.type_),
+                                crate::mapper::type_to_string(&new_input.type_)
+                            ),
+                            None,
+                            Some(format!("{}.{}", name, p_name)),
+                            None,
+                        );
+                    }
+                    push_doc_finding(
+                        report,
+                        "Parameter Documentation Changed",
+                        &format!("Function '{}': parameter '{}'", name, p_name),
+                        &old_input.doc.to_string(),
+                        &new_input.doc.to_string(),
+                        None,
+                        Some(format!("{}.{}", name, p_name)),
+                        None,
+                    );
+                }
             }
+        } else {
+            // Fall back to original positional check
+            for (i, (old_input, new_input)) in old_inputs.iter().zip(new_inputs.iter()).enumerate()
+            {
+                let old_name = old_input.name.to_string();
+                let new_name = new_input.name.to_string();
 
-            if !types_equal(&old_input.type_, &new_input.type_) {
-                push_type_change_finding(
+                if old_name != new_name {
+                    report.findings.push(Finding {
+                        severity: Severity::Warning,
+                        category: "Parameter Renamed".to_string(),
+                        message: format!(
+                            "Function '{}': parameter {} renamed from '{}' to '{}'.",
+                            name, i, old_name, new_name
+                        ),
+                        type_name: None,
+                        target: Some(format!("{}.{}", name, old_name)),
+                        classification: None,
+                    });
+                }
+
+                if !types_equal(&old_input.type_, &new_input.type_) {
+                    push_type_change_finding(
+                        report,
+                        &old_input.type_,
+                        &new_input.type_,
+                        "Parameter Type",
+                        format!(
+                            "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
+                            name,
+                            i,
+                            old_name,
+                            crate::mapper::type_to_string(&old_input.type_),
+                            crate::mapper::type_to_string(&new_input.type_)
+                        ),
+                        None,
+                        Some(format!("{}.{}", name, old_name)),
+                        None,
+                    );
+                }
+
+                push_doc_finding(
                     report,
-                    &old_input.type_,
-                    &new_input.type_,
-                    "Parameter Type",
-                    format!(
-                        "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
-                        name,
-                        i,
-                        old_name,
-                        crate::mapper::type_to_string(&old_input.type_),
-                        crate::mapper::type_to_string(&new_input.type_)
-                    ),
+                    "Parameter Documentation Changed",
+                    &format!("Function '{}': parameter '{}'", name, old_name),
+                    &old_input.doc.to_string(),
+                    &new_input.doc.to_string(),
                     None,
                     Some(format!("{}.{}", name, old_name)),
                     None,
                 );
             }
-
-            push_doc_finding(
-                report,
-                "Parameter Documentation Changed",
-                &format!("Function '{}': parameter '{}'", name, old_name),
-                &old_input.doc.to_string(),
-                &new_input.doc.to_string(),
-                None,
-                Some(format!("{}.{}", name, old_name)),
-                None,
-            );
         }
     }
 
@@ -945,31 +1198,110 @@ fn check_function_signature(
     } else {
         for (i, (old_out, new_out)) in old_outputs.iter().zip(new_outputs.iter()).enumerate() {
             if !types_equal(old_out, new_out) {
-                push_type_change_finding(
-                    report,
-                    old_out,
-                    new_out,
-                    "Return Type",
-                    format!(
-                        "Function '{}': return type {} changed from `{}` to `{}`.",
-                        name,
-                        i,
-                        crate::mapper::type_to_string(old_out),
-                        crate::mapper::type_to_string(new_out)
-                    ),
-                    None,
-                    Some(name.to_string()),
-                    None,
-                );
+                let mut reported_specific = false;
+                if let (ScSpecTypeDef::Result(old_res), ScSpecTypeDef::Result(new_res)) =
+                    (old_out, new_out)
+                {
+                    let ok_diff = !types_equal(&old_res.ok_type, &new_res.ok_type);
+                    let err_diff = !types_equal(&old_res.error_type, &new_res.error_type);
+                    if ok_diff && !err_diff {
+                        report.findings.push(Finding {
+                            severity: Severity::Critical,
+                            category: "Return Type Success Arm Changed".to_string(),
+                            message: format!(
+                                "Function '{}': return type success arm changed from `{}` to `{}`.",
+                                name,
+                                crate::mapper::type_to_string(&old_res.ok_type),
+                                crate::mapper::type_to_string(&new_res.ok_type)
+                            ),
+                            type_name: None,
+                            target: Some(name.to_string()),
+                            classification: None,
+                        });
+                        reported_specific = true;
+                    } else if err_diff && !ok_diff {
+                        report.findings.push(Finding {
+                            severity: Severity::Critical,
+                            category: "Return Type Error Arm Changed".to_string(),
+                            message: format!(
+                                "Function '{}': return type error arm changed from `{}` to `{}`.",
+                                name,
+                                crate::mapper::type_to_string(&old_res.error_type),
+                                crate::mapper::type_to_string(&new_res.error_type)
+                            ),
+                            type_name: None,
+                            target: Some(name.to_string()),
+                            classification: None,
+                        });
+                        reported_specific = true;
+                    }
+                }
+
+                if !reported_specific {
+                    push_type_change_finding(
+                        report,
+                        old_out,
+                        new_out,
+                        "Return Type",
+                        format!(
+                            "Function '{}': return type {} changed from `{}` to `{}`.",
+                            name,
+                            i,
+                            crate::mapper::type_to_string(old_out),
+                            crate::mapper::type_to_string(new_out)
+                        ),
+                        None,
+                        Some(name.to_string()),
+                        None,
+                    );
+                }
             }
         }
     }
 }
 
-/// Compare two ScSpecTypeDef values for equality.
-/// We use the PartialEq derive on the XDR types.
 fn types_equal(a: &ScSpecTypeDef, b: &ScSpecTypeDef) -> bool {
-    a == b
+    match (a, b) {
+        (ScSpecTypeDef::Udt(a_udt), ScSpecTypeDef::Udt(b_udt)) => {
+            let a_name = a_udt.name.to_string();
+            let b_name = b_udt.name.to_string();
+            if a_name == b_name {
+                return true;
+            }
+            RENAME_MAP.with(|m| {
+                if let Some(mapped) = m.borrow().get(&a_name) {
+                    mapped == &b_name
+                } else {
+                    false
+                }
+            })
+        }
+        (ScSpecTypeDef::Option(a_opt), ScSpecTypeDef::Option(b_opt)) => {
+            types_equal(&a_opt.value_type, &b_opt.value_type)
+        }
+        (ScSpecTypeDef::Result(a_res), ScSpecTypeDef::Result(b_res)) => {
+            types_equal(&a_res.ok_type, &b_res.ok_type)
+                && types_equal(&a_res.error_type, &b_res.error_type)
+        }
+        (ScSpecTypeDef::Vec(a_vec), ScSpecTypeDef::Vec(b_vec)) => {
+            types_equal(&a_vec.element_type, &b_vec.element_type)
+        }
+        (ScSpecTypeDef::Map(a_map), ScSpecTypeDef::Map(b_map)) => {
+            types_equal(&a_map.key_type, &b_map.key_type)
+                && types_equal(&a_map.value_type, &b_map.value_type)
+        }
+        (ScSpecTypeDef::Tuple(a_tup), ScSpecTypeDef::Tuple(b_tup)) => {
+            if a_tup.value_types.len() != b_tup.value_types.len() {
+                return false;
+            }
+            a_tup
+                .value_types
+                .iter()
+                .zip(b_tup.value_types.iter())
+                .all(|(x, y)| types_equal(x, y))
+        }
+        _ => a == b,
+    }
 }
 
 /// How a numeric type change relates the old and new representations.
@@ -1976,13 +2308,20 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
     let old_mapper = LayoutMapper::new(old);
     let reverse_deps = old_mapper.build_reverse_dependencies();
 
+    let rename_map = RENAME_MAP.with(|m| m.borrow().clone());
+    let new_to_old: std::collections::HashMap<String, String> = rename_map
+        .iter()
+        .map(|(k, v)| (v.clone(), k.clone()))
+        .collect();
+
     // Collect all UDTs that had a critical breaking change.
     // We read `type_name` directly — no message-text parsing needed.
     let mut broken_types = std::collections::HashSet::new();
     for finding in &report.findings {
         if finding.severity == Severity::Critical {
             if let Some(ref name) = finding.type_name {
-                broken_types.insert(name.clone());
+                let old_name = new_to_old.get(name).cloned().unwrap_or(name.clone());
+                broken_types.insert(old_name);
             }
         }
     }
@@ -2003,16 +2342,22 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
                     cascaded.insert(dep.clone());
                     queue.push(dep.clone());
 
+                    let current_ref = rename_map
+                        .get(&current_broken_type)
+                        .cloned()
+                        .unwrap_or(current_broken_type.clone());
+                    let dep_ref = rename_map.get(dep).cloned().unwrap_or(dep.clone());
+
                     report.findings.push(Finding {
                         severity: Severity::Critical,
                         category: "Cascading Layout Break".to_string(),
                         message: format!(
                             "Type '{}' layout is broken because it embeds modified type '{}'. \
                              Stored data for '{}' is no longer compatible.",
-                            dep, current_broken_type, dep
+                            dep_ref, current_ref, dep_ref
                         ),
-                        type_name: Some(dep.clone()),
-                        target: Some(dep.clone()),
+                        type_name: Some(dep_ref.clone()),
+                        target: Some(dep_ref.clone()),
                         classification: None,
                     });
                 }
@@ -2034,11 +2379,18 @@ fn detect_cascading_layout_breaks_with_policy(
     let old_mapper = LayoutMapper::new_with_policy(old, policy);
     let reverse_deps = old_mapper.try_build_reverse_dependencies()?;
 
+    let rename_map = RENAME_MAP.with(|m| m.borrow().clone());
+    let new_to_old: std::collections::HashMap<String, String> = rename_map
+        .iter()
+        .map(|(k, v)| (v.clone(), k.clone()))
+        .collect();
+
     let mut broken_types = std::collections::HashSet::new();
     for finding in &report.findings {
         if finding.severity == Severity::Critical {
             if let Some(ref name) = finding.type_name {
-                broken_types.insert(name.clone());
+                let old_name = new_to_old.get(name).cloned().unwrap_or(name.clone());
+                broken_types.insert(old_name);
             }
         }
     }
@@ -2057,16 +2409,22 @@ fn detect_cascading_layout_breaks_with_policy(
                     cascaded.insert(dep.clone());
                     queue.push(dep.clone());
 
+                    let current_ref = rename_map
+                        .get(&current_broken_type)
+                        .cloned()
+                        .unwrap_or(current_broken_type.clone());
+                    let dep_ref = rename_map.get(dep).cloned().unwrap_or(dep.clone());
+
                     report.findings.push(Finding {
                         severity: Severity::Critical,
                         category: "Cascading Layout Break".to_string(),
                         message: format!(
                             "Type '{}' layout is broken because it embeds modified type '{}'. \
                              Stored data for '{}' is no longer compatible.",
-                            dep, current_broken_type, dep
+                            dep_ref, current_ref, dep_ref
                         ),
-                        type_name: Some(dep.clone()),
-                        target: Some(dep.clone()),
+                        type_name: Some(dep_ref.clone()),
+                        target: Some(dep_ref.clone()),
                         classification: None,
                     });
                 }
@@ -2083,8 +2441,14 @@ pub fn compare_wasm_imports(
 ) {
     use std::collections::BTreeSet;
 
-    let old_set: BTreeSet<(&str, &str)> = old_imports.iter().map(|(m, n)| (m.as_str(), n.as_str())).collect();
-    let new_set: BTreeSet<(&str, &str)> = new_imports.iter().map(|(m, n)| (m.as_str(), n.as_str())).collect();
+    let old_set: BTreeSet<(&str, &str)> = old_imports
+        .iter()
+        .map(|(m, n)| (m.as_str(), n.as_str()))
+        .collect();
+    let new_set: BTreeSet<(&str, &str)> = new_imports
+        .iter()
+        .map(|(m, n)| (m.as_str(), n.as_str()))
+        .collect();
 
     // Newly required host functions (in new, not in old)
     for (module, name) in &new_set {
@@ -2989,7 +3353,12 @@ mod tests {
         let mut new = ContractSpec::default();
         new.unions.insert(
             "Event".to_string(),
-            union_with_case("Event", "Deposit", "records a deposit", vec![ScSpecTypeDef::U64]),
+            union_with_case(
+                "Event",
+                "Deposit",
+                "records a deposit",
+                vec![ScSpecTypeDef::U64],
+            ),
         );
 
         let report = compare(&old, &new);
@@ -3041,11 +3410,15 @@ mod tests {
     #[test]
     fn error_enum_documentation_change_produces_info_finding() {
         let mut old = ContractSpec::default();
-        old.error_enums
-            .insert("Error".to_string(), error_enum_with_case("Error", "NotFound", "old doc"));
+        old.error_enums.insert(
+            "Error".to_string(),
+            error_enum_with_case("Error", "NotFound", "old doc"),
+        );
         let mut new = ContractSpec::default();
-        new.error_enums
-            .insert("Error".to_string(), error_enum_with_case("Error", "NotFound", "new doc"));
+        new.error_enums.insert(
+            "Error".to_string(),
+            error_enum_with_case("Error", "NotFound", "new doc"),
+        );
 
         let report = compare(&old, &new);
         let finding = report
@@ -3189,5 +3562,249 @@ mod tests {
         let safety = crate::report::SafetyReport::new(&report);
         assert!(safety.is_safe);
         assert_eq!(safety.critical_count, 0);
+    }
+
+    fn spec_with_function_params(
+        func_name: &str,
+        params: Vec<(&str, ScSpecTypeDef)>,
+    ) -> ContractSpec {
+        let mut spec = ContractSpec::default();
+        let inputs: Vec<ScSpecFunctionInputV0> = params
+            .into_iter()
+            .map(|(name, t)| ScSpecFunctionInputV0 {
+                doc: StringM::default(),
+                name: name.try_into().unwrap(),
+                type_: t,
+            })
+            .collect();
+        spec.functions.insert(
+            func_name.to_string(),
+            ScSpecFunctionV0 {
+                doc: StringM::default(),
+                name: func_name.try_into().unwrap(),
+                inputs: VecM::try_from(inputs).unwrap(),
+                outputs: VecM::default(),
+            },
+        );
+        spec
+    }
+
+    fn spec_with_function_outputs(func_name: &str, outputs: Vec<ScSpecTypeDef>) -> ContractSpec {
+        let mut spec = ContractSpec::default();
+        spec.functions.insert(
+            func_name.to_string(),
+            ScSpecFunctionV0 {
+                doc: StringM::default(),
+                name: func_name.try_into().unwrap(),
+                inputs: VecM::default(),
+                outputs: VecM::try_from(outputs).unwrap(),
+            },
+        );
+        spec
+    }
+
+    fn result_type(ok: ScSpecTypeDef, err: ScSpecTypeDef) -> ScSpecTypeDef {
+        ScSpecTypeDef::Result(Box::new(stellar_xdr::curr::ScSpecTypeResult {
+            ok_type: Box::new(ok),
+            error_type: Box::new(err),
+        }))
+    }
+
+    #[test]
+    fn test_parameter_added_removed_aligned() {
+        let old = spec_with_function_params(
+            "test_fn",
+            vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U64)],
+        );
+        let new = spec_with_function_params(
+            "test_fn",
+            vec![("b", ScSpecTypeDef::U64), ("c", ScSpecTypeDef::I32)],
+        );
+        let report = compare(&old, &new);
+
+        let removed = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Parameter Removed");
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().target.as_deref(), Some("test_fn.a"));
+        assert_eq!(removed.unwrap().severity, Severity::Critical);
+
+        let added = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Parameter Added");
+        assert!(added.is_some());
+        assert_eq!(added.unwrap().target.as_deref(), Some("test_fn.c"));
+        assert_eq!(added.unwrap().severity, Severity::Critical);
+    }
+
+    #[test]
+    fn test_parameter_type_changed_on_count_mismatch() {
+        let old = spec_with_function_params(
+            "test_fn",
+            vec![("a", ScSpecTypeDef::U32), ("b", ScSpecTypeDef::U64)],
+        );
+        let new = spec_with_function_params(
+            "test_fn",
+            vec![("b", ScSpecTypeDef::I32), ("c", ScSpecTypeDef::I32)],
+        );
+        let report = compare(&old, &new);
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.category == "Parameter Removed"
+                    && f.target.as_deref() == Some("test_fn.a"))
+        );
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.category == "Parameter Added" && f.target.as_deref() == Some("test_fn.c")));
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.category == "Parameter Type Changed"
+                && f.target.as_deref() == Some("test_fn.b")));
+    }
+
+    #[test]
+    fn test_function_rename_matching() {
+        let mut old = ContractSpec::default();
+        old.functions.insert(
+            "old_func".to_string(),
+            ScSpecFunctionV0 {
+                doc: StringM::default(),
+                name: "old_func".try_into().unwrap(),
+                inputs: VecM::try_from(vec![ScSpecFunctionInputV0 {
+                    doc: StringM::default(),
+                    name: "x".try_into().unwrap(),
+                    type_: ScSpecTypeDef::U32,
+                }])
+                .unwrap(),
+                outputs: VecM::try_from(vec![ScSpecTypeDef::I64]).unwrap(),
+            },
+        );
+
+        let mut new = ContractSpec::default();
+        new.functions.insert(
+            "new_func".to_string(),
+            ScSpecFunctionV0 {
+                doc: StringM::default(),
+                name: "new_func".try_into().unwrap(),
+                inputs: VecM::try_from(vec![ScSpecFunctionInputV0 {
+                    doc: StringM::default(),
+                    name: "x".try_into().unwrap(),
+                    type_: ScSpecTypeDef::U32,
+                }])
+                .unwrap(),
+                outputs: VecM::try_from(vec![ScSpecTypeDef::I64]).unwrap(),
+            },
+        );
+
+        let report = compare(&old, &new);
+
+        let renamed = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Function Renamed");
+        assert!(renamed.is_some());
+        assert_eq!(renamed.unwrap().target.as_deref(), Some("new_func"));
+        assert!(renamed
+            .unwrap()
+            .message
+            .contains("Function 'old_func' appears to have been renamed to 'new_func'"));
+        assert_eq!(renamed.unwrap().severity, Severity::Critical);
+
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.category == "Function Removed"));
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.category == "Function Added"));
+    }
+
+    #[test]
+    fn test_result_return_type_arms() {
+        let old_ok = result_type(ScSpecTypeDef::U32, ScSpecTypeDef::I32);
+        let new_ok_changed = result_type(ScSpecTypeDef::U64, ScSpecTypeDef::I32);
+        let new_err_changed = result_type(ScSpecTypeDef::U32, ScSpecTypeDef::U64);
+
+        let old_spec = spec_with_function_outputs("test_fn", vec![old_ok.clone()]);
+        let new_spec_ok = spec_with_function_outputs("test_fn", vec![new_ok_changed]);
+        let report_ok = compare(&old_spec, &new_spec_ok);
+
+        let arm_ok = report_ok
+            .findings
+            .iter()
+            .find(|f| f.category == "Return Type Success Arm Changed");
+        assert!(arm_ok.is_some());
+        assert_eq!(arm_ok.unwrap().target.as_deref(), Some("test_fn"));
+        assert_eq!(arm_ok.unwrap().severity, Severity::Critical);
+
+        let new_spec_err = spec_with_function_outputs("test_fn", vec![new_err_changed]);
+        let report_err = compare(&old_spec, &new_spec_err);
+
+        let arm_err = report_err
+            .findings
+            .iter()
+            .find(|f| f.category == "Return Type Error Arm Changed");
+        assert!(arm_err.is_some());
+        assert_eq!(arm_err.unwrap().target.as_deref(), Some("test_fn"));
+        assert_eq!(arm_err.unwrap().severity, Severity::Critical);
+    }
+
+    #[test]
+    fn test_udt_rename_cascade_and_warning() {
+        let old = spec_with_structs(vec![
+            ("OldName", vec![("val", ScSpecTypeDef::U32)]),
+            ("Dependent", vec![("info", udt("OldName"))]),
+        ]);
+        let new = spec_with_structs(vec![
+            ("NewName", vec![("val", ScSpecTypeDef::U32)]),
+            ("Dependent", vec![("info", udt("NewName"))]),
+        ]);
+
+        let report = compare(&old, &new);
+
+        let rename_finding = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Type Renamed");
+        assert!(rename_finding.is_some());
+        assert_eq!(rename_finding.unwrap().severity, Severity::Warning);
+        assert_eq!(rename_finding.unwrap().target.as_deref(), Some("NewName"));
+
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.category == "Cascading Layout Break"));
+
+        let new_broken = spec_with_structs(vec![
+            ("NewName", vec![("val", ScSpecTypeDef::U64)]),
+            ("Dependent", vec![("info", udt("NewName"))]),
+        ]);
+
+        let report_broken = compare(&old, &new_broken);
+
+        let rename_changes = report_broken
+            .findings
+            .iter()
+            .find(|f| f.category == "Type Renamed With Changes");
+        assert!(rename_changes.is_some());
+        assert_eq!(rename_changes.unwrap().severity, Severity::Warning);
+
+        let cascade = report_broken
+            .findings
+            .iter()
+            .find(|f| f.category == "Cascading Layout Break");
+        assert!(cascade.is_some());
+        assert_eq!(cascade.unwrap().target.as_deref(), Some("Dependent"));
+        assert!(cascade.unwrap().message.contains(
+            "Type 'Dependent' layout is broken because it embeds modified type 'NewName'"
+        ));
     }
 }
