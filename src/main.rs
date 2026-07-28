@@ -7,7 +7,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use soroban_upgrade_safeguard::{
-    color::should_disable_color,
+    color::{should_disable_color, ColorMode},
     dependency::{
         cycle_findings, missing_contract_findings, ContractDependency, CrossContractFinding,
         DependencyGraph,
@@ -85,6 +85,10 @@ struct Args {
     /// Do not color output
     #[arg(long)]
     no_color: bool,
+
+    /// Control when ANSI color is used. --no-color overrides this option.
+    #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+    color: ColorMode,
 
     /// Allow HTTP connections for RPC when the host is localhost/127.0.0.1.
     /// Without this flag only HTTPS URLs are accepted.
@@ -266,10 +270,13 @@ fn run() -> Result<()> {
 
     if should_disable_color(
         args.no_color,
+        args.color,
         std::env::var_os("NO_COLOR").is_some(),
         std::io::stdout().is_terminal(),
     ) {
         colored::control::set_override(false);
+    } else if args.color == ColorMode::Always {
+        colored::control::set_override(true);
     }
 
     // Validate category filter arguments before doing any real work.
