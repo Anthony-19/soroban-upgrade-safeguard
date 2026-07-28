@@ -3,8 +3,7 @@ use crate::limits::{LimitError, ResourcePolicy};
 use crate::mapper::LayoutMapper;
 use crate::parser::{ContractEnvMeta, ContractMeta, RUST_VERSION_KEY, SDK_VERSION_KEY};
 use crate::rename::{match_renames, Rename};
-use crate::spec::{ContractSpec, DuplicateEntry};
-use crate::storage_schema::ResolvedStorageSchema;
+use crate::spec::ContractSpec;
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -219,10 +218,7 @@ pub fn compare_storage_schemas(
 /// Inject `Info` findings for schema references the resolver could not match
 /// against the exported spec. These are not errors — they just cap the coverage
 /// claim so the report cannot overstate what was verified.
-pub fn report_unresolved_storage_references(
-    unresolved: &[String],
-    report: &mut DiffReport,
-) {
+pub fn report_unresolved_storage_references(unresolved: &[String], report: &mut DiffReport) {
     for name in unresolved {
         report.findings.push(Finding {
             severity: Severity::Info,
@@ -418,6 +414,51 @@ pub fn compare_exports(
                 });
             }
         }
+    }
+}
+
+/// Compare WASM host-function import sections between two builds.
+///
+/// Host imports represent functions the Soroban host must provide (e.g.
+/// `env::*` functions). An import present in the old binary but absent from
+/// the new one is a removal (Info); a new import is also Info. No severity
+/// is Critical because these are SDK-version changes, not user-facing breaks.
+pub fn compare_wasm_imports(
+    old_imports: &[(String, String)],
+    new_imports: &[(String, String)],
+    report: &mut DiffReport,
+) {
+    use std::collections::BTreeSet;
+
+    let old_set: BTreeSet<(&str, &str)> = old_imports
+        .iter()
+        .map(|(m, n)| (m.as_str(), n.as_str()))
+        .collect();
+    let new_set: BTreeSet<(&str, &str)> = new_imports
+        .iter()
+        .map(|(m, n)| (m.as_str(), n.as_str()))
+        .collect();
+
+    for (module, name) in old_set.difference(&new_set) {
+        report.findings.push(Finding {
+            severity: Severity::Info,
+            category: "Host Import Removed".to_string(),
+            message: format!("Host import '{module}.{name}' was removed."),
+            type_name: None,
+            target: Some(format!("{module}.{name}")),
+            classification: None,
+        });
+    }
+
+    for (module, name) in new_set.difference(&old_set) {
+        report.findings.push(Finding {
+            severity: Severity::Info,
+            category: "Host Import Added".to_string(),
+            message: format!("Host import '{module}.{name}' was added."),
+            type_name: None,
+            target: Some(format!("{module}.{name}")),
+            classification: None,
+        });
     }
 }
 
@@ -1718,23 +1759,6 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
     }
 }
 
-/// Compare two contract specs with an explicit [`ResourcePolicy`], bounding
-/// recursive type-walk operations. Returns `Err` only when a resource limit is
-/// exceeded; structural findings are always returned as `Ok(DiffReport)`.
-pub fn compare_with_policy(
-    old: &ContractSpec,
-    new: &ContractSpec,
-    policy: &ResourcePolicy,
-) -> Result<DiffReport, LimitError> {
-    let _ = policy; // limit enforcement lives in the mapper walk; nothing to enforce here
-    Ok(compare_with_classification(
-        old,
-        new,
-        &ClassificationConfig::none(),
-    ))
-}
-
-/// Inject duplicate-spec-entry findings into `report`.
 /// Policy-aware variant of [`detect_cascading_layout_breaks`].
 ///
 /// Uses [`crate::mapper::LayoutMapper::new_with_policy`] so the walk is bounded
@@ -1743,64 +1767,8 @@ pub fn compare_with_policy(
 fn detect_cascading_layout_breaks_with_policy(
     old: &ContractSpec,
     report: &mut DiffReport,
-    compat: bool,
-) {
-    for dup in duplicates {
-        let severity = if dup.is_identical {
-            Severity::Info
-        } else {
-            Severity::Critical
-        };
-        let sections: Vec<String> = dup.sections.iter().map(|s| s.to_string()).collect();
-        report.findings.push(Finding {
-            severity,
-            category: "Duplicate Spec Entry".to_string(),
-            message: format!(
-                "{} build: {} '{}' defined {} times (sections: {}){}.",
-                build,
-                dup.kind.label(),
-                dup.name,
-                dup.sections.len(),
-                sections.join(", "),
-                if dup.is_identical {
-                    " — identical definitions"
-                } else {
-                    " — CONFLICTING definitions"
-                }
-            ),
-            type_name: Some(dup.name.clone()),
-            target: Some(dup.name.clone()),
-            classification: None,
-        });
-        let _ = (section_count, compat);
-    }
-}
-
-/// Compare two resolved storage schemas and return a diff report of findings.
-pub fn compare_storage_schemas(
-    old: &ResolvedStorageSchema,
-    new: &ResolvedStorageSchema,
-) -> DiffReport {
-    compare_with_classification(&old.spec, &new.spec, &ClassificationConfig::none())
-}
-
-/// Report unresolved storage-schema type references as `Warning` findings.
-pub fn report_unresolved_storage_references(unresolved: &[String], report: &mut DiffReport) {
-    for name in unresolved {
-        report.findings.push(Finding {
-            severity: Severity::Warning,
-            category: "Unresolved Storage Reference".to_string(),
-            message: format!(
-                "Storage schema references type '{}' which could not be resolved. \
-                 Coverage is incomplete for this type.",
-                name
-            ),
-            type_name: Some(name.clone()),
-            target: Some(name.clone()),
-            classification: None,
-        });
-    policy: &crate::limits::ResourcePolicy,
-) -> Result<(), crate::limits::LimitError> {
+    policy: &ResourcePolicy,
+) -> Result<(), LimitError> {
     let old_mapper = LayoutMapper::new_with_policy(old, policy);
     let reverse_deps = old_mapper.try_build_reverse_dependencies()?;
 
@@ -1817,14 +1785,6 @@ pub fn report_unresolved_storage_references(unresolved: &[String], report: &mut 
     let mut i = 0;
     let mut cascaded = std::collections::HashSet::new();
 
-    let old_set: BTreeSet<(&str, &str)> = old_imports
-        .iter()
-        .map(|(m, n)| (m.as_str(), n.as_str()))
-        .collect();
-    let new_set: BTreeSet<(&str, &str)> = new_imports
-        .iter()
-        .map(|(m, n)| (m.as_str(), n.as_str()))
-        .collect();
     while i < queue.len() {
         let current_broken_type = queue[i].clone();
         i += 1;
@@ -1858,7 +1818,7 @@ pub fn report_unresolved_storage_references(unresolved: &[String], report: &mut 
 mod tests {
     use super::*;
     use std::collections::{BTreeSet, HashSet};
-    use stellar_xdr::curr::{ScEnvMetaEntry, ScSpecTypeUdt, StringM, VecM};
+    use stellar_xdr::curr::{ScEnvMetaEntry, ScMetaEntry, ScMetaV0, ScSpecTypeUdt, StringM, VecM};
 
     #[test]
     fn exported_functions_detect_removals_additions_and_spec_mismatches() {

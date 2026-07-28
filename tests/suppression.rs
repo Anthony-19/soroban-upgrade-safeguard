@@ -118,9 +118,11 @@ fn rule_id_based_suppression_matches_stable_identifier() {
     assert_eq!(code, 0, "suppressing by rule_id should pass the run");
     assert_eq!(json["suppressed_count"].as_u64().unwrap(), 1);
     assert!(
-        findings(&json).iter().any(|(c, t, s)| c == "Struct Field Removed"
-            && t.as_deref() == Some("ConfigData.threshold")
-            && *s),
+        findings(&json)
+            .iter()
+            .any(|(c, t, s)| c == "Struct Field Removed"
+                && t.as_deref() == Some("ConfigData.threshold")
+                && *s),
         "the removed field must appear as suppressed when matched by rule_id"
     );
 }

@@ -198,6 +198,27 @@ fn resolve_policy(args: &Args, config_path: Option<&Path>) -> Result<ResourcePol
     Ok(policy)
 }
 
+/// Write `content` to a file if `output_path` is `Some`, otherwise print it
+/// to stdout. Writing to a file is atomic: the full string is rendered before
+/// any file is opened, so a failed comparison never leaves a partial file.
+///
+/// When a file path is used, a progress message is emitted via `progress` so
+/// the user can see where the report landed.
+fn emit_report_output(
+    content: &str,
+    output_path: Option<&std::path::Path>,
+    progress: &impl Fn(String),
+) -> Result<()> {
+    if let Some(path) = output_path {
+        std::fs::write(path, content)
+            .with_context(|| format!("Failed to write report to '{}'", path.display()))?;
+        progress(format!("✅ Report written to: {}", path.display()));
+    } else {
+        println!("{}", content);
+    }
+    Ok(())
+}
+
 /// Exit codes:
 /// - `0`: safe (no breaking changes, or all suppressed).
 /// - `1`: breaking changes detected, or a generic/IO/parse error.
@@ -224,55 +245,6 @@ fn main() {
             std::process::exit(1);
         }
     }
-}
-
-fn run() -> Result<()> {
-    let args = Args::parse();
-
-    // Validate category filter arguments
-    let all_categories: Vec<String> = args
-        .include_category
-        .iter()
-        .chain(args.exclude_category.iter())
-        .cloned()
-        .collect();
-    if !all_categories.is_empty() {
-        if let Err(unknown) = validate_categories(&all_categories) {
-            anyhow::bail!(
-                "Unknown category name(s): {}. Valid categories are: {}",
-                unknown.join(", "),
-                report::KNOWN_CATEGORIES.join(", ")
-            );
-        }
-    }
-    let category_filter = CategoryFilter {
-        include: if args.include_category.is_empty() {
-            None
-        } else {
-            Some(args.include_category.iter().cloned().collect())
-        },
-        exclude: args.exclude_category.iter().cloned().collect(),
-    };
-
-/// Write `content` to a file if `output_path` is `Some`, otherwise print it
-/// to stdout. Writing to a file is atomic: the full string is rendered before
-/// any file is opened, so a failed comparison never leaves a partial file.
-///
-/// When a file path is used, a progress message is emitted via `progress` so
-/// the user can see where the report landed.
-fn emit_report_output(
-    content: &str,
-    output_path: Option<&std::path::Path>,
-    progress: &impl Fn(String),
-) -> Result<()> {
-    if let Some(path) = output_path {
-        std::fs::write(path, content)
-            .with_context(|| format!("Failed to write report to '{}'", path.display()))?;
-        progress(format!("✅ Report written to: {}", path.display()));
-    } else {
-        println!("{}", content);
-    }
-    Ok(())
 }
 
 fn run() -> Result<()> {
@@ -348,11 +320,9 @@ fn run() -> Result<()> {
 
     // In JSON or Markdown mode, decorative progress goes to stderr so stdout
     // stays a single, pristine document. In text mode it stays on stdout
-    // exactly as before.
-    let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
-    // stays a single, pristine document. An explicit output file also keeps
-    // stdout empty in text mode: the report is in that file and all progress
-    // belongs on stderr rather than alongside it.
+    // exactly as before. An explicit output file also keeps stdout empty in
+    // text mode: the report is in that file and all progress belongs on stderr
+    // rather than alongside it.
     let clean_stdout = args.output.is_some()
         || args.format == OutputFormat::Json
         || args.format == OutputFormat::Markdown;
@@ -466,7 +436,6 @@ fn run() -> Result<()> {
                     if !all_categories.is_empty() {
                         report.apply_category_filter(&category_filter);
                     }
-                Ok(report) => {
                     if !report.is_safe {
                         overall_safe = false;
                     }
@@ -522,8 +491,7 @@ fn run() -> Result<()> {
         }
 
         // Detect dependencies on contracts absent from this batch.
-        let known_contracts: std::collections::HashSet<String> =
-            results.keys().cloned().collect();
+        let known_contracts: std::collections::HashSet<String> = results.keys().cloned().collect();
         let missing = dep_graph.missing_contracts(&known_contracts);
         let missing_findings_list = missing_contract_findings(&missing);
         if !missing_findings_list.is_empty() {
@@ -551,21 +519,16 @@ fn run() -> Result<()> {
             per_contract_findings.insert(name.clone(), all);
         }
 
-        let cross_findings: Vec<CrossContractFinding> =
-            dep_graph.propagate(&per_contract_findings);
+        let cross_findings: Vec<CrossContractFinding> = dep_graph.propagate(&per_contract_findings);
 
         // Cross-contract criticals always fail; warnings only fail under --strict.
         let cross_critical_count = cross_findings
             .iter()
-            .filter(|f| {
-                f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Critical
-            })
+            .filter(|f| f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Critical)
             .count();
         let cross_warning_count = cross_findings
             .iter()
-            .filter(|f| {
-                f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Warning
-            })
+            .filter(|f| f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Warning)
             .count();
         if cross_critical_count > 0 {
             overall_safe = false;
@@ -614,7 +577,7 @@ fn run() -> Result<()> {
                 let infra_findings: Vec<serde_json::Value> = cycle_findings_list
                     .iter()
                     .chain(missing_findings_list.iter())
-                    .map(|f| serde_json::to_value(f))
+                    .map(serde_json::to_value)
                     .collect::<Result<_, _>>()?;
 
                 // Overall recommended bump: the most severe bump across all
@@ -1006,20 +969,6 @@ fn run() -> Result<()> {
         safety_report.apply_category_filter(&category_filter);
     }
 
-    match args.format {
-        OutputFormat::Json => {
-            // Single JSON document to stdout; no decorative text, no ANSI codes.
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&safety_report.to_json())?
-            );
-        }
-        OutputFormat::Markdown => {
-            println!("{}", safety_report.generate_summary_markdown());
-        }
-        OutputFormat::Text => {
-            println!("{}", safety_report.generate_summary_text(args.explain));
-        }
     // Render the report to a string first so --output can write it atomically.
     let rendered = match args.format {
         OutputFormat::Json => serde_json::to_string_pretty(&safety_report.to_json())?,
@@ -1030,13 +979,9 @@ fn run() -> Result<()> {
 
     // Write the report — either to a file (--output) or to stdout.
     if let Some(ref output_path) = args.output {
-        std::fs::write(output_path, &rendered).with_context(|| {
-            format!("Failed to write report to '{}'", output_path.display())
-        })?;
-        progress(format!(
-            "✅ Report written to: {}",
-            output_path.display()
-        ));
+        std::fs::write(output_path, &rendered)
+            .with_context(|| format!("Failed to write report to '{}'", output_path.display()))?;
+        progress(format!("✅ Report written to: {}", output_path.display()));
     } else {
         println!("{}", rendered);
     }

@@ -7,6 +7,47 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+/// All known category names that this tool can emit. Used for validating
+/// `--include-category` / `--exclude-category` arguments.
+pub static KNOWN_CATEGORIES: &[&str] = crate::diff::ALL_CATEGORIES;
+
+/// Validate that every name in `categories` is a known category.
+/// Returns a `Vec` of unknown names (empty means all are valid).
+pub fn validate_categories(categories: &[String]) -> Result<(), Vec<String>> {
+    let unknown: Vec<String> = categories
+        .iter()
+        .filter(|c| !KNOWN_CATEGORIES.contains(&c.as_str()))
+        .cloned()
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(unknown)
+    }
+}
+
+/// Category filter for include/exclude lists.
+#[derive(Debug, Clone, Default)]
+pub struct CategoryFilter {
+    pub include: Option<HashSet<String>>,
+    pub exclude: HashSet<String>,
+}
+
+/// Internal settings bag captured from the report configuration at construction
+/// time. Exposed as `settings` on [`SafetyReport`] so callers (and tests) can
+/// inspect the effective settings after construction.
+#[derive(Debug, Clone)]
+pub struct ReportSettings {
+    pub strict: bool,
+    pub explain: bool,
+    pub max_suppressions: Option<usize>,
+    pub allow_targetless: Option<bool>,
+    pub max_xdr_depth: u32,
+    pub max_xdr_len: usize,
+    pub max_entries: usize,
+    pub max_walk_depth: usize,
+}
+
 /// One-line summary of exactly what a verdict from this tool certifies.
 ///
 /// Displayed under the status in every human-readable format and mirrored into
@@ -207,7 +248,7 @@ pub struct ReportedFinding {
 /// Per-build size and interface-count metrics, carried in the report for all
 /// three output formats. These are purely informational and never affect
 /// `is_safe`, the exit code, or the recommended bump.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct BuildMetrics {
     /// Total WASM binary size in bytes for the old build.
     pub old_size_bytes: usize,
@@ -239,6 +280,7 @@ pub struct BuildMetrics {
 
 impl BuildMetrics {
     /// Construct metrics from raw byte lengths and spec counts.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         old_size_bytes: usize,
         new_size_bytes: usize,
@@ -326,6 +368,8 @@ pub struct SafetyReport {
     /// Suppression rules from the config that matched no finding during this run.
     /// Non-empty indicates a potential typo or a stale rule, surfaced to stderr.
     pub unmatched_suppressions: Vec<crate::suppression::SuppressionRule>,
+    /// Effective settings captured at construction time.
+    pub settings: ReportSettings,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -368,7 +412,7 @@ pub struct SafetyReportJson<'a> {
 }
 
 /// JSON representation of a suppression rule that matched no finding.
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub struct UnmatchedSuppressionJson {
     pub category: String,
     pub target: Option<String>,
@@ -398,17 +442,6 @@ impl SafetyReport {
         strict: bool,
         policy: &ResourcePolicy,
     ) -> Self {
-        let settings = ReportSettings {
-            strict,
-            explain,
-            max_suppressions: suppressions.max_suppressions,
-            allow_targetless: suppressions.allow_targetless,
-            max_xdr_depth: policy.max_xdr_depth,
-            max_xdr_len: policy.max_xdr_len,
-            max_entries: policy.max_entries,
-            max_walk_depth: policy.max_walk_depth,
-        };
-
         let mut critical_count = 0;
         let mut warning_count = 0;
         let mut info_count = 0;
@@ -511,6 +544,16 @@ impl SafetyReport {
             new_spec_summary: None,
             metrics: None,
             unmatched_suppressions,
+            settings: ReportSettings {
+                strict,
+                explain,
+                max_suppressions: suppressions.max_suppressions,
+                allow_targetless: suppressions.allow_targetless,
+                max_xdr_depth: policy.max_xdr_depth,
+                max_xdr_len: policy.max_xdr_len,
+                max_entries: policy.max_entries,
+                max_walk_depth: policy.max_walk_depth,
+            },
         }
     }
 
@@ -879,12 +922,7 @@ impl SafetyReport {
                     .bold()
                     .to_string(),
             );
-            output.push_str(
-                &"📊 BUILD METRICS\n"
-                    .bold()
-                    .cyan()
-                    .to_string(),
-            );
+            output.push_str(&"📊 BUILD METRICS\n".bold().cyan().to_string());
             output.push_str(
                 &"========================================\n"
                     .bold()
@@ -1069,12 +1107,6 @@ impl SafetyReport {
         output
     }
 
-    /// Append the informational build-metrics table to Markdown output.
-    /// Full implementation comes from the upstream main branch (BuildMetrics).
-    fn append_metrics_markdown(&self, _output: &mut String) {
-        // Populated by main's BuildMetrics feature; no-op on this branch.
-    }
-
     /// Generate GitHub Actions workflow command output.
     ///
     /// Emits one [workflow command] per non-suppressed finding, levelled to
@@ -1141,10 +1173,6 @@ impl SafetyReport {
 
         output
     }
-}
-
-        output
-    }
 
     /// Append the informational build-metrics table to Markdown output.
     fn append_metrics_markdown(&self, output: &mut String) {
@@ -1163,29 +1191,89 @@ impl SafetyReport {
             let delta_enum = m.new_enum_count as i64 - m.old_enum_count as i64;
             let delta_union = m.new_union_count as i64 - m.old_union_count as i64;
             let delta_err = m.new_error_enum_count as i64 - m.old_error_enum_count as i64;
-            let fmt_count = |d: i64| if d >= 0 { format!("+{}", d) } else { format!("{}", d) };
+            let fmt_count = |d: i64| {
+                if d >= 0 {
+                    format!("+{}", d)
+                } else {
+                    format!("{}", d)
+                }
+            };
             output.push_str(&format!(
                 "| **Functions** | {} | {} | {} |\n",
-                m.old_function_count, m.new_function_count, fmt_count(delta_fn)
+                m.old_function_count,
+                m.new_function_count,
+                fmt_count(delta_fn)
             ));
             output.push_str(&format!(
                 "| **Structs** | {} | {} | {} |\n",
-                m.old_struct_count, m.new_struct_count, fmt_count(delta_struct)
+                m.old_struct_count,
+                m.new_struct_count,
+                fmt_count(delta_struct)
             ));
             output.push_str(&format!(
                 "| **Enums** | {} | {} | {} |\n",
-                m.old_enum_count, m.new_enum_count, fmt_count(delta_enum)
+                m.old_enum_count,
+                m.new_enum_count,
+                fmt_count(delta_enum)
             ));
             output.push_str(&format!(
                 "| **Unions** | {} | {} | {} |\n",
-                m.old_union_count, m.new_union_count, fmt_count(delta_union)
+                m.old_union_count,
+                m.new_union_count,
+                fmt_count(delta_union)
             ));
             output.push_str(&format!(
                 "| **Error Enums** | {} | {} | {} |\n",
-                m.old_error_enum_count, m.new_error_enum_count, fmt_count(delta_err)
+                m.old_error_enum_count,
+                m.new_error_enum_count,
+                fmt_count(delta_err)
             ));
             output.push('\n');
         }
+    }
+
+    /// Apply a category filter to the report, removing filtered findings.
+    pub fn apply_category_filter(&mut self, filter: &CategoryFilter) {
+        // Remove whole categories from findings_by_category for excluded categories.
+        if let Some(ref include) = filter.include {
+            self.findings_by_category
+                .retain(|cat, _| include.contains(cat));
+            let mut removed = 0;
+            let mut new_findings = HashMap::new();
+            for (cat, findings) in self.findings_by_category.drain() {
+                if include.contains(&cat) {
+                    new_findings.insert(cat, findings);
+                } else {
+                    removed += findings.len();
+                }
+            }
+            self.findings_by_category = new_findings;
+            self.filtered_count += removed;
+        }
+
+        for cat in &filter.exclude {
+            if let Some(removed) = self.findings_by_category.remove(cat) {
+                self.filtered_count += removed.len();
+            }
+        }
+
+        // Recompute counts from the filtered findings.
+        let mut critical = 0;
+        let mut warning = 0;
+        let mut info = 0;
+        for findings in self.findings_by_category.values() {
+            for f in findings {
+                match f.finding.severity {
+                    Severity::Critical => critical += 1,
+                    Severity::Warning => warning += 1,
+                    Severity::Info => info += 1,
+                }
+            }
+        }
+        self.critical_count = critical;
+        self.warning_count = warning;
+        self.info_count = info;
+        self.is_safe = critical == 0;
     }
 }
 
@@ -1369,6 +1457,16 @@ mod tests {
             new_spec_summary: None,
             metrics: None,
             unmatched_suppressions: Vec::new(),
+            settings: ReportSettings {
+                strict: false,
+                explain: false,
+                max_suppressions: None,
+                allow_targetless: None,
+                max_xdr_depth: 0,
+                max_xdr_len: 0,
+                max_entries: 0,
+                max_walk_depth: 0,
+            },
         };
 
         // Identical upgrade -> patch

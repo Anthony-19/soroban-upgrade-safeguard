@@ -53,7 +53,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::diff::Finding;
 use crate::rules::canonical_rule_id;
@@ -66,7 +66,7 @@ pub const DEFAULT_CONFIG_FILE: &str = ".safeguard.toml";
 /// `deny_unknown_fields` is deliberate: this is the one config file that can
 /// turn the safety gate off, so a mistyped key (`targets`, `[[suppression]]`)
 /// must be a loud parse error rather than a silently dropped rule.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SuppressionConfig {
     /// Configurable maximum number of suppressions. Enforced globally.
@@ -97,7 +97,7 @@ pub struct SuppressionConfig {
 ///
 /// `deny_unknown_fields` guards against a typo (e.g. `targets` for `target`)
 /// silently changing what the rule matches.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SuppressionRule {
     /// The stable rule id to match exactly (e.g. `"struct_field_type_changed"`).
@@ -283,10 +283,7 @@ impl SuppressionConfig {
 
     /// Return the first rule that matches `finding` together with its index, if any.
     /// The index is used by the report layer to track which rules were used.
-    pub fn matching_rule_with_index(
-        &self,
-        finding: &Finding,
-    ) -> Option<(usize, &SuppressionRule)> {
+    pub fn matching_rule_with_index(&self, finding: &Finding) -> Option<(usize, &SuppressionRule)> {
         self.rules
             .iter()
             .enumerate()
