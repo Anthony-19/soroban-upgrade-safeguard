@@ -1,9 +1,8 @@
-use anyhow::{Context, Result};
-use std::collections::BTreeMap;
 use std::io::Cursor;
 use stellar_xdr::curr::{Limited, Limits, ReadXdr, ScEnvMetaEntry, ScSpecEntry};
-use stellar_xdr::curr::{Limited, ReadXdr, ScEnvMetaEntry, ScMetaEntry, ScSpecEntry};
 use wasmparser::{Parser, Payload};
+
+use crate::error::Error;
 
 /// Decoded contents of a contract's `contractenvmetav0` custom section.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,107 +43,19 @@ impl ContractEnvMeta {
     }
 }
 
-/// Metadata key the Soroban SDK populates with its own version (e.g. `21.6.0#...`).
-pub const SDK_VERSION_KEY: &str = "rssdkver";
-/// Metadata key the Soroban SDK populates with the Rust compiler version.
-pub const RUST_VERSION_KEY: &str = "rsver";
-
-/// Decoded contents of a contract's `contractmetav0` custom section.
-///
-/// The section is a sequence of key/value string pairs. The Soroban SDK seeds it
-/// with build provenance — the SDK version ([`SDK_VERSION_KEY`]) and the Rust
-/// compiler version ([`RUST_VERSION_KEY`]) — and contract authors may append
-/// their own keys via the `contractmeta!` macro.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ContractMeta {
-    pub entries: Vec<ScMetaEntry>,
-}
-
-impl ContractMeta {
-    /// All key/value pairs as an ordered map. On a repeated key the last entry
-    /// wins, matching how the section is materialized in practice.
-    pub fn pairs(&self) -> BTreeMap<String, String> {
-        self.entries
-            .iter()
-            .map(|entry| match entry {
-                ScMetaEntry::ScMetaV0(v) => (v.key.to_string(), v.val.to_string()),
-            })
-            .collect()
-    }
-
-    /// The value recorded for `key`, if present.
-    pub fn get(&self, key: &str) -> Option<String> {
-        self.entries.iter().rev().find_map(|entry| match entry {
-            ScMetaEntry::ScMetaV0(v) if v.key.to_string() == key => Some(v.val.to_string()),
-            ScMetaEntry::ScMetaV0(_) => None,
-        })
-    }
-
-    /// The Soroban SDK version recorded by the SDK, when present.
-    pub fn sdk_version(&self) -> Option<String> {
-        self.get(SDK_VERSION_KEY)
-    }
-
-    /// The Rust compiler version recorded by the SDK, when present.
-    pub fn rust_version(&self) -> Option<String> {
-        self.get(RUST_VERSION_KEY)
-    }
-
-    /// Whether the section carried no entries.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Short human-readable summary for report messages.
-    pub fn summary(&self) -> String {
-        if self.entries.is_empty() {
-            "empty".to_string()
-        } else {
-            format!(
-                "{} metadata entr{}",
-                self.entries.len(),
-                if self.entries.len() == 1 { "y" } else { "ies" }
-            )
-        }
-    }
-}
-
 /// Represents the extracted Soroban-specific custom sections from a WASM module.
 #[derive(Debug, Default)]
 pub struct SorobanMetadata {
     pub spec: Vec<ScSpecEntry>,
     pub env_meta: Option<ContractEnvMeta>,
-    /// Decoded `contractmetav0` key/value metadata, when the section is present
-    /// and well-formed. Absence or corruption leaves this `None` (see
-    /// [`extract_metadata_with_policy`]).
-    pub meta: Option<ContractMeta>,
-    /// WASM import section: the host functions this module requires.
-    /// Each entry is `(module, name)`.
-    pub imports: Vec<(String, String)>,
-    /// Names of functions exported from this WASM binary's export section.
-    ///
-    /// These are the names visible to on-chain callers at runtime, which may
-    /// differ from the names declared in the `contractspecv0` spec. Tracking
-    /// both lets the diff layer catch mismatches and removed exports.
-    pub exported_function_names: std::collections::BTreeSet<String>,
 }
 
 /// Decodes concatenated ScSpecEntry XDR objects from raw bytes.
-/// Decodes concatenated ScSpecEntry XDR objects from raw bytes using the default
-/// [`ResourcePolicy`]. Production paths call [`decode_spec_entries_with_policy`]
-/// so limits can be configured; this convenience wrapper exists for tests and
-/// for the `decode_spec_entries` fuzz target, which drives the XDR cursor loop
-/// directly on arbitrary bytes without first building a valid WASM wrapper.
-pub fn decode_spec_entries(data: &[u8]) -> Result<Vec<ScSpecEntry>> {
-    decode_spec_entries_with_policy(data, &ResourcePolicy::default(), 0)
-}
-
-/// Decodes concatenated ScSpecEntry XDR objects from raw bytes under `policy`.
 ///
 /// Soroban custom sections contain multiple XDR-encoded entries back to back.
 /// We wrap the data in a `Limited<Cursor>` and call `read_xdr` in a loop,
 /// checking the cursor position to detect when all bytes are consumed.
-fn decode_spec_entries(data: &[u8]) -> Result<Vec<ScSpecEntry>> {
+fn decode_spec_entries(data: &[u8]) -> Result<Vec<ScSpecEntry>, Error> {
     let cursor = Cursor::new(data);
     let mut limited = Limited::new(cursor, Limits::none());
     let mut entries = Vec::new();
@@ -152,11 +63,11 @@ fn decode_spec_entries(data: &[u8]) -> Result<Vec<ScSpecEntry>> {
     while (limited.inner.position() as usize) < data.len() {
         let entry_index = entries.len();
         let byte_offset = limited.inner.position();
-        let entry = ScSpecEntry::read_xdr(&mut limited).with_context(|| {
-            format!(
-                "Failed to decode ScSpecEntry XDR at entry index {} (byte offset {})",
-                entry_index, byte_offset
-            )
+        let entry = ScSpecEntry::read_xdr(&mut limited).map_err(|e| Error::XdrDecoding {
+            entry_index: Some(entry_index),
+            byte_offset: Some(byte_offset),
+            details: "Failed to decode ScSpecEntry XDR".to_string(),
+            source: Some(Box::new(e)),
         })?;
         entries.push(entry);
     }
@@ -165,14 +76,18 @@ fn decode_spec_entries(data: &[u8]) -> Result<Vec<ScSpecEntry>> {
 }
 
 /// Decodes concatenated ScEnvMetaEntry XDR objects from raw bytes.
-fn decode_env_meta_entries(data: &[u8]) -> Result<Vec<ScEnvMetaEntry>> {
+fn decode_env_meta_entries(data: &[u8]) -> Result<Vec<ScEnvMetaEntry>, Error> {
     let cursor = Cursor::new(data);
     let mut limited = Limited::new(cursor, Limits::none());
     let mut entries = Vec::new();
 
     while (limited.inner.position() as usize) < data.len() {
-        let entry = ScEnvMetaEntry::read_xdr(&mut limited)
-            .context("Failed to decode ScEnvMetaEntry XDR")?;
+        let entry = ScEnvMetaEntry::read_xdr(&mut limited).map_err(|e| Error::XdrDecoding {
+            entry_index: None,
+            byte_offset: None,
+            details: "Failed to decode ScEnvMetaEntry XDR".to_string(),
+            source: Some(Box::new(e)),
+        })?;
         entries.push(entry);
     }
 
@@ -180,157 +95,46 @@ fn decode_env_meta_entries(data: &[u8]) -> Result<Vec<ScEnvMetaEntry>> {
 }
 
 /// Decodes a `contractenvmetav0` section into a comparable representation.
-/// Decodes concatenated ScMetaEntry XDR objects from raw bytes under `policy`.
-///
-/// Follows the same cursor-driven loop as [`decode_env_meta_entries`]: the
-/// section holds back-to-back XDR entries, so we read until the cursor consumes
-/// the whole buffer, bounded by `policy` so an adversarial section cannot
-/// over-allocate.
-fn decode_meta_entries(data: &[u8], policy: &ResourcePolicy) -> Result<Vec<ScMetaEntry>> {
-    let cursor = Cursor::new(data);
-    let mut limited = Limited::new(cursor, policy.xdr_limits());
-    let mut entries = Vec::new();
-
-    while (limited.inner.position() as usize) < data.len() {
-        if entries.len() >= policy.max_entries {
-            return Err(LimitError::EntryCountExceeded {
-                limit: policy.max_entries,
-                kind: EntryKind::Meta,
-            }
-            .into());
-        }
-
-        let entry = match ScMetaEntry::read_xdr(&mut limited) {
-            Ok(entry) => entry,
-            Err(err) => {
-                if let Some(limit_err) = LimitError::from_xdr_error(&err, policy) {
-                    return Err(limit_err.into());
-                }
-                return Err(anyhow::Error::new(err).context("Failed to decode ScMetaEntry XDR"));
-            }
-        };
-        entries.push(entry);
-    }
-
-    Ok(entries)
-}
-
-/// Decodes a `contractmetav0` section into a comparable representation using the
-/// default [`ResourcePolicy`].
-pub fn decode_contract_meta(data: &[u8]) -> Result<ContractMeta> {
-    decode_contract_meta_with_policy(data, &ResourcePolicy::default())
-}
-
-/// Decodes a `contractmetav0` section into a comparable representation under
-/// `policy`.
-pub fn decode_contract_meta_with_policy(
-    data: &[u8],
-    policy: &ResourcePolicy,
-) -> Result<ContractMeta> {
-    let entries = decode_meta_entries(data, policy)?;
-    Ok(ContractMeta { entries })
-}
-
-/// Decodes a `contractenvmetav0` section into a comparable representation using
-/// the default [`ResourcePolicy`].
-pub fn decode_env_meta(data: &[u8]) -> Result<ContractEnvMeta> {
+pub fn decode_env_meta(data: &[u8]) -> Result<ContractEnvMeta, Error> {
     let entries = decode_env_meta_entries(data)?;
     Ok(ContractEnvMeta { entries })
 }
 
 /// Parses the WASM bytes to extract Soroban-specific custom sections and decodes them.
-pub fn extract_metadata(bytes: &[u8]) -> Result<SorobanMetadata> {
+pub fn extract_metadata(bytes: &[u8]) -> Result<SorobanMetadata, Error> {
     let mut metadata = SorobanMetadata::default();
     let parser = Parser::new(0);
 
     let mut spec_section_index = 0usize;
 
     for payload in parser.parse_all(bytes) {
-        if let Payload::CustomSection(section) = payload.context("Failed to parse WASM payload")? {
-            match section.name() {
-                "contractspecv0" => {
-                    let section_index = spec_section_index;
-                    spec_section_index += 1;
+        let section = match payload.map_err(|e| Error::WasmValidation {
+            path: None,
+            details: "Failed to parse WASM payload".to_string(),
+            byte_offset: None,
+            source: Some(Box::new(e)),
+        })? {
+            Payload::CustomSection(section) => section,
+            _ => continue,
+        };
 
-                    let entries = decode_spec_entries(section.data()).with_context(|| {
-                        format!(
-                            "Failed to decode contractspecv0 section {} at byte offset {}",
-                            section_index,
-                            section.data_offset()
-                        )
+        match section.name() {
+            "contractspecv0" => {
+                let section_index = spec_section_index;
+                spec_section_index += 1;
+
+                let entries =
+                    decode_spec_entries(section.data()).map_err(|e| Error::SectionExtraction {
+                        section_name: "contractspecv0".to_string(),
+                        section_index,
+                        byte_offset: section.data_offset() as u64,
+                        details: String::new(),
+                        source: Some(Box::new(e)),
                     })?;
-                    metadata.spec.extend(entries);
-                }
-                "contractenvmetav0" => {
-                    metadata.env_meta = decode_env_meta(section.data()).ok();
-        match payload.context("Failed to parse WASM payload")? {
-            Payload::CustomSection(section) => {
-                match section.name() {
-                    "contractspecv0" => {
-                        let section_index = spec_section_index;
-                        spec_section_index += 1;
-
-                        let entries = decode_spec_entries_with_policy(
-                            section.data(),
-                            policy,
-                            metadata.spec.len(),
-                        )
-                        .with_context(|| {
-                            format!(
-                                "Failed to decode contractspecv0 section {} at byte offset {}",
-                                section_index,
-                                section.data_offset()
-                            )
-                        })?;
-                        // Tag each decoded entry with its source section index so
-                        // duplicate detection can report exactly which sections
-                        // carry conflicting definitions.
-                        let tagged = entries
-                            .into_iter()
-                            .map(|e| TaggedSpecEntry::new(e, section_index));
-                        metadata.spec.extend(tagged);
-                        metadata.spec_section_count += 1;
-                    }
-                    "contractenvmetav0" => {
-                        // A malformed env-meta section is tolerated (best-effort, as
-                        // before), but a resource-limit violation is adversarial and
-                        // must not be silently swallowed.
-                        match decode_env_meta_with_policy(section.data(), policy) {
-                            Ok(env_meta) => metadata.env_meta = Some(env_meta),
-                            Err(err) if find_limit_error(&err).is_some() => return Err(err),
-                            Err(_) => {}
-                        }
-                    }
-                    "contractmetav0" => {
-                        // Tolerant like env-metadata: a corrupt or truncated section
-                        // must not fail the run (an adversarial length still trips the
-                        // resource limit and is surfaced). Absence leaves `meta = None`.
-                        match decode_contract_meta_with_policy(section.data(), policy) {
-                            Ok(meta) => metadata.meta = Some(meta),
-                            Err(err) if find_limit_error(&err).is_some() => return Err(err),
-                            Err(_) => {}
-                        }
-                    }
-                    _ => {}
-                }
+                metadata.spec.extend(entries);
             }
-            Payload::ImportSection(reader) => {
-                for import in reader {
-                    let import = import.context("Failed to parse WASM import")?;
-                    if matches!(import.ty, wasmparser::TypeRef::Func(_)) {
-                        metadata
-                            .imports
-                            .push((import.module.to_string(), import.name.to_string()));
-                    }
-                }
-            }
-            Payload::ExportSection(reader) => {
-                for export in reader {
-                    let export = export.context("Failed to parse WASM export")?;
-                    if matches!(export.kind, wasmparser::ExternalKind::Func) {
-                        metadata.exported_function_names.insert(export.name.to_string());
-                    }
-                }
+            "contractenvmetav0" => {
+                metadata.env_meta = decode_env_meta(section.data()).ok();
             }
             _ => {}
         }
@@ -430,7 +234,13 @@ mod tests {
     fn extract_metadata_reports_contractspec_section_offset_for_decode_errors() {
         let wasm = wasm_with_custom_section("contractspecv0", &[0x00]);
         let error = extract_metadata(&wasm).expect_err("invalid spec section must fail");
-        let messages = error.chain().map(ToString::to_string).collect::<Vec<_>>();
+        let mut messages = vec![error.to_string()];
+        use std::error::Error as StdError;
+        let mut current = StdError::source(&error);
+        while let Some(err) = current {
+            messages.push(err.to_string());
+            current = err.source();
+        }
 
         assert!(
             messages.iter().any(|message| {
@@ -457,63 +267,6 @@ mod tests {
         assert!(
             metadata.env_meta.is_some(),
             "fixture wasm should contain decodable env metadata"
-        );
-    }
-
-    fn encode_meta(pairs: &[(&str, &str)]) -> Vec<u8> {
-        let cursor = Cursor::new(Vec::new());
-        let mut limited = Limited::new(cursor, ResourcePolicy::default().xdr_limits());
-        for &(k, v) in pairs {
-            let entry = ScMetaEntry::ScMetaV0(stellar_xdr::curr::ScMetaV0 {
-                key: k.try_into().unwrap(),
-                val: v.try_into().unwrap(),
-            });
-            entry.write_xdr(&mut limited).unwrap();
-        }
-        limited.inner.into_inner()
-    }
-
-    #[test]
-    fn decode_contract_meta_round_trips_pairs() {
-        let bytes = encode_meta(&[
-            ("rssdkver", "21.6.0"),
-            ("rsver", "1.79.0"),
-            ("author", "acme"),
-        ]);
-        let meta = decode_contract_meta(&bytes).unwrap();
-        assert_eq!(meta.sdk_version().as_deref(), Some("21.6.0"));
-        assert_eq!(meta.rust_version().as_deref(), Some("1.79.0"));
-        assert_eq!(meta.get("author").as_deref(), Some("acme"));
-        assert_eq!(meta.pairs().len(), 3);
-    }
-
-    #[test]
-    fn extract_metadata_decodes_contract_meta_section() {
-        let bytes = encode_meta(&[("rssdkver", "21.6.0")]);
-        let wasm = wasm_with_custom_section("contractmetav0", &bytes);
-        let metadata = extract_metadata(&wasm).expect("valid wasm must parse");
-        let meta = metadata.meta.expect("contractmetav0 should decode");
-        assert_eq!(meta.sdk_version().as_deref(), Some("21.6.0"));
-    }
-
-    #[test]
-    fn extract_metadata_skips_invalid_contract_meta_without_error() {
-        let wasm = wasm_with_custom_section("contractmetav0", &[0xff]);
-        let metadata =
-            extract_metadata(&wasm).expect("invalid contractmetav0 must not fail the run");
-        assert!(
-            metadata.meta.is_none(),
-            "a corrupt contractmetav0 section should be skipped, not fail"
-        );
-    }
-
-    #[test]
-    fn extract_metadata_without_contract_meta_yields_none() {
-        let wasm = wasm_with_custom_section("unrelated", &[0x00]);
-        let metadata = extract_metadata(&wasm).expect("valid wasm must parse");
-        assert!(
-            metadata.meta.is_none(),
-            "a module with no contractmetav0 section should leave meta unset"
         );
     }
 }

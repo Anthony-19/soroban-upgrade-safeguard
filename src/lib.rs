@@ -38,6 +38,7 @@
 
 pub mod color;
 pub mod diff;
+pub mod error;
 pub mod loader;
 pub mod mapper;
 pub mod parser;

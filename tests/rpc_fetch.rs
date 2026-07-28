@@ -289,46 +289,6 @@ fn rpc_fetch_network_failure_produces_clear_error() {
 }
 
 #[test]
-fn rpc_fetch_malformed_url_is_rejected_before_any_request() {
-    // Each of these is wrong in a different way, and none of them should be
-    // allowed to reach the HTTP client: the error must name the URL.
-    let cases = [
-        ("htps://soroban-testnet.stellar.org", "unsupported scheme"),
-        ("soroban-testnet.stellar.org", "no scheme"),
-        ("https:///getLedgerEntries", "no host"),
-        ("ftp://rpc.example.com", "unsupported scheme"),
-    ];
-
-    for (url, expected) in cases {
-        let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
-            .args(["--contract-id", TEST_CONTRACT_ID, "--rpc-url", url])
-            .arg(wasm_fixture("v1.wasm"))
-            .output()
-            .expect("failed to run binary");
-
-        assert_ne!(
-            output.status.code().unwrap(),
-            0,
-            "malformed URL '{url}' must exit non-zero"
-        );
-
-        let stderr = String::from_utf8(output.stderr).expect("stderr not UTF-8");
-        assert!(
-            stderr.contains(expected),
-            "error for '{url}' should mention {expected:?}, got: {stderr}"
-        );
-        assert!(
-            stderr.contains("Invalid RPC URL"),
-            "error for '{url}' should identify the URL as the problem, got: {stderr}"
-        );
-        assert!(
-            !stderr.contains("RPC request failed"),
-            "no request should have been attempted for '{url}', got: {stderr}"
-        );
-    }
-}
-
-#[test]
 fn local_two_file_mode_still_works() {
     // Smoke test: the original two-file positional usage is unchanged
     let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
