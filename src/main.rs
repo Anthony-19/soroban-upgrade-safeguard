@@ -1553,8 +1553,7 @@ fn run() -> Result<()> {
         }
 
         // Detect dependencies on contracts absent from this batch.
-        let known_contracts: std::collections::HashSet<String> =
-            results.keys().cloned().collect();
+        let known_contracts: std::collections::HashSet<String> = results.keys().cloned().collect();
         let missing = dep_graph.missing_contracts(&known_contracts);
         let missing_findings_list = missing_contract_findings(&missing);
         if !missing_findings_list.is_empty() {
@@ -1582,21 +1581,16 @@ fn run() -> Result<()> {
             per_contract_findings.insert(name.clone(), all);
         }
 
-        let cross_findings: Vec<CrossContractFinding> =
-            dep_graph.propagate(&per_contract_findings);
+        let cross_findings: Vec<CrossContractFinding> = dep_graph.propagate(&per_contract_findings);
 
         // Cross-contract criticals always fail; warnings only fail under --strict.
         let cross_critical_count = cross_findings
             .iter()
-            .filter(|f| {
-                f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Critical
-            })
+            .filter(|f| f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Critical)
             .count();
         let cross_warning_count = cross_findings
             .iter()
-            .filter(|f| {
-                f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Warning
-            })
+            .filter(|f| f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Warning)
             .count();
         if cross_critical_count > 0 {
             overall_safe = false;
@@ -2231,7 +2225,10 @@ fn run() -> Result<()> {
     let mut safety_report = if args.old_spec.is_some() || args.new_spec.is_some() {
         // Build SorobanMetadata for the old side.
         let old_meta = if let Some(ref spec_path) = args.old_spec {
-            progress(format!("   📄 Old side: spec JSON '{}'", spec_path.display()));
+            progress(format!(
+                "   📄 Old side: spec JSON '{}'",
+                spec_path.display()
+            ));
             spec_input::load_spec_json(spec_path, &policy)?
         } else {
             parser::extract_metadata_with_policy(&old.bytes, &policy)
@@ -2240,7 +2237,10 @@ fn run() -> Result<()> {
 
         // Build SorobanMetadata for the new side.
         let new_meta = if let Some(ref spec_path) = args.new_spec {
-            progress(format!("   📄 New side: spec JSON '{}'", spec_path.display()));
+            progress(format!(
+                "   📄 New side: spec JSON '{}'",
+                spec_path.display()
+            ));
             spec_input::load_spec_json(spec_path, &policy)?
         } else {
             parser::extract_metadata_with_policy(&new.bytes, &policy)
@@ -2327,13 +2327,9 @@ fn run() -> Result<()> {
 
     // Write the report — either to a file (--output) or to stdout.
     if let Some(ref output_path) = args.output {
-        std::fs::write(output_path, &rendered).with_context(|| {
-            format!("Failed to write report to '{}'", output_path.display())
-        })?;
-        progress(format!(
-            "✅ Report written to: {}",
-            output_path.display()
-        ));
+        std::fs::write(output_path, &rendered)
+            .with_context(|| format!("Failed to write report to '{}'", output_path.display()))?;
+        progress(format!("✅ Report written to: {}", output_path.display()));
     } else {
         println!("{}", rendered);
     }
@@ -2466,10 +2462,9 @@ impl<'de> serde::Deserialize<'de> for ContractSource {
                     }
                 }
 
-                let contract_id = contract_id
-                    .ok_or_else(|| de::Error::missing_field("contract_id"))?;
-                let rpc_url =
-                    rpc_url.ok_or_else(|| de::Error::missing_field("rpc_url"))?;
+                let contract_id =
+                    contract_id.ok_or_else(|| de::Error::missing_field("contract_id"))?;
+                let rpc_url = rpc_url.ok_or_else(|| de::Error::missing_field("rpc_url"))?;
 
                 Ok(ContractSource::OnChain {
                     contract_id,
@@ -2617,12 +2612,7 @@ fn resolve_contract_source(
             rpc_url,
         } => {
             loader::validate_rpc_url(rpc_url, allow_http_local)?;
-            loader::fetch_wasm_from_rpc_with_policy_and_cache(
-                contract_id,
-                rpc_url,
-                policy,
-                cache,
-            )
+            loader::fetch_wasm_from_rpc_with_policy_and_cache(contract_id, rpc_url, policy, cache)
         }
     }
 }
@@ -2666,15 +2656,13 @@ fn resolve_pair_names(pairs: &[ContractPair]) -> Result<Vec<String>> {
     let mut names: Vec<String> = Vec::with_capacity(pairs.len());
 
     for (i, pair) in pairs.iter().enumerate() {
-        let candidate = pair.name.clone().unwrap_or_else(|| {
-            match &pair.new {
-                ContractSource::File(path) => path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| format!("pair_{}", i + 1)),
-                ContractSource::OnChain { contract_id, .. } => contract_id.clone(),
-            }
+        let candidate = pair.name.clone().unwrap_or_else(|| match &pair.new {
+            ContractSource::File(path) => path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(String::from)
+                .unwrap_or_else(|| format!("pair_{}", i + 1)),
+            ContractSource::OnChain { contract_id, .. } => contract_id.clone(),
         });
 
         let count = counts.entry(candidate.clone()).or_insert(0);
@@ -2975,7 +2963,11 @@ fn expand_glob(pattern: &str) -> Result<Vec<PathBuf>> {
 
     // No wildcards at all: the pattern is just a path.
     if segments.is_empty() {
-        return Ok(if root.is_file() { vec![root] } else { Vec::new() });
+        return Ok(if root.is_file() {
+            vec![root]
+        } else {
+            Vec::new()
+        });
     }
 
     let mut matches = Vec::new();
