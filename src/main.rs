@@ -290,6 +290,7 @@ fn main() -> Result<()> {
                 }
 
                 println!("{}", markdown);
+                append_step_summary(&markdown);
             }
             OutputFormat::Text => {
                 println!("========================================");
@@ -1105,6 +1106,24 @@ fn emit_report_output(
     Ok(())
 }
 
+/// Append the given Markdown content to `$GITHUB_STEP_SUMMARY` when the
+/// environment variable is set. This makes the report appear as a job summary
+/// in GitHub Actions. Silently does nothing when the variable is absent.
+fn append_step_summary(content: &str) {
+    let path = match std::env::var("GITHUB_STEP_SUMMARY") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => return,
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", content);
+    }
+}
+
 /// Usage text for `explain`, kept next to its handler.
 const EXPLAIN_USAGE: &str = "\
 Look up what a finding category means and how to respond to it.
@@ -1767,6 +1786,7 @@ fn run() -> Result<()> {
                 }
 
                 println!("{}", markdown);
+                append_step_summary(&markdown);
             }
             OutputFormat::Text => {
                 println!("========================================");
@@ -2326,6 +2346,12 @@ fn run() -> Result<()> {
         progress(format!("✅ Report written to: {}", output_path.display()));
     } else {
         println!("{}", rendered);
+    }
+
+    // When running inside GitHub Actions, append the Markdown report to the
+    // step summary file so it appears in the Actions UI automatically.
+    if args.format == OutputFormat::Markdown {
+        append_step_summary(&rendered);
     }
 
     // Warn about suppression rules that never matched any finding.
