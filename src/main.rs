@@ -73,6 +73,11 @@ struct Args {
     #[arg(long)]
     no_color: bool,
 
+    /// Validate a suppression config and exit, without running a comparison.
+    /// Checks that the file parses and that every rule names a real category.
+    #[arg(long, value_name = "CONFIG")]
+    validate_config: Option<PathBuf>,
+
     /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
     #[arg(long, value_name = "MANIFEST_PATH")]
     manifest: Option<PathBuf>,
@@ -95,6 +100,12 @@ fn main() -> Result<()> {
         std::io::stdout().is_terminal(),
     ) {
         colored::control::set_override(false);
+    }
+
+    // Config-validation mode: check a suppression config on its own and exit,
+    // before any WASM inputs are required.
+    if let Some(path) = &args.validate_config {
+        return validate_suppression_config(path);
     }
 
     // 1. Identify which mode we are running:
@@ -469,6 +480,51 @@ fn compare_contracts(
         *explain,
         *strict,
     ))
+}
+
+/// Validate a suppression config in isolation and exit with a status that
+/// reflects the outcome: `0` when the config is valid, `1` when it is malformed
+/// or names a category the tool never emits. Requires no WASM inputs.
+fn validate_suppression_config(path: &Path) -> Result<()> {
+    println!("Validating suppression config: {}", path.display());
+
+    // Parsing (and file-read) problems surface here as a clear, specific error.
+    let config = match SuppressionConfig::load_from_path(path) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("{}", format!("❌ {e}").red().bold());
+            std::process::exit(1);
+        }
+    };
+
+    println!("  Parsed {} rule(s).", config.rules.len());
+
+    let validation = config.validate();
+    if validation.is_valid() {
+        println!("{}", "✅ Config is valid.".green().bold());
+        return Ok(());
+    }
+
+    for (rule_number, category) in &validation.unknown_categories {
+        eprintln!(
+            "{}",
+            format!(
+                "❌ Rule #{rule_number}: unknown category '{category}' — the tool never emits \
+                 this category, so this rule can never match.",
+            )
+            .red()
+        );
+    }
+    eprintln!(
+        "{}",
+        format!(
+            "\n{} rule(s) name an unknown category. Fix the category name(s) above.",
+            validation.unknown_categories.len()
+        )
+        .red()
+        .bold()
+    );
+    std::process::exit(1);
 }
 
 fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {

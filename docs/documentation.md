@@ -263,6 +263,28 @@ is about, independent of the human-readable message:
 The easiest way to find the right `category` and `target` for a finding is to
 run with `--format json`; every finding carries both fields verbatim.
 
+### Validating a config
+
+A suppression config is easiest to maintain when you can check it on its own,
+without assembling two WASM files to trigger a run. Pass `--validate-config` to
+load a config, confirm it parses, and confirm every rule names a category the
+tool actually emits — then exit:
+
+```bash
+soroban-upgrade-safeguard --validate-config .safeguard.toml
+```
+
+The mode requires no WASM inputs. It exits `0` when the config is valid and `1`
+otherwise, so it drops into CI as a fast lint step. Two classes of problem are
+reported:
+
+- A **malformed file** produces a clear, specific parse error, the same one a
+  real run would raise for an explicit `--config`.
+- A rule naming a **category the tool never emits** — most often a typo such as
+  `"Struct Field Reordded"` for `"Struct Field Reordered"` — is flagged with its
+  rule number. Such a rule would otherwise parse cleanly and then silently never
+  match, leaving a breaking change unacknowledged.
+
 ### What suppression does and does not change
 
 A suppressed finding is **not hidden**. It is still listed in the report, marked
