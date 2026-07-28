@@ -1,12 +1,15 @@
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use soroban_upgrade_safeguard::{
     color::should_disable_color,
-    diff, loader, parser, report, spec,
+    diff, loader, parser,
+    render::RenderableReport,
+    report, spec,
+    spec_json::ExtractedSpec,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
 
@@ -22,23 +25,46 @@ enum OutputFormat {
     Markdown,
 }
 
+/// Output format for a re-rendered report. JSON is excluded: re-rendering a
+/// stored JSON document as JSON would be a no-op copy.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum RenderFormat {
+    /// Colored, human-readable report (default).
+    #[default]
+    Text,
+    /// Markdown document suitable for PR descriptions and comments.
+    Markdown,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     author,
     version,
     about,
     long_about = None,
-    // Four usage modes:
+    // Four comparison usage modes, unchanged, plus two subcommands:
     //   1. Local:      soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM> [OPTIONS]
     //   2. RPC:        soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM> [OPTIONS]
     //   3. Manifest:   soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]
     //   4. Dir Scan:   soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]
+    //   5. Extract:    soroban-upgrade-safeguard extract <WASM> [OPTIONS]
+    //   6. Render:     soroban-upgrade-safeguard render <REPORT_JSON> [OPTIONS]
     override_usage = "soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM> [OPTIONS]\n       \
                       soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM> [OPTIONS]\n       \
                       soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]\n       \
-                      soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]"
+                      soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]\n       \
+                      soroban-upgrade-safeguard extract <WASM> [OPTIONS]\n       \
+                      soroban-upgrade-safeguard render <REPORT_JSON> [OPTIONS]",
+    // A subcommand and the comparison-mode arguments are mutually exclusive, so
+    // the existing modes keep parsing exactly as they did.
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true,
 )]
 struct Args {
+    /// Subcommand, when not running a comparison
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// WASM paths: <OLD_WASM> <NEW_WASM> in local mode, or just <NEW_WASM> in RPC mode
     #[arg(value_name = "WASM", num_args = 0..=2)]
     wasm_paths: Vec<PathBuf>,
@@ -86,8 +112,146 @@ struct Args {
     new_dir: Option<PathBuf>,
 }
 
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Dump a single contract's decoded spec as JSON
+    Extract(ExtractArgs),
+    /// Re-render a previously saved JSON report in another format
+    Render(RenderArgs),
+}
+
+/// `extract`: decode one build and emit its interface.
+#[derive(ClapArgs, Debug)]
+struct ExtractArgs {
+    /// WASM file to decode. Omit when using --contract-id/--rpc-url.
+    #[arg(value_name = "WASM")]
+    wasm: Option<PathBuf>,
+
+    /// Stellar/Soroban Contract ID to fetch from on-chain (e.g. C...)
+    #[arg(long, value_name = "CONTRACT_ID", requires = "rpc_url")]
+    contract_id: Option<String>,
+
+    /// Stellar RPC URL (e.g. https://soroban-testnet.stellar.org)
+    #[arg(long, value_name = "RPC_URL", requires = "contract_id")]
+    rpc_url: Option<String>,
+
+    /// Print only the interface hash, with no other output.
+    ///
+    /// Intended for scripting: the entire stdout is the 64-character hex
+    /// digest plus a newline, so it can be captured directly as a cache key.
+    #[arg(long)]
+    hash_only: bool,
+}
+
+/// `render`: turn a stored JSON report back into a human format.
+#[derive(ClapArgs, Debug)]
+struct RenderArgs {
+    /// Path to a JSON report previously written with --format json, or `-` to
+    /// read it from stdin.
+    #[arg(value_name = "REPORT_JSON")]
+    report: PathBuf,
+
+    /// Output format
+    #[arg(long, value_enum, default_value_t = RenderFormat::Text)]
+    format: RenderFormat,
+
+    /// Print the remediation guidance stored in the report, if it has any.
+    ///
+    /// Guidance is only present when the original run used --explain.
+    #[arg(long)]
+    explain: bool,
+
+    /// Do not color output
+    #[arg(long)]
+    no_color: bool,
+}
+
+/// Decode one build and emit its interface as JSON, or just its hash.
+fn run_extract(args: &ExtractArgs) -> Result<()> {
+    let build = match (&args.wasm, &args.contract_id) {
+        (Some(path), None) => loader::load_wasm(path)?,
+        (None, Some(contract_id)) => {
+            let rpc_url = args
+                .rpc_url
+                .as_ref()
+                .expect("clap requires --rpc-url alongside --contract-id");
+            loader::fetch_wasm_from_rpc(contract_id, rpc_url)?
+        }
+        (Some(_), Some(_)) => anyhow::bail!(
+            "Provide either a WASM path or --contract-id, not both.\n\n\
+             Usage: soroban-upgrade-safeguard extract <WASM>\n       \
+             soroban-upgrade-safeguard extract --contract-id <ID> --rpc-url <URL>"
+        ),
+        (None, None) => anyhow::bail!(
+            "Missing WASM path.\n\n\
+             Usage: soroban-upgrade-safeguard extract <WASM>\n       \
+             soroban-upgrade-safeguard extract --contract-id <ID> --rpc-url <URL>"
+        ),
+    };
+
+    let metadata = parser::extract_metadata(&build.bytes)?;
+    let contract_spec = spec::ContractSpec::from_entries(&metadata.spec);
+
+    if args.hash_only {
+        // Nothing but the digest: this output is meant to be captured by a
+        // shell, so any decoration would have to be stripped by the caller.
+        println!("{}", contract_spec.interface_hash());
+        return Ok(());
+    }
+
+    let extracted = ExtractedSpec::new(&build.path, &metadata, &contract_spec);
+    println!("{}", serde_json::to_string_pretty(&extracted)?);
+    Ok(())
+}
+
+/// Re-render a stored JSON report as text or Markdown.
+fn run_render(args: &RenderArgs) -> Result<()> {
+    let raw = if args.report == Path::new("-") {
+        std::io::read_to_string(std::io::stdin()).context("Failed to read report from stdin")?
+    } else {
+        std::fs::read_to_string(&args.report)
+            .with_context(|| format!("Failed to read report file: {}", args.report.display()))?
+    };
+
+    if should_disable_color(
+        args.no_color,
+        std::env::var_os("NO_COLOR").is_some(),
+        std::io::stdout().is_terminal(),
+    ) {
+        colored::control::set_override(false);
+    }
+
+    let report = RenderableReport::from_json_str(&raw).with_context(|| {
+        format!(
+            "Failed to read the saved report at '{}'",
+            args.report.display()
+        )
+    })?;
+
+    match args.format {
+        RenderFormat::Text => println!("{}", report.to_text(args.explain)),
+        RenderFormat::Markdown => println!("{}", report.to_markdown()),
+    }
+
+    // Re-rendering reports on a stored verdict; it does not re-derive one, so
+    // the exit code mirrors the stored `is_safe` exactly as the original run did.
+    if !report.is_safe {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Subcommands run their own pipeline and return; everything below this
+    // point is the comparison path, unchanged.
+    match &args.command {
+        Some(Command::Extract(extract_args)) => return run_extract(extract_args),
+        Some(Command::Render(render_args)) => return run_render(render_args),
+        None => {}
+    }
 
     if should_disable_color(
         args.no_color,
@@ -463,12 +627,10 @@ fn compare_contracts(
         &mut diff_report,
     );
 
-    Ok(report::SafetyReport::with_suppressions(
-        &diff_report,
-        suppressions,
-        *explain,
-        *strict,
-    ))
+    Ok(
+        report::SafetyReport::with_suppressions(&diff_report, suppressions, *explain, *strict)
+            .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash()),
+    )
 }
 
 fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {

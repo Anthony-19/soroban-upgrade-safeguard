@@ -1,0 +1,579 @@
+//! The report model, and the renderers that operate on it.
+//!
+//! The three output formats used to be produced only from a live
+//! [`crate::report::SafetyReport`], which meant a pipeline that stored the JSON
+//! could not later turn it into the Markdown a reviewer wanted without rerunning
+//! the whole comparison against inputs that may have moved.
+//!
+//! [`RenderableReport`] breaks that coupling. It is the owned, round-trippable
+//! model that `--format json` emits, and the text and Markdown renderers are
+//! implemented *on it* rather than on the live report. A live run and a
+//! re-render of that run's JSON therefore go through exactly the same code, so
+//! they cannot drift apart.
+//!
+//! ```text
+//!   SafetyReport ──to_renderable()──► RenderableReport ──► text / markdown / json
+//!                                            ▲
+//!                       saved report.json ───┘  (RenderableReport::from_json_str)
+//! ```
+
+use std::collections::BTreeMap;
+
+use colored::Colorize;
+use serde::{Deserialize, Serialize};
+
+use crate::diff::Severity;
+use crate::report::ReportedFinding;
+
+/// Version of the JSON report shape.
+///
+/// Bumped only when a change would stop an older reader from rendering a newer
+/// report correctly. Purely additive fields do not require a bump, because
+/// readers ignore keys they do not know.
+pub const REPORT_SCHEMA_VERSION: u32 = 1;
+
+/// Severity counts, serialized as a nested `counts` object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeverityCounts {
+    pub critical: usize,
+    pub warning: usize,
+    pub info: usize,
+}
+
+/// Errors from reading a saved JSON report.
+#[derive(Debug)]
+pub enum RenderError {
+    /// The bytes were not valid JSON, or did not match the report shape.
+    Malformed(serde_json::Error),
+    /// The report declares a schema version this build cannot render.
+    IncompatibleSchema {
+        found: u32,
+        supported: u32,
+        tool_version: String,
+    },
+}
+
+impl std::fmt::Display for RenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RenderError::Malformed(err) => write!(
+                f,
+                "not a valid Soroban Upgrade Safeguard JSON report: {err}. \
+                 Expected a document produced by `--format json`."
+            ),
+            RenderError::IncompatibleSchema {
+                found,
+                supported,
+                tool_version,
+            } => write!(
+                f,
+                "report uses schema version {found}, but this build of \
+                 soroban-upgrade-safeguard {} only understands version \
+                 {supported}. The report was written by tool version {tool_version}. \
+                 Re-run the comparison with this build, or use a build that \
+                 supports schema version {found}.",
+                env!("CARGO_PKG_VERSION"),
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RenderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RenderError::Malformed(err) => Some(err),
+            RenderError::IncompatibleSchema { .. } => None,
+        }
+    }
+}
+
+/// The machine-readable report, and the input to every renderer.
+///
+/// This is what `--format json` writes and what the `render` subcommand reads
+/// back. It carries everything the text and Markdown renderers need, which is
+/// what makes a stored report a complete artifact rather than a summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenderableReport {
+    /// Shape version of this document. See [`REPORT_SCHEMA_VERSION`].
+    #[serde(default = "default_schema_version")]
+    pub report_schema_version: u32,
+    /// The tool version that produced the report, for diagnostics.
+    #[serde(default)]
+    pub tool_version: String,
+    pub is_safe: bool,
+    pub strict: bool,
+    pub counts: SeverityCounts,
+    /// Findings (of any severity) acknowledged by the suppression config.
+    pub suppressed_count: usize,
+    pub total_findings: usize,
+    pub recommended_bump: String,
+    /// Interface hash of the old build, when the pipeline supplied specs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_interface_hash: Option<String>,
+    /// Interface hash of the new build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_interface_hash: Option<String>,
+    /// Categories in a [`BTreeMap`] so the JSON key order is stable and
+    /// diffable across runs.
+    pub findings_by_category: BTreeMap<String, Vec<ReportedFinding>>,
+}
+
+fn default_schema_version() -> u32 {
+    REPORT_SCHEMA_VERSION
+}
+
+impl RenderableReport {
+    /// Parse a previously emitted JSON report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::Malformed`] if the input is not a report
+    /// document, and [`RenderError::IncompatibleSchema`] if it declares a
+    /// schema version this build does not understand.
+    pub fn from_json_str(json: &str) -> Result<Self, RenderError> {
+        // Read the version first, so a report from a *newer* tool produces a
+        // version error rather than a confusing field-level parse failure.
+        let probe: SchemaProbe = serde_json::from_str(json).map_err(RenderError::Malformed)?;
+        if probe.report_schema_version > REPORT_SCHEMA_VERSION {
+            return Err(RenderError::IncompatibleSchema {
+                found: probe.report_schema_version,
+                supported: REPORT_SCHEMA_VERSION,
+                tool_version: probe.tool_version,
+            });
+        }
+
+        serde_json::from_str(json).map_err(RenderError::Malformed)
+    }
+
+    /// True when both builds' interface hashes are known and equal.
+    pub fn interface_unchanged(&self) -> Option<bool> {
+        match (&self.old_interface_hash, &self.new_interface_hash) {
+            (Some(old), Some(new)) => Some(old == new),
+            _ => None,
+        }
+    }
+
+    /// Categories in display order: `Environment` first, then alphabetical.
+    fn ordered_categories(&self) -> Vec<&String> {
+        let mut categories: Vec<&String> = self.findings_by_category.keys().collect();
+        categories.sort_by(|a, b| {
+            let rank = |name: &str| if name == "Environment" { 0 } else { 1 };
+            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+        });
+        categories
+    }
+
+    /// The interface-hash block shared by the text and Markdown headers, as
+    /// `(label, value)` pairs. Empty when no hashes were recorded.
+    fn interface_hash_lines(&self) -> Vec<(&'static str, String)> {
+        let mut lines = Vec::new();
+        if let Some(old) = &self.old_interface_hash {
+            lines.push(("Old Interface Hash", old.clone()));
+        }
+        if let Some(new) = &self.new_interface_hash {
+            lines.push(("New Interface Hash", new.clone()));
+        }
+        if let Some(unchanged) = self.interface_unchanged() {
+            lines.push((
+                "Interface",
+                if unchanged {
+                    "unchanged (identical interface hash)".to_string()
+                } else {
+                    "changed (interface hash differs)".to_string()
+                },
+            ));
+        }
+        lines
+    }
+
+    /// Render the structured, human-readable text output for the CLI.
+    pub fn to_text(&self, explain: bool) -> String {
+        let mut output = String::new();
+        output.push_str(
+            &"\n========================================\n"
+                .bold()
+                .to_string(),
+        );
+        output.push_str(
+            &"    SOROBAN UPGRADE SAFETY REPORT\n"
+                .bold()
+                .cyan()
+                .to_string(),
+        );
+        if self.strict {
+            output.push_str(&"    [STRICT MODE ACTIVE]\n".bold().yellow().to_string());
+        }
+        output.push_str(
+            &"========================================\n"
+                .bold()
+                .to_string(),
+        );
+
+        let status = if self.is_safe {
+            "✅ PASSED (No breaking changes detected)".green().bold()
+        } else if self.strict && self.counts.critical == 0 {
+            "❌ FAILED (Warnings detected in strict mode)".red().bold()
+        } else {
+            "❌ FAILED (Critical breaking changes detected)"
+                .red()
+                .bold()
+        };
+        output.push_str(&format!("Status: {}\n", status));
+
+        let crit_str = if self.counts.critical > 0 {
+            self.counts.critical.to_string().red().bold()
+        } else {
+            self.counts.critical.to_string().green()
+        };
+        let warn_str = if self.counts.warning > 0 {
+            self.counts.warning.to_string().yellow().bold()
+        } else {
+            self.counts.warning.to_string().normal()
+        };
+        let info_str = self.counts.info.to_string().blue();
+
+        output.push_str(&format!("Critical: {}\n", crit_str));
+        output.push_str(&format!("Warnings: {}\n", warn_str));
+        output.push_str(&format!("Info:     {}\n", info_str));
+        if self.suppressed_count > 0 {
+            output.push_str(&format!(
+                "Suppressed: {}\n",
+                self.suppressed_count.to_string().magenta().bold()
+            ));
+        }
+        let bump_str = match self.recommended_bump.as_str() {
+            "major" => "major".red().bold(),
+            "minor" => "minor".yellow().bold(),
+            "patch" => "patch".green().bold(),
+            other => other.normal(),
+        };
+        output.push_str(&format!("Recommended Bump: {}\n", bump_str));
+        for (label, value) in self.interface_hash_lines() {
+            output.push_str(&format!("{}: {}\n", label, value.dimmed()));
+        }
+        output.push_str(
+            &"----------------------------------------\n\n"
+                .dimmed()
+                .to_string(),
+        );
+
+        if self.total_findings == 0 {
+            output.push_str(&"No relevant changes detected. The upgrade is identical in its exports and types.\n".green().to_string());
+            return output;
+        }
+
+        for category in self.ordered_categories() {
+            output.push_str(
+                &format!("--- [{}] ---\n", category.to_ascii_uppercase())
+                    .magenta()
+                    .bold()
+                    .to_string(),
+            );
+            let group = &self.findings_by_category[category];
+            for reported in group {
+                let finding = &reported.finding;
+
+                if reported.suppressed {
+                    // Suppressed findings are still listed, but clearly marked
+                    // and dimmed so they read as acknowledged, not active.
+                    let label = format!("🔕 [SUPPRESSED] {}", finding.message)
+                        .dimmed()
+                        .to_string();
+                    output.push_str(&format!("{}\n", label));
+                    if let Some(reason) = &reported.suppression_reason {
+                        output
+                            .push_str(&format!("    ↳ reason: {}\n", reason).dimmed().to_string());
+                    }
+                    if explain {
+                        if let Some(remediation) = &reported.remediation {
+                            output.push_str(
+                                &format!("    ↳ guidance: {}\n", remediation)
+                                    .dimmed()
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    continue;
+                }
+
+                let formatted = match finding.severity {
+                    Severity::Critical => format!("🔴 {}", finding.message).red(),
+                    Severity::Warning => format!("🟡 {}", finding.message).yellow(),
+                    Severity::Info => format!("🔵 {}", finding.message).cyan(),
+                };
+                output.push_str(&format!("{}\n", formatted));
+                if explain {
+                    if let Some(remediation) = &reported.remediation {
+                        output.push_str(
+                            &format!("    ↳ guidance: {}\n", remediation)
+                                .green()
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            output.push('\n');
+        }
+
+        if !self.is_safe {
+            if self.strict && self.counts.critical == 0 {
+                output.push_str(
+                    &"⚠️  ACTION REQUIRED: Strict mode is active and warnings were detected.\n"
+                        .yellow()
+                        .bold()
+                        .to_string(),
+                );
+                output.push_str(
+                    &"These warnings must be resolved or strict mode disabled to proceed.\n"
+                        .yellow()
+                        .to_string(),
+                );
+            } else {
+                output.push_str(&"⚠️  ACTION REQUIRED: The new contract version modifies existing storage layouts or function interfaces.\n".red().bold().to_string());
+                output.push_str(&"Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n".red().to_string());
+            }
+        }
+
+        output
+    }
+
+    /// Render the structured Markdown output.
+    pub fn to_markdown(&self) -> String {
+        let mut output = String::new();
+        output.push_str("# Soroban Upgrade Safety Report\n\n");
+
+        let status = if self.is_safe {
+            "✅ PASSED (No breaking changes detected)"
+        } else {
+            "❌ FAILED (Critical breaking changes detected)"
+        };
+        output.push_str(&format!("## Status: {}\n\n", status));
+
+        output.push_str("### Summary Table\n\n");
+        output.push_str("| Finding Severity | Count |\n");
+        output.push_str("| :--- | :--- |\n");
+        output.push_str(&format!("| **Critical** | {} |\n", self.counts.critical));
+        output.push_str(&format!("| **Warning** | {} |\n", self.counts.warning));
+        output.push_str(&format!("| **Info** | {} |\n", self.counts.info));
+        if self.suppressed_count > 0 {
+            output.push_str(&format!("| **Suppressed** | {} |\n", self.suppressed_count));
+        }
+        output.push_str(&format!(
+            "\n**Recommended SemVer Bump**: `{}`\n\n",
+            self.recommended_bump
+        ));
+        for (label, value) in self.interface_hash_lines() {
+            output.push_str(&format!("**{}**: `{}`\n\n", label, value));
+        }
+        output.push_str("---\n\n");
+
+        if self.total_findings == 0 {
+            output.push_str("No relevant changes detected. The upgrade is identical in its exports and types.\n");
+            return output;
+        }
+
+        for category in self.ordered_categories() {
+            output.push_str(&format!("### {}\n\n", category));
+            let group = &self.findings_by_category[category];
+            for reported in group {
+                let finding = &reported.finding;
+
+                if reported.suppressed {
+                    output.push_str(&format!("- 🔕 **[SUPPRESSED]** {}\n", finding.message));
+                    if let Some(reason) = &reported.suppression_reason {
+                        output.push_str(&format!("  - ↳ reason: {}\n", reason));
+                    }
+                    continue;
+                }
+
+                let emoji = match finding.severity {
+                    Severity::Critical => "🔴",
+                    Severity::Warning => "🟡",
+                    Severity::Info => "🔵",
+                };
+                output.push_str(&format!("- {} {}\n", emoji, finding.message));
+            }
+            output.push('\n');
+        }
+
+        if !self.is_safe {
+            output.push_str("### ⚠️ Action Required\n\n");
+            output.push_str("- The new contract version modifies existing storage layouts or function interfaces.\n");
+            output.push_str("- Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n");
+        }
+
+        output
+    }
+}
+
+/// Minimal view used to read the schema version before full deserialization.
+#[derive(Deserialize)]
+struct SchemaProbe {
+    #[serde(default = "default_schema_version")]
+    report_schema_version: u32,
+    #[serde(default = "unknown_tool_version")]
+    tool_version: String,
+}
+
+fn unknown_tool_version() -> String {
+    "unknown".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diff::{DiffReport, Finding};
+    use crate::report::SafetyReport;
+
+    fn finding(severity: Severity, category: &str, message: &str) -> Finding {
+        Finding {
+            severity,
+            category: category.to_string(),
+            message: message.to_string(),
+            type_name: None,
+            target: Some("thing".to_string()),
+        }
+    }
+
+    fn sample_report() -> SafetyReport {
+        let diff = DiffReport {
+            findings: vec![
+                finding(
+                    Severity::Critical,
+                    "Function Removed",
+                    "Function 'a' was removed.",
+                ),
+                finding(Severity::Warning, "Parameter Renamed", "Parameter renamed."),
+                finding(Severity::Info, "Function Added", "New function 'b' added."),
+            ],
+        };
+        SafetyReport::new(&diff)
+    }
+
+    /// The acceptance criterion for #252: a saved report renders identically to
+    /// the live run that produced it.
+    #[test]
+    fn round_trip_text_matches_a_live_run() {
+        let live = sample_report();
+        let live_text = live.generate_summary_text(false);
+
+        let json = serde_json::to_string_pretty(&live.to_renderable()).unwrap();
+        let restored = RenderableReport::from_json_str(&json).unwrap();
+
+        assert_eq!(restored.to_text(false), live_text);
+    }
+
+    #[test]
+    fn round_trip_markdown_matches_a_live_run() {
+        let live = sample_report();
+        let live_markdown = live.generate_summary_markdown();
+
+        let json = serde_json::to_string_pretty(&live.to_renderable()).unwrap();
+        let restored = RenderableReport::from_json_str(&json).unwrap();
+
+        assert_eq!(restored.to_markdown(), live_markdown);
+    }
+
+    #[test]
+    fn round_trip_preserves_explain_guidance() {
+        let diff = DiffReport {
+            findings: vec![finding(
+                Severity::Critical,
+                "Function Removed",
+                "Function 'a' was removed.",
+            )],
+        };
+        let live = SafetyReport::with_suppressions(
+            &diff,
+            &crate::suppression::SuppressionConfig::default(),
+            true,
+            false,
+        );
+
+        let json = serde_json::to_string(&live.to_renderable()).unwrap();
+        let restored = RenderableReport::from_json_str(&json).unwrap();
+
+        assert_eq!(
+            restored.to_text(true),
+            live.generate_summary_text(true),
+            "remediation guidance must survive the round trip"
+        );
+        assert!(restored.to_text(true).contains("guidance:"));
+    }
+
+    #[test]
+    fn round_trip_is_idempotent() {
+        let json = serde_json::to_string(&sample_report().to_renderable()).unwrap();
+        let once = RenderableReport::from_json_str(&json).unwrap();
+        let twice_json = serde_json::to_string(&once).unwrap();
+        let twice = RenderableReport::from_json_str(&twice_json).unwrap();
+
+        assert_eq!(once.to_text(false), twice.to_text(false));
+        assert_eq!(once.to_markdown(), twice.to_markdown());
+        assert_eq!(json, twice_json);
+    }
+
+    #[test]
+    fn a_newer_schema_version_is_rejected_clearly() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&sample_report().to_renderable()).unwrap())
+                .unwrap();
+        value["report_schema_version"] = serde_json::json!(REPORT_SCHEMA_VERSION + 1);
+        value["tool_version"] = serde_json::json!("99.0.0");
+
+        let err = RenderableReport::from_json_str(&value.to_string())
+            .expect_err("a newer schema must be rejected");
+
+        let message = err.to_string();
+        assert!(matches!(err, RenderError::IncompatibleSchema { .. }));
+        assert!(message.contains("schema version"), "got: {message}");
+        assert!(
+            message.contains("99.0.0"),
+            "should name the writing tool version, got: {message}"
+        );
+    }
+
+    #[test]
+    fn malformed_json_is_rejected_clearly() {
+        let err = RenderableReport::from_json_str("{ not json").unwrap_err();
+        assert!(matches!(err, RenderError::Malformed(_)));
+        assert!(err.to_string().contains("not a valid"), "got: {err}");
+    }
+
+    #[test]
+    fn a_json_document_of_the_wrong_shape_is_rejected() {
+        let err = RenderableReport::from_json_str(r#"{"hello": "world"}"#).unwrap_err();
+        assert!(matches!(err, RenderError::Malformed(_)));
+    }
+
+    #[test]
+    fn interface_unchanged_reflects_the_hashes() {
+        let mut report = sample_report().to_renderable();
+        assert_eq!(report.interface_unchanged(), None);
+
+        report.old_interface_hash = Some("aa".to_string());
+        assert_eq!(report.interface_unchanged(), None);
+
+        report.new_interface_hash = Some("aa".to_string());
+        assert_eq!(report.interface_unchanged(), Some(true));
+
+        report.new_interface_hash = Some("bb".to_string());
+        assert_eq!(report.interface_unchanged(), Some(false));
+    }
+
+    #[test]
+    fn interface_hashes_appear_in_both_human_formats() {
+        let mut report = sample_report().to_renderable();
+        report.old_interface_hash = Some("a".repeat(64));
+        report.new_interface_hash = Some("b".repeat(64));
+
+        let text = report.to_text(false);
+        assert!(text.contains("Old Interface Hash"));
+        assert!(text.contains(&"b".repeat(64)));
+        assert!(text.contains("changed (interface hash differs)"));
+
+        let markdown = report.to_markdown();
+        assert!(markdown.contains("**New Interface Hash**"));
+        assert!(markdown.contains("unchanged") || markdown.contains("changed"));
+    }
+}

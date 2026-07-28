@@ -13,6 +13,9 @@ A powerful CLI tool to analyze and validate Soroban smart contract upgrades on t
 - **Rich CLI Output**: Beautiful, color-coded reports with actionable severity levels (Critical, Warning, Info).
 - **CI/CD Friendly**: Exits with a non-zero code if critical breaking changes are detected.
 - **Suppression Config**: Acknowledge known, intentional breaking changes (e.g. a planned migration) in a `.safeguard.toml` so they no longer fail the run — while still listing them in the report.
+- **Interface Hash**: A stable, order-independent SHA-256 over the normalised spec. Two builds with the same hash expose the same interface, which makes it a cheap cache key and a direct answer to "did this change the interface?".
+- **Spec Extraction**: `extract` dumps a single build's decoded interface as JSON, so you can inspect a WASM or archive its interface without separate Stellar tooling.
+- **Re-renderable Reports**: `render` turns a saved JSON report back into text or Markdown, so a stored verdict can be presented any number of ways without the original WASM files.
 
 ## Installation
 
@@ -32,6 +35,23 @@ soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>
 
 ```bash
 soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
+```
+
+### Inspecting a single build
+
+```bash
+# The full decoded interface as JSON
+soroban-upgrade-safeguard extract ./wasm/v1.wasm
+
+# Just the interface hash, for scripting and cache keys
+soroban-upgrade-safeguard extract ./wasm/v1.wasm --hash-only
+```
+
+### Re-rendering a saved report
+
+```bash
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --format json > report.json
+soroban-upgrade-safeguard render report.json --format markdown
 ```
 
 ### Suppressing known breaking changes
