@@ -99,15 +99,12 @@ fn json_explain_mode_includes_remediation_field() {
                 assert!(!rem.as_str().unwrap().is_empty());
                 saw_remediation = true;
             }
-<<<<<<< HEAD
             // Ensure the stable rule identifier is present in explain JSON too.
             assert!(
                 finding.get("rule_id").is_some(),
                 "explain JSON finding missing rule_id"
             );
             assert!(finding["rule_id"].is_string());
-=======
->>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
         }
     }
     assert!(

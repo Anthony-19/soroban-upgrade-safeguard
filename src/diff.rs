@@ -987,12 +987,11 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
     }
 
     // A queue for transitive breaks: (type_name, root_target)
-    let mut queue: Vec<(String, String)> = broken_types
-        .into_iter()
-        .map(|t| (t.clone(), t))
-        .collect();
+    let mut queue: Vec<(String, String)> =
+        broken_types.into_iter().map(|t| (t.clone(), t)).collect();
     let mut i = 0;
-    let mut cascaded: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut cascaded: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
 
     while i < queue.len() {
         let (current_broken_type, root) = queue[i].clone();

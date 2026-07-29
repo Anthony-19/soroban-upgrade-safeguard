@@ -340,19 +340,15 @@ impl SafetyReport {
                 for (root_target, cascades) in &by_root {
                     let any_suppressed = cascades.iter().any(|r| r.suppressed);
                     if any_suppressed {
-                        let label = format!(
-                            "🔕 [SUPPRESSED] Cascading break from root: {}",
-                            root_target
-                        )
-                        .dimmed()
-                        .to_string();
+                        let label =
+                            format!("🔕 [SUPPRESSED] Cascading break from root: {}", root_target)
+                                .dimmed()
+                                .to_string();
                         output.push_str(&format!("{}\n", label));
                         for reported in cascades {
                             if let Some(reason) = &reported.suppression_reason {
                                 output.push_str(
-                                    &format!("    ↳ reason: {}\n", reason)
-                                        .dimmed()
-                                        .to_string(),
+                                    &format!("    ↳ reason: {}\n", reason).dimmed().to_string(),
                                 );
                             }
                         }
@@ -363,10 +359,8 @@ impl SafetyReport {
                             Severity::Warning => "🟡",
                             Severity::Info => "🔵",
                         };
-                        let root_label = format!(
-                            "{} Cascading break via root type: {}",
-                            emoji, root_target
-                        );
+                        let root_label =
+                            format!("{} Cascading break via root type: {}", emoji, root_target);
                         let formatted = match first.finding.severity {
                             Severity::Critical => root_label.red(),
                             Severity::Warning => root_label.yellow(),
@@ -769,17 +763,28 @@ mod tests {
         diff.findings.push(Finding {
             severity: Severity::Critical,
             category: "Cascading Layout Break".to_string(),
-            message: "Type 'Outer' layout is broken because it embeds modified type 'Data'".to_string(),
+            message: "Type 'Outer' layout is broken because it embeds modified type 'Data'"
+                .to_string(),
             type_name: Some("Outer".to_string()),
             target: Some("Outer".to_string()),
             root_target: Some("Data".to_string()),
         });
 
-        let report = SafetyReport::with_suppressions(&diff, &SuppressionConfig::default(), false, false);
+        let report =
+            SafetyReport::with_suppressions(&diff, &SuppressionConfig::default(), false, false);
 
-        assert_eq!(report.critical_root_count, 1, "root count must include only the direct critical");
-        assert_eq!(report.cascade_critical_count, 1, "cascade count must include the cascade finding");
-        assert_eq!(report.critical_count, 2, "total critical must be sum of root + cascade");
+        assert_eq!(
+            report.critical_root_count, 1,
+            "root count must include only the direct critical"
+        );
+        assert_eq!(
+            report.cascade_critical_count, 1,
+            "cascade count must include the cascade finding"
+        );
+        assert_eq!(
+            report.critical_count, 2,
+            "total critical must be sum of root + cascade"
+        );
         assert_eq!(report.is_safe, false, "unsuppressed criticals -> unsafe");
     }
 
@@ -818,13 +823,25 @@ mod tests {
         let report = SafetyReport::with_suppressions(&diff, &suppressions, false, false);
 
         // Both root and cascade should be suppressed
-        let root_finding = report.findings_by_category.get("Struct Field Type Changed").unwrap();
+        let root_finding = report
+            .findings_by_category
+            .get("Struct Field Type Changed")
+            .unwrap();
         assert_eq!(root_finding.len(), 1);
-        assert!(root_finding[0].suppressed, "root cause finding should be suppressed");
+        assert!(
+            root_finding[0].suppressed,
+            "root cause finding should be suppressed"
+        );
 
-        let cascade_findings = report.findings_by_category.get("Cascading Layout Break").unwrap();
+        let cascade_findings = report
+            .findings_by_category
+            .get("Cascading Layout Break")
+            .unwrap();
         assert_eq!(cascade_findings.len(), 1);
-        assert!(cascade_findings[0].suppressed, "cascade finding should be suppressed via root cause");
+        assert!(
+            cascade_findings[0].suppressed,
+            "cascade finding should be suppressed via root cause"
+        );
 
         assert!(report.is_safe, "all criticals suppressed -> safe");
         assert_eq!(report.suppressed_count, 2);
@@ -862,10 +879,22 @@ mod tests {
 
         let report = SafetyReport::with_suppressions(&diff, &suppressions, false, false);
 
-        let root_finding = &report.findings_by_category.get("Struct Field Type Changed").unwrap()[0];
-        assert!(!root_finding.suppressed, "different target should not match");
+        let root_finding = &report
+            .findings_by_category
+            .get("Struct Field Type Changed")
+            .unwrap()[0];
+        assert!(
+            !root_finding.suppressed,
+            "different target should not match"
+        );
 
-        let cascade_finding = &report.findings_by_category.get("Cascading Layout Break").unwrap()[0];
-        assert!(!cascade_finding.suppressed, "cascade should not be suppressed when root is not");
+        let cascade_finding = &report
+            .findings_by_category
+            .get("Cascading Layout Break")
+            .unwrap()[0];
+        assert!(
+            !cascade_finding.suppressed,
+            "cascade should not be suppressed when root is not"
+        );
     }
 }
