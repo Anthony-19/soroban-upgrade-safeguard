@@ -1,12 +1,14 @@
-use crate::classification::{ClassificationConfig, TypeClass};
-use crate::limits::{LimitError, ResourcePolicy};
 use crate::mapper::LayoutMapper;
+<<<<<<< HEAD
 use crate::parser::{ContractEnvMeta, ContractMeta, RUST_VERSION_KEY, SDK_VERSION_KEY};
 use crate::rename::{match_renames, Rename};
 use crate::spec::ContractSpec;
 use schemars::JsonSchema;
+=======
+use crate::parser::ContractEnvMeta;
+use crate::spec::ContractSpec;
+>>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
 use stellar_xdr::curr::{
     ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef, ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0,
     ScSpecUdtErrorEnumCaseV0, ScSpecUdtErrorEnumV0, ScSpecUdtStructFieldV0, ScSpecUdtStructV0,
@@ -14,7 +16,7 @@ use stellar_xdr::curr::{
 };
 
 /// Severity of a detected issue.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Critical,
@@ -23,7 +25,7 @@ pub enum Severity {
 }
 
 /// A single finding from the comparison analysis.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Finding {
     pub severity: Severity,
     pub category: String,
@@ -45,15 +47,6 @@ pub struct Finding {
     /// `None` for findings that are not tied to a single named entity (for
     /// example environment-metadata changes).
     pub target: Option<String>,
-    /// How the affected user-defined type was classified (event vs. ordinary
-    /// storage/interface type), when this finding is about a UDT.
-    ///
-    /// This is *display metadata only*. It never appears in [`Self::category`]
-    /// and is never part of the suppression key, so a suppression rule keeps
-    /// matching even if the classification later changes. `None` for findings
-    /// not tied to a UDT (functions, parameters, environment metadata).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub classification: Option<TypeClass>,
 }
 
 /// Holds all findings from a comparison of two contract specs.
@@ -87,38 +80,21 @@ impl DiffReport {
 }
 
 /// Compare two contract specs and return a report of all findings.
-///
-/// Uses the default classification config, which treats every type as ordinary
-/// storage (no event claims). Use [`compare_with_classification`] to supply an
-/// explicit [`ClassificationConfig`].
 pub fn compare(old: &ContractSpec, new: &ContractSpec) -> DiffReport {
-    compare_with_classification(old, new, &ClassificationConfig::none())
-}
-
-/// Compare two contract specs, resolving event/storage classification via
-/// `classification`.
-///
-/// Classification affects only the human-facing message, remediation, and the
-/// per-finding `classification` metadata — never the structural `category` used
-/// for suppression matching.
-pub fn compare_with_classification(
-    old: &ContractSpec,
-    new: &ContractSpec,
-    classification: &ClassificationConfig,
-) -> DiffReport {
     let mut report = DiffReport::default();
 
     compare_functions(old, new, &mut report);
-    compare_structs(old, new, classification, &mut report);
-    compare_enums(old, new, classification, &mut report);
-    compare_unions(old, new, classification, &mut report);
-    compare_error_enums(old, new, classification, &mut report);
+    compare_structs(old, new, &mut report);
+    compare_enums(old, new, &mut report);
+    compare_unions(old, new, &mut report);
+    compare_error_enums(old, new, &mut report);
 
     detect_cascading_layout_breaks(old, &mut report);
 
     report
 }
 
+<<<<<<< HEAD
 /// Run the full structural diff bounded by `policy`.
 ///
 /// This is the function the canonical pipeline ([`crate::lib`]) calls. It
@@ -462,6 +438,11 @@ pub fn compare_wasm_imports(
     }
 }
 
+=======
+/// Category label for contract environment metadata findings.
+pub const ENVIRONMENT_CATEGORY: &str = "Environment";
+
+>>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
 /// Compare decoded environment metadata between two contract builds.
 pub fn compare_env_metadata(
     old: Option<&ContractEnvMeta>,
@@ -479,7 +460,6 @@ pub fn compare_env_metadata(
                 message: format_env_metadata_change(old_meta, new_meta),
                 type_name: None,
                 target: None,
-                classification: None,
             });
         }
     }
@@ -538,194 +518,9 @@ fn format_env_metadata_change(
     }
 }
 
-/// Compare decoded contract metadata (`contractmetav0`) between two builds.
-///
-/// The Soroban SDK records build provenance here — its own version
-/// ([`SDK_VERSION_KEY`]) and the Rust compiler version ([`RUST_VERSION_KEY`]) —
-/// and authors may add their own keys via `contractmeta!`. Provenance changes
-/// are reported as distinct, higher-signal findings (`Warning`) than arbitrary
-/// author-key changes (`Info`). Neither is a storage/interface layout break, so
-/// nothing here is `Critical`: that severity stays reserved for breaks that
-/// actually orphan data or callers.
-pub fn compare_contract_metadata(
-    old: Option<&ContractMeta>,
-    new: Option<&ContractMeta>,
-    report: &mut DiffReport,
-) {
-    let old_pairs = old.map(ContractMeta::pairs).unwrap_or_default();
-    let new_pairs = new.map(ContractMeta::pairs).unwrap_or_default();
-
-    // Reserved provenance keys, reported as dedicated version findings.
-    compare_meta_version(
-        "Metadata SDK Version Changed",
-        "Soroban SDK version",
-        old_pairs.get(SDK_VERSION_KEY),
-        new_pairs.get(SDK_VERSION_KEY),
-        report,
-    );
-    compare_meta_version(
-        "Metadata Compiler Version Changed",
-        "Rust compiler version",
-        old_pairs.get(RUST_VERSION_KEY),
-        new_pairs.get(RUST_VERSION_KEY),
-        report,
-    );
-
-    // Generic author-supplied keys: everything that is not a reserved key. The
-    // union is sorted (BTreeSet) so findings are emitted in a stable order.
-    let keys: BTreeSet<&str> = old_pairs
-        .keys()
-        .chain(new_pairs.keys())
-        .map(String::as_str)
-        .filter(|k| *k != SDK_VERSION_KEY && *k != RUST_VERSION_KEY)
-        .collect();
-
-    for key in keys {
-        match (old_pairs.get(key), new_pairs.get(key)) {
-            (Some(old_val), Some(new_val)) if old_val != new_val => push_meta_key_finding(
-                report,
-                "Metadata Key Changed",
-                format!("Metadata key '{key}' changed from '{old_val}' to '{new_val}'."),
-                key,
-            ),
-            (Some(_), Some(_)) => {}
-            (None, Some(new_val)) => push_meta_key_finding(
-                report,
-                "Metadata Key Added",
-                format!("Metadata key '{key}' was added with value '{new_val}'."),
-                key,
-            ),
-            (Some(old_val), None) => push_meta_key_finding(
-                report,
-                "Metadata Key Removed",
-                format!("Metadata key '{key}' was removed (was '{old_val}')."),
-                key,
-            ),
-            (None, None) => {}
-        }
-    }
-}
-
-/// Emit a provenance-version finding (`Warning`) when a reserved metadata key's
-/// value changed, appeared, or disappeared. `label` is the human noun (e.g.
-/// "Soroban SDK version").
-fn compare_meta_version(
-    category: &str,
-    label: &str,
-    old: Option<&String>,
-    new: Option<&String>,
-    report: &mut DiffReport,
-) {
-    let message = match (old, new) {
-        (Some(o), Some(n)) if o == n => return,
-        (Some(o), Some(n)) => format!("{label} changed from '{o}' to '{n}'."),
-        (None, Some(n)) => format!("{label} is now recorded as '{n}' (previously absent)."),
-        (Some(o), None) => format!("{label} is no longer recorded (was '{o}')."),
-        (None, None) => return,
-    };
-    report.findings.push(Finding {
-        severity: Severity::Warning,
-        category: category.to_string(),
-        message,
-        type_name: None,
-        target: None,
-        classification: None,
-    });
-}
-
-/// Push a generic author-supplied metadata-key finding (`Info`), keyed on the
-/// metadata key so a suppression rule can target it precisely.
-fn push_meta_key_finding(report: &mut DiffReport, category: &str, message: String, key: &str) {
-    report.findings.push(Finding {
-        severity: Severity::Info,
-        category: category.to_string(),
-        message,
-        type_name: None,
-        target: Some(key.to_string()),
-        classification: None,
-    });
-}
-
-/// The human-facing noun used in a message for a type of the given class.
-///
-/// Only the *wording* varies with classification; the structural `category`
-/// (e.g. `"Struct Field Removed"`) never does, so suppression keys stay stable
-/// even if a type's classification later changes. See [`crate::classification`].
-fn type_noun<'a>(class: TypeClass, storage: &'a str, event: &'a str) -> &'a str {
-    match class {
-        TypeClass::Event { .. } => event,
-        TypeClass::Storage => storage,
-    }
-}
-
-/// Append a heuristic-classification disclaimer to `message` when the class was
-/// guessed from the type name rather than declared. Satisfies "the report labels
-/// any heuristic classification as such."
-fn with_heuristic_note(mut message: String, class: TypeClass) -> String {
-    if class.is_heuristic() {
-        message.push_str(
-            " (classified as an event by the name heuristic; \
-             declare it under [classification] to make this explicit)",
-        );
-    }
-    message
-}
-
-/// The two sets of names consumed by detected renames: old names that should no
-/// longer be reported as removed, and new names that should no longer be
-/// reported as added.
-fn rename_name_sets(renames: &[Rename]) -> (BTreeSet<&str>, BTreeSet<&str>) {
-    let old_names = renames.iter().map(|r| r.old_name.as_str()).collect();
-    let new_names = renames.iter().map(|r| r.new_name.as_str()).collect();
-    (old_names, new_names)
-}
-
-/// Emit the finding for a detected rename. An identical layout is informational
-/// (`Type Renamed`); a rename that also changes fields is a warning
-/// (`Type Renamed With Changes`) and is followed by the field-level diff so the
-/// actual break is not buried. `kind` is the lowercase type kind (e.g. `struct`).
-fn emit_rename_finding(rename: &Rename, kind: &str, class: TypeClass, report: &mut DiffReport) {
-    let (severity, category, detail) = if rename.identical {
-        (
-            Severity::Info,
-            "Type Renamed",
-            "the layout is identical, so stored data stays compatible",
-        )
-    } else {
-        (
-            Severity::Warning,
-            "Type Renamed With Changes",
-            "the layout also changed; see the field-level findings below",
-        )
-    };
-    report.findings.push(Finding {
-        severity,
-        category: category.to_string(),
-        message: with_heuristic_note(
-            format!(
-                "{} '{}' appears to have been renamed to '{}' — {}.",
-                capitalize(kind),
-                rename.old_name,
-                rename.new_name,
-                detail
-            ),
-            class,
-        ),
-        // Anchor to the NEW name so cascade/field targets line up with the
-        // surviving type.
-        type_name: Some(rename.new_name.clone()),
-        target: Some(rename.new_name.clone()),
-        classification: Some(class),
-    });
-}
-
-/// Uppercase the first ASCII character of a short, known-lowercase kind label.
-fn capitalize(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
-        None => String::new(),
-    }
+/// Helper to detect if a User-Defined Type represents an Event by standard Soroban naming conventions.
+fn is_event(name: &str) -> bool {
+    name.to_lowercase().contains("event")
 }
 
 /// Compare function signatures between old and new contract specs.
@@ -743,7 +538,6 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                     ),
                     type_name: None,
                     target: Some(name.clone()),
-                    classification: None,
                 });
             }
             Some(new_fn) => {
@@ -766,7 +560,6 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                         message,
                         type_name: None,
                         target: Some(name.clone()),
-                        classification: None,
                     });
                 }
             }
@@ -782,7 +575,6 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                 message: format!("New function '{}' added.", name),
                 type_name: None,
                 target: Some(name.clone()),
-                classification: None,
             });
         }
     }
@@ -811,7 +603,6 @@ fn check_function_signature(
             ),
             type_name: None,
             target: Some(name.to_string()),
-            classification: None,
         });
         return; // No point comparing individual params if count differs
     }
@@ -841,7 +632,6 @@ fn check_function_signature(
             ),
             type_name: None,
             target: Some(name.to_string()),
-            classification: None,
         });
 
         // Check for genuine type changes by matching parameter name.
@@ -867,7 +657,6 @@ fn check_function_signature(
                         ),
                         type_name: None,
                         target: Some(format!("{}.{}", name, p_name)),
-                        classification: None,
                     });
                 }
             }
@@ -888,7 +677,6 @@ fn check_function_signature(
                     ),
                     type_name: None,
                     target: Some(format!("{}.{}", name, old_name)),
-                    classification: None,
                 });
             }
 
@@ -906,7 +694,6 @@ fn check_function_signature(
                     ),
                     type_name: None,
                     target: Some(format!("{}.{}", name, old_name)),
-                    classification: None,
                 });
             }
         }
@@ -928,7 +715,6 @@ fn check_function_signature(
             ),
             type_name: None,
             target: Some(name.to_string()),
-            classification: None,
         });
     } else {
         for (i, (old_out, new_out)) in old_outputs.iter().zip(new_outputs.iter()).enumerate() {
@@ -945,7 +731,6 @@ fn check_function_signature(
                     ),
                     type_name: None,
                     target: Some(name.to_string()),
-                    classification: None,
                 });
             }
         }
@@ -959,113 +744,64 @@ fn types_equal(a: &ScSpecTypeDef, b: &ScSpecTypeDef) -> bool {
 }
 
 /// Compare struct definitions between old and new contract specs.
-///
-/// Types present under the same name in both specs are compared field-by-field.
-/// Names that appear only on one side are run through structural rename
-/// detection ([`match_renames`]) *before* being reported as removed/added, so a
-/// renamed-but-compatible type is reported as a rename rather than a delete plus
-/// an add.
-fn compare_structs(
-    old: &ContractSpec,
-    new: &ContractSpec,
-    classification: &ClassificationConfig,
-    report: &mut DiffReport,
-) {
-    // 1. Types present in both specs (same name): compare in place.
+fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport) {
     for (name, old_struct) in &old.structs {
-        if let Some(new_struct) = new.structs.get(name) {
-            let class = classification.classify(name);
-            check_struct_fields(name, old_struct, new_struct, class, report);
-            // Compare struct doc-strings (informational only)
-            if old_struct.doc != new_struct.doc {
-                let old_doc_empty = old_struct.doc.to_string().is_empty();
-                let new_doc_empty = new_struct.doc.to_string().is_empty();
-                let message = if old_doc_empty && !new_doc_empty {
-                    format!("Struct '{}' documentation was added.", name)
-                } else if !old_doc_empty && new_doc_empty {
-                    format!("Struct '{}' documentation was removed.", name)
-                } else {
-                    format!("Struct '{}' documentation changed.", name)
-                };
-
+        let is_evt = is_event(name);
+        match new.structs.get(name) {
+            None => {
                 report.findings.push(Finding {
-                    severity: Severity::Info,
-                    category: "Struct Documentation Changed".to_string(),
-                    message,
+                    severity: Severity::Critical,
+                    category: if is_evt {
+                        "Event Definition Removed".to_string()
+                    } else {
+                        "Struct Removed".to_string()
+                    },
+                    message: format!(
+                        "{} '{}' was removed. Storage or systems relying on this type will break.",
+                        if is_evt { "Event struct" } else { "Struct" },
+                        name
+                    ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
-                    classification: Some(class),
                 });
+            }
+            Some(new_struct) => {
+                check_struct_fields(name, old_struct, new_struct, report);
+                // Compare struct doc-strings (informational only)
+                if old_struct.doc != new_struct.doc {
+                    let old_doc_empty = old_struct.doc.to_string().is_empty();
+                    let new_doc_empty = new_struct.doc.to_string().is_empty();
+                    let message = if old_doc_empty && !new_doc_empty {
+                        format!("Struct '{}' documentation was added.", name)
+                    } else if !old_doc_empty && new_doc_empty {
+                        format!("Struct '{}' documentation was removed.", name)
+                    } else {
+                        format!("Struct '{}' documentation changed.", name)
+                    };
+
+                    report.findings.push(Finding {
+                        severity: Severity::Info,
+                        category: "Struct Documentation Changed".to_string(),
+                        message,
+                        type_name: Some(name.clone()),
+                        target: Some(name.clone()),
+                    });
+                }
             }
         }
     }
 
-    // 2. Names on only one side: try to pair them up as renames first.
-    let removed: BTreeMap<String, &ScSpecUdtStructV0> = old
-        .structs
-        .iter()
-        .filter(|(n, _)| !new.structs.contains_key(*n))
-        .map(|(n, s)| (n.clone(), s))
-        .collect();
-    let added: BTreeMap<String, &ScSpecUdtStructV0> = new
-        .structs
-        .iter()
-        .filter(|(n, _)| !old.structs.contains_key(*n))
-        .map(|(n, s)| (n.clone(), s))
-        .collect();
-
-    let renames = match_renames(&removed, &added);
-    let (renamed_old, renamed_new) = rename_name_sets(&renames);
-
-    for rename in &renames {
-        let old_struct = removed[&rename.old_name];
-        let new_struct = added[&rename.new_name];
-        let class = classification.classify(&rename.new_name);
-        emit_rename_finding(rename, "struct", class, report);
-        if !rename.identical {
-            // Diff the renamed type under its NEW name so field targets are stable.
-            check_struct_fields(&rename.new_name, old_struct, new_struct, class, report);
+    // Check for newly added structs (informational)
+    for name in new.structs.keys() {
+        if !old.structs.contains_key(name) {
+            report.findings.push(Finding {
+                severity: Severity::Info,
+                category: "Struct Added".to_string(),
+                message: format!("New struct '{}' added.", name),
+                type_name: Some(name.clone()),
+                target: Some(name.clone()),
+            });
         }
-    }
-
-    // 3. Genuinely removed structs (not part of a rename).
-    for name in removed.keys() {
-        if renamed_old.contains(name.as_str()) {
-            continue;
-        }
-        let class = classification.classify(name);
-        let noun = type_noun(class, "Struct", "Event struct");
-        let message = with_heuristic_note(
-            format!(
-                "{} '{}' was removed. Storage or systems relying on this type will break.",
-                noun, name
-            ),
-            class,
-        );
-        report.findings.push(Finding {
-            severity: Severity::Critical,
-            category: "Struct Removed".to_string(),
-            message,
-            type_name: Some(name.clone()),
-            target: Some(name.clone()),
-            classification: Some(class),
-        });
-    }
-
-    // 4. Genuinely added structs (not part of a rename).
-    for name in added.keys() {
-        if renamed_new.contains(name.as_str()) {
-            continue;
-        }
-        let class = classification.classify(name);
-        report.findings.push(Finding {
-            severity: Severity::Info,
-            category: "Struct Added".to_string(),
-            message: format!("New struct '{}' added.", name),
-            type_name: Some(name.clone()),
-            target: Some(name.clone()),
-            classification: Some(class),
-        });
     }
 }
 
@@ -1073,20 +809,21 @@ fn compare_structs(
 ///
 /// Soroban serializes struct fields by position order, so field reordering,
 /// removal, or type changes all break storage layout compatibility.
-///
-/// `class` only affects the human-facing wording and per-finding metadata; the
-/// structural `category` is identical for storage and event types so that a
-/// suppression keyed on it keeps matching even if the classification flips.
 fn check_struct_fields(
     name: &str,
     old_struct: &ScSpecUdtStructV0,
     new_struct: &ScSpecUdtStructV0,
-    class: TypeClass,
     report: &mut DiffReport,
 ) {
     let old_fields: &[ScSpecUdtStructFieldV0] = old_struct.fields.as_ref();
     let new_fields: &[ScSpecUdtStructFieldV0] = new_struct.fields.as_ref();
-    let msg_prefix = type_noun(class, "Struct", "Event schema");
+    let is_evt = is_event(name);
+    let category_prefix = if is_evt {
+        "Event Schema"
+    } else {
+        "Struct Field"
+    };
+    let msg_prefix = if is_evt { "Event schema" } else { "Struct" };
 
     // Check for removed fields
     for old_field in old_fields {
@@ -1095,17 +832,13 @@ fn check_struct_fields(
         if !still_exists {
             report.findings.push(Finding {
                 severity: Severity::Critical,
-                category: "Struct Field Removed".to_string(),
-                message: with_heuristic_note(
-                    format!(
-                        "{} '{}': field '{}' was removed. Backwards compatibility is broken.",
-                        msg_prefix, name, old_name
-                    ),
-                    class,
+                category: format!("{} Removed", category_prefix),
+                message: format!(
+                    "{} '{}': field '{}' was removed. Backwards compatibility is broken.",
+                    msg_prefix, name, old_name
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
-                classification: Some(class),
             });
         }
     }
@@ -1119,18 +852,14 @@ fn check_struct_fields(
         if old_name != new_name {
             report.findings.push(Finding {
                 severity: Severity::Critical,
-                category: "Struct Field Reordered".to_string(),
-                message: with_heuristic_note(
-                    format!(
-                        "{} '{}': field at position {} changed from '{}' to '{}'. \
-                         Positional serialization breaks layout compatibility.",
-                        msg_prefix, name, i, old_name, new_name
-                    ),
-                    class,
+                category: format!("{} Reordered", category_prefix),
+                message: format!(
+                    "{} '{}': field at position {} changed from '{}' to '{}'. \
+                     Positional serialization breaks layout compatibility.",
+                    msg_prefix, name, i, old_name, new_name
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
-                classification: Some(class),
             });
         }
 
@@ -1138,22 +867,18 @@ fn check_struct_fields(
         if !types_equal(&old_field.type_, &new_field.type_) {
             report.findings.push(Finding {
                 severity: Severity::Critical,
-                category: "Struct Field Type Changed".to_string(),
-                message: with_heuristic_note(
-                    format!(
-                        "{} '{}': field '{}' (position {}) type changed from `{}` to `{}`.",
-                        msg_prefix,
-                        name,
-                        old_name,
-                        i,
-                        crate::mapper::type_to_string(&old_field.type_),
-                        crate::mapper::type_to_string(&new_field.type_)
-                    ),
-                    class,
+                category: format!("{} Type Changed", category_prefix),
+                message: format!(
+                    "{} '{}': field '{}' (position {}) type changed from `{}` to `{}`.",
+                    msg_prefix,
+                    name,
+                    old_name,
+                    i,
+                    crate::mapper::type_to_string(&old_field.type_),
+                    crate::mapper::type_to_string(&new_field.type_)
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
-                classification: Some(class),
             });
         }
     }
@@ -1165,136 +890,94 @@ fn check_struct_fields(
                 severity: Severity::Warning,
                 category: "Struct Field Added".to_string(),
                 message: format!(
-                    "{} '{}': new field '{}' appended. \
+                    "Struct '{}': new field '{}' appended. \
                      Existing storage entries won't have this field — ensure migration handles defaults.",
-                    msg_prefix,
                     name,
                     new_field.name
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, new_field.name)),
-                classification: Some(class),
             });
         }
     }
 }
 
 /// Compare enum definitions between old and new contract specs.
-fn compare_enums(
-    old: &ContractSpec,
-    new: &ContractSpec,
-    classification: &ClassificationConfig,
-    report: &mut DiffReport,
-) {
-    // 1. Enums present in both specs (same name): compare in place.
+fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport) {
     for (name, old_enum) in &old.enums {
-        if let Some(new_enum) = new.enums.get(name) {
-            let class = classification.classify(name);
-            check_enum_cases(name, old_enum, new_enum, class, report);
-            // Compare enum doc-strings (informational only)
-            if old_enum.doc != new_enum.doc {
-                let old_doc_empty = old_enum.doc.to_string().is_empty();
-                let new_doc_empty = new_enum.doc.to_string().is_empty();
-                let message = if old_doc_empty && !new_doc_empty {
-                    format!("Enum '{}' documentation was added.", name)
-                } else if !old_doc_empty && new_doc_empty {
-                    format!("Enum '{}' documentation was removed.", name)
-                } else {
-                    format!("Enum '{}' documentation changed.", name)
-                };
-
+        let is_evt = is_event(name);
+        match new.enums.get(name) {
+            None => {
                 report.findings.push(Finding {
-                    severity: Severity::Info,
-                    category: "Enum Documentation Changed".to_string(),
-                    message,
+                    severity: Severity::Critical,
+                    category: if is_evt {
+                        "Event Enum Removed".to_string()
+                    } else {
+                        "Enum Removed".to_string()
+                    },
+                    message: format!(
+                        "{} '{}' was removed. Data using this type will be invalid.",
+                        if is_evt { "Event enum" } else { "Enum" },
+                        name
+                    ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
-                    classification: Some(class),
                 });
+            }
+            Some(new_enum) => {
+                check_enum_cases(name, old_enum, new_enum, report);
+                // Compare enum doc-strings (informational only)
+                if old_enum.doc != new_enum.doc {
+                    let old_doc_empty = old_enum.doc.to_string().is_empty();
+                    let new_doc_empty = new_enum.doc.to_string().is_empty();
+                    let message = if old_doc_empty && !new_doc_empty {
+                        format!("Enum '{}' documentation was added.", name)
+                    } else if !old_doc_empty && new_doc_empty {
+                        format!("Enum '{}' documentation was removed.", name)
+                    } else {
+                        format!("Enum '{}' documentation changed.", name)
+                    };
+
+                    report.findings.push(Finding {
+                        severity: Severity::Info,
+                        category: "Enum Documentation Changed".to_string(),
+                        message,
+                        type_name: Some(name.clone()),
+                        target: Some(name.clone()),
+                    });
+                }
             }
         }
     }
 
-    // 2. Names on only one side: try to pair them up as renames first.
-    let removed: BTreeMap<String, &ScSpecUdtEnumV0> = old
-        .enums
-        .iter()
-        .filter(|(n, _)| !new.enums.contains_key(*n))
-        .map(|(n, e)| (n.clone(), e))
-        .collect();
-    let added: BTreeMap<String, &ScSpecUdtEnumV0> = new
-        .enums
-        .iter()
-        .filter(|(n, _)| !old.enums.contains_key(*n))
-        .map(|(n, e)| (n.clone(), e))
-        .collect();
-
-    let renames = match_renames(&removed, &added);
-    let (renamed_old, renamed_new) = rename_name_sets(&renames);
-
-    for rename in &renames {
-        let old_enum = removed[&rename.old_name];
-        let new_enum = added[&rename.new_name];
-        let class = classification.classify(&rename.new_name);
-        emit_rename_finding(rename, "enum", class, report);
-        if !rename.identical {
-            check_enum_cases(&rename.new_name, old_enum, new_enum, class, report);
+    // Check for newly added enums
+    for name in new.enums.keys() {
+        if !old.enums.contains_key(name) {
+            report.findings.push(Finding {
+                severity: Severity::Info,
+                category: "Enum Added".to_string(),
+                message: format!("New enum '{}' added.", name),
+                type_name: Some(name.clone()),
+                target: Some(name.clone()),
+            });
         }
-    }
-
-    // 3. Genuinely removed enums.
-    for name in removed.keys() {
-        if renamed_old.contains(name.as_str()) {
-            continue;
-        }
-        let class = classification.classify(name);
-        let noun = type_noun(class, "Enum", "Event enum");
-        let message = with_heuristic_note(
-            format!(
-                "{} '{}' was removed. Data using this type will be invalid.",
-                noun, name
-            ),
-            class,
-        );
-        report.findings.push(Finding {
-            severity: Severity::Critical,
-            category: "Enum Removed".to_string(),
-            message,
-            type_name: Some(name.clone()),
-            target: Some(name.clone()),
-            classification: Some(class),
-        });
-    }
-
-    // 4. Genuinely added enums.
-    for name in added.keys() {
-        if renamed_new.contains(name.as_str()) {
-            continue;
-        }
-        let class = classification.classify(name);
-        report.findings.push(Finding {
-            severity: Severity::Info,
-            category: "Enum Added".to_string(),
-            message: format!("New enum '{}' added.", name),
-            type_name: Some(name.clone()),
-            target: Some(name.clone()),
-            classification: Some(class),
-        });
     }
 }
 
 /// Compare cases of two enums with the same name.
-///
-/// `class` affects only the message wording and per-finding metadata; the
-/// structural `category` never varies with classification.
 fn check_enum_cases(
     name: &str,
     old_enum: &ScSpecUdtEnumV0,
     new_enum: &ScSpecUdtEnumV0,
-    class: TypeClass,
     report: &mut DiffReport,
 ) {
-    let msg_prefix = type_noun(class, "Enum", "Event enum");
+    let is_evt = is_event(name);
+    let category_prefix = if is_evt {
+        "Event Enum Case"
+    } else {
+        "Enum Case"
+    };
+    let msg_prefix = if is_evt { "Event enum" } else { "Enum" };
     let old_cases: &[ScSpecUdtEnumCaseV0] = old_enum.cases.as_ref();
     let new_cases: &[ScSpecUdtEnumCaseV0] = new_enum.cases.as_ref();
 
@@ -1306,18 +989,14 @@ fn check_enum_cases(
                 // The case was removed entirely
                 report.findings.push(Finding {
                     severity: Severity::Critical,
-                    category: "Enum Case Removed".to_string(),
-                    message: with_heuristic_note(
-                        format!(
-                            "{} '{}': case '{}' (value: {}) was removed. \
-                             On-chain data or events relying on this value will be invalid.",
-                            msg_prefix, name, old_name, old_case.value
-                        ),
-                        class,
+                    category: format!("{} Removed", category_prefix),
+                    message: format!(
+                        "{} '{}': case '{}' (value: {}) was removed. \
+                         On-chain data or events relying on this value will be invalid.",
+                        msg_prefix, name, old_name, old_case.value
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, old_name)),
-                    classification: Some(class),
                 });
             }
             Some(new_case) => {
@@ -1325,18 +1004,14 @@ fn check_enum_cases(
                 if old_case.value != new_case.value {
                     report.findings.push(Finding {
                         severity: Severity::Critical,
-                        category: "Enum Case Value Changed".to_string(),
-                        message: with_heuristic_note(
-                            format!(
-                                "{} '{}': case '{}' value changed from {} to {}. \
-                                 This breaks data serialization.",
-                                msg_prefix, name, old_name, old_case.value, new_case.value
-                            ),
-                            class,
+                        category: format!("{} Value Changed", category_prefix),
+                        message: format!(
+                            "{} '{}': case '{}' value changed from {} to {}. \
+                             This breaks data serialization.",
+                            msg_prefix, name, old_name, old_case.value, new_case.value
                         ),
                         type_name: Some(name.to_string()),
                         target: Some(format!("{}.{}", name, old_name)),
-                        classification: Some(class),
                     });
                 }
             }
@@ -1350,14 +1025,13 @@ fn check_enum_cases(
             if !old_cases.iter().any(|c| c.name.to_string() == new_name) {
                 report.findings.push(Finding {
                     severity: Severity::Info,
-                    category: "Enum Case Added".to_string(),
+                    category: format!("{} Added", category_prefix),
                     message: format!(
                         "{} '{}': new case '{}' (value {}) added.",
                         msg_prefix, name, new_name, new_case.value
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, new_name)),
-                    classification: Some(class),
                 });
             }
         }
@@ -1365,82 +1039,37 @@ fn check_enum_cases(
 }
 
 /// Compare union definitions between old and new contract specs.
-fn compare_unions(
-    old: &ContractSpec,
-    new: &ContractSpec,
-    classification: &ClassificationConfig,
-    report: &mut DiffReport,
-) {
-    // 1. Same-name unions: compare in place.
+fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport) {
     for (name, old_union) in &old.unions {
-        if let Some(new_union) = new.unions.get(name) {
-            check_union_cases(name, old_union, new_union, report);
+        match new.unions.get(name) {
+            None => {
+                report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category: "Union Removed".to_string(),
+                    message: format!(
+                        "Union '{}' was removed. Data using this type will be invalid.",
+                        name
+                    ),
+                    type_name: Some(name.clone()),
+                    target: Some(name.clone()),
+                });
+            }
+            Some(new_union) => {
+                check_union_cases(name, old_union, new_union, report);
+            }
         }
     }
 
-    // 2. One-sided names: pair renames before reporting delete/add.
-    let removed: BTreeMap<String, &ScSpecUdtUnionV0> = old
-        .unions
-        .iter()
-        .filter(|(n, _)| !new.unions.contains_key(*n))
-        .map(|(n, u)| (n.clone(), u))
-        .collect();
-    let added: BTreeMap<String, &ScSpecUdtUnionV0> = new
-        .unions
-        .iter()
-        .filter(|(n, _)| !old.unions.contains_key(*n))
-        .map(|(n, u)| (n.clone(), u))
-        .collect();
-
-    let renames = match_renames(&removed, &added);
-    let (renamed_old, renamed_new) = rename_name_sets(&renames);
-
-    for rename in &renames {
-        let class = classification.classify(&rename.new_name);
-        emit_rename_finding(rename, "union", class, report);
-        if !rename.identical {
-            check_union_cases(
-                &rename.new_name,
-                removed[&rename.old_name],
-                added[&rename.new_name],
-                report,
-            );
+    for name in new.unions.keys() {
+        if !old.unions.contains_key(name) {
+            report.findings.push(Finding {
+                severity: Severity::Info,
+                category: "Union Added".to_string(),
+                message: format!("New union '{}' added.", name),
+                type_name: Some(name.clone()),
+                target: Some(name.clone()),
+            });
         }
-    }
-
-    // 3. Genuinely removed unions.
-    for name in removed.keys() {
-        if renamed_old.contains(name.as_str()) {
-            continue;
-        }
-        let class = classification.classify(name);
-        report.findings.push(Finding {
-            severity: Severity::Critical,
-            category: "Union Removed".to_string(),
-            message: format!(
-                "Union '{}' was removed. Data using this type will be invalid.",
-                name
-            ),
-            type_name: Some(name.clone()),
-            target: Some(name.clone()),
-            classification: Some(class),
-        });
-    }
-
-    // 4. Genuinely added unions.
-    for name in added.keys() {
-        if renamed_new.contains(name.as_str()) {
-            continue;
-        }
-        let class = classification.classify(name);
-        report.findings.push(Finding {
-            severity: Severity::Info,
-            category: "Union Added".to_string(),
-            message: format!("New union '{}' added.", name),
-            type_name: Some(name.clone()),
-            target: Some(name.clone()),
-            classification: Some(class),
-        });
     }
 }
 
@@ -1470,7 +1099,6 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
-                classification: None,
             });
         }
     }
@@ -1490,7 +1118,6 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
-                classification: None,
             });
         }
 
@@ -1508,7 +1135,6 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
-                classification: None,
             });
         }
     }
@@ -1526,7 +1152,6 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, union_case_name(new_case))),
-                classification: None,
             });
         }
     }
@@ -1566,83 +1191,37 @@ fn union_cases_equal(a: &ScSpecUdtUnionCaseV0, b: &ScSpecUdtUnionCaseV0) -> bool
 }
 
 /// Compare contract error enum definitions between old and new specs.
-///
-/// Error enums are never classified as events, so their findings carry
-/// `classification: None`. Rename detection still applies: an error enum
-/// renamed with an identical set of `name=value` cases is reported as a rename.
-fn compare_error_enums(
-    old: &ContractSpec,
-    new: &ContractSpec,
-    _classification: &ClassificationConfig,
-    report: &mut DiffReport,
-) {
-    // 1. Same name on both sides: compare cases.
+fn compare_error_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport) {
     for (name, old_error_enum) in &old.error_enums {
-        if let Some(new_error_enum) = new.error_enums.get(name) {
-            check_error_enum_cases(name, old_error_enum, new_error_enum, report);
+        match new.error_enums.get(name) {
+            None => {
+                report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category: "Error Enum Removed".to_string(),
+                    message: format!(
+                        "Error enum '{}' was removed. Clients matching on these errors will break.",
+                        name
+                    ),
+                    type_name: Some(name.clone()),
+                    target: Some(name.clone()),
+                });
+            }
+            Some(new_error_enum) => {
+                check_error_enum_cases(name, old_error_enum, new_error_enum, report);
+            }
         }
     }
 
-    // 2. One-sided names: detect renames before reporting removed/added.
-    let removed: BTreeMap<String, &ScSpecUdtErrorEnumV0> = old
-        .error_enums
-        .iter()
-        .filter(|(n, _)| !new.error_enums.contains_key(*n))
-        .map(|(n, e)| (n.clone(), e))
-        .collect();
-    let added: BTreeMap<String, &ScSpecUdtErrorEnumV0> = new
-        .error_enums
-        .iter()
-        .filter(|(n, _)| !old.error_enums.contains_key(*n))
-        .map(|(n, e)| (n.clone(), e))
-        .collect();
-
-    let renames = match_renames(&removed, &added);
-    let (renamed_old, renamed_new) = rename_name_sets(&renames);
-
-    for rename in &renames {
-        emit_rename_finding(rename, "error enum", TypeClass::Storage, report);
-        if !rename.identical {
-            check_error_enum_cases(
-                &rename.new_name,
-                removed[&rename.old_name],
-                added[&rename.new_name],
-                report,
-            );
+    for name in new.error_enums.keys() {
+        if !old.error_enums.contains_key(name) {
+            report.findings.push(Finding {
+                severity: Severity::Info,
+                category: "Error Enum Added".to_string(),
+                message: format!("New error enum '{}' added.", name),
+                type_name: Some(name.clone()),
+                target: Some(name.clone()),
+            });
         }
-    }
-
-    // 3. Genuinely removed error enums.
-    for name in removed.keys() {
-        if renamed_old.contains(name.as_str()) {
-            continue;
-        }
-        report.findings.push(Finding {
-            severity: Severity::Critical,
-            category: "Error Enum Removed".to_string(),
-            message: format!(
-                "Error enum '{}' was removed. Clients matching on these errors will break.",
-                name
-            ),
-            type_name: Some(name.clone()),
-            target: Some(name.clone()),
-            classification: None,
-        });
-    }
-
-    // 4. Genuinely added error enums.
-    for name in added.keys() {
-        if renamed_new.contains(name.as_str()) {
-            continue;
-        }
-        report.findings.push(Finding {
-            severity: Severity::Info,
-            category: "Error Enum Added".to_string(),
-            message: format!("New error enum '{}' added.", name),
-            type_name: Some(name.clone()),
-            target: Some(name.clone()),
-            classification: None,
-        });
     }
 }
 
@@ -1670,7 +1249,6 @@ fn check_error_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, old_name)),
-                    classification: None,
                 });
             }
             Some(new_case) if old_case.value != new_case.value => {
@@ -1684,7 +1262,6 @@ fn check_error_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, old_name)),
-                    classification: None,
                 });
             }
             _ => {}
@@ -1703,7 +1280,6 @@ fn check_error_enum_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, new_name)),
-                classification: None,
             });
         }
     }
@@ -1751,7 +1327,6 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
                         ),
                         type_name: Some(dep.clone()),
                         target: Some(dep.clone()),
-                        classification: None,
                     });
                 }
             }
@@ -1759,6 +1334,7 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
     }
 }
 
+<<<<<<< HEAD
 /// Policy-aware variant of [`detect_cascading_layout_breaks`].
 ///
 /// Uses [`crate::mapper::LayoutMapper::new_with_policy`] so the walk is bounded
@@ -1819,45 +1395,12 @@ mod tests {
     use super::*;
     use std::collections::{BTreeSet, HashSet};
     use stellar_xdr::curr::{ScEnvMetaEntry, ScMetaEntry, ScMetaV0, ScSpecTypeUdt, StringM, VecM};
-
-    #[test]
-    fn exported_functions_detect_removals_additions_and_spec_mismatches() {
-        let old_exports = BTreeSet::from(["legacy".to_string(), "old_only".to_string()]);
-        let new_exports = BTreeSet::from(["legacy".to_string(), "new_only".to_string()]);
-        let old_spec = HashSet::from(["legacy".to_string(), "declared_only_old".to_string()]);
-        let new_spec = HashSet::from(["legacy".to_string(), "declared_only_new".to_string()]);
-        let mut report = DiffReport::default();
-
-        compare_exports(
-            &old_exports,
-            &new_exports,
-            &old_spec,
-            &new_spec,
-            &mut report,
-        );
-
-        assert!(report.findings.iter().any(|finding| {
-            finding.category == "Export Removed"
-                && finding.target.as_deref() == Some("old_only")
-                && finding.severity == Severity::Critical
-        }));
-        assert!(report.findings.iter().any(|finding| {
-            finding.category == "Export Added"
-                && finding.target.as_deref() == Some("new_only")
-                && finding.severity == Severity::Info
-        }));
-        for target in [
-            "declared_only_old",
-            "old_only",
-            "declared_only_new",
-            "new_only",
-        ] {
-            assert!(report.findings.iter().any(|finding| {
-                finding.category == "Export Spec Mismatch"
-                    && finding.target.as_deref() == Some(target)
-            }));
-        }
-    }
+=======
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::{ScEnvMetaEntry, ScSpecTypeUdt, StringM, VecM};
+>>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
 
     /// Helper: build a minimal ContractSpec with the given structs.
     fn spec_with_structs(structs: Vec<(&str, Vec<(&str, ScSpecTypeDef)>)>) -> ContractSpec {
@@ -1968,7 +1511,6 @@ mod tests {
                 .to_string(),
             type_name: Some("Child".to_string()),
             target: Some("Child".to_string()),
-            classification: None,
         });
 
         // Run cascade detection against the old spec
@@ -2002,7 +1544,6 @@ mod tests {
             message: "Function 'do_stuff' was removed.".to_string(),
             type_name: None,
             target: Some("do_stuff".to_string()),
-            classification: None,
         });
 
         detect_cascading_layout_breaks(&old, &mut report);
@@ -2199,136 +1740,6 @@ mod tests {
         let new = env_meta(22, 0);
         let mut report = DiffReport::default();
         compare_env_metadata(Some(&old), Some(&new), &mut report);
-
-        let safety = crate::report::SafetyReport::new(&report);
-        assert!(safety.is_safe);
-        assert_eq!(safety.critical_count, 0);
-    }
-
-    fn contract_meta(pairs: &[(&str, &str)]) -> ContractMeta {
-        ContractMeta {
-            entries: pairs
-                .iter()
-                .map(|&(k, v)| {
-                    ScMetaEntry::ScMetaV0(ScMetaV0 {
-                        key: k.try_into().unwrap(),
-                        val: v.try_into().unwrap(),
-                    })
-                })
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn meta_sdk_version_change_is_warning() {
-        let old = contract_meta(&[("rssdkver", "21.6.0"), ("rsver", "1.79.0")]);
-        let new = contract_meta(&[("rssdkver", "22.0.0"), ("rsver", "1.79.0")]);
-        let mut report = DiffReport::default();
-        compare_contract_metadata(Some(&old), Some(&new), &mut report);
-
-        assert_eq!(report.findings.len(), 1);
-        let f = &report.findings[0];
-        assert_eq!(f.severity, Severity::Warning);
-        assert_eq!(f.category, "Metadata SDK Version Changed");
-        assert!(f.message.contains("Soroban SDK version"));
-    }
-
-    #[test]
-    fn meta_compiler_version_change_is_warning() {
-        let old = contract_meta(&[("rsver", "1.79.0")]);
-        let new = contract_meta(&[("rsver", "1.80.0")]);
-        let mut report = DiffReport::default();
-        compare_contract_metadata(Some(&old), Some(&new), &mut report);
-
-        assert_eq!(report.findings.len(), 1);
-        let f = &report.findings[0];
-        assert_eq!(f.severity, Severity::Warning);
-        assert_eq!(f.category, "Metadata Compiler Version Changed");
-        assert!(f.message.contains("Rust compiler version"));
-    }
-
-    #[test]
-    fn meta_generic_key_added_is_info() {
-        let old = contract_meta(&[]);
-        let new = contract_meta(&[("author", "acme")]);
-        let mut report = DiffReport::default();
-        compare_contract_metadata(Some(&old), Some(&new), &mut report);
-
-        assert_eq!(report.findings.len(), 1);
-        let f = &report.findings[0];
-        assert_eq!(f.severity, Severity::Info);
-        assert_eq!(f.category, "Metadata Key Added");
-        assert_eq!(f.target.as_deref(), Some("author"));
-    }
-
-    #[test]
-    fn meta_generic_key_removed_is_info() {
-        let old = contract_meta(&[("author", "acme")]);
-        let new = contract_meta(&[]);
-        let mut report = DiffReport::default();
-        compare_contract_metadata(Some(&old), Some(&new), &mut report);
-
-        assert_eq!(report.findings.len(), 1);
-        let f = &report.findings[0];
-        assert_eq!(f.severity, Severity::Info);
-        assert_eq!(f.category, "Metadata Key Removed");
-        assert_eq!(f.target.as_deref(), Some("author"));
-    }
-
-    #[test]
-    fn meta_generic_key_changed_is_info() {
-        let old = contract_meta(&[("author", "acme")]);
-        let new = contract_meta(&[("author", "globex")]);
-        let mut report = DiffReport::default();
-        compare_contract_metadata(Some(&old), Some(&new), &mut report);
-
-        assert_eq!(report.findings.len(), 1);
-        let f = &report.findings[0];
-        assert_eq!(f.severity, Severity::Info);
-        assert_eq!(f.category, "Metadata Key Changed");
-        assert!(f.message.contains("globex"));
-    }
-
-    #[test]
-    fn meta_version_and_generic_are_distinct_findings() {
-        // Version bumps and author-key changes are graded differently and must
-        // not collapse into one finding.
-        let old = contract_meta(&[("rssdkver", "21.6.0"), ("author", "acme")]);
-        let new = contract_meta(&[("rssdkver", "22.0.0"), ("author", "globex")]);
-        let mut report = DiffReport::default();
-        compare_contract_metadata(Some(&old), Some(&new), &mut report);
-
-        assert_eq!(report.findings.len(), 2);
-        assert!(report.findings.iter().any(
-            |f| f.category == "Metadata SDK Version Changed" && f.severity == Severity::Warning
-        ));
-        assert!(report
-            .findings
-            .iter()
-            .any(|f| f.category == "Metadata Key Changed" && f.severity == Severity::Info));
-    }
-
-    #[test]
-    fn meta_absent_in_both_produces_no_finding() {
-        let mut report = DiffReport::default();
-        compare_contract_metadata(None, None, &mut report);
-        assert!(report.findings.is_empty());
-    }
-
-    #[test]
-    fn meta_identical_produces_no_finding() {
-        let meta = contract_meta(&[("rssdkver", "21.6.0"), ("author", "acme")]);
-        let mut report = DiffReport::default();
-        compare_contract_metadata(Some(&meta), Some(&meta), &mut report);
-        assert!(report.findings.is_empty());
-    }
-
-    #[test]
-    fn meta_findings_do_not_affect_is_safe() {
-        let old = contract_meta(&[("rssdkver", "21.6.0")]);
-        let new = contract_meta(&[("rssdkver", "22.0.0")]);
-        let mut report = DiffReport::default();
-        compare_contract_metadata(Some(&old), Some(&new), &mut report);
 
         let safety = crate::report::SafetyReport::new(&report);
         assert!(safety.is_safe);

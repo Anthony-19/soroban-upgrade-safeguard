@@ -10,12 +10,11 @@ Thank you for your interest in improving Soroban Upgrade Safeguard. This guide e
 4. [Building and Running](#building-and-running)
 5. [Testing](#testing)
 6. [Test Fixtures](#test-fixtures)
-7. [Fuzzing](#fuzzing)
-8. [Coding Guidelines](#coding-guidelines)
-9. [Adding a New Detection Rule](#adding-a-new-detection-rule)
-10. [Commit and Pull Request Process](#commit-and-pull-request-process)
-11. [Reporting Bugs](#reporting-bugs)
-12. [Code of Conduct](#code-of-conduct)
+7. [Coding Guidelines](#coding-guidelines)
+8. [Adding a New Detection Rule](#adding-a-new-detection-rule)
+9. [Commit and Pull Request Process](#commit-and-pull-request-process)
+10. [Reporting Bugs](#reporting-bugs)
+11. [Code of Conduct](#code-of-conduct)
 
 ## Ways to Contribute
 
@@ -56,32 +55,14 @@ rustup component add rustfmt clippy
 The source lives under `src/` and is split into focused modules. Understanding this layout makes it much easier to find where a change belongs.
 
 - `main.rs` parses command line arguments with clap and drives the full pipeline.
-- `lib.rs` exposes the reusable library API and the canonical comparison pipeline.
-- `color.rs` decides whether terminal output should use color.
-- `suppression.rs` parses `.safeguard.toml` and matches acknowledged findings.
-- `limits.rs` defines the resource limits that protect decoding and type walks from untrusted input.
 - `loader.rs` reads a WASM file from disk and validates that it is a well formed WASM binary.
 - `parser.rs` extracts the Soroban custom sections and decodes the XDR spec entries.
 - `spec.rs` defines `ContractSpec`, the in-memory model that groups functions and user-defined types by name.
-- `storage_schema.rs` loads optional manifests for checking internal storage layouts.
 - `mapper.rs` turns type definitions into readable signatures and builds the reverse dependency graph used for cascade detection.
 - `diff.rs` holds the comparison logic and the `Finding` and `Severity` types. This is where most detection rules live.
-- `dependency.rs` propagates breaking changes across declared contract dependencies in batch comparisons.
 - `report.rs` aggregates findings into a `SafetyReport` and renders the colored summary.
 
 Tests and fixtures live under `tests/`.
-
-Snapshot tests live in `tests/snapshot_tests.rs` and cover the Text, Markdown, and JSON output formats. They use a custom snapshot helper that compares rendered output against stored `.txt`, `.md`, and `.json` files in `tests/snapshots/`.
-
-### Updating snapshots
-
-When you intentionally change the output format (e.g., add a new finding category or modify the report layout), the snapshot tests will fail. To update all snapshots:
-
-```bash
-UPDATE_SNAPSHOTS=1 cargo test --test snapshot_tests
-```
-
-Review the changed snapshot files with `git diff tests/snapshots/` to confirm the differences are expected, then commit them alongside your code changes.
 
 For a deeper explanation of how these pieces fit together at runtime, read [documentation.md](documentation.md).
 
@@ -121,62 +102,6 @@ Integration tests compare real compiled contracts. The `tests/` directory contai
 
 When you add a fixture, keep each pair minimal and focused on a single kind of change so the resulting test reads clearly. A fixture that mixes many unrelated changes makes failures hard to diagnose. Document briefly what the pair is meant to demonstrate, either in a short comment or in the test that consumes it.
 
-## Fuzzing
-
-The parsing path decodes input the tool does not control — a WASM binary, in RPC
-mode fetched from a remote endpoint — so it is exercised by coverage-guided
-fuzzing with [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz). The targets
-live in `fuzz/` and are **not** part of `cargo test`: they need a nightly
-toolchain and libFuzzer, so they are run on demand rather than in the normal
-suite.
-
-### One-time setup
-
-`cargo-fuzz` builds with libFuzzer, which requires a nightly toolchain:
-
-```bash
-rustup toolchain install nightly
-cargo install cargo-fuzz
-```
-
-### Targets
-
-- `extract_metadata` — feeds arbitrary bytes through the full WASM parse and
-  custom-section XDR decode (`parser::extract_metadata`).
-- `decode_spec_entries` — feeds arbitrary bytes straight into the concatenated
-  `ScSpecEntry` XDR cursor loop (`parser::decode_spec_entries`), bypassing the
-  WASM wrapper so the loop is reached without first building a valid module.
-
-Both assert the same property: the function returns `Ok` or `Err` on any input
-and never panics or hangs. Loop termination depends on the XDR cursor position
-strictly advancing each iteration; libFuzzer's timeout enforces the no-hang half
-of the property.
-
-### Running
-
-```bash
-# Run a target until stopped (Ctrl-C). Seeds come from fuzz/corpus/<target>/.
-cargo +nightly fuzz run extract_metadata
-cargo +nightly fuzz run decode_spec_entries
-
-# Time-boxed run, e.g. a quick smoke check or a CI budget:
-cargo +nightly fuzz run extract_metadata -- -max_total_time=60
-cargo +nightly fuzz run decode_spec_entries -- -max_total_time=60
-```
-
-A seed corpus derived from the `tests/wasm` fixtures is committed under
-`fuzz/corpus/<target>/` — the full modules for `extract_metadata`, and the
-extracted `contractspecv0` section bytes for `decode_spec_entries`. Any crash or
-hang is written to `fuzz/artifacts/<target>/`; reproduce it with:
-
-```bash
-cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<crash-file>
-```
-
-`stellar-xdr`'s `arbitrary` feature is declared in `fuzz/Cargo.toml` rather than
-in the crate's release dependencies, so structure-aware targets can use it
-without pulling it into the shipped binary (see issue #79).
-
 ## Coding Guidelines
 
 - Format every change with `cargo fmt` before committing.
@@ -202,10 +127,9 @@ When in doubt about whether something should be critical or a warning, lean towa
 
 1. Create a branch from `main` for your work.
 2. Keep commits focused and write clear commit messages that explain why the change is needed, not only what changed.
-3. Update `CHANGELOG.md` under the `Unreleased` section if your change is user-facing. Contributors should record additions, removals, and deprecations so consumers can see what changed between versions.
-4. Ensure `cargo fmt --check`, `cargo clippy`, `cargo build`, and `cargo test` all pass locally before pushing. These are the exact steps the CI workflow runs, so a clean local run means CI will pass.
-5. Open a pull request that describes the change, the motivation, and how you verified it. Link any related issue. The CI workflow at `.github/workflows/ci.yml` will run automatically and must be green before the pull request can be merged.
-6. Be responsive to review feedback. Small follow-up commits during review are fine; we can squash on merge.
+3. Ensure `cargo fmt --check`, `cargo clippy`, `cargo build`, and `cargo test` all pass locally before pushing. These are the exact steps the CI workflow runs, so a clean local run means CI will pass.
+4. Open a pull request that describes the change, the motivation, and how you verified it. Link any related issue. The CI workflow at `.github/workflows/ci.yml` will run automatically and must be green before the pull request can be merged.
+5. Be responsive to review feedback. Small follow-up commits during review are fine; we can squash on merge.
 
 ## Reporting Bugs
 

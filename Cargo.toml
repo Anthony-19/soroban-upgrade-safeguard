@@ -3,11 +3,6 @@ name = "soroban-upgrade-safeguard"
 version = "0.1.0"
 edition = "2021"
 description = "A safety tool to check for breaking changes in Soroban contract upgrades."
-license = "MIT"
-repository = "https://github.com/ShippedLabs/soroban-upgrade-safeguard"
-readme = "README.md"
-keywords = ["soroban", "stellar", "smart-contracts", "wasm", "cli"]
-categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "soroban_upgrade_safeguard"
@@ -30,20 +25,8 @@ clap = { version = "4.4", features = ["derive"] }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# JSON Schema generation for the report output types (see schema/). Deriving the
-# schema from the types keeps it from drifting away from what is serialized.
-schemars = "0.8"
 toml = "0.8"
 colored = "2.1"
 indicatif = "0.17"
 hex = "0.4"
-sha2 = "0.10"
 ureq = { version = "2.9", features = ["json"] }
-
-[dev-dependencies]
-# Property-based/fuzz testing for the decode + type-walk paths (see
-# tests/fuzz_walk.rs). Dev-only: it does not affect the shipped binary.
-proptest = "1"
-# Validates real emitted JSON output against the committed schema (see
-# tests/schema_validation.rs) so the schema and the output cannot drift apart.
-jsonschema = "0.18"

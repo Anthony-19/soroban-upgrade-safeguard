@@ -39,7 +39,7 @@ fn markdown_breaking_upgrade_reports_critical_and_exits_one() {
         "Missing title"
     );
     assert!(
-        stdout.contains("## Status: ❌ FAILED (Exported-interface breaking changes detected)"),
+        stdout.contains("## Status: ❌ FAILED (Critical breaking changes detected)"),
         "Missing status"
     );
     assert!(
@@ -93,7 +93,7 @@ fn markdown_identical_upgrade_is_safe_and_exits_zero() {
         "Missing title"
     );
     assert!(
-        stdout.contains("## Status: ✅ PASSED (No exported-interface breaking changes)"),
+        stdout.contains("## Status: ✅ PASSED (No breaking changes detected)"),
         "Missing status"
     );
     assert!(
@@ -113,26 +113,5 @@ fn markdown_identical_upgrade_is_safe_and_exits_zero() {
     assert!(
         stderr.contains("🔍 Soroban Upgrade Safeguard"),
         "Decorative progress should be in stderr"
-    );
-}
-
-#[test]
-fn markdown_output_includes_build_metrics_table() {
-    let (_code, stdout, _stderr) = run_markdown("v1.wasm", "v2.wasm");
-
-    assert!(
-        stdout.contains("Build Metrics") || stdout.contains("WASM size"),
-        "Markdown output must include a build metrics section, got: {}",
-        &stdout[..stdout.len().min(500)]
-    );
-
-    // The metrics table must include WASM size and at least one count row.
-    assert!(
-        stdout.contains("WASM size") || stdout.contains("wasm size"),
-        "Markdown metrics table must contain WASM size row"
-    );
-    assert!(
-        stdout.contains("Functions"),
-        "Markdown metrics table must contain Functions row"
     );
 }

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use stellar_xdr::curr::{
@@ -6,64 +6,9 @@ use stellar_xdr::curr::{
     ScSpecUdtUnionV0,
 };
 
-/// A spec entry annotated with which `contractspecv0` section it came from
-/// (zero-indexed). Provenance is tracked so duplicate analysis can report
-/// exactly which sections carry conflicting definitions.
-#[derive(Debug, Clone)]
-pub struct TaggedSpecEntry {
-    /// The decoded entry.
-    pub entry: ScSpecEntry,
-    /// Index of the `contractspecv0` section this entry was decoded from.
-    pub section_index: usize,
-}
-
-impl TaggedSpecEntry {
-    pub fn new(entry: ScSpecEntry, section_index: usize) -> Self {
-        Self {
-            entry,
-            section_index,
-        }
-    }
-}
-
-/// The kind of a spec entry, used in duplicate-detection reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SpecEntryKind {
-    Function,
-    Struct,
-    Enum,
-    Union,
-    ErrorEnum,
-}
-
-impl SpecEntryKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            SpecEntryKind::Function => "function",
-            SpecEntryKind::Struct => "struct",
-            SpecEntryKind::Enum => "enum",
-            SpecEntryKind::Union => "union",
-            SpecEntryKind::ErrorEnum => "error enum",
-        }
-    }
-}
-
-/// A duplicate entry found during `from_entries_checked`.
-#[derive(Debug, Clone)]
-pub struct DuplicateEntry {
-    /// Kind of the duplicated entry.
-    pub kind: SpecEntryKind,
-    /// Name shared by the conflicting definitions.
-    pub name: String,
-    /// Sections (0-indexed) that carried a definition for this name.
-    pub sections: Vec<usize>,
-    /// Whether all definitions are byte-identical.
-    pub is_identical: bool,
-}
-
 /// A structured representation of a Soroban contract's public interface,
 /// organized by type for easy comparison between contract versions.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct ContractSpec {
     /// Contract functions, keyed by name.
     pub functions: HashMap<String, ScSpecFunctionV0>,
@@ -78,45 +23,20 @@ pub struct ContractSpec {
 }
 
 impl ContractSpec {
-    /// Build a `ContractSpec` from a list of decoded `ScSpecEntry` objects,
-    /// returning both the spec and a list of any duplicate entries found.
+    /// Build a `ContractSpec` from a list of decoded `ScSpecEntry` objects.
     ///
-    /// The duplicate-detection policy:
-    ///
-    /// - **Identical duplicates**: two definitions that are structurally equal
-    ///   are treated as informational — they are safe to deduplicate
-    ///   deterministically, but the caller should still surface the condition
-    ///   so an operator knows the WASM is non-canonical.
-    ///   `DuplicateEntry::is_identical` is `true`.
-    ///
-    /// - **Conflicting duplicates**: two definitions that differ under the same
-    ///   name produce a critical finding.  The first-encountered definition is
-    ///   used so behaviour is deterministic and independent of HashMap
-    ///   iteration order; the second definition is recorded in the returned
-    ///   `DuplicateEntry` but is NOT silently discarded — callers must fail
-    ///   the run for conflicting duplicates.
-    ///   `DuplicateEntry::is_identical` is `false`.
-    ///
-    /// Provenance (which section each entry came from) is available via
-    /// `TaggedSpecEntry::section_index`.
-    pub fn from_entries_checked(entries: &[TaggedSpecEntry]) -> (Self, Vec<DuplicateEntry>) {
+    /// If multiple entries with the same name for a given kind (e.g., two functions
+    /// with the same name) are encountered, a warning is printed to stderr. Under the
+    /// first-wins tie-break strategy, the first entry encountered in the `entries`
+    /// slice is retained, and subsequent duplicates are ignored.
+    pub fn from_entries(entries: &[ScSpecEntry]) -> Self {
         let mut spec = ContractSpec::default();
-        let mut duplicates: Vec<DuplicateEntry> = Vec::new();
 
-        // Per-kind name → (first_section, serialized_xdr) maps for identity
-        // comparison without re-implementing structural equality manually.
-        // We use `BTreeMap` for deterministic iteration in tests.
-        let mut fn_seen: BTreeMap<String, (usize, Vec<u8>)> = BTreeMap::new();
-        let mut struct_seen: BTreeMap<String, (usize, Vec<u8>)> = BTreeMap::new();
-        let mut enum_seen: BTreeMap<String, (usize, Vec<u8>)> = BTreeMap::new();
-        let mut union_seen: BTreeMap<String, (usize, Vec<u8>)> = BTreeMap::new();
-        let mut err_seen: BTreeMap<String, (usize, Vec<u8>)> = BTreeMap::new();
-
-        for tagged in entries {
-            let section = tagged.section_index;
-            match &tagged.entry {
+        for entry in entries {
+            match entry {
                 ScSpecEntry::FunctionV0(f) => {
                     let name = f.name.to_string();
+<<<<<<< HEAD
                     let xdr = entry_to_xdr(&tagged.entry);
                     check_and_insert(
                         &name,
@@ -195,26 +115,79 @@ impl ContractSpec {
                                 .or_insert_with(|| e.clone());
                         },
                     );
+=======
+                    match spec.functions.entry(name) {
+                        Entry::Occupied(entry) => {
+                            eprintln!(
+                                "WARNING: Duplicate function '{}' detected. Keeping the first entry.",
+                                entry.key()
+                            );
+                        }
+                        Entry::Vacant(slot) => {
+                            slot.insert(f.clone());
+                        }
+                    }
+                }
+                ScSpecEntry::UdtStructV0(s) => {
+                    let name = s.name.to_string();
+                    match spec.structs.entry(name) {
+                        Entry::Occupied(entry) => {
+                            eprintln!(
+                                "WARNING: Duplicate struct '{}' detected. Keeping the first entry.",
+                                entry.key()
+                            );
+                        }
+                        Entry::Vacant(slot) => {
+                            slot.insert(s.clone());
+                        }
+                    }
+                }
+                ScSpecEntry::UdtEnumV0(e) => {
+                    let name = e.name.to_string();
+                    match spec.enums.entry(name) {
+                        Entry::Occupied(entry) => {
+                            eprintln!(
+                                "WARNING: Duplicate enum '{}' detected. Keeping the first entry.",
+                                entry.key()
+                            );
+                        }
+                        Entry::Vacant(slot) => {
+                            slot.insert(e.clone());
+                        }
+                    }
+                }
+                ScSpecEntry::UdtUnionV0(u) => {
+                    let name = u.name.to_string();
+                    match spec.unions.entry(name) {
+                        Entry::Occupied(entry) => {
+                            eprintln!(
+                                "WARNING: Duplicate union '{}' detected. Keeping the first entry.",
+                                entry.key()
+                            );
+                        }
+                        Entry::Vacant(slot) => {
+                            slot.insert(u.clone());
+                        }
+                    }
+                }
+                ScSpecEntry::UdtErrorEnumV0(e) => {
+                    let name = e.name.to_string();
+                    match spec.error_enums.entry(name) {
+                        Entry::Occupied(entry) => {
+                            eprintln!(
+                                "WARNING: Duplicate error enum '{}' detected. Keeping the first entry.",
+                                entry.key()
+                            );
+                        }
+                        Entry::Vacant(slot) => {
+                            slot.insert(e.clone());
+                        }
+                    }
+>>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
                 }
             }
         }
 
-        (spec, duplicates)
-    }
-
-    /// Convenience wrapper over [`from_entries_checked`] that accepts bare
-    /// `ScSpecEntry` slices (section index 0 for all entries). Intended for
-    /// callers that do not track section provenance and do not need the
-    /// duplicate report.
-    ///
-    /// When duplicates are detected they are silently discarded (first-wins),
-    /// exactly as before; use [`from_entries_checked`] to surface them.
-    pub fn from_entries(entries: &[ScSpecEntry]) -> Self {
-        let tagged: Vec<TaggedSpecEntry> = entries
-            .iter()
-            .map(|e| TaggedSpecEntry::new(e.clone(), 0))
-            .collect();
-        let (spec, _) = Self::from_entries_checked(&tagged);
         spec
     }
 
@@ -231,6 +204,7 @@ impl ContractSpec {
     }
 }
 
+<<<<<<< HEAD
 /// Serialize a `ScSpecEntry` to raw XDR bytes for structural identity comparison.
 ///
 /// This is the canonical way to check whether two entries with the same name
@@ -293,11 +267,14 @@ fn check_and_insert(
     }
 }
 
+=======
+>>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
 #[cfg(test)]
 mod tests {
     use super::*;
     use stellar_xdr::curr::{StringM, VecM};
 
+<<<<<<< HEAD
     // ---------------------------------------------------------------
     // Helper builders
     // ---------------------------------------------------------------
@@ -592,6 +569,8 @@ mod tests {
     // ---------------------------------------------------------------
     // Old test parity: from_entries_checked equivalent of the original tests
     // ---------------------------------------------------------------
+=======
+>>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
     #[test]
     fn test_from_entries_duplicate_function_first_wins() {
         let f1 = ScSpecFunctionV0 {
@@ -606,10 +585,116 @@ mod tests {
             inputs: VecM::default(),
             outputs: VecM::default(),
         };
+<<<<<<< HEAD
         let entries = vec![ScSpecEntry::FunctionV0(f1), ScSpecEntry::FunctionV0(f2)];
+=======
+
+        let entries = vec![ScSpecEntry::FunctionV0(f1), ScSpecEntry::FunctionV0(f2)];
+
+>>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
         let spec = ContractSpec::from_entries(&entries);
+
         assert_eq!(spec.functions.len(), 1);
         let resolved = spec.functions.get("my_func").unwrap();
+        assert_eq!(resolved.doc.to_string(), "doc1");
+    }
+
+    #[test]
+    fn test_from_entries_duplicate_struct_first_wins() {
+        let s1 = ScSpecUdtStructV0 {
+            doc: "doc1".try_into().unwrap(),
+            lib: StringM::default(),
+            name: "my_struct".try_into().unwrap(),
+            fields: VecM::default(),
+        };
+        let s2 = ScSpecUdtStructV0 {
+            doc: "doc2".try_into().unwrap(),
+            lib: StringM::default(),
+            name: "my_struct".try_into().unwrap(),
+            fields: VecM::default(),
+        };
+
+        let entries = vec![ScSpecEntry::UdtStructV0(s1), ScSpecEntry::UdtStructV0(s2)];
+
+        let spec = ContractSpec::from_entries(&entries);
+
+        assert_eq!(spec.structs.len(), 1);
+        let resolved = spec.structs.get("my_struct").unwrap();
+        assert_eq!(resolved.doc.to_string(), "doc1");
+    }
+
+    #[test]
+    fn test_from_entries_duplicate_enum_first_wins() {
+        let e1 = ScSpecUdtEnumV0 {
+            doc: "doc1".try_into().unwrap(),
+            lib: StringM::default(),
+            name: "my_enum".try_into().unwrap(),
+            cases: VecM::default(),
+        };
+        let e2 = ScSpecUdtEnumV0 {
+            doc: "doc2".try_into().unwrap(),
+            lib: StringM::default(),
+            name: "my_enum".try_into().unwrap(),
+            cases: VecM::default(),
+        };
+
+        let entries = vec![ScSpecEntry::UdtEnumV0(e1), ScSpecEntry::UdtEnumV0(e2)];
+
+        let spec = ContractSpec::from_entries(&entries);
+
+        assert_eq!(spec.enums.len(), 1);
+        let resolved = spec.enums.get("my_enum").unwrap();
+        assert_eq!(resolved.doc.to_string(), "doc1");
+    }
+
+    #[test]
+    fn test_from_entries_duplicate_union_first_wins() {
+        let u1 = ScSpecUdtUnionV0 {
+            doc: "doc1".try_into().unwrap(),
+            lib: StringM::default(),
+            name: "my_union".try_into().unwrap(),
+            cases: VecM::default(),
+        };
+        let u2 = ScSpecUdtUnionV0 {
+            doc: "doc2".try_into().unwrap(),
+            lib: StringM::default(),
+            name: "my_union".try_into().unwrap(),
+            cases: VecM::default(),
+        };
+
+        let entries = vec![ScSpecEntry::UdtUnionV0(u1), ScSpecEntry::UdtUnionV0(u2)];
+
+        let spec = ContractSpec::from_entries(&entries);
+
+        assert_eq!(spec.unions.len(), 1);
+        let resolved = spec.unions.get("my_union").unwrap();
+        assert_eq!(resolved.doc.to_string(), "doc1");
+    }
+
+    #[test]
+    fn test_from_entries_duplicate_error_enum_first_wins() {
+        let e1 = ScSpecUdtErrorEnumV0 {
+            doc: "doc1".try_into().unwrap(),
+            lib: StringM::default(),
+            name: "my_err".try_into().unwrap(),
+            cases: VecM::default(),
+        };
+        let e2 = ScSpecUdtErrorEnumV0 {
+            doc: "doc2".try_into().unwrap(),
+            lib: StringM::default(),
+            name: "my_err".try_into().unwrap(),
+            cases: VecM::default(),
+        };
+
+        let entries = vec![
+            ScSpecEntry::UdtErrorEnumV0(e1),
+            ScSpecEntry::UdtErrorEnumV0(e2),
+        ];
+
+        let spec = ContractSpec::from_entries(&entries);
+
+        assert_eq!(spec.error_enums.len(), 1);
+        let resolved = spec.error_enums.get("my_err").unwrap();
         assert_eq!(resolved.doc.to_string(), "doc1");
     }
 
@@ -627,7 +712,13 @@ mod tests {
             inputs: VecM::default(),
             outputs: VecM::default(),
         };
+<<<<<<< HEAD
         let entries = vec![ScSpecEntry::FunctionV0(f1), ScSpecEntry::FunctionV0(f2)];
+=======
+
+        let entries = vec![ScSpecEntry::FunctionV0(f1), ScSpecEntry::FunctionV0(f2)];
+
+>>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
         let spec = ContractSpec::from_entries(&entries);
         assert_eq!(spec.functions.len(), 2);
     }
