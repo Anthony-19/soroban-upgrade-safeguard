@@ -844,6 +844,7 @@ pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
         "Error Enum Case Value Changed" => Some("This is a breaking change. Modifying error case values breaks error-code compatibility. Revert the value change."),
         "Error Enum Case Added" => Some("No action required. Ensure clients can handle the new error case gracefully."),
         "Cascading Layout Break" => Some("This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type."),
+        "BytesN Size Changed" => Some("This is a breaking change. Changing the size of a fixed-size byte array alters its binary encoding. Revert the size or migrate data that depends on the original byte length."),
         _ => None,
     }
 }

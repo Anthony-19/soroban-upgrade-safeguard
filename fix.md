@@ -1,35 +1,44 @@
-When a field or parameter is a container such as Vec<T>, Map<K, V>,
-Option<T>, or a tuple, and only the inner type changes, src/diff.rs reports the
-change by stringifying the entire outer type on each side.
+A change from BytesN<32> to BytesN<64> is reported through the generic
+type-changed path in src/diff.rs. The message is "type changed from BytesN<32>
+to BytesN<64>" and the guidance is the generic advice to revert or migrate.
 
-So a field going from Map<Address, u32> to Map<Address, u64> produces:
-
-type changed from `Map<Address, u32>` to `Map<Address, u64>`
-leaving the reader to diff two signatures by eye to find that only the value type
-changed. For deeply nested types such as Vec<Map<Address, Vec<u32>>> this gets
-progressively harder to read, which defeats the point of a message that is
-supposed to make the change obvious.
+A fixed-size byte array is a common, meaningful type in Soroban contracts: 32-byte
+hashes, keys, and identifiers. Changing its length is a specific and recognisable
+migration, distinct from swapping one type for an unrelated other, and the report
+gives no signal that this is a size change rather than an arbitrary type swap.
 
 Expected behaviour
-The finding should point at the specific inner type that changed rather than
-restating the whole outer signature, while still giving enough context to locate
-it.
+A change that only alters the N of a BytesN<N>, on either side of a field,
+parameter, return, or union case, should be reported as a byte-array size change
+with guidance specific to it.
 
 Suggested approach
-When the outer type constructors match and differ only in a type argument, recurse
-to describe the innermost difference, for example "the value type of Map changed
-from u32 to u64". Keep the full-signature form as a fallback for cases where the
-outer constructors themselves differ. This is presentation only and should not
-change severity or which findings are produced.
+Detect the BytesN(a) -> BytesN(b) case before falling back to the generic
+type-changed finding, everywhere a type change is currently reported. Add a
+dedicated category with its own remediation guidance, since src/report.rs
+asserts every emitted category has guidance.
 
 Acceptance criteria
 
-A change confined to an inner type of a container names the inner type that
-changed rather than restating the whole signature.
+A BytesN<N> size change is reported as a distinct, clearly worded finding.
 
-A change to the outer constructor itself still reports clearly.
+The classification applies to struct fields, parameters, return types, and
+union case payloads.
 
-Severity and the set of findings produced are unchanged.
+A change between BytesN and an unrelated type still falls through to the
+generic finding.
 
-Unit tests in src/diff.rs cover nested Vec, Map, Option, and tuple
-cases.
+The new category has remediation guidance and unit tests in src/diff.rs.
+Getting started
+Fork this repository, clone your fork, and add this repo as upstream:
+
+git clone https://github.com/<your-username>/soroban-upgrade-safeguard.git
+cd soroban-upgrade-safeguard
+git remote add upstream https://github.com/ShippedLabs/soroban-upgrade-safeguard.git
+Create a branch for this issue:
+
+git checkout -b feat/classify-bytesn-size-changes
+Suggested commit message:
+
+feat: report BytesN size changes as a distinct finding
+Run cargo fmt --check, cargo clippy, and cargo test

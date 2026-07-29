@@ -291,22 +291,30 @@ fn check_function_signature(
             let p_name = old_input.name.to_string();
             if let Some(new_type) = new_by_name.get(&p_name) {
                 if !types_equal(&old_input.type_, new_type) {
+                    let (category, detail) =
+                        if let Some(bytesn_msg) =
+                            describe_bytesn_size_change(&old_input.type_, new_type)
+                        {
+                            ("BytesN Size Changed".to_string(), bytesn_msg)
+                        } else {
+                            (
+                                "Parameter Type Changed".to_string(),
+                                describe_nested_type_change(&old_input.type_, new_type)
+                                    .unwrap_or_else(|| {
+                                        format!(
+                                            "type changed from `{}` to `{}`",
+                                            crate::mapper::type_to_string(&old_input.type_),
+                                            crate::mapper::type_to_string(new_type)
+                                        )
+                                    }),
+                            )
+                        };
                     report.findings.push(Finding {
                         severity: Severity::Critical,
-                        category: "Parameter Type Changed".to_string(),
+                        category,
                         message: format!(
                             "Function '{}': parameter {} ('{}') {}.",
-                            name,
-                            i,
-                            p_name,
-                            describe_nested_type_change(&old_input.type_, new_type)
-                                .unwrap_or_else(|| {
-                                    format!(
-                                        "type changed from `{}` to `{}`",
-                                        crate::mapper::type_to_string(&old_input.type_),
-                                        crate::mapper::type_to_string(new_type)
-                                    )
-                                })
+                            name, i, p_name, detail
                         ),
                         type_name: None,
                         target: Some(format!("{}.{}", name, p_name)),
@@ -334,22 +342,30 @@ fn check_function_signature(
             }
 
             if !types_equal(&old_input.type_, &new_input.type_) {
+                let (category, detail) =
+                    if let Some(bytesn_msg) =
+                        describe_bytesn_size_change(&old_input.type_, &new_input.type_)
+                    {
+                        ("BytesN Size Changed".to_string(), bytesn_msg)
+                    } else {
+                        (
+                            "Parameter Type Changed".to_string(),
+                            describe_nested_type_change(&old_input.type_, &new_input.type_)
+                                .unwrap_or_else(|| {
+                                    format!(
+                                        "type changed from `{}` to `{}`",
+                                        crate::mapper::type_to_string(&old_input.type_),
+                                        crate::mapper::type_to_string(&new_input.type_)
+                                    )
+                                }),
+                        )
+                    };
                 report.findings.push(Finding {
                     severity: Severity::Critical,
-                    category: "Parameter Type Changed".to_string(),
+                    category,
                     message: format!(
                         "Function '{}': parameter {} ('{}') {}.",
-                        name,
-                        i,
-                        old_name,
-                        describe_nested_type_change(&old_input.type_, &new_input.type_)
-                            .unwrap_or_else(|| {
-                                format!(
-                                    "type changed from `{}` to `{}`",
-                                    crate::mapper::type_to_string(&old_input.type_),
-                                    crate::mapper::type_to_string(&new_input.type_)
-                                )
-                            })
+                        name, i, old_name, detail
                     ),
                     type_name: None,
                     target: Some(format!("{}.{}", name, old_name)),
@@ -378,22 +394,25 @@ fn check_function_signature(
     } else {
         for (i, (old_out, new_out)) in old_outputs.iter().zip(new_outputs.iter()).enumerate() {
             if !types_equal(old_out, new_out) {
-                report.findings.push(Finding {
-                    severity: Severity::Critical,
-                    category: "Return Type Changed".to_string(),
-                    message: format!(
-                        "Function '{}': return type {} {}.",
-                        name,
-                        i,
-                        describe_nested_type_change(old_out, new_out)
-                            .unwrap_or_else(|| {
+                let (category, detail) =
+                    if let Some(bytesn_msg) = describe_bytesn_size_change(old_out, new_out) {
+                        ("BytesN Size Changed".to_string(), bytesn_msg)
+                    } else {
+                        (
+                            "Return Type Changed".to_string(),
+                            describe_nested_type_change(old_out, new_out).unwrap_or_else(|| {
                                 format!(
                                     "changed from `{}` to `{}`",
                                     crate::mapper::type_to_string(old_out),
                                     crate::mapper::type_to_string(new_out)
                                 )
-                            })
-                    ),
+                            }),
+                        )
+                    };
+                report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category,
+                    message: format!("Function '{}': return type {} {}.", name, i, detail),
                     type_name: None,
                     target: Some(name.to_string()),
                 });
@@ -530,23 +549,30 @@ fn check_struct_fields(
 
         // Field type changed
         if !types_equal(&old_field.type_, &new_field.type_) {
+            let (category, detail) =
+                if let Some(bytesn_msg) =
+                    describe_bytesn_size_change(&old_field.type_, &new_field.type_)
+                {
+                    ("BytesN Size Changed".to_string(), bytesn_msg)
+                } else {
+                    (
+                        format!("{} Type Changed", category_prefix),
+                        describe_nested_type_change(&old_field.type_, &new_field.type_)
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "type changed from `{}` to `{}`",
+                                    crate::mapper::type_to_string(&old_field.type_),
+                                    crate::mapper::type_to_string(&new_field.type_)
+                                )
+                            }),
+                    )
+                };
             report.findings.push(Finding {
                 severity: Severity::Critical,
-                category: format!("{} Type Changed", category_prefix),
+                category,
                 message: format!(
                     "{} '{}': field '{}' (position {}) {}.",
-                    msg_prefix,
-                    name,
-                    old_name,
-                    i,
-                    describe_nested_type_change(&old_field.type_, &new_field.type_)
-                        .unwrap_or_else(|| {
-                            format!(
-                                "type changed from `{}` to `{}`",
-                                crate::mapper::type_to_string(&old_field.type_),
-                                crate::mapper::type_to_string(&new_field.type_)
-                            )
-                        })
+                    msg_prefix, name, old_name, i, detail
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
@@ -793,22 +819,27 @@ fn check_union_cases(
         }
 
         if !union_cases_equal(old_case, new_case) {
-            report.findings.push(Finding {
-                severity: Severity::Critical,
-                category: "Union Case Type Changed".to_string(),
-                message: format!(
-                    "Union '{}': case '{}' (position {}) {}.",
-                    name,
-                    old_name,
-                    i,
-                    describe_union_case_type_change(old_case, new_case)
-                        .unwrap_or_else(|| {
+            let (category, detail) =
+                if let Some(bytesn_msg) = union_case_bytesn_size_change(old_case, new_case) {
+                    ("BytesN Size Changed".to_string(), bytesn_msg)
+                } else {
+                    (
+                        "Union Case Type Changed".to_string(),
+                        describe_union_case_type_change(old_case, new_case).unwrap_or_else(|| {
                             format!(
                                 "type changed from `{}` to `{}`",
                                 union_case_type_signature(old_case),
                                 union_case_type_signature(new_case)
                             )
-                        })
+                        }),
+                    )
+                };
+            report.findings.push(Finding {
+                severity: Severity::Critical,
+                category,
+                message: format!(
+                    "Union '{}': case '{}' (position {}) {}.",
+                    name, old_name, i, detail
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
@@ -1124,6 +1155,37 @@ fn describe_nested_type_change(old: &ScSpecTypeDef, new: &ScSpecTypeDef) -> Opti
                             crate::mapper::type_to_string(bt),
                         ))
                     });
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn describe_bytesn_size_change(old: &ScSpecTypeDef, new: &ScSpecTypeDef) -> Option<String> {
+    match (old, new) {
+        (ScSpecTypeDef::BytesN(a), ScSpecTypeDef::BytesN(b)) if a.n != b.n => {
+            Some(format!("size of BytesN changed from {} to {}", a.n, b.n))
+        }
+        _ => None,
+    }
+}
+
+fn union_case_bytesn_size_change(
+    old: &ScSpecUdtUnionCaseV0,
+    new: &ScSpecUdtUnionCaseV0,
+) -> Option<String> {
+    match (old, new) {
+        (ScSpecUdtUnionCaseV0::TupleV0(a), ScSpecUdtUnionCaseV0::TupleV0(b)) => {
+            let a_types: &[ScSpecTypeDef] = a.type_.as_ref();
+            let b_types: &[ScSpecTypeDef] = b.type_.as_ref();
+            if a_types.len() != b_types.len() {
+                return None;
+            }
+            for (i, (at, bt)) in a_types.iter().zip(b_types.iter()).enumerate() {
+                if let Some(msg) = describe_bytesn_size_change(at, bt) {
+                    return Some(format!("{} in payload type at index {}", msg, i));
                 }
             }
             None
@@ -1849,6 +1911,90 @@ mod tests {
             .expect("Expected field type change");
         assert!(
             fc.message.contains("type changed from `u32` to `i128`"),
+            "Message was: {}",
+            fc.message
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // BytesN size change unit tests
+    // ---------------------------------------------------------------
+    fn bytesn(n: u32) -> ScSpecTypeDef {
+        ScSpecTypeDef::BytesN(stellar_xdr::curr::ScSpecTypeBytesN { n })
+    }
+
+    #[test]
+    fn bytesn_size_change_detected() {
+        let desc = describe_bytesn_size_change(&bytesn(32), &bytesn(64));
+        assert_eq!(
+            desc,
+            Some("size of BytesN changed from 32 to 64".to_string())
+        );
+    }
+
+    #[test]
+    fn bytesn_same_size_no_change() {
+        let desc = describe_bytesn_size_change(&bytesn(32), &bytesn(32));
+        assert_eq!(desc, None);
+    }
+
+    #[test]
+    fn bytesn_to_unrelated_no_change() {
+        let desc = describe_bytesn_size_change(&bytesn(32), &ScSpecTypeDef::U64);
+        assert_eq!(desc, None);
+    }
+
+    #[test]
+    fn bytesn_struct_field_gets_specific_category() {
+        let old = spec_with_structs(vec![("Data", vec![("key", bytesn(32))])]);
+        let new = spec_with_structs(vec![("Data", vec![("key", bytesn(64))])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "BytesN Size Changed")
+            .expect("Expected a BytesN Size Changed finding");
+        assert!(
+            fc.message.contains("size of BytesN changed from 32 to 64"),
+            "Message was: {}",
+            fc.message
+        );
+        assert_eq!(fc.severity, Severity::Critical);
+        assert_eq!(fc.target.as_deref(), Some("Data.key"));
+    }
+
+    #[test]
+    fn bytesn_field_change_to_unrelated_uses_generic_category() {
+        let old = spec_with_structs(vec![("Data", vec![("key", bytesn(32))])]);
+        let new = spec_with_structs(vec![("Data", vec![("key", ScSpecTypeDef::String)])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Type Changed")
+            .expect("Expected generic Struct Field Type Changed");
+        assert!(
+            fc.message.contains("type changed from `BytesN<32>` to `String`"),
+            "Message was: {}",
+            fc.message
+        );
+    }
+
+    #[test]
+    fn bytesn_parameter_change_gets_specific_category() {
+        let old = spec_with_functions(vec![("test", vec![("x", bytesn(32))])]);
+        let new = spec_with_functions(vec![("test", vec![("x", bytesn(64))])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "BytesN Size Changed")
+            .expect("Expected a BytesN Size Changed finding");
+        assert!(
+            fc.message.contains("size of BytesN changed from 32 to 64"),
             "Message was: {}",
             fc.message
         );
