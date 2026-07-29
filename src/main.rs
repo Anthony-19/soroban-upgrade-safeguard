@@ -3,24 +3,14 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use soroban_upgrade_safeguard::{
-    color::should_disable_color,
+    color::{should_disable_color, ColorMode},
     diff, loader, parser,
     render::RenderableReport,
     report, spec,
     spec_json::ExtractedSpec,
-    color::{should_disable_color, ColorMode},
-    dependency::{
-        cycle_findings, missing_contract_findings, ContractDependency, CrossContractFinding,
-        DependencyGraph,
-    },
-    diff,
-    limits::{find_limit_error, LimitsConfig, ResourcePolicy},
-    loader, parser,
-    report::{self, validate_categories, CategoryFilter},
-    spec,
-    storage_schema::StorageSchema,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
 
@@ -34,6 +24,52 @@ enum OutputFormat {
     Json,
     /// Markdown document suitable for PR descriptions and comments.
     Markdown,
+}
+
+impl OutputFormat {
+    fn file_extension(&self) -> &'static str {
+        match self {
+            OutputFormat::Json => "json",
+            OutputFormat::Markdown => "md",
+            OutputFormat::Text => "txt",
+        }
+    }
+}
+
+/// A single output specification: a format and an optional file path.
+/// When `path` is `None`, output goes to stdout.
+struct OutputSpec {
+    format: OutputFormat,
+    path: Option<PathBuf>,
+}
+
+impl std::str::FromStr for OutputSpec {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some((fmt, path)) = s.split_once(':') {
+            let format: OutputFormat =
+                fmt.parse().map_err(|_| {
+                    format!(
+                        "Invalid format '{fmt}'. Supported: text, json, markdown"
+                    )
+                })?;
+            Ok(OutputSpec {
+                format,
+                path: Some(PathBuf::from(path)),
+            })
+        } else {
+            let format: OutputFormat = s.parse().map_err(|_| {
+                format!(
+                    "Invalid format '{s}'. Use 'format:path' or one of: text, json, markdown"
+                )
+            })?;
+            Ok(OutputSpec {
+                format,
+                path: None,
+            })
+        }
+    }
 }
 
 /// Output format for a re-rendered report. JSON is excluded: re-rendering a
@@ -53,21 +89,12 @@ enum RenderFormat {
     version,
     about,
     long_about = None,
-    // Four comparison usage modes, unchanged, plus two subcommands:
-    //   1. Local:      soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM> [OPTIONS]
-    //   2. RPC:        soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM> [OPTIONS]
-    //   3. Manifest:   soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]
-    //   4. Dir Scan:   soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]
-    //   5. Extract:    soroban-upgrade-safeguard extract <WASM> [OPTIONS]
-    //   6. Render:     soroban-upgrade-safeguard render <REPORT_JSON> [OPTIONS]
     override_usage = "soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM> [OPTIONS]\n       \
                       soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM> [OPTIONS]\n       \
                       soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]\n       \
                       soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]\n       \
                       soroban-upgrade-safeguard extract <WASM> [OPTIONS]\n       \
                       soroban-upgrade-safeguard render <REPORT_JSON> [OPTIONS]",
-    // A subcommand and the comparison-mode arguments are mutually exclusive, so
-    // the existing modes keep parsing exactly as they did.
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
 )]
@@ -76,14 +103,19 @@ struct Args {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// WASM paths: <OLD_WASM> <NEW_WASM> in local mode, or just <NEW_WASM> in RPC mode
-    /// WASM paths: <OLD_WASM> <NEW_WASM> in local mode, or just <NEW_WASM> in RPC mode. Use - to read one WASM from stdin.
+    /// WASM paths: <OLD_WASM> <NEW_WASM> in local mode, or just <NEW_WASM> in RPC mode.
+    /// Use - to read one WASM from stdin.
     #[arg(value_name = "WASM", num_args = 0..=2)]
     wasm_paths: Vec<PathBuf>,
 
-    /// Output format
-    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-    format: OutputFormat,
+    /// Output format for stdout. Omit or use --output for file output.
+    #[arg(long, value_enum)]
+    format: Option<OutputFormat>,
+
+    /// Output specification(s) in FORMAT:PATH format (e.g. json:report.json).
+    /// Can be specified multiple times. FORMAT is one of: text, json, markdown.
+    #[arg(long, value_name = "FORMAT:PATH", num_args = 1)]
+    output: Vec<OutputSpec>,
 
     /// Stellar/Soroban Contract ID to fetch from on-chain (e.g. C...)
     #[arg(long, value_name = "CONTRACT_ID", requires = "rpc_url")]
@@ -129,8 +161,6 @@ struct Args {
     allow_http_local: bool,
 
     /// Expected SHA-256 hash (hex) of the on-chain WASM baseline.
-    /// When provided the tool verifies the hash of the fetched bytecode
-    /// matches this value and fails immediately on mismatch.
     #[arg(long, value_name = "HEX_HASH")]
     expected_wasm_hash: Option<String>,
 
@@ -157,6 +187,14 @@ struct Args {
         value_name = "DIR"
     )]
     per_contract_output_dir: Option<PathBuf>,
+
+    /// Watch mode: re-run comparison when input files change
+    #[arg(long)]
+    watch: bool,
+
+    /// Suppress timestamps in report output for deterministic/snapshot testing
+    #[arg(long)]
+    no_timestamp: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -183,9 +221,6 @@ struct ExtractArgs {
     rpc_url: Option<String>,
 
     /// Print only the interface hash, with no other output.
-    ///
-    /// Intended for scripting: the entire stdout is the 64-character hex
-    /// digest plus a newline, so it can be captured directly as a cache key.
     #[arg(long)]
     hash_only: bool,
 }
@@ -203,8 +238,6 @@ struct RenderArgs {
     format: RenderFormat,
 
     /// Print the remediation guidance stored in the report, if it has any.
-    ///
-    /// Guidance is only present when the original run used --explain.
     #[arg(long)]
     explain: bool,
 
@@ -240,8 +273,6 @@ fn run_extract(args: &ExtractArgs) -> Result<()> {
     let contract_spec = spec::ContractSpec::from_entries(&metadata.spec);
 
     if args.hash_only {
-        // Nothing but the digest: this output is meant to be captured by a
-        // shell, so any decoration would have to be stripped by the caller.
         println!("{}", contract_spec.interface_hash());
         return Ok(());
     }
@@ -262,6 +293,7 @@ fn run_render(args: &RenderArgs) -> Result<()> {
 
     if should_disable_color(
         args.no_color,
+        ColorMode::Auto,
         std::env::var_os("NO_COLOR").is_some(),
         std::io::stdout().is_terminal(),
     ) {
@@ -280,8 +312,6 @@ fn run_render(args: &RenderArgs) -> Result<()> {
         RenderFormat::Markdown => println!("{}", report.to_markdown()),
     }
 
-    // Re-rendering reports on a stored verdict; it does not re-derive one, so
-    // the exit code mirrors the stored `is_safe` exactly as the original run did.
     if !report.is_safe {
         std::process::exit(1);
     }
@@ -292,8 +322,6 @@ fn run_render(args: &RenderArgs) -> Result<()> {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Subcommands run their own pipeline and return; everything below this
-    // point is the comparison path, unchanged.
     match &args.command {
         Some(Command::Extract(extract_args)) => return run_extract(extract_args),
         Some(Command::Render(render_args)) => return run_render(render_args),
@@ -311,10 +339,6 @@ fn main() -> Result<()> {
         colored::control::set_override(true);
     }
 
-    // 1. Identify which mode we are running:
-    //    - Batch Manifest Mode
-    //    - Batch Directory Mode
-    //    - Single Contract Pair Mode
     let is_batch = args.manifest.is_some() || (args.old_dir.is_some() && args.new_dir.is_some());
 
     if args.manifest.is_some() && (args.old_dir.is_some() || args.new_dir.is_some()) {
@@ -325,15 +349,44 @@ fn main() -> Result<()> {
         anyhow::bail!("Cannot specify positional WASM paths when using batch mode (--manifest or --old-dir/--new-dir)");
     }
 
-    // In JSON or Markdown mode, decorative progress goes to stderr so stdout
-    // stays a single, pristine document. In text mode it stays on stdout
-    // exactly as before. --quiet suppresses progress in every format.
-    let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
+    // Determine stdout format: use --format if given, or "text" as default
+    // (only used when no --output flags target stdout).
+    let stdout_format = args.format.unwrap_or(OutputFormat::Text);
+
+    // Build the list of outputs:
+    // - If --format is given and no --output targets stdout, add stdout output for --format.
+    // - If no --output at all, fallback to --format (or Text) to stdout.
+    let outputs: Vec<OutputSpec> = if !args.output.is_empty() {
+        // User specified explicit outputs; --format still controls stdout if not
+        // already covered by an --output spec.
+        let has_stdout = args.output.iter().any(|o| o.path.is_none());
+        let mut outputs = args.output.clone();
+        if !has_stdout {
+            // Add --format (or text) as stdout output
+            outputs.push(OutputSpec {
+                format: stdout_format,
+                path: None,
+            });
+        }
+        outputs
+    } else {
+        vec![OutputSpec {
+            format: stdout_format,
+            path: None,
+        }]
+    };
+
+    let has_non_stdout = outputs.iter().any(|o| o.path.is_some());
+    // Decorative progress goes to stderr when stdout is clean (JSON/Markdown to file
+    // or when stdout format would produce a clean document), or when any file output
+    // is requested alongside stdout in a clean format.
+    let stdout_is_clean = outputs.iter().any(|o| o.path.is_none())
+        && (stdout_format == OutputFormat::Json || stdout_format == OutputFormat::Markdown);
+    let clean_stdout = stdout_is_clean || has_non_stdout;
     let progress = |line: String| {
         if args.quiet {
             return;
         }
-
         if clean_stdout {
             eprintln!("{line}");
         } else {
@@ -341,106 +394,136 @@ fn main() -> Result<()> {
         }
     };
 
-    // Load suppression config: --no-config means a clean run with no
-    // suppressions; otherwise an explicit --config must exist, and with neither
-    // flag we fall back to `.safeguard.toml` if present.
     let suppressions = if args.no_config {
         SuppressionConfig::default()
     } else {
         match &args.config {
             Some(path) => SuppressionConfig::load_from_path(path)?,
             None => {
-                SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?.unwrap_or_default()
+                SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?
+                    .unwrap_or_default()
             }
         }
     };
 
     if is_batch {
-        let pairs = if let Some(manifest_path) = &args.manifest {
-            parse_manifest(manifest_path)?
-        } else {
-            scan_directories(
-                args.old_dir.as_ref().unwrap(),
-                args.new_dir.as_ref().unwrap(),
-            )?
-        };
+        return run_batch(&args, &outputs, &suppressions, &progress);
+    }
 
-        progress("🔍 Soroban Upgrade Safeguard (Batch Mode)".to_string());
-        progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
-        progress(format!("Loaded {} pair(s) for comparison.\n", pairs.len()));
+    run_single(&args, &outputs, &suppressions, &progress)
+}
 
-        let mut results = std::collections::BTreeMap::new();
-        let mut overall_safe = true;
-        let mut seen_names = std::collections::BTreeSet::new();
+fn run_batch(
+    args: &Args,
+    outputs: &[OutputSpec],
+    suppressions: &SuppressionConfig,
+    progress: &impl Fn(String),
+) -> Result<()> {
+    let pairs = if let Some(manifest_path) = &args.manifest {
+        parse_manifest(manifest_path)?
+    } else {
+        scan_directories(
+            args.old_dir.as_ref().unwrap(),
+            args.new_dir.as_ref().unwrap(),
+        )?
+    };
 
-        for (i, pair) in pairs.iter().enumerate() {
-            let default_name = format!("pair_{}", i + 1);
-            let contract_name = pair.name.clone().unwrap_or_else(|| {
-                pair.new
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.to_string())
-                    .unwrap_or(default_name)
-            });
+    progress("🔍 Soroban Upgrade Safeguard (Batch Mode)".to_string());
+    progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
+    progress(format!("Loaded {} pair(s) for comparison.\n", pairs.len()));
 
-            if !seen_names.insert(contract_name.clone()) {
-                anyhow::bail!(
-                    "Duplicate contract name '{}' found in batch input; names must be unique",
-                    contract_name
-                );
-            }
+    let mut results = std::collections::BTreeMap::new();
+    let mut overall_safe = true;
+    let mut seen_names = std::collections::BTreeSet::new();
 
-            progress(format!(
-                "📦 [{}/{}] Comparing contract pair: {}",
-                i + 1,
-                pairs.len(),
-                contract_name.bold()
-            ));
+    for (i, pair) in pairs.iter().enumerate() {
+        let default_name = format!("pair_{}", i + 1);
+        let contract_name = pair.name.clone().unwrap_or_else(|| {
+            pair.new
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.to_string())
+                .unwrap_or(default_name)
+        });
 
-            let old_wasm = loader::load_wasm(&pair.old)?;
-            let new_wasm = loader::load_wasm(&pair.new)?;
-
-            let report = compare_contracts(
-                &ContractComparison {
-                    old_bytes: &old_wasm.bytes,
-                    old_path: &old_wasm.path,
-                    new_bytes: &new_wasm.bytes,
-                    new_path: &new_wasm.path,
-                    suppressions: &suppressions,
-                    explain: args.explain,
-                    strict: args.strict,
-                },
-                &progress,
-            )?;
-
-            if !report.is_safe {
-                overall_safe = false;
-            }
-
-            let rendered_report = render_report(&report, args.format, args.explain)?;
-            if let Some(output_dir) = args.per_contract_output_dir.as_deref() {
-                write_report_file(output_dir, &contract_name, args.format, &rendered_report)?;
-            }
-
-            results.insert(contract_name, report);
-            progress("\n----------------------------------------\n".to_string());
+        if !seen_names.insert(contract_name.clone()) {
+            anyhow::bail!(
+                "Duplicate contract name '{}' found in batch input; names must be unique",
+                contract_name
+            );
         }
 
-        match args.format {
+        progress(format!(
+            "📦 [{}/{}] Comparing contract pair: {}",
+            i + 1,
+            pairs.len(),
+            contract_name.bold()
+        ));
+
+        let old_wasm = loader::load_wasm(&pair.old)?;
+        let new_wasm = loader::load_wasm(&pair.new)?;
+
+        let report = compare_contracts(
+            &ContractComparison {
+                old_bytes: &old_wasm.bytes,
+                old_path: &old_wasm.path,
+                new_bytes: &new_wasm.bytes,
+                new_path: &new_wasm.path,
+                suppressions,
+                explain: args.explain,
+                strict: args.strict,
+                no_timestamp: args.no_timestamp,
+            },
+            progress,
+        )?;
+
+        if !report.is_safe {
+            overall_safe = false;
+        }
+
+        // Write per-contract outputs
+        render_to_outputs(&report, outputs, args.explain, Some(&contract_name), progress)?;
+
+        if let Some(output_dir) = args.per_contract_output_dir.as_deref() {
+            let content = render_single(&report, args.format.unwrap_or(OutputFormat::Text), args.explain)?;
+            write_report_file(output_dir, &contract_name, args.format.unwrap_or(OutputFormat::Text), &content)?;
+        }
+
+        results.insert(contract_name, report);
+        progress("\n----------------------------------------\n".to_string());
+    }
+
+    render_batch_summary(&results, overall_safe, pairs.len(), args.strict, outputs, progress)?;
+
+    if !overall_safe {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+fn render_batch_summary(
+    results: &std::collections::BTreeMap<String, report::SafetyReport>,
+    overall_safe: bool,
+    total_pairs: usize,
+    strict: bool,
+    outputs: &[OutputSpec],
+    progress: &impl Fn(String),
+) -> Result<()> {
+    for output in outputs {
+        let content = match output.format {
             OutputFormat::Json => {
                 let mut results_json = serde_json::Map::new();
-                for (name, report) in &results {
+                for (name, report) in results {
                     results_json.insert(name.clone(), serde_json::to_value(report.to_json())?);
                 }
-
                 let batch_json = serde_json::json!({
                     "is_safe": overall_safe,
-                    "strict": args.strict,
-                    "total_pairs": pairs.len(),
+                    "strict": strict,
+                    "total_pairs": total_pairs,
                     "results": results_json,
                 });
-
-                println!("{}", serde_json::to_string_pretty(&batch_json)?);
+                serde_json::to_string_pretty(&batch_json)?
             }
             OutputFormat::Markdown => {
                 let mut markdown = String::new();
@@ -453,19 +536,53 @@ fn main() -> Result<()> {
                 };
                 markdown.push_str(&format!("## Status: {}\n\n", status));
                 markdown.push_str("### Summary\n\n");
-                markdown
-                    .push_str("| Contract | Status | Critical | Warning | Info | Suppressed |\n");
+                markdown.push_str("| Contract | Status | Critical | Warning | Info | Suppressed |\n");
                 markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
 
-                for (name, report) in &results {
-                    let status_str = if report.is_safe {
-                        "✅ PASSED"
-                    } else {
-                        "❌ FAILED"
-                    };
+                for (name, report) in results {
+                    let status_str = if report.is_safe { "✅ PASSED" } else { "❌ FAILED" };
                     markdown.push_str(&format!(
                         "| {} | {} | {} | {} | {} | {} |\n",
-                        name,
+                        name, status_str, report.critical_count, report.warning_count,
+                        report.info_count, report.suppressed_count
+                    ));
+                }
+
+                markdown.push_str("\n---\n\n");
+
+                for (name, report) in results {
+                    markdown.push_str(&format!("## Details: {}\n\n", name));
+                    let report_md = report.generate_summary_markdown();
+                    let stripped_md = report_md.replace("# Soroban Upgrade Safety Report\n\n", "");
+                    markdown.push_str(&stripped_md);
+                    markdown.push_str("\n---\n\n");
+                }
+
+                markdown
+            }
+            OutputFormat::Text => {
+                let mut text = String::new();
+                text.push_str("========================================\n");
+                text.push_str("    SOROBAN BATCH SAFETY REPORT\n");
+                text.push_str("========================================\n");
+
+                let status = if overall_safe {
+                    "✅ PASSED (All contracts safe)".green().bold().to_string()
+                } else {
+                    "❌ FAILED (Some contracts have breaking changes)".red().bold().to_string()
+                };
+                text.push_str(&format!("Overall Status: {}\n\n", status));
+
+                text.push_str("Summary of Contracts:\n");
+                for (name, report) in results {
+                    let status_str = if report.is_safe {
+                        "✅ PASSED".green().to_string()
+                    } else {
+                        "❌ FAILED".red().bold().to_string()
+                    };
+                    text.push_str(&format!(
+                        "  - {}: {} ({} critical, {} warnings, {} info, {} suppressed)\n",
+                        name.bold(),
                         status_str,
                         report.critical_count,
                         report.warning_count,
@@ -474,72 +591,38 @@ fn main() -> Result<()> {
                     ));
                 }
 
-                markdown.push_str("\n---\n\n");
+                text.push_str("\n========================================\n\n");
 
-                for (name, report) in &results {
-                    markdown.push_str(&format!("## Details: {}\n\n", name));
-                    let report_md = report.generate_summary_markdown();
-                    let stripped_md = report_md.replace("# Soroban Upgrade Safety Report\n\n", "");
-                    markdown.push_str(&stripped_md);
-                    markdown.push_str("\n---\n\n");
+                for (name, report) in results {
+                    text.push_str(&format!("=== Contract: {} ===\n", name.bold().magenta()));
+                    text.push_str(&report.generate_summary_text(false));
+                    text.push_str("========================================\n\n");
                 }
 
-                println!("{}", markdown);
+                text
             }
-            OutputFormat::Text => {
-                println!("========================================");
-                println!("    SOROBAN BATCH SAFETY REPORT");
-                println!("========================================");
+        };
 
-                let status = if overall_safe {
-                    "✅ PASSED (All contracts safe)".green().bold()
-                } else {
-                    "❌ FAILED (Some contracts have breaking changes)"
-                        .red()
-                        .bold()
-                };
-                println!("Overall Status: {}\n", status);
-
-                println!("Summary of Contracts:");
-                for (name, report) in &results {
-                    let status_str = if report.is_safe {
-                        "✅ PASSED".green()
-                    } else {
-                        "❌ FAILED".red().bold()
-                    };
-                    println!(
-                        "  - {}: {} ({} critical, {} warnings, {} info, {} suppressed)",
-                        name.bold(),
-                        status_str,
-                        report.critical_count,
-                        report.warning_count,
-                        report.info_count,
-                        report.suppressed_count
-                    );
-                }
-
-                println!("\n========================================\n");
-
-                for (name, report) in &results {
-                    println!("=== Contract: {} ===", name.bold().magenta());
-                    println!("{}", report.generate_summary_text(args.explain));
-                    println!("========================================\n");
-                }
-            }
+        emit_output(output, &content)?;
+        if output.path.is_none() && output.format != OutputFormat::Text {
+            progress(format!("  {} batch report written to stdout", output.format.to_string().to_lowercase()));
+        } else if let Some(path) = &output.path {
+            progress(format!("  batch report written to {}", path.display()));
         }
-
-        if !overall_safe {
-            std::process::exit(1);
-        }
-        return Ok(());
     }
 
-    // Resolve the two usage modes for single pair:
-    //   - 2 positional args => local-vs-local comparison
-    //   - 1 positional arg  + --contract-id/--rpc-url => RPC-vs-local comparison
+    Ok(())
+}
+
+fn run_single(
+    args: &Args,
+    outputs: &[OutputSpec],
+    suppressions: &SuppressionConfig,
+    progress: &impl Fn(String),
+) -> Result<()> {
     let (old_source, new_wasm_path) = match (args.wasm_paths.len(), &args.contract_id) {
-        (2, None) => (None, &args.wasm_paths[1]), // local mode
-        (1, Some(_)) => (args.contract_id.as_deref(), &args.wasm_paths[0]), // RPC mode
+        (2, None) => (None, &args.wasm_paths[1]),
+        (1, Some(_)) => (args.contract_id.as_deref(), &args.wasm_paths[0]),
         (2, Some(_)) => {
             anyhow::bail!(
                 "When using --contract-id, provide only the NEW_WASM path as a positional argument"
@@ -578,66 +661,255 @@ fn main() -> Result<()> {
         );
     }
 
-    progress("🔍 Soroban Upgrade Safeguard".to_string());
-    progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
-
-    progress(format!(
-        "\n{}",
-        "📦 Loading and Parsing contracts...".cyan().bold()
-    ));
-
-    // Old WASM — from file or from RPC
-    let old = if let Some(contract_id) = old_source {
-        let rpc_url = args.rpc_url.as_ref().unwrap();
-        loader::fetch_wasm_from_rpc(contract_id, rpc_url)?
+    // Collect the actual file paths for watch mode
+    let watch_paths: Vec<PathBuf> = if args.watch {
+        let mut paths = Vec::new();
+        if !is_batch_mode(args) {
+            if old_source.is_none() && args.wasm_paths.len() >= 1 {
+                let p = args.wasm_paths[0].clone();
+                if !is_stdin_wasm_path(&p) {
+                    paths.push(p);
+                }
+            }
+            let p = new_wasm_path.clone();
+            if !is_stdin_wasm_path(&p) {
+                paths.push(p);
+            }
+        }
+        paths
     } else {
-        load_positional_wasm(&args.wasm_paths[0])?
+        Vec::new()
     };
 
-    // New WASM
-    let new = load_positional_wasm(new_wasm_path)?;
+    let run_comparison = |progress: &impl Fn(String)| -> Result<bool> {
+        progress("🔍 Soroban Upgrade Safeguard".to_string());
+        progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
 
-    if !suppressions.rules.is_empty() {
         progress(format!(
-            "\n🔕 {} suppression rule(s) loaded",
-            suppressions.rules.len()
+            "\n{}",
+            "📦 Loading and Parsing contracts...".cyan().bold()
         ));
+
+        let old = if let Some(contract_id) = old_source {
+            let rpc_url = args.rpc_url.as_ref().unwrap();
+            loader::fetch_wasm_from_rpc(contract_id, rpc_url)?
+        } else {
+            load_positional_wasm(&args.wasm_paths[0])?
+        };
+
+        let new = load_positional_wasm(new_wasm_path)?;
+
+        if !suppressions.rules.is_empty() {
+            progress(format!(
+                "\n🔕 {} suppression rule(s) loaded",
+                suppressions.rules.len()
+            ));
+        }
+
+        let safety_report = compare_contracts(
+            &ContractComparison {
+                old_bytes: &old.bytes,
+                old_path: &old.path,
+                new_bytes: &new.bytes,
+                new_path: &new.path,
+                suppressions,
+                explain: args.explain,
+                strict: args.strict,
+                no_timestamp: args.no_timestamp,
+            },
+            progress,
+        )?;
+
+        render_to_outputs(&safety_report, outputs, args.explain, None, progress)?;
+
+        let is_safe = safety_report.is_safe;
+        if !is_safe {
+            return Ok(false);
+        }
+        Ok(true)
+    };
+
+    let is_safe = run_comparison(&progress)?;
+
+    if args.watch && !watch_paths.is_empty() {
+        run_watch_mode(&watch_paths, args, outputs, suppressions, run_comparison)?;
+    } else if args.watch {
+        eprintln!("Warning: --watch requires local file paths (stdin or RPC sources not supported)");
     }
 
-    // Generate Safety Report using the factored helper
-    let safety_report = compare_contracts(
-        &ContractComparison {
-            old_bytes: &old.bytes,
-            old_path: &old.path,
-            new_bytes: &new.bytes,
-            new_path: &new.path,
-            suppressions: &suppressions,
-            explain: args.explain,
-            strict: args.strict,
-        },
-        &progress,
-    )?;
-
-    match args.format {
-        OutputFormat::Json => {
-            // Single JSON document to stdout; no decorative text, no ANSI codes.
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&safety_report.to_json())?
-            );
-        }
-        OutputFormat::Markdown => {
-            println!("{}", safety_report.generate_summary_markdown());
-        }
-        OutputFormat::Text => {
-            println!("{}", safety_report.generate_summary_text(args.explain));
-        }
-    }
-
-    if !safety_report.is_safe {
+    if !is_safe {
         std::process::exit(1);
     }
 
+    Ok(())
+}
+
+fn is_batch_mode(args: &Args) -> bool {
+    args.manifest.is_some() || (args.old_dir.is_some() && args.new_dir.is_some())
+}
+
+fn render_to_outputs(
+    report: &report::SafetyReport,
+    outputs: &[OutputSpec],
+    explain: bool,
+    contract_name: Option<&str>,
+    progress: &impl Fn(String),
+) -> Result<()> {
+    for output in outputs {
+        let content = render_single(report, output.format, explain)?;
+        emit_output(output, &content)?;
+
+        if let Some(ref path) = output.path {
+            let label = contract_name
+                .map(|n| format!("{}.{}", n, output.format.file_extension()))
+                .unwrap_or_else(|| path.to_string_lossy().to_string());
+            progress(format!("  report written to {}", label));
+        }
+    }
+    Ok(())
+}
+
+fn render_single(report: &report::SafetyReport, format: OutputFormat, explain: bool) -> Result<String> {
+    match format {
+        OutputFormat::Json => Ok(serde_json::to_string_pretty(&report.to_json())?),
+        OutputFormat::Markdown => Ok(report.generate_summary_markdown()),
+        OutputFormat::Text => Ok(report.generate_summary_text(explain)),
+    }
+}
+
+fn emit_output(spec: &OutputSpec, content: &str) -> Result<()> {
+    match &spec.path {
+        Some(path) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let temp_path = path.with_extension(format!(
+                "{}.tmp",
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or("tmp")
+            ));
+            std::fs::write(&temp_path, content)?;
+            std::fs::rename(&temp_path, path)?;
+        }
+        None => {
+            println!("{content}");
+        }
+    }
+    Ok(())
+}
+
+/// Watch mode: monitor input files and re-run on changes.
+#[cfg(feature = "watch")]
+fn run_watch_mode(
+    watch_paths: &[PathBuf],
+    _args: &Args,
+    _outputs: &[OutputSpec],
+    _suppressions: &SuppressionConfig,
+    run_comparison: impl Fn(&impl Fn(String)) -> Result<bool>,
+) -> Result<()> {
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |res| {
+        if let Ok(event) = res {
+            tx.send(event).ok();
+        }
+    })
+    .map_err(|e| anyhow::anyhow!("Failed to create file watcher: {e}"))?;
+
+    for path in watch_paths {
+        watcher
+            .watch(path, notify::RecursiveMode::NonRecursive)
+            .unwrap_or_else(|e| {
+                eprintln!("Warning: cannot watch {}: {e}", path.display());
+            });
+    }
+
+    eprintln!("\n👀 Watch mode active. Waiting for file changes... (Ctrl+C to stop)\n");
+
+    let mut last_event = std::time::Instant::now();
+    let debounce_ms = 300;
+
+    loop {
+        match rx.recv_timeout(Duration::from_millis(debounce_ms)) {
+            Ok(_event) => {
+                last_event = std::time::Instant::now();
+                // Brief debounce window: wait for more events
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(_) => {
+                            last_event = std::time::Instant::now();
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(anyhow::anyhow!("File watcher channel disconnected"));
+                        }
+                    }
+                }
+
+                // Check that watched files exist before re-running
+                let all_exist = watch_paths.iter().all(|p| p.exists());
+                if !all_exist {
+                    eprintln!("⚠️  Watched file(s) missing, waiting for them to reappear...");
+                    // Poll until files exist or timeout
+                    let start = std::time::Instant::now();
+                    let timeout = Duration::from_secs(30);
+                    loop {
+                        if watch_paths.iter().all(|p| p.exists()) {
+                            break;
+                        }
+                        if start.elapsed() > timeout {
+                            eprintln!("⚠️  Timed out waiting for files to reappear");
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+
+                // Clear terminal
+                print!("\x1B[2J\x1B[H");
+
+                let progress = |line: String| {
+                    eprintln!("{line}");
+                };
+
+                eprintln!("🔄 Change detected, re-running comparison...\n");
+
+                match run_comparison(&progress) {
+                    Ok(safe) => {
+                        if safe {
+                            eprintln!("\n✅ Comparison passed");
+                        } else {
+                            eprintln!("\n❌ Comparison failed (breaking changes detected)");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("\n⚠️  Error during comparison: {e:#}");
+                    }
+                }
+
+                eprintln!("\n👀 Watch mode active. Waiting for file changes... (Ctrl+C to stop)\n");
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // No event - if this is the first run, just continue
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow::anyhow!("File watcher channel disconnected"));
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "watch"))]
+fn run_watch_mode(
+    _watch_paths: &[PathBuf],
+    _args: &Args,
+    _outputs: &[OutputSpec],
+    _suppressions: &SuppressionConfig,
+    _run_comparison: impl Fn(&impl Fn(String)) -> Result<bool>,
+) -> Result<()> {
+    eprintln!("Warning: --watch is not available in this build. Rebuild with the 'watch' feature enabled.");
     Ok(())
 }
 
@@ -674,9 +946,9 @@ struct ContractComparison<'a> {
     suppressions: &'a SuppressionConfig,
     explain: bool,
     strict: bool,
+    no_timestamp: bool,
 }
 
-/// Helper function to run comparison for a single pair.
 fn compare_contracts(
     comparison: &ContractComparison<'_>,
     progress: &impl Fn(String),
@@ -689,6 +961,7 @@ fn compare_contracts(
         suppressions,
         explain,
         strict,
+        no_timestamp,
     } = comparison;
     let old_meta = parser::extract_metadata(old_bytes)?;
     let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
@@ -721,17 +994,18 @@ fn compare_contracts(
         &mut diff_report,
     );
 
-    Ok(
-        report::SafetyReport::with_suppressions(&diff_report, suppressions, *explain, *strict)
-            .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash()),
-    )
+    let mut report = report::SafetyReport::with_suppressions(&diff_report, suppressions, *explain, *strict)
+        .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash());
+
+    report.no_timestamp = *no_timestamp;
+
+    Ok(report)
 }
 
 fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read manifest file: {}", path.display()))?;
 
-    // Try TOML, then JSON
     if let Ok(manifest) = toml::from_str::<Manifest>(&content) {
         return Ok(manifest.pairs);
     }
@@ -845,4 +1119,56 @@ fn sanitize_report_filename(contract_name: &str, format: OutputFormat) -> PathBu
     let mut path = PathBuf::from(sanitized);
     path.set_extension(extension);
     path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_output_spec_from_str_format_only() {
+        let spec: OutputSpec = "json".parse().unwrap();
+        assert_eq!(spec.format, OutputFormat::Json);
+        assert!(spec.path.is_none());
+    }
+
+    #[test]
+    fn test_output_spec_from_str_format_with_path() {
+        let spec: OutputSpec = "json:report.json".parse().unwrap();
+        assert_eq!(spec.format, OutputFormat::Json);
+        assert_eq!(spec.path.unwrap(), PathBuf::from("report.json"));
+    }
+
+    #[test]
+    fn test_output_spec_from_str_markdown_with_path() {
+        let spec: OutputSpec = "markdown:docs/report.md".parse().unwrap();
+        assert_eq!(spec.format, OutputFormat::Markdown);
+        assert_eq!(spec.path.unwrap(), PathBuf::from("docs/report.md"));
+    }
+
+    #[test]
+    fn test_output_spec_from_str_invalid_format() {
+        let result: Result<OutputSpec, String> = "invalid".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_output_spec_from_str_invalid_format_in_pair() {
+        let result: Result<OutputSpec, String> = "invalid:path.txt".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_output_format_file_extension() {
+        assert_eq!(OutputFormat::Json.file_extension(), "json");
+        assert_eq!(OutputFormat::Markdown.file_extension(), "md");
+        assert_eq!(OutputFormat::Text.file_extension(), "txt");
+    }
+
+    #[test]
+    fn test_output_spec_default() {
+        let spec: OutputSpec = "text".parse().unwrap();
+        assert_eq!(spec.format, OutputFormat::Text);
+        assert!(spec.path.is_none());
+    }
 }

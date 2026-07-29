@@ -16,6 +16,10 @@ A powerful CLI tool to analyze and validate Soroban smart contract upgrades on t
 - **Interface Hash**: A stable, order-independent SHA-256 over the normalised spec. Two builds with the same hash expose the same interface, which makes it a cheap cache key and a direct answer to "did this change the interface?".
 - **Spec Extraction**: `extract` dumps a single build's decoded interface as JSON, so you can inspect a WASM or archive its interface without separate Stellar tooling.
 - **Re-renderable Reports**: `render` turns a saved JSON report back into text or Markdown, so a stored verdict can be presented any number of ways without the original WASM files.
+- **Multi-Format Output**: Emit the same report as JSON, Markdown, and text simultaneously — each to its own file or stdout — in a single run.
+- **Watch Mode**: Continuously monitor input WASM files for changes and automatically re-run the comparison on every build.
+- **Provenance Metadata**: Every report includes the tool version, a timestamp, and input identifiers for full auditability (`--no-timestamp` for deterministic snapshot testing).
+- **GitHub Action**: Reusable action that posts the Markdown report as a PR comment and updates it in-place on subsequent pushes.
 
 ## Installation
 
@@ -82,6 +86,98 @@ The tool auto-loads `.safeguard.toml` from the current directory, or use
 [`.safeguard.example.toml`](.safeguard.example.toml) for a documented template
 and the [documentation](docs/documentation.md#suppressing-known-breaking-changes)
 for the full `target` convention.
+
+### Multiple output formats
+
+Emit the same report in several formats and destinations in a single run:
+
+```bash
+# Write JSON to a file, Markdown to another, and print text to stdout
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
+  --output json:report.json \
+  --output markdown:report.md
+
+# Write to stdout only (default)
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
+
+# Explicit stdout format with file output
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
+  --format text \
+  --output json:ci-report.json
+```
+
+### Watch mode
+
+Re-run the comparison automatically when input WASM files change:
+
+```bash
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --watch
+```
+
+Watch mode:
+- Monitors both WASM files for changes using filesystem notifications.
+- Debounces rapid writes (e.g. from build tools) with a 300ms window.
+- Clears the terminal screen and re-renders the report on each change.
+- Handles transient missing files gracefully (e.g. build tools that delete and recreate).
+- Keeps the process running regardless of comparison verdict (non-zero exit codes do NOT exit the watcher).
+- Exit with `Ctrl+C`.
+
+### Deterministic output for snapshot testing
+
+Use `--no-timestamp` to suppress the timestamp in report provenance,
+enabling reproducible snapshot tests:
+
+```bash
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
+  --format json --no-timestamp > report.json
+```
+
+### GitHub Action
+
+A reusable GitHub Action is provided to run the safeguard tool and post
+the Markdown report as a pull request comment. It updates the comment
+in-place on subsequent pushes.
+
+**Workflow example** (`.github/workflows/safeguard-report.yml`):
+
+```yaml
+name: Soroban Upgrade Safety Report
+
+on:
+  pull_request:
+    paths:
+      - 'wasm/**/*.wasm'
+
+jobs:
+  safeguard-report:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build safeguard
+        run: cargo build --release
+      - name: Add to PATH
+        run: echo "${{ github.workspace }}/target/release" >> "$GITHUB_PATH"
+      - name: Run Soroban Upgrade Safeguard
+        uses: ./.github/actions/soroban-upgrade-safeguard
+        with:
+          old-wasm: ./wasm/v1.wasm
+          new-wasm: ./wasm/v2.wasm
+          token: ${{ secrets.GITHUB_TOKEN }}
+          args: --strict --explain
+```
+
+The action uses the GitHub CLI (`gh`) to manage comments. It searches for
+an existing comment containing the hidden marker
+`<!-- soroban-upgrade-safeguard-report -->` and updates it, or creates a new
+one if none exists. The action requires `pull-requests: write` permission.
+
+If run on a forked PR without write permissions, the action logs a warning
+and exits gracefully — the report is still generated but the comment is not
+posted.
 
 ## How it Works
 
