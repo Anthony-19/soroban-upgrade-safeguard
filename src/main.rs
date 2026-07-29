@@ -5,8 +5,17 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use soroban_upgrade_safeguard::{
-    color::should_disable_color,
-    diff, loader, parser, report, spec,
+    color::{should_disable_color, ColorMode},
+    dependency::{
+        cycle_findings, missing_contract_findings, ContractDependency, CrossContractFinding,
+        DependencyGraph,
+    },
+    diff,
+    limits::{find_limit_error, LimitsConfig, ResourcePolicy},
+    loader, parser,
+    report::{self, validate_categories, CategoryFilter},
+    spec,
+    storage_schema::StorageSchema,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
 
@@ -39,7 +48,7 @@ enum OutputFormat {
                       soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]"
 )]
 struct Args {
-    /// WASM paths: <OLD_WASM> <NEW_WASM> in local mode, or just <NEW_WASM> in RPC mode
+    /// WASM paths: <OLD_WASM> <NEW_WASM> in local mode, or just <NEW_WASM> in RPC mode. Use - to read one WASM from stdin.
     #[arg(value_name = "WASM", num_args = 0..=2)]
     wasm_paths: Vec<PathBuf>,
 
@@ -61,6 +70,10 @@ struct Args {
     #[arg(long, value_name = "CONFIG")]
     config: Option<PathBuf>,
 
+    /// Do not load any suppression config, including the default .safeguard.toml.
+    #[arg(long, conflicts_with = "config")]
+    no_config: bool,
+
     /// Print a concise remediation explanation for each finding.
     #[arg(long)]
     explain: bool,
@@ -72,6 +85,25 @@ struct Args {
     /// Do not color output
     #[arg(long)]
     no_color: bool,
+
+    /// Suppress decorative and progress output; the report and exit code are unchanged.
+    #[arg(long)]
+    quiet: bool,
+
+    /// Control when ANSI color is used. --no-color overrides this option.
+    #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+    color: ColorMode,
+
+    /// Allow HTTP connections for RPC when the host is localhost/127.0.0.1.
+    /// Without this flag only HTTPS URLs are accepted.
+    #[arg(long)]
+    allow_http_local: bool,
+
+    /// Expected SHA-256 hash (hex) of the on-chain WASM baseline.
+    /// When provided the tool verifies the hash of the fetched bytecode
+    /// matches this value and fails immediately on mismatch.
+    #[arg(long, value_name = "HEX_HASH")]
+    expected_wasm_hash: Option<String>,
 
     /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
     #[arg(long, value_name = "MANIFEST_PATH")]
@@ -91,10 +123,13 @@ fn main() -> Result<()> {
 
     if should_disable_color(
         args.no_color,
+        args.color,
         std::env::var_os("NO_COLOR").is_some(),
         std::io::stdout().is_terminal(),
     ) {
         colored::control::set_override(false);
+    } else if args.color == ColorMode::Always {
+        colored::control::set_override(true);
     }
 
     // 1. Identify which mode we are running:
@@ -113,9 +148,13 @@ fn main() -> Result<()> {
 
     // In JSON or Markdown mode, decorative progress goes to stderr so stdout
     // stays a single, pristine document. In text mode it stays on stdout
-    // exactly as before.
+    // exactly as before. --quiet suppresses progress in every format.
     let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
     let progress = |line: String| {
+        if args.quiet {
+            return;
+        }
+
         if clean_stdout {
             eprintln!("{line}");
         } else {
@@ -123,13 +162,17 @@ fn main() -> Result<()> {
         }
     };
 
-    // Load suppression config: an explicit --config must exist; otherwise fall
-    // back to `.safeguard.toml` in the working directory if it happens to be
-    // present. With neither, an empty config preserves today's behavior.
-    let suppressions = match &args.config {
-        Some(path) => SuppressionConfig::load_from_path(path)?,
-        None => {
-            SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?.unwrap_or_default()
+    // Load suppression config: --no-config means a clean run with no
+    // suppressions; otherwise an explicit --config must exist, and with neither
+    // flag we fall back to `.safeguard.toml` if present.
+    let suppressions = if args.no_config {
+        SuppressionConfig::default()
+    } else {
+        match &args.config {
+            Some(path) => SuppressionConfig::load_from_path(path)?,
+            None => {
+                SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?.unwrap_or_default()
+            }
         }
     };
 
@@ -333,6 +376,16 @@ fn main() -> Result<()> {
         }
     };
 
+    if old_source.is_none()
+        && is_stdin_wasm_path(&args.wasm_paths[0])
+        && is_stdin_wasm_path(new_wasm_path)
+    {
+        anyhow::bail!(
+            "Cannot use '-' for both OLD_WASM and NEW_WASM because stdin can only be read once. \
+             Provide one side as a file path."
+        );
+    }
+
     progress("🔍 Soroban Upgrade Safeguard".to_string());
     progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
 
@@ -346,11 +399,11 @@ fn main() -> Result<()> {
         let rpc_url = args.rpc_url.as_ref().unwrap();
         loader::fetch_wasm_from_rpc(contract_id, rpc_url)?
     } else {
-        loader::load_wasm(&args.wasm_paths[0])?
+        load_positional_wasm(&args.wasm_paths[0])?
     };
 
     // New WASM
-    let new = loader::load_wasm(new_wasm_path)?;
+    let new = load_positional_wasm(new_wasm_path)?;
 
     if !suppressions.rules.is_empty() {
         progress(format!(
@@ -394,6 +447,19 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn is_stdin_wasm_path(path: &Path) -> bool {
+    path == Path::new("-")
+}
+
+fn load_positional_wasm(path: &Path) -> Result<loader::WasmModule> {
+    if is_stdin_wasm_path(path) {
+        let mut stdin = std::io::stdin().lock();
+        Ok(loader::load_wasm_from_stdin(&mut stdin)?)
+    } else {
+        Ok(loader::load_wasm(path)?)
+    }
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
