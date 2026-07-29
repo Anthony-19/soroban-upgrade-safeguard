@@ -11,38 +11,240 @@ pub use crate::render::SeverityCounts;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportedFinding {
     #[serde(flatten)]
+    #[cfg(feature = "unstable")]
     pub finding: Finding,
+    #[serde(flatten)]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) finding: Finding,
+
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg(feature = "unstable")]
     pub suppressed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) suppressed: bool,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(feature = "unstable")]
     pub suppression_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) suppression_reason: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(feature = "unstable")]
     pub remediation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) remediation: Option<String>,
+}
+
+impl ReportedFinding {
+    pub fn finding(&self) -> &Finding {
+        &self.finding
+    }
+
+    pub fn suppressed(&self) -> bool {
+        self.suppressed
+    }
+
+    pub fn suppression_reason(&self) -> Option<&str> {
+        self.suppression_reason.as_deref()
+    }
+
+    pub fn remediation(&self) -> Option<&str> {
+        self.remediation.as_deref()
+    }
 }
 
 /// A structured container for aggregated comparison findings.
 #[derive(Debug, Default)]
 pub struct SafetyReport {
+    #[cfg(feature = "unstable")]
     pub critical_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) critical_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub warning_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) warning_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub info_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) info_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub suppressed_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) suppressed_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub suppressed_critical_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) suppressed_critical_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub suppressed_warning_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) suppressed_warning_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub suppressed_info_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) suppressed_info_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub total_findings: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) total_findings: usize,
+
+    #[cfg(feature = "unstable")]
     pub is_safe: bool,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) is_safe: bool,
+
+    #[cfg(feature = "unstable")]
     pub findings_by_category: HashMap<String, Vec<ReportedFinding>>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) findings_by_category: HashMap<String, Vec<ReportedFinding>>,
+
+    #[cfg(feature = "unstable")]
     pub strict: bool,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) strict: bool,
+
+    #[cfg(feature = "unstable")]
     pub critical_root_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) critical_root_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub cascade_critical_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) cascade_critical_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub old_interface_hash: Option<InterfaceHash>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) old_interface_hash: Option<InterfaceHash>,
+
+    #[cfg(feature = "unstable")]
     pub new_interface_hash: Option<InterfaceHash>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) new_interface_hash: Option<InterfaceHash>,
+
+    #[cfg(feature = "unstable")]
     pub no_timestamp: bool,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) no_timestamp: bool,
+
+    #[cfg(feature = "unstable")]
     pub old_spec_summary: Option<String>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) old_spec_summary: Option<String>,
+
+    #[cfg(feature = "unstable")]
     pub new_spec_summary: Option<String>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) new_spec_summary: Option<String>,
+
+    #[cfg(feature = "unstable")]
     pub scope: AnalysisScope,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) scope: AnalysisScope,
+
+    #[cfg(feature = "unstable")]
     pub metrics: Option<BuildMetrics>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) metrics: Option<BuildMetrics>,
+}
+
+impl SafetyReport {
+    pub fn critical_count(&self) -> usize {
+        self.critical_count
+    }
+
+    pub fn warning_count(&self) -> usize {
+        self.warning_count
+    }
+
+    pub fn info_count(&self) -> usize {
+        self.info_count
+    }
+
+    pub fn suppressed_count(&self) -> usize {
+        self.suppressed_count
+    }
+
+    pub fn suppressed_critical_count(&self) -> usize {
+        self.suppressed_critical_count
+    }
+
+    pub fn suppressed_warning_count(&self) -> usize {
+        self.suppressed_warning_count
+    }
+
+    pub fn suppressed_info_count(&self) -> usize {
+        self.suppressed_info_count
+    }
+
+    pub fn total_findings(&self) -> usize {
+        self.total_findings
+    }
+
+    pub fn is_safe(&self) -> bool {
+        self.is_safe
+    }
+
+    pub fn findings_by_category(&self) -> &HashMap<String, Vec<ReportedFinding>> {
+        &self.findings_by_category
+    }
+
+    pub fn strict(&self) -> bool {
+        self.strict
+    }
+
+    pub fn critical_root_count(&self) -> usize {
+        self.critical_root_count
+    }
+
+    pub fn cascade_critical_count(&self) -> usize {
+        self.cascade_critical_count
+    }
+
+    pub fn old_interface_hash(&self) -> Option<&InterfaceHash> {
+        self.old_interface_hash.as_ref()
+    }
+
+    pub fn new_interface_hash(&self) -> Option<&InterfaceHash> {
+        self.new_interface_hash.as_ref()
+    }
+
+    pub fn no_timestamp(&self) -> bool {
+        self.no_timestamp
+    }
+
+    pub fn set_no_timestamp(&mut self, val: bool) {
+        self.no_timestamp = val;
+    }
+
+    pub fn old_spec_summary(&self) -> Option<&str> {
+        self.old_spec_summary.as_deref()
+    }
+
+    pub fn new_spec_summary(&self) -> Option<&str> {
+        self.new_spec_summary.as_deref()
+    }
+
+    pub fn scope(&self) -> &AnalysisScope {
+        &self.scope
+    }
+
+    pub fn metrics(&self) -> Option<&BuildMetrics> {
+        self.metrics.as_ref()
+    }
 }
 
 /// Track what was analyzed in the report.
