@@ -20,10 +20,33 @@ pub enum Severity {
     Info,
 }
 
+/// A compatibility axis along which findings can be categorized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompatibilityAxis {
+    StorageLayout,
+    CallAbi,
+    EventIndexer,
+    SourceLevel,
+}
+
+impl CompatibilityAxis {
+    pub fn default_severity(&self) -> Severity {
+        match self {
+            CompatibilityAxis::StorageLayout => Severity::Critical,
+            CompatibilityAxis::CallAbi => Severity::Critical,
+            CompatibilityAxis::EventIndexer => Severity::Warning,
+            CompatibilityAxis::SourceLevel => Severity::Info,
+        }
+    }
+}
+
 /// A single finding from the comparison analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     pub severity: Severity,
+    #[serde(default)]
+    pub axes: Vec<CompatibilityAxis>,
     pub category: String,
     pub message: String,
     /// The name of the affected UDT (struct/enum/union), if this finding
@@ -48,6 +71,37 @@ pub struct Finding {
     /// For cascade findings, the `target` of the root cause finding.
     /// `None` for direct (non-cascade) findings.
     pub root_target: Option<String>,
+}
+
+impl Finding {
+    pub fn new(
+        axes: Vec<CompatibilityAxis>,
+        category: String,
+        message: String,
+        type_name: Option<String>,
+        target: Option<String>,
+        root_target: Option<String>,
+    ) -> Self {
+        let severity = axes
+            .iter()
+            .map(|a| a.default_severity())
+            .max_by_key(|s| match s {
+                Severity::Critical => 3,
+                Severity::Warning => 2,
+                Severity::Info => 1,
+            })
+            .unwrap_or(Severity::Info);
+
+        Self {
+            severity,
+            axes,
+            category,
+            message,
+            type_name,
+            target,
+            root_target,
+        }
+    }
 }
 
 /// Holds all findings from a comparison of two contract specs.
