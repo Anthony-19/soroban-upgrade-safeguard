@@ -382,16 +382,44 @@ impl SafetyReport {
     ///   or `Struct Field Added` explicitly to `minor` because they represent changes
     ///   that are not strictly breaking for all contexts, but require caller adjustments
     ///   or data migrations).
-    /// - `Info` findings present -> `minor` (additive, non-breaking changes).
+    /// - `Info` findings present that are additive (e.g. new functions, new types) -> `minor`.
+    /// - `Info` findings present that are only documentation changes -> `patch`.
     /// - No findings -> `patch` (identical interface).
     pub fn recommended_bump(&self) -> &'static str {
         if self.critical_count > 0 {
             "major"
-        } else if self.warning_count > 0 || self.info_count > 0 {
+        } else if self.warning_count > 0 {
             "minor"
+        } else if self.info_count > 0 {
+            if self.has_non_documentation_info_findings() {
+                "minor"
+            } else {
+                "patch"
+            }
         } else {
             "patch"
         }
+    }
+
+    /// Returns `true` when at least one Info-severity finding is not a
+    /// non-functional documentation change (e.g. reworded doc comments).
+    fn has_non_documentation_info_findings(&self) -> bool {
+        const DOC_CATEGORIES: &[&str] = &[
+            "Function Documentation Changed",
+            "Struct Documentation Changed",
+            "Enum Documentation Changed",
+        ];
+
+        for findings in self.findings_by_category.values() {
+            for reported in findings {
+                if reported.finding.severity == Severity::Info
+                    && !DOC_CATEGORIES.contains(&reported.finding.category.as_str())
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Build a serializable, machine-readable view of this report.
@@ -513,7 +541,8 @@ impl SafetyReport {
                 )
                 .red()
                 .bold()
-        };
+            );
+        }
         output.push_str(&format!("Status: {}\n", status));
 
         let crit_str = if self.critical_count > 0 {
@@ -696,6 +725,7 @@ impl SafetyReport {
             } else {
                 output.push_str("No relevant changes detected. The exported interface is identical in its exports and types.\n");
             }
+        }
 
         if let Some(source) = &self.baseline_source {
             output.push_str(&format!("**Baseline Source**: `{}`\n\n", source));
@@ -913,6 +943,23 @@ mod tests {
 
     #[test]
     fn test_recommended_semver_bump() {
+        use crate::diff::Finding;
+
+        fn make_finding(severity: Severity, category: &str) -> ReportedFinding {
+            ReportedFinding {
+                finding: Finding {
+                    severity,
+                    category: category.to_string(),
+                    message: String::new(),
+                    type_name: None,
+                    target: None,
+                },
+                suppressed: false,
+                suppression_reason: None,
+                remediation: None,
+            }
+        }
+
         let mut report = SafetyReport {
             critical_count: 0,
             warning_count: 0,
@@ -927,13 +974,32 @@ mod tests {
         // Identical upgrade -> patch
         assert_eq!(report.recommended_bump(), "patch");
 
-        // Info findings -> minor
+        // Additive Info findings -> minor
         report.info_count = 1;
+        report.findings_by_category.insert(
+            "Function Added".to_string(),
+            vec![make_finding(Severity::Info, "Function Added")],
+        );
         assert_eq!(report.recommended_bump(), "minor");
+
+        // Documentation-only Info findings -> patch
+        report.info_count = 1;
+        report.warning_count = 0;
+        report.critical_count = 0;
+        report.findings_by_category.clear();
+        report.findings_by_category.insert(
+            "Function Documentation Changed".to_string(),
+            vec![make_finding(
+                Severity::Info,
+                "Function Documentation Changed",
+            )],
+        );
+        assert_eq!(report.recommended_bump(), "patch");
 
         // Warning findings -> minor
         report.info_count = 0;
         report.warning_count = 1;
+        report.findings_by_category.clear();
         assert_eq!(report.recommended_bump(), "minor");
 
         // Critical findings -> major (even if other findings are present)
