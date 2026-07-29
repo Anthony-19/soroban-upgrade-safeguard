@@ -40,6 +40,9 @@ pub struct Finding {
     /// `None` for findings that are not tied to a single named entity (for
     /// example environment-metadata changes).
     pub target: Option<String>,
+    /// For cascade findings, the `target` of the root cause finding.
+    /// `None` for direct (non-cascade) findings.
+    pub root_target: Option<String>,
 }
 
 /// Holds all findings from a comparison of two contract specs.
@@ -107,6 +110,7 @@ pub fn compare_env_metadata(
                 message: format_env_metadata_change(old_meta, new_meta),
                 type_name: None,
                 target: None,
+                root_target: None,
             });
         }
     }
@@ -185,6 +189,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                     ),
                     type_name: None,
                     target: Some(name.clone()),
+                    root_target: None,
                 });
             }
             Some(new_fn) => {
@@ -207,6 +212,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                         message,
                         type_name: None,
                         target: Some(name.clone()),
+                        root_target: None,
                     });
                 }
             }
@@ -222,6 +228,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                 message: format!("New function '{}' added.", name),
                 type_name: None,
                 target: Some(name.clone()),
+                root_target: None,
             });
         }
     }
@@ -250,6 +257,7 @@ fn check_function_signature(
             ),
             type_name: None,
             target: Some(name.to_string()),
+            root_target: None,
         });
         return; // No point comparing individual params if count differs
     }
@@ -279,6 +287,7 @@ fn check_function_signature(
             ),
             type_name: None,
             target: Some(name.to_string()),
+            root_target: None,
         });
 
         // Check for genuine type changes by matching parameter name.
@@ -291,19 +300,34 @@ fn check_function_signature(
             let p_name = old_input.name.to_string();
             if let Some(new_type) = new_by_name.get(&p_name) {
                 if !types_equal(&old_input.type_, new_type) {
+                    let (category, detail) =
+                        if let Some(bytesn_msg) =
+                            describe_bytesn_size_change(&old_input.type_, new_type)
+                        {
+                            ("BytesN Size Changed".to_string(), bytesn_msg)
+                        } else {
+                            (
+                                "Parameter Type Changed".to_string(),
+                                describe_nested_type_change(&old_input.type_, new_type)
+                                    .unwrap_or_else(|| {
+                                        format!(
+                                            "type changed from `{}` to `{}`",
+                                            crate::mapper::type_to_string(&old_input.type_),
+                                            crate::mapper::type_to_string(new_type)
+                                        )
+                                    }),
+                            )
+                        };
                     report.findings.push(Finding {
                         severity: Severity::Critical,
-                        category: "Parameter Type Changed".to_string(),
+                        category,
                         message: format!(
-                            "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
-                            name,
-                            i,
-                            p_name,
-                            crate::mapper::type_to_string(&old_input.type_),
-                            crate::mapper::type_to_string(new_type)
+                            "Function '{}': parameter {} ('{}') {}.",
+                            name, i, p_name, detail
                         ),
                         type_name: None,
                         target: Some(format!("{}.{}", name, p_name)),
+                        root_target: None,
                     });
                 }
             }
@@ -324,23 +348,39 @@ fn check_function_signature(
                     ),
                     type_name: None,
                     target: Some(format!("{}.{}", name, old_name)),
+                    root_target: None,
                 });
             }
 
             if !types_equal(&old_input.type_, &new_input.type_) {
+                let (category, detail) =
+                    if let Some(bytesn_msg) =
+                        describe_bytesn_size_change(&old_input.type_, &new_input.type_)
+                    {
+                        ("BytesN Size Changed".to_string(), bytesn_msg)
+                    } else {
+                        (
+                            "Parameter Type Changed".to_string(),
+                            describe_nested_type_change(&old_input.type_, &new_input.type_)
+                                .unwrap_or_else(|| {
+                                    format!(
+                                        "type changed from `{}` to `{}`",
+                                        crate::mapper::type_to_string(&old_input.type_),
+                                        crate::mapper::type_to_string(&new_input.type_)
+                                    )
+                                }),
+                        )
+                    };
                 report.findings.push(Finding {
                     severity: Severity::Critical,
-                    category: "Parameter Type Changed".to_string(),
+                    category,
                     message: format!(
-                        "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
-                        name,
-                        i,
-                        old_name,
-                        crate::mapper::type_to_string(&old_input.type_),
-                        crate::mapper::type_to_string(&new_input.type_)
+                        "Function '{}': parameter {} ('{}') {}.",
+                        name, i, old_name, detail
                     ),
                     type_name: None,
                     target: Some(format!("{}.{}", name, old_name)),
+                    root_target: None,
                 });
             }
         }
@@ -362,22 +402,33 @@ fn check_function_signature(
             ),
             type_name: None,
             target: Some(name.to_string()),
+            root_target: None,
         });
     } else {
         for (i, (old_out, new_out)) in old_outputs.iter().zip(new_outputs.iter()).enumerate() {
             if !types_equal(old_out, new_out) {
+                let (category, detail) =
+                    if let Some(bytesn_msg) = describe_bytesn_size_change(old_out, new_out) {
+                        ("BytesN Size Changed".to_string(), bytesn_msg)
+                    } else {
+                        (
+                            "Return Type Changed".to_string(),
+                            describe_nested_type_change(old_out, new_out).unwrap_or_else(|| {
+                                format!(
+                                    "changed from `{}` to `{}`",
+                                    crate::mapper::type_to_string(old_out),
+                                    crate::mapper::type_to_string(new_out)
+                                )
+                            }),
+                        )
+                    };
                 report.findings.push(Finding {
                     severity: Severity::Critical,
-                    category: "Return Type Changed".to_string(),
-                    message: format!(
-                        "Function '{}': return type {} changed from `{}` to `{}`.",
-                        name,
-                        i,
-                        crate::mapper::type_to_string(old_out),
-                        crate::mapper::type_to_string(new_out)
-                    ),
+                    category,
+                    message: format!("Function '{}': return type {} {}.", name, i, detail),
                     type_name: None,
                     target: Some(name.to_string()),
+                    root_target: None,
                 });
             }
         }
@@ -410,6 +461,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                     ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
+                    root_target: None,
                 });
             }
             Some(new_struct) => {
@@ -432,6 +484,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                         message,
                         type_name: Some(name.clone()),
                         target: Some(name.clone()),
+                        root_target: None,
                     });
                 }
             }
@@ -447,6 +500,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                 message: format!("New struct '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
+                root_target: None,
             });
         }
     }
@@ -486,6 +540,7 @@ fn check_struct_fields(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
     }
@@ -507,25 +562,40 @@ fn check_struct_fields(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
 
         // Field type changed
         if !types_equal(&old_field.type_, &new_field.type_) {
+            let (category, detail) =
+                if let Some(bytesn_msg) =
+                    describe_bytesn_size_change(&old_field.type_, &new_field.type_)
+                {
+                    ("BytesN Size Changed".to_string(), bytesn_msg)
+                } else {
+                    (
+                        format!("{} Type Changed", category_prefix),
+                        describe_nested_type_change(&old_field.type_, &new_field.type_)
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "type changed from `{}` to `{}`",
+                                    crate::mapper::type_to_string(&old_field.type_),
+                                    crate::mapper::type_to_string(&new_field.type_)
+                                )
+                            }),
+                    )
+                };
             report.findings.push(Finding {
                 severity: Severity::Critical,
-                category: format!("{} Type Changed", category_prefix),
+                category,
                 message: format!(
-                    "{} '{}': field '{}' (position {}) type changed from `{}` to `{}`.",
-                    msg_prefix,
-                    name,
-                    old_name,
-                    i,
-                    crate::mapper::type_to_string(&old_field.type_),
-                    crate::mapper::type_to_string(&new_field.type_)
+                    "{} '{}': field '{}' (position {}) {}.",
+                    msg_prefix, name, old_name, i, detail
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
     }
@@ -544,6 +614,7 @@ fn check_struct_fields(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, new_field.name)),
+                root_target: None,
             });
         }
     }
@@ -569,6 +640,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                     ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
+                    root_target: None,
                 });
             }
             Some(new_enum) => {
@@ -591,6 +663,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                         message,
                         type_name: Some(name.clone()),
                         target: Some(name.clone()),
+                        root_target: None,
                     });
                 }
             }
@@ -606,6 +679,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                 message: format!("New enum '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
+                root_target: None,
             });
         }
     }
@@ -644,6 +718,7 @@ fn check_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, old_name)),
+                    root_target: None,
                 });
             }
             Some(new_case) => {
@@ -659,6 +734,7 @@ fn check_enum_cases(
                         ),
                         type_name: Some(name.to_string()),
                         target: Some(format!("{}.{}", name, old_name)),
+                        root_target: None,
                     });
                 }
             }
@@ -679,6 +755,7 @@ fn check_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, new_name)),
+                    root_target: None,
                 });
             }
         }
@@ -699,6 +776,7 @@ fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepor
                     ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
+                    root_target: None,
                 });
             }
             Some(new_union) => {
@@ -715,6 +793,7 @@ fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepor
                 message: format!("New union '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
+                root_target: None,
             });
         }
     }
@@ -746,6 +825,7 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
     }
@@ -765,23 +845,36 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
 
         if !union_cases_equal(old_case, new_case) {
+            let (category, detail) =
+                if let Some(bytesn_msg) = union_case_bytesn_size_change(old_case, new_case) {
+                    ("BytesN Size Changed".to_string(), bytesn_msg)
+                } else {
+                    (
+                        "Union Case Type Changed".to_string(),
+                        describe_union_case_type_change(old_case, new_case).unwrap_or_else(|| {
+                            format!(
+                                "type changed from `{}` to `{}`",
+                                union_case_type_signature(old_case),
+                                union_case_type_signature(new_case)
+                            )
+                        }),
+                    )
+                };
             report.findings.push(Finding {
                 severity: Severity::Critical,
-                category: "Union Case Type Changed".to_string(),
+                category,
                 message: format!(
-                    "Union '{}': case '{}' (position {}) type changed from `{}` to `{}`.",
-                    name,
-                    old_name,
-                    i,
-                    union_case_type_signature(old_case),
-                    union_case_type_signature(new_case)
+                    "Union '{}': case '{}' (position {}) {}.",
+                    name, old_name, i, detail
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
     }
@@ -799,6 +892,7 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, union_case_name(new_case))),
+                root_target: None,
             });
         }
     }
@@ -851,6 +945,7 @@ fn compare_error_enums(old: &ContractSpec, new: &ContractSpec, report: &mut Diff
                     ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
+                    root_target: None,
                 });
             }
             Some(new_error_enum) => {
@@ -867,6 +962,7 @@ fn compare_error_enums(old: &ContractSpec, new: &ContractSpec, report: &mut Diff
                 message: format!("New error enum '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
+                root_target: None,
             });
         }
     }
@@ -896,6 +992,7 @@ fn check_error_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, old_name)),
+                    root_target: None,
                 });
             }
             Some(new_case) if old_case.value != new_case.value => {
@@ -909,6 +1006,7 @@ fn check_error_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, old_name)),
+                    root_target: None,
                 });
             }
             _ => {}
@@ -927,6 +1025,7 @@ fn check_error_enum_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, new_name)),
+                root_target: None,
             });
         }
     }
@@ -948,21 +1047,23 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
         }
     }
 
-    // A queue for transitive breaks
-    let mut queue: Vec<String> = broken_types.into_iter().collect();
+    // A queue for transitive breaks: (type_name, root_target)
+    let mut queue: Vec<(String, String)> =
+        broken_types.into_iter().map(|t| (t.clone(), t)).collect();
     let mut i = 0;
-    let mut cascaded = std::collections::HashSet::new();
+    let mut cascaded: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
 
     while i < queue.len() {
-        let current_broken_type = queue[i].clone();
+        let (current_broken_type, root) = queue[i].clone();
         i += 1;
 
         if let Some(dependents) = reverse_deps.get(&current_broken_type) {
             for dep in dependents {
-                // Ignore if it was the original broken type
-                if !cascaded.contains(dep) {
-                    cascaded.insert(dep.clone());
-                    queue.push(dep.clone());
+                let key = (dep.clone(), root.clone());
+                if !cascaded.contains(&key) {
+                    cascaded.insert(key);
+                    queue.push((dep.clone(), root.clone()));
 
                     report.findings.push(Finding {
                         severity: Severity::Critical,
@@ -974,10 +1075,163 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
                         ),
                         type_name: Some(dep.clone()),
                         target: Some(dep.clone()),
+                        root_target: Some(root.clone()),
                     });
                 }
             }
         }
+    }
+}
+
+/// When two `ScSpecUdtUnionCaseV0` values are both tuples with the same length
+/// and differ only in one inner type, produce a concise description of the
+/// innermost difference.  Returns `None` when the outer structures differ,
+/// signalling the caller to fall back to the full-signature form.
+fn describe_union_case_type_change(
+    old: &ScSpecUdtUnionCaseV0,
+    new: &ScSpecUdtUnionCaseV0,
+) -> Option<String> {
+    match (old, new) {
+        (ScSpecUdtUnionCaseV0::TupleV0(a), ScSpecUdtUnionCaseV0::TupleV0(b)) => {
+            let a_types: &[ScSpecTypeDef] = a.type_.as_ref();
+            let b_types: &[ScSpecTypeDef] = b.type_.as_ref();
+            if a_types.len() != b_types.len() {
+                return None;
+            }
+            for (i, (at, bt)) in a_types.iter().zip(b_types.iter()).enumerate() {
+                if at != bt {
+                    return describe_nested_type_change(at, bt).or_else(|| {
+                        Some(format!(
+                            "payload type at index {} changed from `{}` to `{}`",
+                            i,
+                            crate::mapper::type_to_string(at),
+                            crate::mapper::type_to_string(bt),
+                        ))
+                    });
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// When two `ScSpecTypeDef` values share the same container shape (e.g. both are
+/// `Vec`) and differ only in a type argument, produce a concise description of
+/// the innermost difference.  Returns `None` when the outer constructors
+/// themselves differ, signalling the caller to fall back to the full-signature
+/// form (e.g.  `"type changed from \`Map<Address, u32>\` to \`Map<Address, u64>\`"`).
+fn describe_nested_type_change(old: &ScSpecTypeDef, new: &ScSpecTypeDef) -> Option<String> {
+    if old == new {
+        return None;
+    }
+    match (old, new) {
+        (ScSpecTypeDef::Option(a), ScSpecTypeDef::Option(b)) => {
+            describe_nested_type_change(&a.value_type, &b.value_type).or_else(|| {
+                Some(format!(
+                    "the inner type of Option changed from `{}` to `{}`",
+                    crate::mapper::type_to_string(&a.value_type),
+                    crate::mapper::type_to_string(&b.value_type),
+                ))
+            })
+        }
+        (ScSpecTypeDef::Vec(a), ScSpecTypeDef::Vec(b)) => {
+            describe_nested_type_change(&a.element_type, &b.element_type).or_else(|| {
+                Some(format!(
+                    "the element type of Vec changed from `{}` to `{}`",
+                    crate::mapper::type_to_string(&a.element_type),
+                    crate::mapper::type_to_string(&b.element_type),
+                ))
+            })
+        }
+        (ScSpecTypeDef::Map(a), ScSpecTypeDef::Map(b)) => {
+            if a.key_type != b.key_type {
+                return describe_nested_type_change(&a.key_type, &b.key_type).or_else(|| {
+                    Some(format!(
+                        "the key type of Map changed from `{}` to `{}`",
+                        crate::mapper::type_to_string(&a.key_type),
+                        crate::mapper::type_to_string(&b.key_type),
+                    ))
+                });
+            }
+            describe_nested_type_change(&a.value_type, &b.value_type).or_else(|| {
+                Some(format!(
+                    "the value type of Map changed from `{}` to `{}`",
+                    crate::mapper::type_to_string(&a.value_type),
+                    crate::mapper::type_to_string(&b.value_type),
+                ))
+            })
+        }
+        (ScSpecTypeDef::Result(a), ScSpecTypeDef::Result(b)) => {
+            if a.ok_type != b.ok_type {
+                return describe_nested_type_change(&a.ok_type, &b.ok_type).or_else(|| {
+                    Some(format!(
+                        "the ok type of Result changed from `{}` to `{}`",
+                        crate::mapper::type_to_string(&a.ok_type),
+                        crate::mapper::type_to_string(&b.ok_type),
+                    ))
+                });
+            }
+            describe_nested_type_change(&a.error_type, &b.error_type).or_else(|| {
+                Some(format!(
+                    "the error type of Result changed from `{}` to `{}`",
+                    crate::mapper::type_to_string(&a.error_type),
+                    crate::mapper::type_to_string(&b.error_type),
+                ))
+            })
+        }
+        (ScSpecTypeDef::Tuple(a), ScSpecTypeDef::Tuple(b)) => {
+            let a_types: &[ScSpecTypeDef] = a.value_types.as_ref();
+            let b_types: &[ScSpecTypeDef] = b.value_types.as_ref();
+            if a_types.len() != b_types.len() {
+                return None;
+            }
+            for (i, (at, bt)) in a_types.iter().zip(b_types.iter()).enumerate() {
+                if at != bt {
+                    return describe_nested_type_change(at, bt).or_else(|| {
+                        Some(format!(
+                            "type at index {} of tuple changed from `{}` to `{}`",
+                            i,
+                            crate::mapper::type_to_string(at),
+                            crate::mapper::type_to_string(bt),
+                        ))
+                    });
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn describe_bytesn_size_change(old: &ScSpecTypeDef, new: &ScSpecTypeDef) -> Option<String> {
+    match (old, new) {
+        (ScSpecTypeDef::BytesN(a), ScSpecTypeDef::BytesN(b)) if a.n != b.n => {
+            Some(format!("size of BytesN changed from {} to {}", a.n, b.n))
+        }
+        _ => None,
+    }
+}
+
+fn union_case_bytesn_size_change(
+    old: &ScSpecUdtUnionCaseV0,
+    new: &ScSpecUdtUnionCaseV0,
+) -> Option<String> {
+    match (old, new) {
+        (ScSpecUdtUnionCaseV0::TupleV0(a), ScSpecUdtUnionCaseV0::TupleV0(b)) => {
+            let a_types: &[ScSpecTypeDef] = a.type_.as_ref();
+            let b_types: &[ScSpecTypeDef] = b.type_.as_ref();
+            if a_types.len() != b_types.len() {
+                return None;
+            }
+            for (i, (at, bt)) in a_types.iter().zip(b_types.iter()).enumerate() {
+                if let Some(msg) = describe_bytesn_size_change(at, bt) {
+                    return Some(format!("{} in payload type at index {}", msg, i));
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -1095,6 +1349,7 @@ mod tests {
                 .to_string(),
             type_name: Some("Child".to_string()),
             target: Some("Child".to_string()),
+            root_target: None,
         });
 
         // Run cascade detection against the old spec
@@ -1128,6 +1383,7 @@ mod tests {
             message: "Function 'do_stuff' was removed.".to_string(),
             type_name: None,
             target: Some("do_stuff".to_string()),
+            root_target: None,
         });
 
         detect_cascading_layout_breaks(&old, &mut report);
@@ -1492,5 +1748,298 @@ mod tests {
         let tf = type_finding.unwrap();
         assert_eq!(tf.severity, Severity::Critical);
         assert!(tf.message.contains("parameter 0 ('a') type changed")); // Index in old is 0
+    }
+
+    // ---------------------------------------------------------------
+    // describe_nested_type_change unit tests
+    // ---------------------------------------------------------------
+    #[test]
+    fn nested_type_change_option() {
+        let old = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+            value_type: ScSpecTypeDef::U32,
+        }));
+        let new = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+            value_type: ScSpecTypeDef::U64,
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some("the inner type of Option changed from `u32` to `u64`".to_string())
+        );
+    }
+
+    #[test]
+    fn nested_type_change_vec() {
+        let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+            element_type: ScSpecTypeDef::U32,
+        }));
+        let new = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+            element_type: ScSpecTypeDef::U64,
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some("the element type of Vec changed from `u32` to `u64`".to_string())
+        );
+    }
+
+    #[test]
+    fn nested_type_change_map_value() {
+        let old = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+            key_type: ScSpecTypeDef::Address,
+            value_type: ScSpecTypeDef::U32,
+        }));
+        let new = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+            key_type: ScSpecTypeDef::Address,
+            value_type: ScSpecTypeDef::U64,
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some(
+                "the value type of Map changed from `u32` to `u64`"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn nested_type_change_map_key() {
+        let old = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+            key_type: ScSpecTypeDef::Symbol,
+            value_type: ScSpecTypeDef::U32,
+        }));
+        let new = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+            key_type: ScSpecTypeDef::String,
+            value_type: ScSpecTypeDef::U32,
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some("the key type of Map changed from `Symbol` to `String`".to_string())
+        );
+    }
+
+    #[test]
+    fn nested_type_change_tuple() {
+        let make_tuple = |types: Vec<ScSpecTypeDef>| {
+            ScSpecTypeDef::Tuple(Box::new(stellar_xdr::curr::ScSpecTypeTuple {
+                value_types: stellar_xdr::curr::VecM::try_from(types).unwrap(),
+            }))
+        };
+        let old = make_tuple(vec![ScSpecTypeDef::U32, ScSpecTypeDef::U64]);
+        let new = make_tuple(vec![ScSpecTypeDef::U32, ScSpecTypeDef::I128]);
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some(
+                "type at index 1 of tuple changed from `u64` to `i128`"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn nested_type_change_deeply_nested() {
+        // Vec<Option<Map<Address, u32>>> -> Vec<Option<Map<Address, u64>>>
+        let inner_map = |value: ScSpecTypeDef| {
+            ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+                key_type: ScSpecTypeDef::Address,
+                value_type: value,
+            }))
+        };
+        let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+            element_type: ScSpecTypeDef::Option(Box::new(
+                stellar_xdr::curr::ScSpecTypeOption {
+                    value_type: inner_map(ScSpecTypeDef::U32),
+                },
+            )),
+        }));
+        let new = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+            element_type: ScSpecTypeDef::Option(Box::new(
+                stellar_xdr::curr::ScSpecTypeOption {
+                    value_type: inner_map(ScSpecTypeDef::U64),
+                },
+            )),
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some(
+                "the value type of Map changed from `u32` to `u64`"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn nested_type_change_outer_constructor_differs() {
+        // Vec<u32> -> Option<u32> — different outer constructors
+        let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+            element_type: ScSpecTypeDef::U32,
+        }));
+        let new = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+            value_type: ScSpecTypeDef::U32,
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(desc, None);
+    }
+
+    // ---------------------------------------------------------------
+    // Integration tests: type-change messages use concise format
+    // ---------------------------------------------------------------
+    #[test]
+    fn field_type_change_vec_shows_concise_message() {
+        let old = spec_with_structs(vec![("Data", vec![(
+            "values",
+            ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+                element_type: ScSpecTypeDef::U32,
+            })),
+        )])]);
+        let new = spec_with_structs(vec![("Data", vec![(
+            "values",
+            ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+                element_type: ScSpecTypeDef::U64,
+            })),
+        )])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Type Changed")
+            .expect("Expected field type change");
+        assert!(
+            fc.message.contains("the element type of Vec changed from `u32` to `u64`"),
+            "Message was: {}",
+            fc.message
+        );
+    }
+
+    #[test]
+    fn field_type_change_map_shows_concise_message() {
+        let make_map = |value: ScSpecTypeDef| {
+            ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+                key_type: ScSpecTypeDef::Address,
+                value_type: value,
+            }))
+        };
+        let old = spec_with_structs(vec![("Data", vec![("balances", make_map(ScSpecTypeDef::U32))])]);
+        let new = spec_with_structs(vec![("Data", vec![("balances", make_map(ScSpecTypeDef::U64))])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Type Changed")
+            .expect("Expected field type change");
+        assert!(
+            fc.message.contains("the value type of Map changed from `u32` to `u64`"),
+            "Message was: {}",
+            fc.message
+        );
+    }
+
+    #[test]
+    fn field_type_change_primitive_shows_full_message() {
+        // u32 -> i128 — primitive change, should use full fallback format
+        let old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::I128)])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Type Changed")
+            .expect("Expected field type change");
+        assert!(
+            fc.message.contains("type changed from `u32` to `i128`"),
+            "Message was: {}",
+            fc.message
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // BytesN size change unit tests
+    // ---------------------------------------------------------------
+    fn bytesn(n: u32) -> ScSpecTypeDef {
+        ScSpecTypeDef::BytesN(stellar_xdr::curr::ScSpecTypeBytesN { n })
+    }
+
+    #[test]
+    fn bytesn_size_change_detected() {
+        let desc = describe_bytesn_size_change(&bytesn(32), &bytesn(64));
+        assert_eq!(
+            desc,
+            Some("size of BytesN changed from 32 to 64".to_string())
+        );
+    }
+
+    #[test]
+    fn bytesn_same_size_no_change() {
+        let desc = describe_bytesn_size_change(&bytesn(32), &bytesn(32));
+        assert_eq!(desc, None);
+    }
+
+    #[test]
+    fn bytesn_to_unrelated_no_change() {
+        let desc = describe_bytesn_size_change(&bytesn(32), &ScSpecTypeDef::U64);
+        assert_eq!(desc, None);
+    }
+
+    #[test]
+    fn bytesn_struct_field_gets_specific_category() {
+        let old = spec_with_structs(vec![("Data", vec![("key", bytesn(32))])]);
+        let new = spec_with_structs(vec![("Data", vec![("key", bytesn(64))])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "BytesN Size Changed")
+            .expect("Expected a BytesN Size Changed finding");
+        assert!(
+            fc.message.contains("size of BytesN changed from 32 to 64"),
+            "Message was: {}",
+            fc.message
+        );
+        assert_eq!(fc.severity, Severity::Critical);
+        assert_eq!(fc.target.as_deref(), Some("Data.key"));
+    }
+
+    #[test]
+    fn bytesn_field_change_to_unrelated_uses_generic_category() {
+        let old = spec_with_structs(vec![("Data", vec![("key", bytesn(32))])]);
+        let new = spec_with_structs(vec![("Data", vec![("key", ScSpecTypeDef::String)])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Type Changed")
+            .expect("Expected generic Struct Field Type Changed");
+        assert!(
+            fc.message.contains("type changed from `BytesN<32>` to `String`"),
+            "Message was: {}",
+            fc.message
+        );
+    }
+
+    #[test]
+    fn bytesn_parameter_change_gets_specific_category() {
+        let old = spec_with_functions(vec![("test", vec![("x", bytesn(32))])]);
+        let new = spec_with_functions(vec![("test", vec![("x", bytesn(64))])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "BytesN Size Changed")
+            .expect("Expected a BytesN Size Changed finding");
+        assert!(
+            fc.message.contains("size of BytesN changed from 32 to 64"),
+            "Message was: {}",
+            fc.message
+        );
     }
 }
