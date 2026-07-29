@@ -165,6 +165,7 @@ mod tests {
     fn finding(category: &str, target: Option<&str>) -> Finding {
         Finding {
             severity: Severity::Critical,
+            axes: Vec::new(),
             category: category.to_string(),
             message: "irrelevant to matching".to_string(),
             type_name: target.map(|t| t.split('.').next().unwrap().to_string()),
