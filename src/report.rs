@@ -43,6 +43,8 @@ pub struct SafetyReport {
     pub new_spec_summary: Option<String>,
     pub scope: AnalysisScope,
     pub metrics: Option<BuildMetrics>,
+    pub empirical: bool,
+    pub empirical_findings: Vec<crate::empirical::EmpiricalFinding>,
 }
 
 /// Track what was analyzed in the report.
@@ -201,6 +203,8 @@ impl SafetyReport {
                 old_wasm_size, new_wasm_size,
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             )),
+            empirical: false,
+            empirical_findings: Vec::new(),
         }
     }
 
@@ -314,6 +318,8 @@ impl SafetyReport {
             new_spec_summary: None,
             scope: AnalysisScope::default(),
             metrics: None,
+            empirical: false,
+            empirical_findings: Vec::new(),
         }
     }
 
@@ -396,6 +402,8 @@ impl SafetyReport {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            empirical: self.empirical,
+            empirical_findings: self.empirical_findings.clone(),
         }
     }
 
