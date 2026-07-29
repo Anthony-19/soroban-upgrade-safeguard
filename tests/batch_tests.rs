@@ -244,3 +244,63 @@ fn batch_conflicting_options_exit_with_error() {
         "positional args + manifest must fail"
     );
 }
+
+#[test]
+fn batch_manifest_writes_per_contract_reports_to_output_dir() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("per_contract_reports");
+    let output_dir = tmp_dir.join("reports");
+    std::fs::create_dir_all(&tmp_dir).expect("failed to create tmp dir");
+
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "clean_contract"
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "breaking_contract"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v2.wasm").to_str().unwrap()
+    );
+
+    let manifest_path = write_manifest("manifest_per_contract.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--per-contract-output-dir")
+        .arg(&output_dir)
+        .output()
+        .expect("failed to run binary");
+
+    let code = output.status.code().expect("process terminated by signal");
+    assert_eq!(code, 1, "batch run with breaking contract must exit 1");
+
+    let clean_path = output_dir.join("clean_contract.txt");
+    let breaking_path = output_dir.join("breaking_contract.txt");
+
+    assert!(clean_path.exists(), "expected clean contract report file");
+    assert!(
+        breaking_path.exists(),
+        "expected breaking contract report file"
+    );
+
+    let clean_contents = std::fs::read_to_string(&clean_path).expect("failed to read clean report");
+    let breaking_contents =
+        std::fs::read_to_string(&breaking_path).expect("failed to read breaking report");
+
+    assert!(
+        clean_contents.contains("SOROBAN UPGRADE SAFETY REPORT"),
+        "clean report missing header"
+    );
+    assert!(
+        breaking_contents.contains("SOROBAN UPGRADE SAFETY REPORT"),
+        "breaking report missing header"
+    );
+}

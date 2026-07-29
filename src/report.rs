@@ -138,7 +138,16 @@ impl SafetyReport {
             metrics: Some(BuildMetrics::new(
                 old_wasm_size,
                 new_wasm_size,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
             )),
             unmatched_suppressions: Vec::new(),
             baseline_diff: None,
@@ -260,6 +269,87 @@ impl SafetyReport {
             is_safe,
             findings_by_category,
             strict,
+            settings,
+            scope: AnalysisScope::default(),
+            baseline_source: None,
+            verified_code_hash: None,
+            category_filter: CategoryFilter::default(),
+            old_spec_summary: None,
+            new_spec_summary: None,
+            old_contract_name: None,
+            old_contract_version: None,
+            new_contract_name: None,
+            new_contract_version: None,
+            metrics: None,
+            unmatched_suppressions,
+            baseline_diff: None,
+            diff_types: false,
+            use_color: false,
+            is_noop: false,
+        }
+    }
+
+    /// The passing status label, widened only as far as the analysis actually
+    /// went. Without a storage schema the claim stays bounded to the exported
+    /// interface; with one it may also speak to the declared storage types.
+    pub fn passed_status_label(&self) -> &'static str {
+        if self.scope.storage_analyzed() {
+            "✅ PASSED (No exported-interface or declared-storage breaks)"
+        } else {
+            "✅ PASSED (No exported-interface breaking changes)"
+        }
+    }
+
+    /// The failing status label, naming the scopes a break could have come from.
+    pub fn failed_status_label(&self) -> &'static str {
+        if self.scope.storage_analyzed() {
+            "❌ FAILED (Breaking changes detected in the exported interface or declared storage)"
+        } else {
+            "❌ FAILED (Exported-interface breaking changes detected)"
+        }
+    }
+
+    /// The sentence stating that a `[severity]` override changed the verdict,
+    /// or `None` when it did not.
+    ///
+    /// A tool that can be quietly reconfigured into always passing is worse than
+    /// no tool, so this is the one line that must appear, unhedged, in every
+    /// format whenever configuration — not analysis — decided the outcome.
+    pub fn override_verdict_notice(&self) -> Option<String> {
+        if !self.verdict_changed_by_override {
+            return None;
+        }
+        Some(if self.is_safe {
+            "VERDICT CHANGED BY CONFIG: this run passes only because the [severity] table \
+             lowered one or more findings. Without those overrides it would have FAILED."
+                .to_string()
+        } else {
+            "VERDICT CHANGED BY CONFIG: this run fails only because the [severity] table \
+             raised one or more findings. Without those overrides it would have PASSED."
+                .to_string()
+        })
+    }
+
+    /// The override notice rendered for text output, empty when not applicable.
+    fn override_verdict_notice_text(&self) -> String {
+        match self.override_verdict_notice() {
+            // Red rather than dimmed: a demotion that greens a failing gate is
+            // the case this line exists to make impossible to skim past.
+            Some(notice) => format!("{}\n", format!("⚠️  {notice}").red().bold()),
+            None => String::new(),
+        }
+    }
+
+    /// The `[SEVERITY: critical → warning]` tag for a finding whose severity an
+    /// override changed, or an empty string when it was left alone.
+    fn override_tag(reported: &ReportedFinding) -> String {
+        match &reported.original_severity {
+            Some(original) => format!(
+                "[SEVERITY {} → {}] ",
+                original.label(),
+                reported.finding.severity.label()
+            ),
+            None => String::new(),
             critical_root_count,
             cascade_critical_count,
         }
@@ -368,6 +458,66 @@ impl SafetyReport {
             "❌ FAILED (Critical breaking changes detected)"
                 .red()
                 .bold()
+        };
+        output.push_str(&format!("Status: {}\n", status));
+        // Show contract identity when available.
+        if self.old_contract_name.is_some()
+            || self.new_contract_name.is_some()
+            || self.old_contract_version.is_some()
+            || self.new_contract_version.is_some()
+        {
+            let old_label = contract_identity_label(
+                self.old_contract_name.as_deref(),
+                self.old_contract_version.as_deref(),
+            );
+            let new_label = contract_identity_label(
+                self.new_contract_name.as_deref(),
+                self.new_contract_version.as_deref(),
+            );
+            output.push_str(&format!("Contract: {} → {}\n", old_label, new_label));
+        }
+        output.push_str(&format!("Scope:  {}\n", self.scope.summary_line().dimmed()));
+        let storage_status = self.scope.storage_status_line();
+        let storage_status = if self.scope.storage_analyzed() {
+            storage_status.dimmed()
+        } else {
+            // No schema: make the "not analyzed" gap visible rather than dim.
+            storage_status.yellow()
+        };
+        output.push_str(&format!("        {}\n", storage_status));
+
+        // Spec-section integrity summary (non-zero section count or duplicates).
+        if self.scope.old_spec_section_count > 1 || self.scope.new_spec_section_count > 1 {
+            output.push_str(
+                &format!(
+                    "        Spec sections: old={}, new={} (multi-section WASMs detected)\n",
+                    self.scope.old_spec_section_count, self.scope.new_spec_section_count,
+                )
+                .yellow()
+                .to_string(),
+            );
+        }
+        let all_dups: Vec<String> = self
+            .scope
+            .old_duplicate_names
+            .iter()
+            .map(|n| format!("old:{n}"))
+            .chain(
+                self.scope
+                    .new_duplicate_names
+                    .iter()
+                    .map(|n| format!("new:{n}")),
+            )
+            .collect();
+        if !all_dups.is_empty() {
+            output.push_str(
+                &format!(
+                    "        Duplicate entries detected: {}\n",
+                    all_dups.join(", ")
+                )
+                .red()
+                .bold()
+                .to_string(),
             );
         }
         output.push_str(&format!("Status: {}\n", status));
@@ -409,6 +559,19 @@ impl SafetyReport {
         );
 
         if self.total_findings == 0 {
+            if self.is_noop {
+                output.push_str(
+                    &"No-op upgrade detected: the old and new WASM binaries are byte-identical.\n"
+                        .green()
+                        .bold()
+                        .to_string(),
+                );
+                output.push_str(&"The full analysis pipeline was skipped because there are no differences to report.\n".green().to_string());
+            } else {
+                output.push_str(&"No relevant changes detected. The exported interface is identical in its exports and types.\n".green().to_string());
+            }
+            output.push_str(&format!("\n{}\n", STORAGE_NOT_VERIFIED_NOTE.dimmed()));
+            self.append_metrics_text(&mut output);
             output.push_str(&"No relevant changes detected. The upgrade is identical in its exports and types.\n".green().to_string());
             return output;
         }
@@ -630,10 +793,14 @@ impl SafetyReport {
         output.push_str("---\n\n");
 
         if self.total_findings == 0 {
-            output.push_str("No relevant changes detected. The exported interface is identical in its exports and types.\n\n");
+            if self.is_noop {
+                output.push_str("**No-op upgrade detected**: the old and new WASM binaries are byte-identical.\n\n");
+                output.push_str("The full analysis pipeline was skipped because there are no differences to report.\n\n");
+            } else {
+                output.push_str("No relevant changes detected. The exported interface is identical in its exports and types.\n\n");
+            }
             output.push_str(&format!("> {}\n", STORAGE_NOT_VERIFIED_NOTE));
             self.append_metrics_markdown(&mut output);
-            output.push_str("No relevant changes detected. The upgrade is identical in its exports and types.\n");
             return output;
         }
 

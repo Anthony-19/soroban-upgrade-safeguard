@@ -116,6 +116,18 @@ struct Args {
     /// Directory containing the new versions of the contracts for directory comparison
     #[arg(long, value_name = "NEW_DIR", requires = "old_dir")]
     new_dir: Option<PathBuf>,
+
+    /// Directory to write one report file per contract into, using the selected format
+    #[arg(
+        long = "per-contract-output-dir",
+        alias = "report-dir",
+        alias = "output-dir",
+        alias = "per-contract-report-dir",
+        alias = "per-contract-reports-dir",
+        alias = "batch-output-dir",
+        value_name = "DIR"
+    )]
+    per_contract_output_dir: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -192,6 +204,7 @@ fn main() -> Result<()> {
 
         let mut results = std::collections::BTreeMap::new();
         let mut overall_safe = true;
+        let mut seen_names = std::collections::BTreeSet::new();
 
         for (i, pair) in pairs.iter().enumerate() {
             let default_name = format!("pair_{}", i + 1);
@@ -202,6 +215,13 @@ fn main() -> Result<()> {
                     .map(|n| n.to_string())
                     .unwrap_or(default_name)
             });
+
+            if !seen_names.insert(contract_name.clone()) {
+                anyhow::bail!(
+                    "Duplicate contract name '{}' found in batch input; names must be unique",
+                    contract_name
+                );
+            }
 
             progress(format!(
                 "📦 [{}/{}] Comparing contract pair: {}",
@@ -228,6 +248,11 @@ fn main() -> Result<()> {
 
             if !report.is_safe {
                 overall_safe = false;
+            }
+
+            let rendered_report = render_report(&report, args.format, args.explain)?;
+            if let Some(output_dir) = args.per_contract_output_dir.as_deref() {
+                write_report_file(output_dir, &contract_name, args.format, &rendered_report)?;
             }
 
             results.insert(contract_name, report);
@@ -596,4 +621,63 @@ fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>>
     }
 
     Ok(pairs)
+}
+
+fn render_report(
+    report: &report::SafetyReport,
+    format: OutputFormat,
+    explain: bool,
+) -> Result<String> {
+    match format {
+        OutputFormat::Json => Ok(serde_json::to_string_pretty(&report.to_json())?),
+        OutputFormat::Markdown => Ok(report.generate_summary_markdown()),
+        OutputFormat::Text => Ok(report.generate_summary_text(explain)),
+    }
+}
+
+fn write_report_file(
+    output_dir: &Path,
+    contract_name: &str,
+    format: OutputFormat,
+    content: &str,
+) -> Result<()> {
+    let filename = sanitize_report_filename(contract_name, format);
+    let output_path = output_dir.join(filename);
+    let temp_path = output_path.with_extension(format!(
+        "{}.tmp",
+        output_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("tmp")
+    ));
+
+    std::fs::create_dir_all(output_dir)?;
+    std::fs::write(&temp_path, content)?;
+    std::fs::rename(&temp_path, &output_path)?;
+    Ok(())
+}
+
+fn sanitize_report_filename(contract_name: &str, format: OutputFormat) -> PathBuf {
+    let mut sanitized = String::new();
+    for ch in contract_name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        sanitized = "contract".to_string();
+    }
+
+    let extension = match format {
+        OutputFormat::Json => "json",
+        OutputFormat::Markdown => "md",
+        OutputFormat::Text => "txt",
+    };
+
+    let mut path = PathBuf::from(sanitized);
+    path.set_extension(extension);
+    path
 }
