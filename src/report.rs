@@ -284,8 +284,14 @@ impl AnalysisScope {
 
     pub fn storage_status_line(&self) -> String {
         match &self.storage_schema {
-            StorageScopeState::Analyzed { key_types, value_types } => {
-                format!("Storage layout analyzed ({} key types, {} value types)", key_types, value_types)
+            StorageScopeState::Analyzed {
+                key_types,
+                value_types,
+            } => {
+                format!(
+                    "Storage layout analyzed ({} key types, {} value types)",
+                    key_types, value_types
+                )
             }
             StorageScopeState::NotAnalyzed => {
                 "Storage layout: NOT analyzed (use a storage schema manifest)".to_string()
@@ -298,7 +304,10 @@ impl AnalysisScope {
 #[derive(Debug, Clone)]
 pub enum StorageScopeState {
     NotAnalyzed,
-    Analyzed { key_types: usize, value_types: usize },
+    Analyzed {
+        key_types: usize,
+        value_types: usize,
+    },
 }
 
 impl Default for StorageScopeState {
@@ -400,8 +409,18 @@ impl SafetyReport {
             new_spec_summary: None,
             scope: AnalysisScope::default(),
             metrics: Some(BuildMetrics::new(
-                old_wasm_size, new_wasm_size,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                old_wasm_size,
+                new_wasm_size,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
             )),
         }
     }
@@ -584,8 +603,12 @@ impl SafetyReport {
             is_safe: self.is_safe,
             strict: self.strict,
             counts: SeverityCounts {
-                critical: self.critical_count.saturating_sub(self.suppressed_critical_count),
-                warning: self.warning_count.saturating_sub(self.suppressed_warning_count),
+                critical: self
+                    .critical_count
+                    .saturating_sub(self.suppressed_critical_count),
+                warning: self
+                    .warning_count
+                    .saturating_sub(self.suppressed_warning_count),
                 info: self.info_count.saturating_sub(self.suppressed_info_count),
             },
             suppressed_count: self.suppressed_count,
@@ -709,7 +732,13 @@ fn chrono_now_rfc3339() -> String {
 
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        year, month, day, hour, minute, second, nanos / 1_000_000
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        nanos / 1_000_000
     )
 }
 
@@ -756,8 +785,11 @@ mod tests {
                         if !literal.is_empty() {
                             if literal.contains("{}") {
                                 let suffixes = vec![
-                                    "Removed", "Reordered", "Type Changed",
-                                    "Value Changed", "Added",
+                                    "Removed",
+                                    "Reordered",
+                                    "Type Changed",
+                                    "Value Changed",
+                                    "Added",
                                 ];
                                 for suffix in suffixes {
                                     if literal == format!("{{}} {}", suffix) {
@@ -769,8 +801,10 @@ mod tests {
                                                 vec!["Enum Case", "Event Enum Case"]
                                             }
                                             "Removed" => vec![
-                                                "Struct Field", "Event Field",
-                                                "Enum Case", "Event Enum Case",
+                                                "Struct Field",
+                                                "Event Field",
+                                                "Enum Case",
+                                                "Event Enum Case",
                                             ],
                                             _ => unreachable!(),
                                         };
@@ -864,7 +898,10 @@ mod tests {
         report.findings_by_category.clear();
         report.findings_by_category.insert(
             "Function Documentation Changed".to_string(),
-            vec![make_finding(Severity::Info, "Function Documentation Changed")],
+            vec![make_finding(
+                Severity::Info,
+                "Function Documentation Changed",
+            )],
         );
         assert_eq!(report.recommended_bump(), "patch");
 
@@ -891,7 +928,8 @@ mod tests {
         diff.findings.push(Finding {
             severity: Severity::Critical,
             category: "Cascading Layout Break".to_string(),
-            message: "Type 'Outer' layout is broken because it embeds modified type 'Data'".to_string(),
+            message: "Type 'Outer' layout is broken because it embeds modified type 'Data'"
+                .to_string(),
             type_name: Some("Outer".to_string()),
             target: Some("Outer".to_string()),
             root_target: Some("Data".to_string()),

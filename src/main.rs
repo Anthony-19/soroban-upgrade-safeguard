@@ -44,7 +44,9 @@ impl std::str::FromStr for OutputFormat {
             "text" => Ok(OutputFormat::Text),
             "json" => Ok(OutputFormat::Json),
             "markdown" | "md" => Ok(OutputFormat::Markdown),
-            _ => Err(format!("Unknown format '{s}'. Supported: text, json, markdown")),
+            _ => Err(format!(
+                "Unknown format '{s}'. Supported: text, json, markdown"
+            )),
         }
     }
 }
@@ -63,7 +65,6 @@ impl OutputFormat {
 /// When `path` is `None`, output goes to stdout.
 #[derive(Clone, Debug)]
 struct OutputSpec {
-
     format: OutputFormat,
     path: Option<PathBuf>,
 }
@@ -73,26 +74,18 @@ impl std::str::FromStr for OutputSpec {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Some((fmt, path)) = s.split_once(':') {
-            let format: OutputFormat =
-                fmt.parse().map_err(|_| {
-                    format!(
-                        "Invalid format '{fmt}'. Supported: text, json, markdown"
-                    )
-                })?;
+            let format: OutputFormat = fmt
+                .parse()
+                .map_err(|_| format!("Invalid format '{fmt}'. Supported: text, json, markdown"))?;
             Ok(OutputSpec {
                 format,
                 path: Some(PathBuf::from(path)),
             })
         } else {
             let format: OutputFormat = s.parse().map_err(|_| {
-                format!(
-                    "Invalid format '{s}'. Use 'format:path' or one of: text, json, markdown"
-                )
+                format!("Invalid format '{s}'. Use 'format:path' or one of: text, json, markdown")
             })?;
-            Ok(OutputSpec {
-                format,
-                path: None,
-            })
+            Ok(OutputSpec { format, path: None })
         }
     }
 }
@@ -424,10 +417,8 @@ fn main() -> Result<()> {
     } else {
         match &args.config {
             Some(path) => SuppressionConfig::load_from_path(path)?,
-            None => {
-                SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?
-                    .unwrap_or_default()
-            }
+            None => SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?
+                .unwrap_or_default(),
         }
     };
 
@@ -533,11 +524,26 @@ fn run_batch(
             },
         };
 
-        render_to_outputs(&gap_report, outputs, args.explain, Some(&gap.name), progress)?;
+        render_to_outputs(
+            &gap_report,
+            outputs,
+            args.explain,
+            Some(&gap.name),
+            progress,
+        )?;
 
         if let Some(output_dir) = args.per_contract_output_dir.as_deref() {
-            let content = render_single(&gap_report, args.format.unwrap_or(OutputFormat::Text), args.explain)?;
-            write_report_file(output_dir, &gap.name, args.format.unwrap_or(OutputFormat::Text), &content)?;
+            let content = render_single(
+                &gap_report,
+                args.format.unwrap_or(OutputFormat::Text),
+                args.explain,
+            )?;
+            write_report_file(
+                output_dir,
+                &gap.name,
+                args.format.unwrap_or(OutputFormat::Text),
+                &content,
+            )?;
         }
 
         results.insert(gap.name, gap_report);
@@ -591,7 +597,12 @@ fn run_batch(
                             contract_name,
                             e.to_string().red()
                         ));
-                        synthesize_error_report(&contract_name, &e.to_string(), args.strict, args.no_timestamp)
+                        synthesize_error_report(
+                            &contract_name,
+                            &e.to_string(),
+                            args.strict,
+                            args.no_timestamp,
+                        )
                     }
                 }
             }
@@ -601,7 +612,12 @@ fn run_batch(
                     contract_name,
                     e.to_string().red()
                 ));
-                synthesize_error_report(&contract_name, &e.to_string(), args.strict, args.no_timestamp)
+                synthesize_error_report(
+                    &contract_name,
+                    &e.to_string(),
+                    args.strict,
+                    args.no_timestamp,
+                )
             }
         };
 
@@ -609,18 +625,40 @@ fn run_batch(
             overall_safe = false;
         }
 
-        render_to_outputs(&report, outputs, args.explain, Some(&contract_name), progress)?;
+        render_to_outputs(
+            &report,
+            outputs,
+            args.explain,
+            Some(&contract_name),
+            progress,
+        )?;
 
         if let Some(output_dir) = args.per_contract_output_dir.as_deref() {
-            let content = render_single(&report, args.format.unwrap_or(OutputFormat::Text), args.explain)?;
-            write_report_file(output_dir, &contract_name, args.format.unwrap_or(OutputFormat::Text), &content)?;
+            let content = render_single(
+                &report,
+                args.format.unwrap_or(OutputFormat::Text),
+                args.explain,
+            )?;
+            write_report_file(
+                output_dir,
+                &contract_name,
+                args.format.unwrap_or(OutputFormat::Text),
+                &content,
+            )?;
         }
 
         results.insert(contract_name, report);
         progress("\n----------------------------------------\n".to_string());
     }
 
-    render_batch_summary(&results, overall_safe, total, args.strict, outputs, progress)?;
+    render_batch_summary(
+        &results,
+        overall_safe,
+        total,
+        args.strict,
+        outputs,
+        progress,
+    )?;
 
     if !overall_safe {
         std::process::exit(1);
@@ -629,7 +667,12 @@ fn run_batch(
     Ok(())
 }
 
-fn synthesize_error_report(name: &str, error_message: &str, strict: bool, no_timestamp: bool) -> report::SafetyReport {
+fn synthesize_error_report(
+    name: &str,
+    error_message: &str,
+    strict: bool,
+    no_timestamp: bool,
+) -> report::SafetyReport {
     report::SafetyReport {
         critical_count: 1,
         warning_count: 0,
@@ -711,15 +754,24 @@ fn render_batch_summary(
                 };
                 markdown.push_str(&format!("## Status: {}\n\n", status));
                 markdown.push_str("### Summary\n\n");
-                markdown.push_str("| Contract | Status | Critical | Warning | Info | Suppressed |\n");
+                markdown
+                    .push_str("| Contract | Status | Critical | Warning | Info | Suppressed |\n");
                 markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
 
                 for (name, report) in results {
-                    let status_str = if report.is_safe() { "✅ PASSED" } else { "❌ FAILED" };
+                    let status_str = if report.is_safe() {
+                        "✅ PASSED"
+                    } else {
+                        "❌ FAILED"
+                    };
                     markdown.push_str(&format!(
                         "| {} | {} | {} | {} | {} | {} |\n",
-                        name, status_str, report.critical_count(), report.warning_count(),
-                        report.info_count(), report.suppressed_count()
+                        name,
+                        status_str,
+                        report.critical_count(),
+                        report.warning_count(),
+                        report.info_count(),
+                        report.suppressed_count()
                     ));
                 }
 
@@ -744,7 +796,10 @@ fn render_batch_summary(
                 let status = if overall_safe {
                     "✅ PASSED (All contracts safe)".green().bold().to_string()
                 } else {
-                    "❌ FAILED (Some contracts have breaking changes)".red().bold().to_string()
+                    "❌ FAILED (Some contracts have breaking changes)"
+                        .red()
+                        .bold()
+                        .to_string()
                 };
                 text.push_str(&format!("Overall Status: {}\n\n", status));
 
@@ -780,7 +835,10 @@ fn render_batch_summary(
 
         emit_output(output, &content)?;
         if output.path.is_none() && output.format != OutputFormat::Text {
-            progress(format!("  {} batch report written to stdout", output.format.to_string().to_lowercase()));
+            progress(format!(
+                "  {} batch report written to stdout",
+                output.format.to_string().to_lowercase()
+            ));
         } else if let Some(path) = &output.path {
             progress(format!("  batch report written to {}", path.display()));
         }
@@ -909,7 +967,9 @@ fn run_single(
     if args.watch && !watch_paths.is_empty() {
         run_watch_mode(&watch_paths, args, outputs, suppressions, run_comparison)?;
     } else if args.watch {
-        eprintln!("Warning: --watch requires local file paths (stdin or RPC sources not supported)");
+        eprintln!(
+            "Warning: --watch requires local file paths (stdin or RPC sources not supported)"
+        );
     }
 
     if !is_safe {
@@ -944,7 +1004,11 @@ fn render_to_outputs(
     Ok(())
 }
 
-fn render_single(report: &report::SafetyReport, format: OutputFormat, explain: bool) -> Result<String> {
+fn render_single(
+    report: &report::SafetyReport,
+    format: OutputFormat,
+    explain: bool,
+) -> Result<String> {
     match format {
         OutputFormat::Json => Ok(serde_json::to_string_pretty(&report.to_json())?),
         OutputFormat::Markdown => Ok(report.generate_summary_markdown()),
@@ -1169,8 +1233,9 @@ fn compare_contracts(
         &mut diff_report,
     );
 
-    let mut report = report::SafetyReport::with_suppressions(&diff_report, suppressions, *explain, *strict)
-        .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash());
+    let mut report =
+        report::SafetyReport::with_suppressions(&diff_report, suppressions, *explain, *strict)
+            .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash());
 
     report.no_timestamp = *no_timestamp;
 
@@ -1200,7 +1265,10 @@ struct GapContract {
     old_path: PathBuf,
 }
 
-fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<(Vec<ContractPair>, Vec<GapContract>)> {
+fn scan_directories(
+    old_dir: &Path,
+    new_dir: &Path,
+) -> Result<(Vec<ContractPair>, Vec<GapContract>)> {
     if !old_dir.is_dir() {
         anyhow::bail!("Old directory '{}' is not a directory", old_dir.display());
     }
@@ -1234,10 +1302,7 @@ fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<(Vec<ContractPair>
     }
 
     if pairs.is_empty() && gaps.is_empty() {
-        anyhow::bail!(
-            "No .wasm files found in '{}'",
-            old_dir.display()
-        );
+        anyhow::bail!("No .wasm files found in '{}'", old_dir.display());
     }
 
     Ok((pairs, gaps))

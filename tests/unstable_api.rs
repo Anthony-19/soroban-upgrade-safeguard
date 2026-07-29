@@ -75,7 +75,7 @@ fn test_unstable_contract_spec_diff() {
     // 1. Setup mock old and new contract specs
     let old_spec = ContractSpec::default();
     let mut new_spec = ContractSpec::default();
-    
+
     // 2. Create a mock function definition
     let func = stellar_xdr::curr::ScSpecFunctionV0 {
         doc: stellar_xdr::curr::StringM::default(),
@@ -83,18 +83,21 @@ fn test_unstable_contract_spec_diff() {
         inputs: stellar_xdr::curr::VecM::default(),
         outputs: stellar_xdr::curr::VecM::default(),
     };
-    
+
     new_spec.functions.insert("hello".to_string(), func);
-    
+
     // 3. Run unstable comparison
     let diff_report = compare(&old_spec, &new_spec);
 
     assert!(!diff_report.findings.is_empty());
-    
+
     let finding = &diff_report.findings[0];
     assert_eq!(finding.category(), "Function Added");
     assert_eq!(finding.target(), Some("hello"));
-    assert_eq!(*finding.severity(), soroban_upgrade_safeguard::diff::Severity::Info);
+    assert_eq!(
+        *finding.severity(),
+        soroban_upgrade_safeguard::diff::Severity::Info
+    );
 }
 
 #[test]
@@ -102,7 +105,7 @@ fn test_unstable_suppression_config_construction() {
     use soroban_upgrade_safeguard::suppression::{SuppressionConfig, SuppressionRule};
 
     let mut config = SuppressionConfig::default();
-    
+
     let mut rule = SuppressionRule::default();
     rule.category = "Function Removed".to_string();
     rule.target = Some("old_fn".to_string());
@@ -110,9 +113,9 @@ fn test_unstable_suppression_config_construction() {
     rule.reason = Some("Legacy function cleanup".to_string());
     rule.expiry = Some("2026-12-31".to_string());
     rule.fingerprint = Some("abc123hex".to_string());
-    
+
     config.rules.push(rule);
-    
+
     assert_eq!(config.rules().len(), 1);
     let rule_ref = &config.rules()[0];
     assert_eq!(rule_ref.category(), "Function Removed");
