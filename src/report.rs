@@ -211,7 +211,16 @@ impl SafetyReport {
             metrics: Some(BuildMetrics::new(
                 old_wasm_size,
                 new_wasm_size,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
             )),
             unmatched_suppressions: Vec::new(),
             baseline_diff: None,
@@ -312,7 +321,7 @@ impl SafetyReport {
         }
     }
 
-/// The passing status label, widened only as far as the analysis actually
+    /// The passing status label, widened only as far as the analysis actually
     /// went. Without a storage schema the claim stays bounded to the exported
     /// interface; with one it may also speak to the declared storage types.
     pub fn passed_status_label(&self) -> &'static str {
@@ -453,7 +462,8 @@ impl SafetyReport {
             "❌ FAILED (Warnings detected in strict mode)".red().bold()
         } else {
             "❌ FAILED (Critical breaking changes detected)"
-            self.failed_status_label().red().bold()
+                .red()
+                .bold()
         };
         output.push_str(&format!("Status: {}\n", status));
         // Show contract identity when available.
@@ -513,7 +523,9 @@ impl SafetyReport {
                 )
                 .red()
                 .bold()
-        };
+                .to_string(),
+            );
+        }
         output.push_str(&format!("Status: {}\n", status));
 
         let crit_str = if self.critical_count > 0 {
@@ -553,7 +565,12 @@ impl SafetyReport {
 
         if self.total_findings == 0 {
             if self.is_noop {
-                output.push_str(&"No-op upgrade detected: the old and new WASM binaries are byte-identical.\n".green().bold().to_string());
+                output.push_str(
+                    &"No-op upgrade detected: the old and new WASM binaries are byte-identical.\n"
+                        .green()
+                        .bold()
+                        .to_string(),
+                );
                 output.push_str(&"The full analysis pipeline was skipped because there are no differences to report.\n".green().to_string());
             } else {
                 output.push_str(&"No relevant changes detected. The exported interface is identical in its exports and types.\n".green().to_string());
@@ -689,14 +706,6 @@ impl SafetyReport {
         ));
         output.push_str("---\n\n");
 
-        if self.total_findings == 0 {
-            if self.is_noop {
-                output.push_str("**No-op upgrade detected**: the old and new WASM binaries are byte-identical.\n\n");
-                output.push_str("The full analysis pipeline was skipped because there are no differences to report.\n");
-            } else {
-                output.push_str("No relevant changes detected. The exported interface is identical in its exports and types.\n");
-            }
-
         if let Some(source) = &self.baseline_source {
             output.push_str(&format!("**Baseline Source**: `{}`\n\n", source));
         }
@@ -721,10 +730,14 @@ impl SafetyReport {
         output.push_str("---\n\n");
 
         if self.total_findings == 0 {
-            output.push_str("No relevant changes detected. The exported interface is identical in its exports and types.\n\n");
+            if self.is_noop {
+                output.push_str("**No-op upgrade detected**: the old and new WASM binaries are byte-identical.\n\n");
+                output.push_str("The full analysis pipeline was skipped because there are no differences to report.\n\n");
+            } else {
+                output.push_str("No relevant changes detected. The exported interface is identical in its exports and types.\n\n");
+            }
             output.push_str(&format!("> {}\n", STORAGE_NOT_VERIFIED_NOTE));
             self.append_metrics_markdown(&mut output);
-            output.push_str("No relevant changes detected. The upgrade is identical in its exports and types.\n");
             return output;
         }
 
