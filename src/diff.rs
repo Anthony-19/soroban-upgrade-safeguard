@@ -23,14 +23,34 @@ pub enum Severity {
 /// A single finding from the comparison analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
+    #[cfg(feature = "unstable")]
     pub severity: Severity,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) severity: Severity,
+
+    #[cfg(feature = "unstable")]
     pub category: String,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) category: String,
+
+    #[cfg(feature = "unstable")]
     pub message: String,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) message: String,
+
     /// The name of the affected UDT (struct/enum/union), if this finding
     /// relates to a specific type.  Used by cascade-detection so it never
     /// needs to re-parse `message`.
     #[serde(default)]
+    #[cfg(feature = "unstable")]
     pub type_name: Option<String>,
+    /// The name of the affected UDT (struct/enum/union), if this finding
+    /// relates to a specific type.  Used by cascade-detection so it never
+    /// needs to re-parse `message`.
+    #[serde(default)]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) type_name: Option<String>,
+
     /// A stable, structured identifier for the exact entity this finding is
     /// about, independent of the human-readable `message`. It is the key used
     /// by the suppression config to match a finding precisely:
@@ -44,10 +64,64 @@ pub struct Finding {
     /// `None` for findings that are not tied to a single named entity (for
     /// example environment-metadata changes).
     #[serde(default)]
+    #[cfg(feature = "unstable")]
     pub target: Option<String>,
+    /// A stable, structured identifier for the exact entity this finding is
+    /// about, independent of the human-readable `message`. It is the key used
+    /// by the suppression config to match a finding precisely:
+    ///
+    /// - functions: the function name (e.g. `transfer`)
+    /// - function parameters: `function.param` (e.g. `transfer.to`)
+    /// - types (struct/enum removed/added, cascades): the type name (e.g. `Data`)
+    /// - struct fields: `Type.field` (e.g. `Data.amount`)
+    /// - enum cases: `Enum.case` (e.g. `Status.Active`)
+    ///
+    /// `None` for findings that are not tied to a single named entity (for
+    /// example environment-metadata changes).
+    #[serde(default)]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) target: Option<String>,
+
     /// For cascade findings, the `target` of the root cause finding.
     /// `None` for direct (non-cascade) findings.
+    #[cfg(feature = "unstable")]
     pub root_target: Option<String>,
+    /// For cascade findings, the `target` of the root cause finding.
+    /// `None` for direct (non-cascade) findings.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) root_target: Option<String>,
+}
+
+impl Finding {
+    /// Get the severity of the finding.
+    pub fn severity(&self) -> &Severity {
+        &self.severity
+    }
+
+    /// Get the category of the finding.
+    pub fn category(&self) -> &str {
+        &self.category
+    }
+
+    /// Get the message of the finding.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Get the type name associated with this finding, if any.
+    pub fn type_name(&self) -> Option<&str> {
+        self.type_name.as_deref()
+    }
+
+    /// Get the stable, structured target identifier of the finding, if any.
+    pub fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
+    /// Get the root target of the cascading break, if any.
+    pub fn root_target(&self) -> Option<&str> {
+        self.root_target.as_deref()
+    }
 }
 
 /// Holds all findings from a comparison of two contract specs.

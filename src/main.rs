@@ -617,7 +617,7 @@ fn run_batch(
             }
         };
 
-        if !report.is_safe {
+        if !report.is_safe() {
             overall_safe = false;
         }
 
@@ -727,11 +727,11 @@ fn render_batch_summary(
                 markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
 
                 for (name, report) in results {
-                    let status_str = if report.is_safe { "✅ PASSED" } else { "❌ FAILED" };
+                    let status_str = if report.is_safe() { "✅ PASSED" } else { "❌ FAILED" };
                     markdown.push_str(&format!(
                         "| {} | {} | {} | {} | {} | {} |\n",
-                        name, status_str, report.critical_count, report.warning_count,
-                        report.info_count, report.suppressed_count
+                        name, status_str, report.critical_count(), report.warning_count(),
+                        report.info_count(), report.suppressed_count()
                     ));
                 }
 
@@ -762,7 +762,7 @@ fn render_batch_summary(
 
                 text.push_str("Summary of Contracts:\n");
                 for (name, report) in results {
-                    let status_str = if report.is_safe {
+                    let status_str = if report.is_safe() {
                         "✅ PASSED".green().to_string()
                     } else {
                         "❌ FAILED".red().bold().to_string()
@@ -771,10 +771,10 @@ fn render_batch_summary(
                         "  - {}: {} ({} critical, {} warnings, {} info, {} suppressed)\n",
                         name.bold(),
                         status_str,
-                        report.critical_count,
-                        report.warning_count,
-                        report.info_count,
-                        report.suppressed_count
+                        report.critical_count(),
+                        report.warning_count(),
+                        report.info_count(),
+                        report.suppressed_count()
                     ));
                 }
 
@@ -913,7 +913,7 @@ fn run_single(
 
         render_to_outputs(&safety_report, outputs, args.explain, None, progress)?;
 
-        let is_safe = safety_report.is_safe;
+        let is_safe = safety_report.is_safe();
         if !is_safe {
             return Ok(false);
         }
