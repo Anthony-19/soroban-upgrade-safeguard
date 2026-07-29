@@ -1,21 +1,71 @@
+#[cfg(feature = "unstable")]
 pub mod color;
+#[cfg(not(feature = "unstable"))]
+mod color;
+
+#[cfg(feature = "unstable")]
 pub mod diff;
+#[cfg(not(feature = "unstable"))]
+mod diff;
+
+#[cfg(feature = "unstable")]
 pub mod error;
+#[cfg(not(feature = "unstable"))]
+mod error;
+
+#[cfg(feature = "unstable")]
 pub mod interface_hash;
+#[cfg(not(feature = "unstable"))]
+mod interface_hash;
+
+#[cfg(feature = "unstable")]
 pub mod loader;
+#[cfg(not(feature = "unstable"))]
+mod loader;
+
+#[cfg(feature = "unstable")]
 pub mod mapper;
+#[cfg(not(feature = "unstable"))]
+mod mapper;
+
+#[cfg(feature = "unstable")]
 pub mod parser;
+#[cfg(not(feature = "unstable"))]
+mod parser;
+
+#[cfg(feature = "unstable")]
 pub mod render;
+#[cfg(not(feature = "unstable"))]
+mod render;
+
+#[cfg(feature = "unstable")]
 pub mod report;
+#[cfg(not(feature = "unstable"))]
+mod report;
+
+#[cfg(feature = "unstable")]
 pub mod spec;
+#[cfg(not(feature = "unstable"))]
+mod spec;
+
+#[cfg(feature = "unstable")]
 pub mod spec_json;
+#[cfg(not(feature = "unstable"))]
+mod spec_json;
+
+#[cfg(feature = "unstable")]
 pub mod suppression;
+#[cfg(not(feature = "unstable"))]
+mod suppression;
+
+// Stable public API exports at the root
+pub use crate::diff::{Finding, Severity};
+pub use crate::report::{ReportedFinding, SafetyReport};
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::report::SafetyReport;
 use crate::spec::ContractSpec;
 use crate::suppression::SuppressionConfig;
 

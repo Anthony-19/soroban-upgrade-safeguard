@@ -63,7 +63,6 @@ impl OutputFormat {
 /// When `path` is `None`, output goes to stdout.
 #[derive(Clone, Debug)]
 struct OutputSpec {
-
     format: OutputFormat,
     path: Option<PathBuf>,
 }
@@ -119,7 +118,8 @@ enum RenderFormat {
                       soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]\n       \
                       soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]\n       \
                       soroban-upgrade-safeguard extract <WASM> [OPTIONS]\n       \
-                      soroban-upgrade-safeguard render <REPORT_JSON> [OPTIONS]",
+                      soroban-upgrade-safeguard render <REPORT_JSON> [OPTIONS]\n       \
+                      soroban-upgrade-safeguard init [OPTIONS]",
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
 )]
@@ -220,6 +220,14 @@ struct Args {
     /// Suppress timestamps in report output for deterministic/snapshot testing
     #[arg(long)]
     no_timestamp: bool,
+
+    /// Sample storage entries and perform empirical validation.
+    #[arg(long)]
+    empirical: bool,
+
+    /// Path to a JSON file containing captured ledger/storage entries for offline validation.
+    #[arg(long, value_name = "EMPIRICAL_FILE")]
+    empirical_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -228,6 +236,8 @@ enum Command {
     Extract(ExtractArgs),
     /// Re-render a previously saved JSON report in another format
     Render(RenderArgs),
+    /// Generate a suppression config from current findings
+    Init(InitArgs),
 }
 
 /// `extract`: decode one build and emit its interface.
@@ -269,6 +279,30 @@ struct RenderArgs {
     /// Do not color output
     #[arg(long)]
     no_color: bool,
+}
+
+/// `init`: generate a suppression config from current findings.
+#[derive(ClapArgs, Debug)]
+struct InitArgs {
+    /// Overwrite existing .safeguard.toml if it exists
+    #[arg(long)]
+    force: bool,
+
+    /// Path to the old WASM file (or contract ID with --rpc-url)
+    #[arg(value_name = "OLD")]
+    old: Option<PathBuf>,
+
+    /// Path to the new WASM file
+    #[arg(value_name = "NEW")]
+    new: Option<PathBuf>,
+
+    /// Stellar/Soroban Contract ID to fetch from on-chain (e.g. C...)
+    #[arg(long, value_name = "CONTRACT_ID", requires = "rpc_url")]
+    contract_id: Option<String>,
+
+    /// Stellar RPC URL (e.g. https://soroban-testnet.stellar.org)
+    #[arg(long, value_name = "RPC_URL", requires = "contract_id")]
+    rpc_url: Option<String>,
 }
 
 /// Decode one build and emit its interface as JSON, or just its hash.
@@ -344,12 +378,141 @@ fn run_render(args: &RenderArgs) -> Result<()> {
     Ok(())
 }
 
+/// Generate a suppression config from current findings.
+fn run_init(args: &InitArgs) -> Result<()> {
+    use std::fs;
+    use std::io::Write;
+
+    let config_path = Path::new(DEFAULT_CONFIG_FILE);
+
+    // Check if config already exists
+    if config_path.exists() && !args.force {
+        anyhow::bail!(
+            "{} already exists. Use --force to overwrite.",
+            config_path.display()
+        );
+    }
+
+    // Determine old and new sources
+    let (old_source, new_source) = match (&args.old, &args.new, &args.contract_id) {
+        (Some(old), Some(new), None) => (Ok(loader::load_wasm(old)?), Ok(loader::load_wasm(new)?)),
+        (None, Some(new), Some(contract_id)) => {
+            let rpc_url = args
+                .rpc_url
+                .as_ref()
+                .expect("clap requires --rpc-url alongside --contract-id");
+            (
+                loader::fetch_wasm_from_rpc(contract_id, rpc_url),
+                loader::load_wasm(new),
+            )
+        }
+        (Some(_), Some(_), Some(_)) => anyhow::bail!(
+            "Provide either WASM paths or --contract-id, not both.\n\n\
+             Usage: soroban-upgrade-safeguard init <OLD_WASM> <NEW_WASM>\n       \
+             soroban-upgrade-safeguard init --contract-id <ID> --rpc-url <URL> <NEW_WASM>"
+        ),
+        _ => anyhow::bail!(
+            "Missing WASM paths.\n\n\
+             Usage: soroban-upgrade-safeguard init <OLD_WASM> <NEW_WASM>\n       \
+             soroban-upgrade-safeguard init --contract-id <ID> --rpc-url <URL> <NEW_WASM>"
+        ),
+    };
+
+    let old = old_source?;
+    let new = new_source?;
+
+    // Extract metadata and compare
+    let old_meta = parser::extract_metadata(&old.bytes)?;
+    let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
+
+    let new_meta = parser::extract_metadata(&new.bytes)?;
+    let new_spec = spec::ContractSpec::from_entries(&new_meta.spec);
+
+    // Generate diff
+    let diff_report = diff::compare(&old_spec, &new_spec);
+
+    // Collect unsuppressed findings (with empty suppression config)
+    let empty_suppressions = SuppressionConfig::default();
+    let safety_report =
+        report::SafetyReport::with_suppressions(&diff_report, &empty_suppressions, false, false);
+
+    // Extract findings from the report
+    let mut findings: Vec<(String, String)> = Vec::new();
+
+    // Extract from findings_by_category
+    for (category, reported_findings) in safety_report.findings_by_category.iter() {
+        for finding in reported_findings {
+            // Skip suppressed findings (none will be suppressed with empty config)
+            if !finding.suppressed {
+                let target = finding
+                    .finding
+                    .target
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                findings.push((category.clone(), target));
+            }
+        }
+    }
+
+    // Generate config content
+    let mut content = String::new();
+    content.push_str("# Auto-generated suppression config\n");
+    content.push_str("# This file was generated by `soroban-upgrade-safeguard init`.\n");
+    content.push_str("# Each suppression entry requires a reason to be filled in.\n");
+    content.push_str("# Remove the '#' to uncomment and activate each suppression.\n\n");
+
+    if findings.is_empty() {
+        content.push_str("# No findings found. Your contracts are compatible!\n");
+        content.push_str("# No suppression entries needed.\n");
+    } else {
+        content.push_str(
+            "# Suppressions are commented out by default. Edit this file and\n",
+        );
+        content.push_str(
+            "# remove the '#' before each [[suppress]] block you want to apply.\n\n",
+        );
+
+        for (category, target) in &findings {
+            content.push_str(&format!(
+                "# [[suppress]]\n\
+                 # category = \"{}\"\n\
+                 # target = \"{}\"\n\
+                 # reason = \"TODO: Add justification for suppressing this rule.\"\n\n",
+                category, target
+            ));
+        }
+    }
+
+    // Write the file
+    let mut file = fs::File::create(config_path)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+
+    println!("✅ Generated {}", config_path.display());
+    println!(
+        "📝 Found {} finding(s) requiring attention",
+        findings.len()
+    );
+    if findings.is_empty() {
+        println!("🎉 No compatibility issues detected. No suppressions needed.");
+    } else {
+        println!(
+            "📝 Please edit {} and add a valid reason for each suppression entry you want to apply.",
+            config_path.display()
+        );
+        println!("   Remove the '#' before each [[suppress]] block to activate it.");
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
     match &args.command {
         Some(Command::Extract(extract_args)) => return run_extract(extract_args),
         Some(Command::Render(render_args)) => return run_render(render_args),
+        Some(Command::Init(init_args)) => return run_init(init_args),
         None => {}
     }
 
@@ -597,6 +760,10 @@ fn run_batch(
                         explain: args.explain,
                         strict: args.strict,
                         no_timestamp: args.no_timestamp,
+                        empirical: args.empirical || args.empirical_file.is_some(),
+                        empirical_file: args.empirical_file.as_deref(),
+                        contract_id: None,
+                        rpc_url: None,
                     },
                     progress,
                 ) {
@@ -621,7 +788,7 @@ fn run_batch(
             }
         };
 
-        if !report.is_safe {
+        if !report.is_safe() {
             overall_safe = false;
         }
 
@@ -747,11 +914,11 @@ fn render_batch_summary(
                 markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
 
                 for (name, report) in results {
-                    let status_str = if report.is_safe { "✅ PASSED" } else { "❌ FAILED" };
+                    let status_str = if report.is_safe() { "✅ PASSED" } else { "❌ FAILED" };
                     markdown.push_str(&format!(
                         "| {} | {} | {} | {} | {} | {} |\n",
-                        name, status_str, report.critical_count, report.warning_count,
-                        report.info_count, report.suppressed_count
+                        name, status_str, report.critical_count(), report.warning_count(),
+                        report.info_count(), report.suppressed_count()
                     ));
                 }
 
@@ -782,7 +949,7 @@ fn render_batch_summary(
 
                 text.push_str("Summary of Contracts:\n");
                 for (name, report) in results {
-                    let status_str = if report.is_safe {
+                    let status_str = if report.is_safe() {
                         "✅ PASSED".green().to_string()
                     } else {
                         "❌ FAILED".red().bold().to_string()
@@ -791,10 +958,10 @@ fn render_batch_summary(
                         "  - {}: {} ({} critical, {} warnings, {} info, {} suppressed)\n",
                         name.bold(),
                         status_str,
-                        report.critical_count,
-                        report.warning_count,
-                        report.info_count,
-                        report.suppressed_count
+                        report.critical_count(),
+                        report.warning_count(),
+                        report.info_count(),
+                        report.suppressed_count()
                     ));
                 }
 
@@ -923,13 +1090,17 @@ fn run_single(
                 explain: args.explain,
                 strict: args.strict,
                 no_timestamp: args.no_timestamp,
+                empirical: args.empirical || args.empirical_file.is_some(),
+                empirical_file: args.empirical_file.as_deref(),
+                contract_id: old_source,
+                rpc_url: args.rpc_url.as_deref(),
             },
             progress,
         )?;
 
         render_to_outputs(&safety_report, outputs, args.explain, None, progress)?;
 
-        let is_safe = safety_report.is_safe;
+        let is_safe = safety_report.is_safe();
         if !is_safe {
             return Ok(false);
         }
@@ -1154,6 +1325,10 @@ struct ContractComparison<'a> {
     explain: bool,
     strict: bool,
     no_timestamp: bool,
+    empirical: bool,
+    empirical_file: Option<&'a Path>,
+    contract_id: Option<&'a str>,
+    rpc_url: Option<&'a str>,
 }
 
 fn compare_contracts(
@@ -1169,6 +1344,10 @@ fn compare_contracts(
         explain,
         strict,
         no_timestamp,
+        empirical,
+        empirical_file,
+        contract_id,
+        rpc_url,
     } = comparison;
     let old_meta = parser::extract_metadata(old_bytes)?;
     let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
@@ -1205,6 +1384,58 @@ fn compare_contracts(
         .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash());
 
     report.no_timestamp = *no_timestamp;
+
+    let mut empirical_findings = Vec::new();
+    let mut is_empirical = false;
+
+    if *empirical {
+        is_empirical = true;
+        let mut entries = Vec::new();
+
+        if let Some(file_path) = empirical_file {
+            progress(format!("📖 Loading empirical storage entries from: {}", file_path.display()));
+            match soroban_upgrade_safeguard::empirical::load_empirical_entries(file_path) {
+                Ok(loaded) => {
+                    progress(format!("✅ Loaded {} storage entries from file", loaded.len()));
+                    entries = loaded;
+                }
+                Err(e) => {
+                    progress(format!("❌ Failed to load empirical storage file: {}", e));
+                    return Err(anyhow::anyhow!("Empirical validation error: {}", e));
+                }
+            }
+        } else if let (Some(cid), Some(rpc)) = (contract_id, rpc_url) {
+            progress(format!("🌐 Fetching contract instance storage from RPC..."));
+            match loader::fetch_instance_storage_from_rpc(cid, rpc) {
+                Ok(loaded) => {
+                    progress(format!("✅ Fetched {} instance storage entries from RPC", loaded.len()));
+                    entries = loaded;
+                }
+                Err(e) => {
+                    progress(format!("⚠️  Failed to fetch instance storage from RPC: {}", e));
+                    progress(format!("Limits: Stellar RPC does not support wildcard ledger enumeration. Degrading gracefully."));
+                }
+            }
+        } else {
+            progress(format!("⚠️  Empirical mode requested, but no local file (--empirical-file) or RPC source (--contract-id and --rpc-url) was provided."));
+        }
+
+        // Run empirical checks
+        let structural_findings: Vec<diff::Finding> = diff_report.findings.clone();
+        empirical_findings = soroban_upgrade_safeguard::empirical::run_empirical_check(
+            &old_spec,
+            &new_spec,
+            &entries,
+            &structural_findings,
+        );
+    }
+
+    report.empirical = is_empirical;
+    report.empirical_findings = empirical_findings;
+
+    if report.empirical_findings.iter().any(|ef| !ef.is_success) {
+        report.is_safe = false;
+    }
 
     Ok(report)
 }

@@ -126,15 +126,10 @@ pub struct RenderableReport {
     /// Categories in a [`BTreeMap`] so the JSON key order is stable and
     /// diffable across runs.
     pub findings_by_category: BTreeMap<String, Vec<ReportedFinding>>,
-    /// Grouped by compatibility axes.
     #[serde(default)]
-    pub findings_by_axis: BTreeMap<crate::diff::CompatibilityAxis, Vec<ReportedFinding>>,
-    /// Verdict status per compatibility axis.
-    #[serde(default)]
-    pub axis_verdicts: HashMap<crate::diff::CompatibilityAxis, crate::report::AxisStatus>,
-    /// Gated compatibility axes.
-    #[serde(default)]
-    pub gated_axes: HashSet<crate::diff::CompatibilityAxis>,
+    pub empirical: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub empirical_findings: Vec<crate::empirical::EmpiricalFinding>,
 }
 
 fn default_schema_version() -> u32 {
@@ -374,6 +369,28 @@ impl RenderableReport {
                     Severity::Info => format!("🔵 {}", finding.message).cyan(),
                 };
                 output.push_str(&format!("{}\n", formatted));
+                if self.empirical {
+                    if let Some(ref udt_name) = finding.type_name {
+                        let matching_emp: Vec<&crate::empirical::EmpiricalFinding> = self.empirical_findings
+                            .iter()
+                            .filter(|ef| &ef.type_name == udt_name)
+                            .collect();
+                        if !matching_emp.is_empty() {
+                            let has_failures = matching_emp.iter().any(|ef| !ef.is_success);
+                            if has_failures {
+                                for ef in matching_emp.iter().filter(|ef| !ef.is_success) {
+                                    if let Some(ref err) = ef.error {
+                                        output.push_str(&format!("    ↳ 🔴 [CONFIRMED] Stored data failed to decode: {}\n", err).red().bold().to_string());
+                                    }
+                                }
+                            } else {
+                                output.push_str(&format!("    ↳ 🟢 [CONTRADICTED] Sampled stored values all decoded successfully under the new spec.\n").green().to_string());
+                            }
+                        } else {
+                            output.push_str(&format!("    ↳ ⚪ [UNCONFIRMED] No matching stored data found in the sample.\n").dimmed().to_string());
+                        }
+                    }
+                }
                 if explain {
                     if let Some(remediation) = &reported.remediation {
                         output.push_str(
@@ -404,6 +421,32 @@ impl RenderableReport {
                 output.push_str(&"⚠️  ACTION REQUIRED: The new contract version modifies existing storage layouts or function interfaces.\n".red().bold().to_string());
                 output.push_str(&"Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n".red().to_string());
             }
+        }
+
+        if self.empirical {
+            output.push_str(
+                &"\n========================================\n"
+                    .bold()
+                    .to_string(),
+            );
+            output.push_str(
+                &"    EMPIRICAL STORAGE VALIDATION SUMMARY\n"
+                    .bold()
+                    .magenta()
+                    .to_string(),
+            );
+            output.push_str(
+                &"========================================\n"
+                    .bold()
+                    .to_string(),
+            );
+            let successes = self.empirical_findings.iter().filter(|ef| ef.is_success).count();
+            let failures = self.empirical_findings.iter().filter(|ef| !ef.is_success).count();
+            let total_sampled = self.empirical_findings.len();
+            output.push_str(&format!("Total Sampled UDT Values: {}\n", total_sampled));
+            output.push_str(&format!("  - Decoded Successfully: {}\n", successes.to_string().green()));
+            output.push_str(&format!("  - Failed to Decode:     {}\n", if failures > 0 { failures.to_string().red().bold().to_string() } else { failures.to_string() }));
+            output.push_str("Limits: Stellar RPC does not support wildcard ledger enumeration. Coverage is bounded to instance storage or offline files.\n");
         }
 
         output
@@ -511,6 +554,28 @@ impl RenderableReport {
                     Severity::Info => "🔵",
                 };
                 output.push_str(&format!("- {} {}\n", emoji, finding.message));
+                if self.empirical {
+                    if let Some(ref udt_name) = finding.type_name {
+                        let matching_emp: Vec<&crate::empirical::EmpiricalFinding> = self.empirical_findings
+                            .iter()
+                            .filter(|ef| &ef.type_name == udt_name)
+                            .collect();
+                        if !matching_emp.is_empty() {
+                            let has_failures = matching_emp.iter().any(|ef| !ef.is_success);
+                            if has_failures {
+                                for ef in matching_emp.iter().filter(|ef| !ef.is_success) {
+                                    if let Some(ref err) = ef.error {
+                                        output.push_str(&format!("  - ↳ 🔴 **[CONFIRMED]** Stored data failed to decode: `{}`\n", err));
+                                    }
+                                }
+                            } else {
+                                output.push_str("  - ↳ 🟢 **[CONTRADICTED]** Sampled stored values all decoded successfully under the new spec.\n");
+                            }
+                        } else {
+                            output.push_str("  - ↳ ⚪ **[UNCONFIRMED]** No matching stored data found in the sample.\n");
+                        }
+                    }
+                }
             }
             output.push('\n');
         }
@@ -518,7 +583,18 @@ impl RenderableReport {
         if !self.is_safe {
             output.push_str("### ⚠️ Action Required\n\n");
             output.push_str("- The new contract version modifies existing storage layouts or function interfaces.\n");
-            output.push_str("- Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n");
+            output.push_str("- Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n\n");
+        }
+
+        if self.empirical {
+            output.push_str("### 📊 Empirical Storage Validation Summary\n\n");
+            let successes = self.empirical_findings.iter().filter(|ef| ef.is_success).count();
+            let failures = self.empirical_findings.iter().filter(|ef| !ef.is_success).count();
+            let total_sampled = self.empirical_findings.len();
+            output.push_str(&format!("- **Total Sampled UDT Values**: {}\n", total_sampled));
+            output.push_str(&format!("- **Decoded Successfully**: {}\n", successes));
+            output.push_str(&format!("- **Failed to Decode**: {}\n", failures));
+            output.push_str("- **Limits**: Stellar RPC does not support wildcard ledger enumeration. Coverage is bounded to instance storage or offline files.\n\n");
         }
 
         output
