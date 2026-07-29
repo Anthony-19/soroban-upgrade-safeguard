@@ -1,24 +1,5 @@
-# ── Base image pinning policy ─────────────────────────────────────────────────
-# Both stages pin an explicit version tag AND a content digest (`tag@sha256:…`)
-# so a given commit always builds from exactly one image: the tag documents the
-# human-readable version, and the digest is what Docker actually resolves and
-# verifies. This makes "which toolchain produced this binary" a question the repo
-# can answer, and turns a toolchain bump into a visible, reviewable diff.
-#
-# How to bump (routine, reviewable):
-#   1. Pick the new version and pull it, e.g.
-#        docker pull rust:<X.Y.Z>-slim-bookworm      # builder
-#        docker pull debian:bookworm-slim            # runtime
-#   2. Resolve the digest it now points at:
-#        docker inspect --format '{{index .RepoDigests 0}}' rust:<X.Y.Z>-slim-bookworm
-#        docker inspect --format '{{index .RepoDigests 0}}' debian:bookworm-slim
-#   3. Replace both the tag and the `@sha256:…` digest on the matching FROM line.
-# Dependabot (see .github/dependabot.yml, `docker` ecosystem) opens these bumps
-# automatically so the pins are kept current rather than quietly rotting.
-
 # ── Stage 1: Builder ──────────────────────────────────────────────────────────
-# rustc 1.97.1 — pinned by tag + digest (see base image pinning policy above).
-FROM rust:1.97.1-slim-bookworm@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777 AS builder
+FROM rust:slim-bookworm AS builder
 
 # ring 0.17 compiles C code via the `cc` crate; gcc and pkg-config are required.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -50,8 +31,7 @@ COPY src/ ./src/
 RUN cargo build --release
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-# Debian 12 (bookworm) slim — pinned by tag + digest (see policy above).
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
+FROM debian:bookworm-slim AS runtime
 
 # ca-certificates is required by rustls/ureq when using --rpc-url (HTTPS).
 # Local-mode users (two WASM paths, no network) are unaffected but it is

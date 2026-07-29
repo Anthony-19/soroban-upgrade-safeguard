@@ -18,80 +18,13 @@
 #   - enum cases ........... "Enum.case"              e.g. "StatusEvent.Paused"
 #
 # Omit `target` to match only findings that have no target (e.g. "Environment").
-#
-# `category` is always STRUCTURAL — "Enum Case Value Changed", never
-# "Event Enum Case Value Changed". Whether a type is an event is reported
-# separately (see [classification] below) and never affects the suppression
-# key, so reclassifying a type cannot silently change what a rule matches.
-# Pre-1.0 event-flavored category names still work and are mapped onto their
-# structural equivalents.
-
-max_suppressions = 10
-allow_targetless = false
 
 [[suppress]]
-category    = "Struct Field Removed"
-target      = "ConfigData.threshold"
-author      = "Alice <alice@example.com>"
-reason      = "Planned storage migration in v2 drops the unused threshold field."
-expiry      = "2026-12-31"
-fingerprint = "8a3f..."
+category = "Struct Field Removed"
+target   = "ConfigData.threshold"
+reason   = "Planned storage migration in v2 drops the unused threshold field."
 
 [[suppress]]
-category    = "Function Signature Changed"
-target      = "initialize"
-author      = "Bob <bob@example.com>"
-reason      = "Re-init is intentional and gated behind the migration admin call."
-expiry      = "2026-12-31"
-fingerprint = "7b2e..."
-
-# ---------------------------------------------------------------------------
-# Per-category severity overrides (optional).
-#
-# The analysis engine assigns one fixed severity per category. Those defaults
-# are reasonable but not universal: a project with no named-argument RPC
-# clients has good reason to treat a parameter rename as informational, while a
-# project with strict downstream event indexing may want an appended struct
-# field to fail outright. `--strict` promotes every warning at once and a
-# suppression only ever suppresses one named finding — this table is the dial
-# in between.
-#
-# Keys accept the display name ("Parameter Renamed"), the stable rule id
-# ("parameter_renamed"), or a pre-1.0 event-flavored alias. Values are
-# "critical", "warning", or "info". An unknown category is rejected when the
-# config loads, with near matches suggested — a typo that merely never fired
-# would leave you trusting a policy that is not in effect.
-#
-# Run `soroban-upgrade-safeguard explain` to list every category, or
-# `explain <CATEGORY>` for one category's guidance and default severity.
-#
-# Overrides are applied in the report layer, alongside suppression, so the
-# analysis itself stays a pure description of what changed. Every overridden
-# finding is marked in the report, and a verdict that changed *because* of an
-# override says so prominently in all formats — a gate that can be quietly
-# reconfigured into always passing would be worse than no gate at all.
-
-# [severity]
-# "Parameter Renamed"  = "info"      # No named-argument RPC clients here.
-# "Struct Field Added" = "critical"  # Downstream indexers require a migration.
-
-# ---------------------------------------------------------------------------
-# Resource limits (optional).
-#
-# The WASM and its embedded XDR are treated as untrusted input. These limits
-# bound how much work a single (possibly malicious) contract can cause; an input
-# that exceeds one stops the run with a controlled error and exit code 2 —
-# distinct from exit code 1 (breaking changes) — rather than crashing the gate
-# with an out-of-memory allocation or a stack overflow.
-#
-# Every field is optional; an omitted field keeps the built-in default shown
-# below. Each is independently configurable, and any of them can be overridden
-# for a single run with the matching --max-* CLI flag (flags win over this file).
-# The defaults accept every real mainnet spec — only raise a limit if a
-# legitimate, unusually large contract is rejected.
-
-[limits]
-max_xdr_depth  = 64         # Max XDR nesting depth per entry (stack-overflow guard).
-max_xdr_len    = 33554432   # Max bytes decoded per custom section, 32 MiB (allocation guard).
-max_entries    = 100000     # Max decoded spec entries, summed across all sections.
-max_walk_depth = 128        # Max recursive type-walk depth (equality, rendering, cascades).
+category = "Function Signature Changed"
+target   = "initialize"
+reason   = "Re-init is intentional and gated behind the migration admin call."
