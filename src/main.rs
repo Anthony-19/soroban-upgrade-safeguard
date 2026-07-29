@@ -10,6 +10,17 @@ use soroban_upgrade_safeguard::{
     render::RenderableReport,
     report, spec,
     spec_json::ExtractedSpec,
+    color::{should_disable_color, ColorMode},
+    dependency::{
+        cycle_findings, missing_contract_findings, ContractDependency, CrossContractFinding,
+        DependencyGraph,
+    },
+    diff,
+    limits::{find_limit_error, LimitsConfig, ResourcePolicy},
+    loader, parser,
+    report::{self, validate_categories, CategoryFilter},
+    spec,
+    storage_schema::StorageSchema,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
 
@@ -66,6 +77,7 @@ struct Args {
     command: Option<Command>,
 
     /// WASM paths: <OLD_WASM> <NEW_WASM> in local mode, or just <NEW_WASM> in RPC mode
+    /// WASM paths: <OLD_WASM> <NEW_WASM> in local mode, or just <NEW_WASM> in RPC mode. Use - to read one WASM from stdin.
     #[arg(value_name = "WASM", num_args = 0..=2)]
     wasm_paths: Vec<PathBuf>,
 
@@ -87,6 +99,10 @@ struct Args {
     #[arg(long, value_name = "CONFIG")]
     config: Option<PathBuf>,
 
+    /// Do not load any suppression config, including the default .safeguard.toml.
+    #[arg(long, conflicts_with = "config")]
+    no_config: bool,
+
     /// Print a concise remediation explanation for each finding.
     #[arg(long)]
     explain: bool,
@@ -99,6 +115,25 @@ struct Args {
     #[arg(long)]
     no_color: bool,
 
+    /// Suppress decorative and progress output; the report and exit code are unchanged.
+    #[arg(long)]
+    quiet: bool,
+
+    /// Control when ANSI color is used. --no-color overrides this option.
+    #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+    color: ColorMode,
+
+    /// Allow HTTP connections for RPC when the host is localhost/127.0.0.1.
+    /// Without this flag only HTTPS URLs are accepted.
+    #[arg(long)]
+    allow_http_local: bool,
+
+    /// Expected SHA-256 hash (hex) of the on-chain WASM baseline.
+    /// When provided the tool verifies the hash of the fetched bytecode
+    /// matches this value and fails immediately on mismatch.
+    #[arg(long, value_name = "HEX_HASH")]
+    expected_wasm_hash: Option<String>,
+
     /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
     #[arg(long, value_name = "MANIFEST_PATH")]
     manifest: Option<PathBuf>,
@@ -110,6 +145,18 @@ struct Args {
     /// Directory containing the new versions of the contracts for directory comparison
     #[arg(long, value_name = "NEW_DIR", requires = "old_dir")]
     new_dir: Option<PathBuf>,
+
+    /// Directory to write one report file per contract into, using the selected format
+    #[arg(
+        long = "per-contract-output-dir",
+        alias = "report-dir",
+        alias = "output-dir",
+        alias = "per-contract-report-dir",
+        alias = "per-contract-reports-dir",
+        alias = "batch-output-dir",
+        value_name = "DIR"
+    )]
+    per_contract_output_dir: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -255,10 +302,13 @@ fn main() -> Result<()> {
 
     if should_disable_color(
         args.no_color,
+        args.color,
         std::env::var_os("NO_COLOR").is_some(),
         std::io::stdout().is_terminal(),
     ) {
         colored::control::set_override(false);
+    } else if args.color == ColorMode::Always {
+        colored::control::set_override(true);
     }
 
     // 1. Identify which mode we are running:
@@ -277,9 +327,13 @@ fn main() -> Result<()> {
 
     // In JSON or Markdown mode, decorative progress goes to stderr so stdout
     // stays a single, pristine document. In text mode it stays on stdout
-    // exactly as before.
+    // exactly as before. --quiet suppresses progress in every format.
     let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
     let progress = |line: String| {
+        if args.quiet {
+            return;
+        }
+
         if clean_stdout {
             eprintln!("{line}");
         } else {
@@ -287,13 +341,17 @@ fn main() -> Result<()> {
         }
     };
 
-    // Load suppression config: an explicit --config must exist; otherwise fall
-    // back to `.safeguard.toml` in the working directory if it happens to be
-    // present. With neither, an empty config preserves today's behavior.
-    let suppressions = match &args.config {
-        Some(path) => SuppressionConfig::load_from_path(path)?,
-        None => {
-            SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?.unwrap_or_default()
+    // Load suppression config: --no-config means a clean run with no
+    // suppressions; otherwise an explicit --config must exist, and with neither
+    // flag we fall back to `.safeguard.toml` if present.
+    let suppressions = if args.no_config {
+        SuppressionConfig::default()
+    } else {
+        match &args.config {
+            Some(path) => SuppressionConfig::load_from_path(path)?,
+            None => {
+                SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?.unwrap_or_default()
+            }
         }
     };
 
@@ -313,6 +371,7 @@ fn main() -> Result<()> {
 
         let mut results = std::collections::BTreeMap::new();
         let mut overall_safe = true;
+        let mut seen_names = std::collections::BTreeSet::new();
 
         for (i, pair) in pairs.iter().enumerate() {
             let default_name = format!("pair_{}", i + 1);
@@ -323,6 +382,13 @@ fn main() -> Result<()> {
                     .map(|n| n.to_string())
                     .unwrap_or(default_name)
             });
+
+            if !seen_names.insert(contract_name.clone()) {
+                anyhow::bail!(
+                    "Duplicate contract name '{}' found in batch input; names must be unique",
+                    contract_name
+                );
+            }
 
             progress(format!(
                 "📦 [{}/{}] Comparing contract pair: {}",
@@ -349,6 +415,11 @@ fn main() -> Result<()> {
 
             if !report.is_safe {
                 overall_safe = false;
+            }
+
+            let rendered_report = render_report(&report, args.format, args.explain)?;
+            if let Some(output_dir) = args.per_contract_output_dir.as_deref() {
+                write_report_file(output_dir, &contract_name, args.format, &rendered_report)?;
             }
 
             results.insert(contract_name, report);
@@ -497,6 +568,16 @@ fn main() -> Result<()> {
         }
     };
 
+    if old_source.is_none()
+        && is_stdin_wasm_path(&args.wasm_paths[0])
+        && is_stdin_wasm_path(new_wasm_path)
+    {
+        anyhow::bail!(
+            "Cannot use '-' for both OLD_WASM and NEW_WASM because stdin can only be read once. \
+             Provide one side as a file path."
+        );
+    }
+
     progress("🔍 Soroban Upgrade Safeguard".to_string());
     progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
 
@@ -510,11 +591,11 @@ fn main() -> Result<()> {
         let rpc_url = args.rpc_url.as_ref().unwrap();
         loader::fetch_wasm_from_rpc(contract_id, rpc_url)?
     } else {
-        loader::load_wasm(&args.wasm_paths[0])?
+        load_positional_wasm(&args.wasm_paths[0])?
     };
 
     // New WASM
-    let new = loader::load_wasm(new_wasm_path)?;
+    let new = load_positional_wasm(new_wasm_path)?;
 
     if !suppressions.rules.is_empty() {
         progress(format!(
@@ -558,6 +639,19 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn is_stdin_wasm_path(path: &Path) -> bool {
+    path == Path::new("-")
+}
+
+fn load_positional_wasm(path: &Path) -> Result<loader::WasmModule> {
+    if is_stdin_wasm_path(path) {
+        let mut stdin = std::io::stdin().lock();
+        Ok(loader::load_wasm_from_stdin(&mut stdin)?)
+    } else {
+        Ok(loader::load_wasm(path)?)
+    }
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -692,4 +786,63 @@ fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>>
     }
 
     Ok(pairs)
+}
+
+fn render_report(
+    report: &report::SafetyReport,
+    format: OutputFormat,
+    explain: bool,
+) -> Result<String> {
+    match format {
+        OutputFormat::Json => Ok(serde_json::to_string_pretty(&report.to_json())?),
+        OutputFormat::Markdown => Ok(report.generate_summary_markdown()),
+        OutputFormat::Text => Ok(report.generate_summary_text(explain)),
+    }
+}
+
+fn write_report_file(
+    output_dir: &Path,
+    contract_name: &str,
+    format: OutputFormat,
+    content: &str,
+) -> Result<()> {
+    let filename = sanitize_report_filename(contract_name, format);
+    let output_path = output_dir.join(filename);
+    let temp_path = output_path.with_extension(format!(
+        "{}.tmp",
+        output_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("tmp")
+    ));
+
+    std::fs::create_dir_all(output_dir)?;
+    std::fs::write(&temp_path, content)?;
+    std::fs::rename(&temp_path, &output_path)?;
+    Ok(())
+}
+
+fn sanitize_report_filename(contract_name: &str, format: OutputFormat) -> PathBuf {
+    let mut sanitized = String::new();
+    for ch in contract_name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        sanitized = "contract".to_string();
+    }
+
+    let extension = match format {
+        OutputFormat::Json => "json",
+        OutputFormat::Markdown => "md",
+        OutputFormat::Text => "txt",
+    };
+
+    let mut path = PathBuf::from(sanitized);
+    path.set_extension(extension);
+    path
 }

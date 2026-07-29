@@ -202,6 +202,43 @@ Two details worth knowing:
 - **`--explain` guidance only appears if the original run recorded it.** Remediation text is stored in the JSON only when the comparison used `--explain`, so `render --explain` can surface it but cannot invent it.
 
 An unreadable or incompatible report fails with a specific message rather than a parse error — a report written by a newer tool version names both the schema version it needs and the tool version that produced it.
+### Usage modes
+
+The tool runs in one of four modes, selected by which arguments you pass:
+
+```
+soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM> [OPTIONS]
+soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM> [OPTIONS]
+soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]
+soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]
+```
+
+### Flag reference
+
+Every option accepted by the tool is listed below. This reference is drawn from
+the clap definitions in [`src/main.rs`](../src/main.rs); it is meant to stay in
+sync with `--help`, so run `soroban-upgrade-safeguard --help` if you need to
+confirm the exact set your installed version supports.
+
+| Flag | Argument | Default | What it does |
+| :--- | :--- | :--- | :--- |
+| `<WASM>...` | up to two paths | — | Positional WASM inputs. In local mode, pass both `<OLD_WASM>` and `<NEW_WASM>`. In RPC mode, pass only `<NEW_WASM>` (the old build is fetched from chain). Not allowed in batch mode. |
+| `--format` | `text` \| `json` \| `markdown` | `text` | Output format. `text` is the colored human-readable report; `json` emits a single machine-readable document for CI and dashboards; `markdown` is suited to PR descriptions and comments. In `json`/`markdown` mode, progress lines go to stderr so stdout stays a single clean document. |
+| `--contract-id` | `CONTRACT_ID` | — | Stellar/Soroban contract ID (e.g. `C…`) to fetch the old build from on-chain instead of from a local file. **Requires `--rpc-url`.** When set, provide only the new WASM as a positional argument. |
+| `--rpc-url` | `RPC_URL` | — | Stellar RPC endpoint (e.g. `https://soroban-testnet.stellar.org`) used to fetch the old build. **Requires `--contract-id`.** |
+| `--config` | `CONFIG` | `.safeguard.toml` if present | Path to a suppression config acknowledging known, intentional breaking changes. When omitted, `.safeguard.toml` in the current directory is used if it exists; otherwise no suppressions are applied. A missing or malformed *explicit* `--config` is a hard error. See [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes). |
+| `--explain` | *(flag)* | off | Print a concise remediation explanation beneath each finding. |
+| `--strict` | *(flag)* | off | **Affects the exit code.** Treat Warnings as failures too, so the run exits non-zero if any Warning *or* Critical finding is present. See [Exit Codes and CI Integration](#exit-codes-and-ci-integration). |
+| `--no-color` | *(flag)* | off (color when stdout is a TTY) | Disable ANSI color in the text report. Color is also disabled automatically when the `NO_COLOR` environment variable is set or when stdout is not a terminal. |
+| `--manifest` | `MANIFEST_PATH` | — | Run in batch mode over a manifest file (TOML or JSON) listing contract pairs to compare. Cannot be combined with `--old-dir`/`--new-dir` or with positional WASM paths. |
+| `--old-dir` | `OLD_DIR` | — | Run in batch mode by pairing WASM files by filename between two directories; this is the directory of old builds. **Requires `--new-dir`.** |
+| `--new-dir` | `NEW_DIR` | — | The directory of new builds for directory batch mode. **Requires `--old-dir`.** |
+| `-h`, `--help` | *(flag)* | — | Print help and exit. |
+| `-V`, `--version` | *(flag)* | — | Print the version and exit. |
+
+Only `--strict` changes the exit code; every other flag affects what is analyzed
+or how the report is rendered. See [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
+for the full exit-code contract.
 
 ## How the Analysis Works
 

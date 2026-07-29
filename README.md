@@ -53,6 +53,15 @@ soroban-upgrade-safeguard extract ./wasm/v1.wasm --hash-only
 soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --format json > report.json
 soroban-upgrade-safeguard render report.json --format markdown
 ```
+Use `-` for one positional WASM to read it from stdin, for example when a build
+artifact is piped from another command:
+
+```bash
+cat ./wasm/v2.wasm | soroban-upgrade-safeguard ./wasm/v1.wasm -
+```
+
+Only one positional input may be `-`; using `-` for both `OLD_WASM` and
+`NEW_WASM` is rejected because stdin can only be consumed once.
 
 ### Suppressing known breaking changes
 

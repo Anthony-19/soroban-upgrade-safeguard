@@ -1,0 +1,174 @@
+//! Integration tests for the `--output` flag (Feature 4).
+//!
+//! Verifies that `--output PATH` writes the report to the given file,
+//! that the file contains only the report (no progress lines), and that
+//! without the flag output goes to stdout as before.
+
+use std::path::PathBuf;
+use std::process::Command;
+
+fn wasm(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("wasm")
+        .join(name)
+}
+
+fn tmp(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
+}
+
+/// Run the binary with optional `--output`, `--format`, returning
+/// (stdout, stderr, exit_code, file_contents_if_output_path_given).
+fn run_with_output(
+    old: &str,
+    new: &str,
+    format: &str,
+    output_path: Option<&PathBuf>,
+) -> (String, String, i32, Option<String>) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"));
+    cmd.arg(wasm(old)).arg(wasm(new));
+    cmd.args(["--format", format]);
+    if let Some(path) = output_path {
+        cmd.args(["--output", path.to_str().unwrap()]);
+    }
+
+    let output = cmd.output().expect("failed to run binary");
+    let stdout = String::from_utf8(output.stdout).expect("stdout not utf8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr not utf8");
+    let code = output.status.code().expect("process killed by signal");
+
+    let file_contents = output_path.map(|p| {
+        if p.exists() {
+            std::fs::read_to_string(p).expect("failed to read output file")
+        } else {
+            String::new()
+        }
+    });
+
+    (stdout, stderr, code, file_contents)
+}
+
+// ──────────────────────────────────────────────────────────────────
+// JSON format with --output
+// ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn output_flag_json_writes_to_file_not_stdout() {
+    let out = tmp("output_flag_json.json");
+    let (stdout, stderr, _code, file) = run_with_output("v1.wasm", "v2.wasm", "json", Some(&out));
+
+    let contents = file.expect("output file should exist");
+
+    // The file must contain valid JSON with the expected structure.
+    let json: serde_json::Value = serde_json::from_str(&contents)
+        .unwrap_or_else(|e| panic!("output file not valid JSON: {e}\n{contents}"));
+    assert!(json.get("is_safe").is_some(), "JSON must have 'is_safe'");
+    assert!(json.get("counts").is_some(), "JSON must have 'counts'");
+
+    // stdout must be empty — report went to the file.
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout must be empty when --output is used, got: {stdout}"
+    );
+
+    // stderr should contain the "report written" confirmation.
+    assert!(
+        stderr.contains("Report written to") || stderr.contains("report written"),
+        "stderr must confirm the file was written, got: {stderr}"
+    );
+
+    // The file must not contain ANSI escape codes.
+    assert!(
+        !contents.contains('\u{1b}'),
+        "output file must not contain ANSI codes"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Markdown format with --output
+// ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn output_flag_markdown_writes_to_file_not_stdout() {
+    let out = tmp("output_flag_markdown.md");
+    let (stdout, _stderr, _code, file) =
+        run_with_output("v1.wasm", "v2.wasm", "markdown", Some(&out));
+
+    let contents = file.expect("output file should exist");
+
+    assert!(
+        contents.contains("# Soroban Upgrade Safety Report"),
+        "markdown output must contain heading, got: {contents}"
+    );
+
+    // No progress lines (like the loading banner) in the file.
+    assert!(
+        !contents.contains("Loading and Parsing"),
+        "output file must not contain progress lines, got start: {}",
+        &contents[..contents.len().min(200)]
+    );
+
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout must be empty when --output is used, got: {stdout}"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Text format with --output  (the hard case — progress used to go
+// to stdout in text mode, so --output must separate them cleanly)
+// ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn output_flag_text_writes_report_only_no_progress_lines() {
+    let out = tmp("output_flag_text.txt");
+    let (stdout, _stderr, _code, file) = run_with_output("v1.wasm", "v2.wasm", "text", Some(&out));
+
+    let contents = file.expect("output file should exist");
+
+    // The report section header must be present.
+    assert!(
+        contents.contains("SOROBAN UPGRADE SAFETY REPORT"),
+        "text output must contain the report header"
+    );
+
+    // stdout must be empty.
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout must be empty when --output is used, got: {stdout}"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Without --output, stdout receives the report as before
+// ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn without_output_flag_report_goes_to_stdout() {
+    let (stdout, _stderr, _code, _file) = run_with_output("v1.wasm", "v2.wasm", "json", None);
+
+    // stdout must contain valid JSON when no --output is given.
+    assert!(
+        !stdout.trim().is_empty(),
+        "stdout must contain the report when --output is not used"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\n{stdout}"));
+    assert!(json.get("is_safe").is_some());
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Safe upgrade also writes correctly to file
+// ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn output_flag_safe_upgrade_writes_file_and_exits_zero() {
+    let out = tmp("output_flag_safe.json");
+    let (_stdout, _stderr, code, file) = run_with_output("v1.wasm", "v1.wasm", "json", Some(&out));
+
+    assert_eq!(code, 0, "identical upgrade must exit 0");
+    let contents = file.expect("output file should exist");
+    let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
+    assert_eq!(json["is_safe"], serde_json::Value::Bool(true));
+}
