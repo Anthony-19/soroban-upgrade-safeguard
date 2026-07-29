@@ -1,5 +1,18 @@
 use crate::diff::{DiffReport, Finding, Severity};
+use crate::interface_hash::InterfaceHash;
+use crate::render::{RenderableReport, REPORT_SCHEMA_VERSION};
 use crate::suppression::SuppressionConfig;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+pub use crate::render::SeverityCounts;
+
+/// The machine-readable view of a report.
+///
+/// Kept as an alias so existing callers of `SafetyReport::to_json()` keep
+/// compiling; the model itself now lives in [`crate::render`], where the
+/// renderers that consume it also live.
+pub type SafetyReportJson = RenderableReport;
 use colored::Colorize;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -9,24 +22,25 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// The raw [`Finding`] from the diff layer is left untouched; suppression is a
 /// report-time concern layered on top. A suppressed finding is still listed in
 /// full — it simply does not count toward the failing set.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportedFinding {
     /// The underlying finding, flattened so JSON keeps its original shape
     /// (`severity`, `category`, `message`, `type_name`, `target`).
     #[serde(flatten)]
     pub finding: Finding,
     /// Whether a suppression rule acknowledged this finding.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suppressed: bool,
     /// The justification copied from the matching rule, if it provided one.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suppression_reason: Option<String>,
     /// Optional remediation/explanation advice for the user.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remediation: Option<String>,
 }
 
 /// A structured container for aggregated comparison findings.
+#[derive(Debug, Default)]
 pub struct SafetyReport {
     pub critical_count: usize,
     pub warning_count: usize,
@@ -88,6 +102,61 @@ pub struct SafetyReportJson<'a> {
     pub total_findings: usize,
     pub recommended_bump: &'static str,
     pub findings_by_category: BTreeMap<&'a str, &'a Vec<ReportedFinding>>,
+    /// Build size and interface-count metrics (always present in CLI output).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<&'a BuildMetrics>,
+    /// Suppression rules from the config that matched no finding.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unmatched_suppressions: Vec<UnmatchedSuppressionJson>,
+    /// This tool's version, so a later run can detect an incompatible
+    /// baseline before comparing against this report via `--baseline`.
+    pub tool_version: &'static str,
+    /// Present when `--baseline` was supplied: classifies this run's
+    /// findings as new/persisting relative to it, and lists resolved ones.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_diff: Option<&'a crate::baseline::BaselineDiff>,
+    /// Contract name from the old build's metadata (if present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_contract_name: Option<&'a str>,
+    /// Contract version from the old build's metadata (if present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_contract_version: Option<&'a str>,
+    /// Contract name from the new build's metadata (if present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_contract_name: Option<&'a str>,
+    /// Contract version from the new build's metadata (if present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_contract_version: Option<&'a str>,
+    /// Whether the old and new WASM binaries were byte-identical (no-op).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_noop: bool,
+}
+
+/// JSON representation of a suppression rule that matched no finding.
+#[derive(Serialize, JsonSchema)]
+pub struct UnmatchedSuppressionJson {
+    pub category: String,
+    pub target: Option<String>,
+}
+
+/// Format a contract identity label from optional name and version strings.
+///
+/// Used in both text and Markdown report headers to display which contract
+/// is being compared. Falls back to `<unknown>` when both are absent.
+fn contract_identity_label(name: Option<&str>, version: Option<&str>) -> String {
+    match (name, version) {
+        (Some(n), Some(v)) => format!("{} v{}", n, v),
+        (Some(n), None) => n.to_string(),
+        (None, Some(v)) => format!("v{}", v),
+        (None, None) => "<unknown>".to_string(),
+    }
+    /// Interface hash of the old build's spec.
+    ///
+    /// `None` when the report was built straight from a [`DiffReport`] without
+    /// the specs in hand; the CLI pipeline always populates both.
+    pub old_interface_hash: Option<InterfaceHash>,
+    /// Interface hash of the new build's spec.
+    pub new_interface_hash: Option<InterfaceHash>,
 }
 
 impl SafetyReport {
@@ -350,6 +419,27 @@ impl SafetyReport {
                 reported.finding.severity.label()
             ),
             None => String::new(),
+            old_interface_hash: None,
+            new_interface_hash: None,
+        }
+    }
+
+    /// Attach the two builds' interface hashes.
+    ///
+    /// The diff layer works on findings alone and never sees the specs, so the
+    /// hashes are supplied by whichever pipeline stage did have them.
+    pub fn with_interface_hashes(mut self, old: InterfaceHash, new: InterfaceHash) -> Self {
+        self.old_interface_hash = Some(old);
+        self.new_interface_hash = Some(new);
+        self
+    }
+
+    /// True when both interface hashes are known and equal — that is, the two
+    /// builds expose the same interface.
+    pub fn interface_unchanged(&self) -> Option<bool> {
+        match (self.old_interface_hash, self.new_interface_hash) {
+            (Some(old), Some(new)) => Some(old == new),
+            _ => None,
             critical_root_count,
             cascade_critical_count,
         }
@@ -380,6 +470,15 @@ impl SafetyReport {
         }
     }
 
+    /// Build the owned, serializable model that every renderer consumes.
+    ///
+    /// This is the single source of truth for output: `--format json` writes
+    /// it, and the text and Markdown renderers read it. A re-render of a saved
+    /// JSON report therefore takes exactly the same path as a live run.
+    pub fn to_renderable(&self) -> RenderableReport {
+        RenderableReport {
+            report_schema_version: REPORT_SCHEMA_VERSION,
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
     /// Returns `true` when at least one Info-severity finding is not a
     /// non-functional documentation change (e.g. reworded doc comments).
     fn has_non_documentation_info_findings(&self) -> bool {
@@ -418,16 +517,28 @@ impl SafetyReport {
             cascade_critical_count: self.cascade_critical_count,
             suppressed_count: self.suppressed_count,
             total_findings: self.total_findings,
-            recommended_bump: self.recommended_bump(),
+            recommended_bump: self.recommended_bump().to_string(),
+            old_interface_hash: self.old_interface_hash.map(|h| h.to_hex()),
+            new_interface_hash: self.new_interface_hash.map(|h| h.to_hex()),
             findings_by_category: self
                 .findings_by_category
                 .iter()
-                .map(|(k, v)| (k.as_str(), v))
+                .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         }
     }
 
+    /// Build a serializable, machine-readable view of this report.
+    ///
+    /// Retained as the historical name for [`Self::to_renderable`].
+    pub fn to_json(&self) -> SafetyReportJson {
+        self.to_renderable()
+    }
+
     /// Generate a structured, human-readable text output for the CLI.
+    ///
+    /// Delegates to [`RenderableReport::to_text`] so that this output and a
+    /// re-render of the saved JSON are produced by the same code.
     pub fn generate_summary_text(&self, explain: bool) -> String {
         let mut output = String::new();
         output.push_str(
@@ -708,9 +819,13 @@ impl SafetyReport {
         }
 
         output
+        self.to_renderable().to_text(explain)
     }
 
     /// Generate a structured Markdown output.
+    ///
+    /// Delegates to [`RenderableReport::to_markdown`], for the same reason as
+    /// [`Self::generate_summary_text`].
     pub fn generate_summary_markdown(&self) -> String {
         let mut output = String::new();
         output.push_str("# Soroban Upgrade Safety Report\n\n");
@@ -887,6 +1002,7 @@ impl SafetyReport {
         }
 
         output
+        self.to_renderable().to_markdown()
     }
 }
 
@@ -935,6 +1051,7 @@ pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
         "Error Enum Case Value Changed" => Some("This is a breaking change. Modifying error case values breaks error-code compatibility. Revert the value change."),
         "Error Enum Case Added" => Some("No action required. Ensure clients can handle the new error case gracefully."),
         "Cascading Layout Break" => Some("This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type."),
+        "Type Kind Changed" => Some("This is a breaking change. The type kept its name but is now a different kind of type (struct, enum, union, or error enum), so its serialized layout changed entirely. Stored data written as the old kind cannot be decoded as the new one. Restore the original kind, or migrate the stored data and give the replacement a new name."),
         "BytesN Size Changed" => Some("This is a breaking change. Changing the size of a fixed-size byte array alters its binary encoding. Revert the size or migrate data that depends on the original byte length."),
         _ => None,
     }
@@ -958,6 +1075,13 @@ mod tests {
                 // If it is ENVIRONMENT_CATEGORY
                 if line.contains("ENVIRONMENT_CATEGORY") {
                     checked_categories.insert("Environment".to_string());
+                    continue;
+                }
+
+                // Categories referenced through a constant carry no string
+                // literal on the `category:` line, so name them explicitly.
+                if line.contains("TYPE_KIND_CHANGED_CATEGORY") {
+                    checked_categories.insert(crate::diff::TYPE_KIND_CHANGED_CATEGORY.to_string());
                     continue;
                 }
 
@@ -1053,6 +1177,8 @@ mod tests {
         }
 
         let mut report = SafetyReport {
+            is_safe: true,
+            ..Default::default()
             critical_count: 0,
             warning_count: 0,
             info_count: 0,

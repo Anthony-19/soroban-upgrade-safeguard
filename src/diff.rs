@@ -1,7 +1,7 @@
 use crate::mapper::LayoutMapper;
 use crate::parser::ContractEnvMeta;
 use crate::spec::ContractSpec;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use stellar_xdr::curr::{
     ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef, ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0,
     ScSpecUdtErrorEnumCaseV0, ScSpecUdtErrorEnumV0, ScSpecUdtStructFieldV0, ScSpecUdtStructV0,
@@ -9,7 +9,10 @@ use stellar_xdr::curr::{
 };
 
 /// Severity of a detected issue.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// `Deserialize` is derived so a previously emitted JSON report can be read
+/// back and re-rendered (see [`crate::render`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Critical,
@@ -18,7 +21,7 @@ pub enum Severity {
 }
 
 /// A single finding from the comparison analysis.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     pub severity: Severity,
     pub category: String,
@@ -26,6 +29,7 @@ pub struct Finding {
     /// The name of the affected UDT (struct/enum/union), if this finding
     /// relates to a specific type.  Used by cascade-detection so it never
     /// needs to re-parse `message`.
+    #[serde(default)]
     pub type_name: Option<String>,
     /// A stable, structured identifier for the exact entity this finding is
     /// about, independent of the human-readable `message`. It is the key used
@@ -39,6 +43,7 @@ pub struct Finding {
     ///
     /// `None` for findings that are not tied to a single named entity (for
     /// example environment-metadata changes).
+    #[serde(default)]
     pub target: Option<String>,
     /// For cascade findings, the `target` of the root cause finding.
     /// `None` for direct (non-cascade) findings.
@@ -84,6 +89,12 @@ pub fn compare(old: &ContractSpec, new: &ContractSpec) -> DiffReport {
     compare_enums(old, new, &mut report);
     compare_unions(old, new, &mut report);
     compare_error_enums(old, new, &mut report);
+
+    // Must run after the per-kind passes, which each see only their own map and
+    // so mistake a kind change for an unrelated removal plus addition, and
+    // before cascade detection, so a type that changed kind still propagates to
+    // everything embedding it.
+    detect_type_kind_changes(old, new, &mut report);
 
     detect_cascading_layout_breaks(old, &mut report);
 
@@ -1032,6 +1043,148 @@ fn check_error_enum_cases(
 }
 
 /// Uses dependency graphing to figure out if storage layout changes cascade to other types.
+/// Category label for a user-defined type whose name survived but whose kind
+/// changed (for example a struct that became an enum).
+pub const TYPE_KIND_CHANGED_CATEGORY: &str = "Type Kind Changed";
+
+/// Which of the five spec maps a user-defined type lives in.
+///
+/// The per-kind comparison passes each look at a single map, so they cannot see
+/// that a name moved between maps. This enum is what lets
+/// [`detect_type_kind_changes`] reason across them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UdtKind {
+    Struct,
+    Enum,
+    Union,
+    ErrorEnum,
+}
+
+impl UdtKind {
+    /// Human-readable label used in finding messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            UdtKind::Struct => "struct",
+            UdtKind::Enum => "enum",
+            UdtKind::Union => "union",
+            UdtKind::ErrorEnum => "error enum",
+        }
+    }
+
+    /// The categories a per-kind pass emits when a type of this kind vanishes
+    /// from the new spec.
+    ///
+    /// Two are possible for structs and enums because the event-naming
+    /// convention picks a different label for the same underlying removal.
+    fn removal_categories(self) -> &'static [&'static str] {
+        match self {
+            UdtKind::Struct => &["Struct Removed", "Event Definition Removed"],
+            UdtKind::Enum => &["Enum Removed", "Event Enum Removed"],
+            UdtKind::Union => &["Union Removed"],
+            UdtKind::ErrorEnum => &["Error Enum Removed"],
+        }
+    }
+
+    /// The category a per-kind pass emits when a type of this kind appears in
+    /// the new spec.
+    fn addition_category(self) -> &'static str {
+        match self {
+            UdtKind::Struct => "Struct Added",
+            UdtKind::Enum => "Enum Added",
+            UdtKind::Union => "Union Added",
+            UdtKind::ErrorEnum => "Error Enum Added",
+        }
+    }
+}
+
+/// The kind a name is defined as in `spec`, if it is defined at all.
+///
+/// A name resolves to at most one kind: Rust type names are unique within a
+/// contract, so the maps cannot both claim it.
+fn udt_kind_of(spec: &ContractSpec, name: &str) -> Option<UdtKind> {
+    if spec.structs.contains_key(name) {
+        Some(UdtKind::Struct)
+    } else if spec.enums.contains_key(name) {
+        Some(UdtKind::Enum)
+    } else if spec.unions.contains_key(name) {
+        Some(UdtKind::Union)
+    } else if spec.error_enums.contains_key(name) {
+        Some(UdtKind::ErrorEnum)
+    } else {
+        None
+    }
+}
+
+/// Report a user-defined type whose name persists but whose kind changed.
+///
+/// `compare_structs`, `compare_enums`, `compare_unions`, and
+/// `compare_error_enums` each consult only their own map. When `Status` is a
+/// struct in the old build and an enum in the new one, `compare_structs` sees a
+/// struct that disappeared and reports a critical `Struct Removed`, while
+/// `compare_enums` sees a brand-new enum and reports an informational
+/// `Enum Added`. Nothing connects the two, and the informational half badly
+/// understates the change: the type did not appear from nowhere, it replaced a
+/// struct of the same name, which invalidates any stored data of that type.
+///
+/// This pass replaces that pair with a single critical finding. It runs after
+/// the per-kind passes so it can retract their output, matching on `target`
+/// (which is the bare type name for whole-type findings) rather than on message
+/// text. Member-level findings such as `Status.field` are never retracted,
+/// because their target carries a `Type.member` suffix.
+///
+/// There is currently no type-level rename detection in this module; if one is
+/// added it must skip names handled here, so that a single change is not
+/// reported as both a rename and a kind change.
+pub fn detect_type_kind_changes(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport) {
+    let mut changed: Vec<(String, UdtKind, UdtKind)> = old
+        .structs
+        .keys()
+        .chain(old.enums.keys())
+        .chain(old.unions.keys())
+        .chain(old.error_enums.keys())
+        .filter_map(|name| {
+            let old_kind = udt_kind_of(old, name)?;
+            let new_kind = udt_kind_of(new, name)?;
+            (old_kind != new_kind).then(|| (name.clone(), old_kind, new_kind))
+        })
+        .collect();
+
+    // The spec maps have no inherent order, so sort for a deterministic report.
+    changed.sort();
+
+    for (name, old_kind, new_kind) in changed {
+        // Drop the spurious removal/addition pair the per-kind passes produced
+        // for this name. Anything else about the type is left alone.
+        report.findings.retain(|finding| {
+            if finding.target.as_deref() != Some(name.as_str()) {
+                return true;
+            }
+            let is_stale_removal = old_kind
+                .removal_categories()
+                .contains(&finding.category.as_str());
+            let is_stale_addition = finding.category == new_kind.addition_category();
+            !(is_stale_removal || is_stale_addition)
+        });
+
+        report.findings.push(Finding {
+            severity: Severity::Critical,
+            category: TYPE_KIND_CHANGED_CATEGORY.to_string(),
+            message: format!(
+                "Type '{}' changed from {} to {}. Stored data and client \
+                 decoders written against the {} layout cannot read the {} \
+                 that replaced it.",
+                name,
+                old_kind.label(),
+                new_kind.label(),
+                old_kind.label(),
+                new_kind.label(),
+            ),
+            type_name: Some(name.clone()),
+            target: Some(name),
+        });
+    }
+}
+
 fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
     let old_mapper = LayoutMapper::new(old);
     let reverse_deps = old_mapper.build_reverse_dependencies();
@@ -1750,6 +1903,89 @@ mod tests {
         assert!(tf.message.contains("parameter 0 ('a') type changed")); // Index in old is 0
     }
 
+    // --- Type kind changes (#250) -------------------------------------------
+
+    fn insert_struct(spec: &mut ContractSpec, name: &str) {
+        spec.structs.insert(
+            name.to_string(),
+            ScSpecUdtStructV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: name.try_into().unwrap(),
+                fields: VecM::default(),
+            },
+        );
+    }
+
+    fn insert_enum(spec: &mut ContractSpec, name: &str) {
+        spec.enums.insert(
+            name.to_string(),
+            ScSpecUdtEnumV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: name.try_into().unwrap(),
+                cases: VecM::default(),
+            },
+        );
+    }
+
+    fn insert_union(spec: &mut ContractSpec, name: &str) {
+        spec.unions.insert(
+            name.to_string(),
+            ScSpecUdtUnionV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: name.try_into().unwrap(),
+                cases: VecM::default(),
+            },
+        );
+    }
+
+    fn insert_error_enum(spec: &mut ContractSpec, name: &str) {
+        spec.error_enums.insert(
+            name.to_string(),
+            ScSpecUdtErrorEnumV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: name.try_into().unwrap(),
+                cases: VecM::default(),
+            },
+        );
+    }
+
+    fn kind_change_findings<'a>(report: &'a DiffReport, name: &str) -> Vec<&'a Finding> {
+        report
+            .findings
+            .iter()
+            .filter(|f| {
+                f.category == TYPE_KIND_CHANGED_CATEGORY && f.target.as_deref() == Some(name)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn struct_to_enum_is_a_single_breaking_kind_change() {
+        let mut old = ContractSpec::default();
+        insert_struct(&mut old, "Status");
+        let mut new = ContractSpec::default();
+        insert_enum(&mut new, "Status");
+
+        let report = compare(&old, &new);
+
+        let findings = kind_change_findings(&report, "Status");
+        assert_eq!(
+            findings.len(),
+            1,
+            "expected exactly one kind-change finding"
+        );
+
+        let finding = findings[0];
+        assert_eq!(finding.severity, Severity::Critical);
+        assert_eq!(finding.type_name.as_deref(), Some("Status"));
+        assert!(
+            finding.message.contains("from struct to enum"),
+            "message should name both kinds, got: {}",
+            finding.message
     // ---------------------------------------------------------------
     // describe_nested_type_change unit tests
     // ---------------------------------------------------------------
@@ -1840,6 +2076,21 @@ mod tests {
     }
 
     #[test]
+    fn enum_to_union_is_a_single_breaking_kind_change() {
+        let mut old = ContractSpec::default();
+        insert_enum(&mut old, "Payload");
+        let mut new = ContractSpec::default();
+        insert_union(&mut new, "Payload");
+
+        let report = compare(&old, &new);
+
+        let findings = kind_change_findings(&report, "Payload");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Critical);
+        assert!(
+            findings[0].message.contains("from enum to union"),
+            "message should name both kinds, got: {}",
+            findings[0].message
     fn nested_type_change_deeply_nested() {
         // Vec<Option<Map<Address, u32>>> -> Vec<Option<Map<Address, u64>>>
         let inner_map = |value: ScSpecTypeDef| {
@@ -1873,6 +2124,70 @@ mod tests {
     }
 
     #[test]
+    fn kind_change_replaces_the_spurious_removal_and_addition() {
+        let mut old = ContractSpec::default();
+        insert_struct(&mut old, "Status");
+        let mut new = ContractSpec::default();
+        insert_enum(&mut new, "Status");
+
+        let report = compare(&old, &new);
+
+        // The removal `compare_structs` produced and the addition
+        // `compare_enums` produced must both be gone.
+        for category in ["Struct Removed", "Enum Added"] {
+            assert!(
+                !report
+                    .findings
+                    .iter()
+                    .any(|f| f.category == category && f.target.as_deref() == Some("Status")),
+                "'{category}' should have been replaced by the kind change"
+            );
+        }
+
+        // And nothing else should be reported about `Status`.
+        let about_status: Vec<&str> = report
+            .findings
+            .iter()
+            .filter(|f| f.target.as_deref() == Some("Status"))
+            .map(|f| f.category.as_str())
+            .collect();
+        assert_eq!(about_status, vec![TYPE_KIND_CHANGED_CATEGORY]);
+    }
+
+    #[test]
+    fn kind_change_to_error_enum_is_detected() {
+        let mut old = ContractSpec::default();
+        insert_union(&mut old, "Outcome");
+        let mut new = ContractSpec::default();
+        insert_error_enum(&mut new, "Outcome");
+
+        let report = compare(&old, &new);
+
+        assert_eq!(kind_change_findings(&report, "Outcome").len(), 1);
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.category == "Union Removed" || f.category == "Error Enum Added"));
+    }
+
+    #[test]
+    fn event_named_struct_to_enum_retracts_the_event_removal_variant() {
+        // `is_event` gives a struct named "...Event" a different removal
+        // category, which the retraction must also cover.
+        let mut old = ContractSpec::default();
+        insert_struct(&mut old, "TransferEvent");
+        let mut new = ContractSpec::default();
+        insert_enum(&mut new, "TransferEvent");
+
+        let report = compare(&old, &new);
+
+        assert_eq!(kind_change_findings(&report, "TransferEvent").len(), 1);
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.category == "Event Definition Removed"),
+            "the event-flavored removal must be retracted too"
     fn nested_type_change_outer_constructor_differs() {
         // Vec<u32> -> Option<u32> — different outer constructors
         let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
@@ -1917,6 +2232,89 @@ mod tests {
     }
 
     #[test]
+    fn a_genuine_removal_is_still_reported() {
+        // A type that really did disappear, with no replacement of another
+        // kind, must keep its plain removal finding.
+        let mut old = ContractSpec::default();
+        insert_struct(&mut old, "Gone");
+        let new = ContractSpec::default();
+
+        let report = compare(&old, &new);
+
+        assert!(kind_change_findings(&report, "Gone").is_empty());
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.category == "Struct Removed" && f.target.as_deref() == Some("Gone")));
+    }
+
+    #[test]
+    fn a_genuine_addition_is_still_reported() {
+        let old = ContractSpec::default();
+        let mut new = ContractSpec::default();
+        insert_enum(&mut new, "Fresh");
+
+        let report = compare(&old, &new);
+
+        assert!(kind_change_findings(&report, "Fresh").is_empty());
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.category == "Enum Added" && f.target.as_deref() == Some("Fresh")));
+    }
+
+    #[test]
+    fn an_unchanged_kind_produces_no_kind_change() {
+        let mut old = ContractSpec::default();
+        insert_struct(&mut old, "Same");
+        let mut new = ContractSpec::default();
+        insert_struct(&mut new, "Same");
+
+        let report = compare(&old, &new);
+        assert!(kind_change_findings(&report, "Same").is_empty());
+    }
+
+    #[test]
+    fn kind_change_does_not_retract_member_level_findings() {
+        // A struct `Data` loses a field *and* another type changes kind. The
+        // field finding targets `Data.amount`, so it must survive.
+        let mut old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::I128)])]);
+        insert_struct(&mut old, "Status");
+
+        let mut new = spec_with_structs(vec![("Data", vec![])]);
+        insert_enum(&mut new, "Status");
+
+        let report = compare(&old, &new);
+
+        assert_eq!(kind_change_findings(&report, "Status").len(), 1);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.target.as_deref() == Some("Data.amount")),
+            "member-level findings must not be retracted"
+        );
+    }
+
+    #[test]
+    fn kind_change_cascades_to_embedding_types() {
+        // `Wrapper` embeds `Status`. When `Status` changes kind, `Wrapper`'s
+        // stored layout breaks too, so cascade detection must still fire.
+        let mut old = spec_with_structs(vec![("Wrapper", vec![("status", udt("Status"))])]);
+        insert_struct(&mut old, "Status");
+
+        let mut new = spec_with_structs(vec![("Wrapper", vec![("status", udt("Status"))])]);
+        insert_enum(&mut new, "Status");
+
+        let report = compare(&old, &new);
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.category == "Cascading Layout Break"
+                    && f.target.as_deref() == Some("Wrapper")),
+            "a kind change must cascade to types embedding it"
     fn field_type_change_map_shows_concise_message() {
         let make_map = |value: ScSpecTypeDef| {
             ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
@@ -2026,6 +2424,34 @@ mod tests {
     }
 
     #[test]
+    fn multiple_kind_changes_are_reported_deterministically() {
+        let mut old = ContractSpec::default();
+        insert_struct(&mut old, "Beta");
+        insert_struct(&mut old, "Alpha");
+        insert_union(&mut old, "Gamma");
+
+        let mut new = ContractSpec::default();
+        insert_enum(&mut new, "Beta");
+        insert_enum(&mut new, "Alpha");
+        insert_enum(&mut new, "Gamma");
+
+        // The spec maps have no inherent order; the emitted order must not
+        // depend on it, so repeated runs have to agree.
+        let names_in_order = |report: &DiffReport| -> Vec<String> {
+            report
+                .findings
+                .iter()
+                .filter(|f| f.category == TYPE_KIND_CHANGED_CATEGORY)
+                .map(|f| f.target.clone().unwrap())
+                .collect()
+        };
+
+        let first = names_in_order(&compare(&old, &new));
+        assert_eq!(first, vec!["Alpha", "Beta", "Gamma"]);
+
+        for _ in 0..5 {
+            assert_eq!(names_in_order(&compare(&old, &new)), first);
+        }
     fn bytesn_parameter_change_gets_specific_category() {
         let old = spec_with_functions(vec![("test", vec![("x", bytesn(32))])]);
         let new = spec_with_functions(vec![("test", vec![("x", bytesn(64))])]);

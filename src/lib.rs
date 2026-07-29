@@ -39,11 +39,14 @@
 pub mod color;
 pub mod diff;
 pub mod error;
+pub mod interface_hash;
 pub mod loader;
 pub mod mapper;
 pub mod parser;
+pub mod render;
 pub mod report;
 pub mod spec;
+pub mod spec_json;
 pub mod suppression;
 
 use std::path::Path;
@@ -78,7 +81,8 @@ pub fn compare_wasm_bytes(old_wasm: &[u8], new_wasm: &[u8]) -> Result<SafetyRepo
     let new_spec = ContractSpec::from_entries(&new_meta.spec);
 
     let diff_report = diff::compare(&old_spec, &new_spec);
-    Ok(SafetyReport::new(&diff_report))
+    Ok(SafetyReport::new(&diff_report)
+        .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash()))
 }
 
 /// Compare two Soroban contract builds read from WASM files on disk.

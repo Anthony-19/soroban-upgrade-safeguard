@@ -9,15 +9,18 @@ This document explains what Soroban Upgrade Safeguard does, how it works interna
 3. [Installation](#installation)
 4. [Docker](#docker)
 5. [Command Line Usage](#command-line-usage)
-6. [How the Analysis Works](#how-the-analysis-works)
-7. [Detection Categories](#detection-categories)
-8. [Severity Levels](#severity-levels)
-9. [Cascading Layout Breaks](#cascading-layout-breaks)
-10. [Reading the Report](#reading-the-report)
-11. [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes)
-12. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
-13. [Limitations](#limitations)
-14. [Frequently Asked Questions](#frequently-asked-questions)
+6. [Inspecting a Single Build (`extract`)](#inspecting-a-single-build-extract)
+7. [Re-rendering a Saved Report (`render`)](#re-rendering-a-saved-report-render)
+8. [How the Analysis Works](#how-the-analysis-works)
+9. [Detection Categories](#detection-categories)
+10. [Severity Levels](#severity-levels)
+11. [Cascading Layout Breaks](#cascading-layout-breaks)
+12. [The Interface Hash](#the-interface-hash)
+13. [Reading the Report](#reading-the-report)
+14. [Suppressing Known Breaking Changes](#suppressing-known-breaking-changes)
+15. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
+16. [Limitations](#limitations)
+17. [Frequently Asked Questions](#frequently-asked-questions)
 
 ## Overview
 
@@ -132,6 +135,73 @@ soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
 
 The first argument should be the build that is currently deployed on chain. The second argument should be the build you intend to deploy. Order matters: the comparison is directional, because removing a field from the old version is treated differently from adding a field in the new version.
 
+Two subcommands do something other than compare a pair: `extract` dumps one build's decoded interface, and `render` turns a saved JSON report back into a human format. They are additive — every invocation form described above continues to work unchanged.
+
+## Inspecting a Single Build (`extract`)
+
+Comparing two builds is not the only useful thing to do with a decoded interface. `extract` emits what a single WASM actually exposes, so you can inspect a build directly or archive its interface as a pipeline artifact without reaching for separate Stellar tooling.
+
+```bash
+soroban-upgrade-safeguard extract ./wasm/v1.wasm
+soroban-upgrade-safeguard extract --contract-id C... --rpc-url https://soroban-testnet.stellar.org
+```
+
+The output is a single JSON document on stdout:
+
+```json
+{
+  "spec_schema_version": 1,
+  "tool_version": "0.1.0",
+  "source": "./wasm/v1.wasm",
+  "interface_hash": "17618edb2d0d9911…",
+  "env_meta": {
+    "interface_version": 90194313216,
+    "protocol_version": 21,
+    "pre_release_version": 0
+  },
+  "functions":   [ { "name": "…", "doc": "…", "inputs": [ … ], "outputs": [ … ] } ],
+  "structs":     [ { "name": "…", "doc": "…", "lib": "…", "fields": [ … ] } ],
+  "enums":       [ { "name": "…", "doc": "…", "lib": "…", "cases": [ … ] } ],
+  "unions":      [ { "name": "…", "doc": "…", "lib": "…", "cases": [ … ] } ],
+  "error_enums": [ { "name": "…", "doc": "…", "lib": "…", "cases": [ … ] } ]
+}
+```
+
+Notes on the shape, which is intended to be stable enough to consume:
+
+- Every collection is **sorted by name**, so two extractions of the same build are byte-identical. The underlying spec maps have no inherent order, so without this the output would vary between runs.
+- Within a function, `inputs` and `outputs` stay in **declaration order**, and struct `fields` and union `cases` likewise, because those positions are part of the serialized layout.
+- `env_meta` is `null` when the WASM carries no `contractenvmetav0` section.
+- Types are emitted **structurally**, tagged with a `kind` field, rather than as display strings: `{"kind":"u32"}`, `{"kind":"udt","name":"Data"}`, `{"kind":"option","value":{"kind":"address"}}`. A display string would be ambiguous, since a user-defined type named `u32` renders identically to the primitive.
+- `spec_schema_version` is bumped only when a change would break a consumer reading the current shape. Adding a field is not such a change.
+
+For scripting, `--hash-only` prints just the interface hash and nothing else, which makes it usable directly as a cache key:
+
+```bash
+$ soroban-upgrade-safeguard extract ./wasm/v1.wasm --hash-only
+17618edb2d0d99112a446eec51b056ef59d07e2d1ffdbbb0656f48f62e4a4265
+```
+
+## Re-rendering a Saved Report (`render`)
+
+The JSON report is the durable artifact. `render` turns a stored one back into text or Markdown, so a pipeline that archived the JSON can later produce the Markdown a reviewer wants without rerunning the comparison against inputs that may have moved.
+
+```bash
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --format json > report.json
+soroban-upgrade-safeguard render report.json --format markdown
+cat report.json | soroban-upgrade-safeguard render - --format text
+```
+
+Pass `-` as the path to read from stdin. The available formats are `text` (default) and `markdown`; JSON is excluded because re-rendering JSON as JSON would be a plain copy.
+
+The re-rendered output is identical to what the original run printed. That is structural rather than a promise: both the live run and `render` build the same `RenderableReport` model and call the same renderer, so the two paths cannot drift apart.
+
+Two details worth knowing:
+
+- **The exit code reflects the stored verdict.** Rendering a failing report exits 1, exactly as the original run did. `render` reports on a verdict; it does not re-derive one.
+- **`--explain` guidance only appears if the original run recorded it.** Remediation text is stored in the JSON only when the comparison used `--explain`, so `render --explain` can surface it but cannot invent it.
+
+An unreadable or incompatible report fails with a specific message rather than a parse error — a report written by a newer tool version names both the schema version it needs and the tool version that produced it.
 ### Usage modes
 
 The tool runs in one of four modes, selected by which arguments you pass:
@@ -215,6 +285,16 @@ The comparison stage looks for the following classes of change.
 - **Enum Case Value Changed.** A variant kept its name but its integer value changed, which breaks serialization. Critical.
 - **Enum Case Added.** A new variant. Informational.
 
+### Type Kind Changes
+
+- **Type Kind Changed.** A user-defined type kept its name but became a different kind of type — a struct that is now an enum, an enum that is now a union, and so on. Critical.
+
+This one is worth explaining, because it is easy to misread. Each of the per-kind comparison passes looks only at its own map: the struct pass compares structs against structs, the enum pass enums against enums. So when `Status` is a struct in the old build and an enum in the new one, the struct pass sees a struct that vanished and the enum pass sees an enum that appeared, and neither can tell that they are looking at two halves of the same change.
+
+Reported that way it would read as a critical `Struct Removed` plus an informational `Enum Added` — and the informational half badly understates what happened. The type did not appear from nowhere; it replaced a struct of the same name, which invalidates every stored value of that type.
+
+The tool therefore runs a pass after the per-kind comparisons that detects names defined as one kind in the old spec and another kind in the new one, reports a single critical **Type Kind Changed** finding, and retracts the spurious removal-plus-addition pair for that name. Findings about the type's *members* (for example `Status.field`) are untouched, and the kind change still propagates through [cascading layout breaks](#cascading-layout-breaks) to any type that embeds it.
+
 ### Events
 
 Soroban does not mark event types explicitly in the spec, so the tool uses a naming heuristic: any user-defined type whose name contains the word `event` (case insensitive) is treated as an event type. When such a type changes, the same struct and enum checks apply but the findings are labeled with event-specific categories such as **Event Schema Removed** or **Event Enum Case Value Changed**. This matters because off-chain indexers and subscribers depend on a stable event shape, and a change that is merely awkward for storage can be fully breaking for an indexer.
@@ -232,6 +312,54 @@ Every finding carries one of three severity levels.
 The most subtle failures come from shared types. Suppose a small struct named `Money` is used as a field inside `Account`, and `Account` is used inside `Ledger`. If you change `Money`, the stored bytes for every `Account` and every `Ledger` are now wrong, even though you never touched those larger types directly.
 
 To catch this, `mapper.rs` builds a reverse dependency graph: for each user-defined type, it records which other types embed it. After the direct comparison finds the set of types with critical changes, `diff.rs` walks that graph outward and marks every dependent type as broken too, transitively. These appear in the report under the **Cascading Layout Break** category, naming both the affected parent type and the underlying modified type that caused the break. Cyclic type references are handled safely so the walk always terminates.
+
+## The Interface Hash
+
+Every comparison also computes an **interface hash** for each build: a SHA-256 digest over a canonical form of the decoded spec, shown in the report and available on its own via `extract --hash-only`.
+
+It answers, cheaply and directly, a question that otherwise requires a full pairwise diff: *do these two builds expose the same interface?* Two builds with the same interface hash expose the same functions and types, regardless of compiler noise, entry ordering, or byte-level differences in the WASM. That makes it useful for caching a comparison result, for indexing builds by interface, and for catching the case where a change you believed was interface-preserving quietly was not.
+
+The hash is order-independent by construction. A `ContractSpec` is built from hash maps with no inherent iteration order, and two builds of semantically identical source may lay their `contractspecv0` entries out differently, so the canonical form sorts every collection whose order is not itself part of the interface.
+
+### What the hash covers
+
+Included, because changing any of these changes the interface:
+
+| Included | Detail |
+| :--- | :--- |
+| Functions | Name, parameter names, parameter types, parameter **order**, and return types in order |
+| Structs | Name, field names, field types, and field **order** — struct fields serialize positionally |
+| Unions | Name, case names, case payload types, and case **order** — union cases serialize by positional discriminant |
+| Enums, error enums | Name, and the set of `(case name, value)` pairs |
+| Type kind | Whether a given name is a struct, enum, union, or error enum |
+
+Two ordering rules deserve a note, because they are the part that had to be got right:
+
+- Struct fields, union cases, and function parameters keep their **declared order** in the canonical form, since Soroban serializes and invokes them positionally. Reordering them is a breaking change, and the hash moves accordingly.
+- Enum and error-enum cases are **sorted by name** instead. Their integer values are explicit and the comparison matches them by name, so reordering variants in the source is not an interface change and must not move the hash.
+
+Deliberately **not** included, because these are prose or provenance rather than interface shape:
+
+- **Doc strings**, on any entry, field, parameter, or case. Editing a comment must not invalidate a cached interface hash. Note that the comparison still *reports* doc changes as informational findings — the hash tracks the interface, not the full finding set.
+- The **`lib`** field on user-defined types, which records the defining library and is never compared.
+- Everything **outside the spec**: WASM bytes, compiler version, section ordering, `contractenvmetav0` (and therefore the Soroban protocol version), and `contractmetav0`. Two builds with the same interface hash may target different protocol versions, so the hash is not a substitute for the environment check.
+
+### Stability
+
+A canonical-form version is mixed into the digest, so if the encoding ever changes, every hash changes with it rather than silently colliding across tool versions. The canonical form is also length-prefixed throughout, which means no combination of type, field, or case names can collide by running together across a separator.
+
+### Using it from a script
+
+```bash
+old=$(soroban-upgrade-safeguard extract ./wasm/v1.wasm --hash-only)
+new=$(soroban-upgrade-safeguard extract ./wasm/v2.wasm --hash-only)
+
+if [ "$old" = "$new" ]; then
+  echo "Interface unchanged — skipping the full comparison"
+fi
+```
+
+In a comparison report, both hashes appear in the header of every format, along with a line stating whether the interface changed, and in the JSON as `old_interface_hash` and `new_interface_hash`.
 
 ## Reading the Report
 
