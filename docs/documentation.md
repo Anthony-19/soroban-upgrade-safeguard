@@ -186,19 +186,43 @@ The image preserves exit code semantics (0 = safe, 1 = critical findings). Use i
 
 ## Command Line Usage
 
-The tool takes exactly two positional arguments: the path to the previous (on-chain) WASM and the path to the new (candidate) WASM.
+The tool supports several invocation modes. It no longer assumes exactly two positional
+arguments; instead use the mode appropriate to your environment:
+
+- Local file comparison (two positional WASM paths):
 
 ```bash
 soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>
 ```
 
-Example:
+- RPC baseline mode (fetch the on-chain baseline; single positional new WASM):
 
 ```bash
-soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
+soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>
 ```
 
-The first argument should be the build that is currently deployed on chain. The second argument should be the build you intend to deploy. Order matters: the comparison is directional, because removing a field from the old version is treated differently from adding a field in the new version.
+- Manifest (batch) mode: compare many pairs listed in a manifest file:
+
+```bash
+soroban-upgrade-safeguard --manifest <MANIFEST_PATH>
+```
+
+- Directory scan (pair by file stem):
+
+```bash
+soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>
+```
+
+- Glob pair mode (pair matches by file stem):
+
+```bash
+soroban-upgrade-safeguard --old-glob '<OLD_PATTERN>' --new-glob '<NEW_PATTERN>'
+```
+
+The first form (two positional paths) remains the simplest for ad-hoc, local checks.
+RPC mode fetches the baseline from chain and verifies it cryptographically; manifest,
+directory, and glob modes run batch comparisons. The full usage strings and options
+match the CLI help output (`--help`) and the `override_usage` in `src/main.rs`.
 
 Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, and the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)).
 
@@ -479,6 +503,28 @@ The comparison stage looks for the following classes of change.
 - **Enum Case Removed.** A variant disappeared, so stored values using it become invalid. Critical.
 - **Enum Case Value Changed.** A variant kept its name but its integer value changed, which breaks serialization. Critical.
 - **Enum Case Added.** A new variant. Informational.
+
+### Unions
+
+- **Union Removed.** A union present in the old build is missing. Any stored values using this union become invalid. Critical.
+- **Union Case Removed.** A union case disappeared, breaking positional discriminants and layout compatibility. Critical.
+- **Union Case Reordered.** A case moved position; unions serialize by positional discriminant, so reordering breaks layout. Critical.
+- **Union Case Type Changed.** A case's payload type changed (non-numeric or multi-value change). Critical.
+- **Union Case Type Widened.** A numeric widening of a case payload (e.g. `i32` → `i64`). Warning.
+- **Union Case Type Narrowed.** A numeric narrowing of a case payload. Critical.
+- **Union Case Type Signedness Changed.** A numeric signedness change in a case payload. Critical.
+- **Union Case Added.** A new case appended to the union. Informational.
+- **Union Added.** A new union type in the new build. Informational.
+- **Union Documentation Changed.** Doc-string changes for a union. Informational.
+
+### Error Enums
+
+- **Error Enum Removed.** An error enum present in the old build is missing. Clients matching on these error codes will break. Critical.
+- **Error Enum Case Removed.** A case was removed from an error enum. Critical.
+- **Error Enum Case Value Changed.** A case's numeric value changed, breaking error-code compatibility. Critical.
+- **Error Enum Case Added.** A new error enum case was added. Informational.
+- **Error Enum Added.** A new error enum type in the new build. Informational.
+- **Error Enum Documentation Changed.** Doc-string changes for an error enum. Informational.
 
 ### Type Renames
 

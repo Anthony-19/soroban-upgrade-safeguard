@@ -58,6 +58,15 @@ We recommend installing the standard formatting and linting components:
 rustup component add rustfmt clippy
 ```
 
+Optional: install the `pre-commit` framework to run quick checks automatically on every commit.
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+The repository includes a `.pre-commit-config.yaml` that runs `cargo fmt` and `cargo clippy` on staged files. These checks are intentionally limited to fast, local validations so they catch common problems before pushing. Running the full test suite is left to CI (or to a manual `pre-push` hook if you opt in).
+
 ## Project Structure
 
 The source lives under `src/` and is split into focused modules. Understanding this layout makes it much easier to find where a change belongs.
