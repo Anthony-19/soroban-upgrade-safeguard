@@ -26,11 +26,21 @@ use crate::diff::Severity;
 use crate::report::ReportedFinding;
 
 /// Version of the JSON report shape.
-///
-/// Bumped only when a change would stop an older reader from rendering a newer
-/// report correctly. Purely additive fields do not require a bump, because
-/// readers ignore keys they do not know.
 pub const REPORT_SCHEMA_VERSION: u32 = 1;
+
+/// Provenance metadata embedded in every report for auditability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Provenance {
+    /// Tool version from crate metadata (CARGO_PKG_VERSION).
+    pub tool_version: String,
+    /// Timestamp in ISO 8601 / RFC 3339 format.
+    /// Empty string when `--no-timestamp` is active.
+    #[serde(default)]
+    pub timestamp: String,
+    /// Input identifiers: paths, contract IDs, or content hashes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<String>,
+}
 
 /// Severity counts, serialized as a nested `counts` object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,9 +107,9 @@ pub struct RenderableReport {
     /// Shape version of this document. See [`REPORT_SCHEMA_VERSION`].
     #[serde(default = "default_schema_version")]
     pub report_schema_version: u32,
-    /// The tool version that produced the report, for diagnostics.
+    /// Provenance metadata (tool version, timestamp, inputs).
     #[serde(default)]
-    pub tool_version: String,
+    pub provenance: Provenance,
     pub is_safe: bool,
     pub strict: bool,
     pub counts: SeverityCounts,
@@ -124,15 +134,7 @@ fn default_schema_version() -> u32 {
 
 impl RenderableReport {
     /// Parse a previously emitted JSON report.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RenderError::Malformed`] if the input is not a report
-    /// document, and [`RenderError::IncompatibleSchema`] if it declares a
-    /// schema version this build does not understand.
     pub fn from_json_str(json: &str) -> Result<Self, RenderError> {
-        // Read the version first, so a report from a *newer* tool produces a
-        // version error rather than a confusing field-level parse failure.
         let probe: SchemaProbe = serde_json::from_str(json).map_err(RenderError::Malformed)?;
         if probe.report_schema_version > REPORT_SCHEMA_VERSION {
             return Err(RenderError::IncompatibleSchema {
@@ -163,8 +165,7 @@ impl RenderableReport {
         categories
     }
 
-    /// The interface-hash block shared by the text and Markdown headers, as
-    /// `(label, value)` pairs. Empty when no hashes were recorded.
+    /// The interface-hash block shared by the text and Markdown headers.
     fn interface_hash_lines(&self) -> Vec<(&'static str, String)> {
         let mut lines = Vec::new();
         if let Some(old) = &self.old_interface_hash {
@@ -184,6 +185,36 @@ impl RenderableReport {
             ));
         }
         lines
+    }
+
+    /// Render provenance as a compact text block for human-readable outputs.
+    fn provenance_block_text(&self) -> String {
+        let mut block = String::new();
+        block.push_str(&"────────────────────────────────────────\n".dimmed().to_string());
+        block.push_str(&format!("Tool:     v{}\n", self.provenance.tool_version).dimmed());
+        if !self.provenance.timestamp.is_empty() {
+            block.push_str(&format!("Time:     {}\n", self.provenance.timestamp).dimmed());
+        }
+        for input in &self.provenance.inputs {
+            block.push_str(&format!("Input:    {input}\n").dimmed());
+        }
+        block.push_str(&"────────────────────────────────────────\n".dimmed().to_string());
+        block
+    }
+
+    /// Render provenance as a compact Markdown block.
+    fn provenance_block_markdown(&self) -> String {
+        let mut block = String::new();
+        block.push_str("###### Provenance\n\n");
+        block.push_str(&format!("- **Tool**: `soroban-upgrade-safeguard v{}`\n", self.provenance.tool_version));
+        if !self.provenance.timestamp.is_empty() {
+            block.push_str(&format!("- **Timestamp**: `{}`\n", self.provenance.timestamp));
+        }
+        for input in &self.provenance.inputs {
+            block.push_str(&format!("- **Input**: `{input}`\n"));
+        }
+        block.push('\n');
+        block
     }
 
     /// Render the structured, human-readable text output for the CLI.
@@ -257,6 +288,8 @@ impl RenderableReport {
                 .to_string(),
         );
 
+        output.push_str(&self.provenance_block_text());
+
         if self.total_findings == 0 {
             output.push_str(&"No relevant changes detected. The upgrade is identical in its exports and types.\n".green().to_string());
             return output;
@@ -274,8 +307,6 @@ impl RenderableReport {
                 let finding = &reported.finding;
 
                 if reported.suppressed {
-                    // Suppressed findings are still listed, but clearly marked
-                    // and dimmed so they read as acknowledged, not active.
                     let label = format!("🔕 [SUPPRESSED] {}", finding.message)
                         .dimmed()
                         .to_string();
@@ -367,6 +398,9 @@ impl RenderableReport {
         }
         output.push_str("---\n\n");
 
+        output.push_str(&self.provenance_block_markdown());
+        output.push_str("---\n\n");
+
         if self.total_findings == 0 {
             output.push_str("No relevant changes detected. The upgrade is identical in its exports and types.\n");
             return output;
@@ -450,8 +484,6 @@ mod tests {
         SafetyReport::new(&diff)
     }
 
-    /// The acceptance criterion for #252: a saved report renders identically to
-    /// the live run that produced it.
     #[test]
     fn round_trip_text_matches_a_live_run() {
         let live = sample_report();
@@ -575,5 +607,95 @@ mod tests {
         let markdown = report.to_markdown();
         assert!(markdown.contains("**New Interface Hash**"));
         assert!(markdown.contains("unchanged") || markdown.contains("changed"));
+    }
+
+    #[test]
+    fn provenance_appears_in_json_output() {
+        let live = sample_report();
+        let mut renderable = live.to_renderable();
+        renderable.provenance = Provenance {
+            tool_version: "0.1.0".to_string(),
+            timestamp: "2024-01-15T10:30:00Z".to_string(),
+            inputs: vec!["v1.wasm".to_string(), "v2.wasm".to_string()],
+        };
+
+        let json = serde_json::to_string_pretty(&renderable).unwrap();
+        assert!(json.contains("\"provenance\""));
+        assert!(json.contains("0.1.0"));
+        assert!(json.contains("2024-01-15T10:30:00Z"));
+        assert!(json.contains("v1.wasm"));
+        assert!(json.contains("v2.wasm"));
+    }
+
+    #[test]
+    fn provenance_appears_in_text_output() {
+        let live = sample_report();
+        let mut renderable = live.to_renderable();
+        renderable.provenance = Provenance {
+            tool_version: "0.1.0".to_string(),
+            timestamp: "2024-01-15T10:30:00Z".to_string(),
+            inputs: vec!["v1.wasm".to_string(), "v2.wasm".to_string()],
+        };
+
+        let text = renderable.to_text(false);
+        assert!(text.contains("Tool:"));
+        assert!(text.contains("v0.1.0"));
+        assert!(text.contains("Time:"));
+        assert!(text.contains("Input:"));
+        assert!(text.contains("v1.wasm"));
+    }
+
+    #[test]
+    fn provenance_appears_in_markdown_output() {
+        let live = sample_report();
+        let mut renderable = live.to_renderable();
+        renderable.provenance = Provenance {
+            tool_version: "0.1.0".to_string(),
+            timestamp: "2024-01-15T10:30:00Z".to_string(),
+            inputs: vec!["v1.wasm".to_string(), "v2.wasm".to_string()],
+        };
+
+        let markdown = renderable.to_markdown();
+        assert!(markdown.contains("###### Provenance"));
+        assert!(markdown.contains("soroban-upgrade-safeguard v0.1.0"));
+        assert!(markdown.contains("2024-01-15T10:30:00Z"));
+    }
+
+    #[test]
+    fn provenance_timestamp_suppressed_when_empty() {
+        let live = sample_report();
+        let mut renderable = live.to_renderable();
+        renderable.provenance = Provenance {
+            tool_version: "0.1.0".to_string(),
+            timestamp: String::new(),
+            inputs: vec![],
+        };
+
+        let text = renderable.to_text(false);
+        assert!(text.contains("Tool:"));
+        assert!(!text.contains("Time:"));
+
+        let markdown = renderable.to_markdown();
+        assert!(markdown.contains("###### Provenance"));
+        assert!(!markdown.contains("Timestamp"));
+    }
+
+    #[test]
+    fn provenance_round_trips_through_json() {
+        let live = sample_report();
+        let mut renderable = live.to_renderable();
+        renderable.provenance = Provenance {
+            tool_version: "0.2.0".to_string(),
+            timestamp: "2024-06-01T00:00:00Z".to_string(),
+            inputs: vec!["old.wasm".to_string(), "new.wasm".to_string()],
+        };
+
+        let json = serde_json::to_string(&renderable).unwrap();
+        let restored = RenderableReport::from_json_str(&json).unwrap();
+
+        assert_eq!(restored.provenance.tool_version, "0.2.0");
+        assert_eq!(restored.provenance.timestamp, "2024-06-01T00:00:00Z");
+        assert_eq!(restored.provenance.inputs.len(), 2);
+        assert!(restored.provenance.inputs.contains(&"old.wasm".to_string()));
     }
 }

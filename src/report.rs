@@ -5,13 +5,10 @@ use crate::suppression::SuppressionConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::render::Provenance;
+
 pub use crate::render::SeverityCounts;
 
-/// The machine-readable view of a report.
-///
-/// Kept as an alias so existing callers of `SafetyReport::to_json()` keep
-/// compiling; the model itself now lives in [`crate::render`], where the
-/// renderers that consume it also live.
 pub type SafetyReportJson = RenderableReport;
 use colored::Colorize;
 use serde::Serialize;
@@ -61,6 +58,12 @@ pub struct SafetyReport {
     pub critical_root_count: usize,
     /// Number of critical cascade consequences.
     pub cascade_critical_count: usize,
+    /// Interface hash of the old build's spec.
+    pub old_interface_hash: Option<InterfaceHash>,
+    /// Interface hash of the new build's spec.
+    pub new_interface_hash: Option<InterfaceHash>,
+    /// Suppress timestamp in provenance for deterministic/snapshot testing.
+    pub no_timestamp: bool,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -355,6 +358,9 @@ impl SafetyReport {
             diff_types: false,
             use_color: false,
             is_noop: false,
+            no_timestamp: false,
+            old_interface_hash: None,
+            new_interface_hash: None,
         }
     }
 
@@ -476,9 +482,39 @@ impl SafetyReport {
     /// it, and the text and Markdown renderers read it. A re-render of a saved
     /// JSON report therefore takes exactly the same path as a live run.
     pub fn to_renderable(&self) -> RenderableReport {
+        let timestamp = if self.no_timestamp {
+            String::new()
+        } else {
+            chrono_now_rfc3339()
+        };
+
         RenderableReport {
             report_schema_version: REPORT_SCHEMA_VERSION,
-            tool_version: env!("CARGO_PKG_VERSION").to_string(),
+            provenance: Provenance {
+                tool_version: env!("CARGO_PKG_VERSION").to_string(),
+                timestamp,
+                inputs: vec![],
+            },
+            is_safe: self.is_safe,
+            strict: self.strict,
+            counts: SeverityCounts {
+                critical: self.critical_count.saturating_sub(self.suppressed_critical_count),
+                warning: self.warning_count.saturating_sub(self.suppressed_warning_count),
+                info: self.info_count.saturating_sub(self.suppressed_info_count),
+            },
+            suppressed_count: self.suppressed_count,
+            total_findings: self.total_findings,
+            recommended_bump: self.recommended_bump().to_string(),
+            old_interface_hash: self.old_interface_hash.map(|h| h.to_hex()),
+            new_interface_hash: self.new_interface_hash.map(|h| h.to_hex()),
+            findings_by_category: self
+                .findings_by_category
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        }
+    }
+
     /// Returns `true` when at least one Info-severity finding is not a
     /// non-functional documentation change (e.g. reworded doc comments).
     fn has_non_documentation_info_findings(&self) -> bool {
@@ -498,34 +534,6 @@ impl SafetyReport {
             }
         }
         false
-    }
-
-    /// Build a serializable, machine-readable view of this report.
-    pub fn to_json(&self) -> SafetyReportJson<'_> {
-        SafetyReportJson {
-            is_safe: self.is_safe,
-            strict: self.strict,
-            counts: SeverityCounts {
-                critical: self.critical_count - self.suppressed_critical_count,
-                warning: self.warning_count - self.suppressed_warning_count,
-                info: self.info_count - self.suppressed_info_count,
-                suppressed_critical: self.suppressed_critical_count,
-                suppressed_warning: self.suppressed_warning_count,
-                suppressed_info: self.suppressed_info_count,
-            },
-            critical_root_count: self.critical_root_count,
-            cascade_critical_count: self.cascade_critical_count,
-            suppressed_count: self.suppressed_count,
-            total_findings: self.total_findings,
-            recommended_bump: self.recommended_bump().to_string(),
-            old_interface_hash: self.old_interface_hash.map(|h| h.to_hex()),
-            new_interface_hash: self.new_interface_hash.map(|h| h.to_hex()),
-            findings_by_category: self
-                .findings_by_category
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        }
     }
 
     /// Build a serializable, machine-readable view of this report.
@@ -1055,6 +1063,60 @@ pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
         "BytesN Size Changed" => Some("This is a breaking change. Changing the size of a fixed-size byte array alters its binary encoding. Revert the size or migrate data that depends on the original byte length."),
         _ => None,
     }
+}
+
+/// Return the current UTC time as an RFC 3339 / ISO 8601 string.
+fn chrono_now_rfc3339() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let nanos = now.subsec_nanos();
+
+    // Compute year, month, day, hour, minute, second from Unix timestamp.
+    let leap_years = |y: u64| y / 4 - y / 100 + y / 400;
+    let mut days = secs / 86400;
+    let time_secs = secs % 86400;
+
+    let mut year: u64 = 1970;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+
+    let month_days = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month = 0u64;
+    let mut day = days;
+    for (i, &md) in month_days.iter().enumerate() {
+        if day < md {
+            month = i as u64 + 1;
+            break;
+        }
+        day -= md;
+    }
+    day += 1;
+
+    let hour = time_secs / 3600;
+    let minute = (time_secs % 3600) / 60;
+    let second = time_secs % 60;
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        year, month, day, hour, minute, second, nanos / 1_000_000
+    )
+}
+
+fn is_leap_year(y: u64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 #[cfg(test)]
