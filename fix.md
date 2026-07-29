@@ -1,34 +1,40 @@
-A change from BytesN<32> to BytesN<64> is reported through the generic
-type-changed path in src/diff.rs. The message is "type changed from BytesN<32>
-to BytesN<64>" and the guidance is the generic advice to revert or migrate.
+SafetyReport::with_suppressions in src/report.rs increments critical_count,
+warning_count, and info_count for every finding regardless of suppression, and
+tracks the failing (unsuppressed) counts separately only to decide is_safe.
 
-A fixed-size byte array is a common, meaningful type in Soroban contracts: 32-byte
-hashes, keys, and identifiers. Changing its length is a specific and recognisable
-migration, distinct from swapping one type for an unrelated other, and the report
-gives no signal that this is a size change rather than an arbitrary type swap.
+The summary the user reads prints the raw counts. So a run where the only critical
+finding is suppressed shows:
+
+Status: ✅ PASSED
+Critical: 1
+That reads as a contradiction. The verdict says safe, the count says one critical.
+A reviewer has no way to tell from the numbers that the critical was acknowledged,
+short of reading every finding line for the [SUPPRESSED] marker.
 
 Expected behaviour
-A change that only alters the N of a BytesN<N>, on either side of a field,
-parameter, return, or union case, should be reported as a byte-array size change
-with guidance specific to it.
+The displayed counts should make the suppressed portion legible, so the numbers
+next to the verdict cannot contradict it. At minimum the active (failing) count
+should be distinguishable from the suppressed count.
 
 Suggested approach
-Detect the BytesN(a) -> BytesN(b) case before falling back to the generic
-type-changed finding, everywhere a type change is currently reported. Add a
-dedicated category with its own remediation guidance, since src/report.rs
-asserts every emitted category has guidance.
+Show the active and suppressed portions separately, for example an active critical
+count with the suppressed count called out alongside, in the text summary, the
+Markdown summary table, and the JSON counts. The report already carries
+suppressed_count; the per-severity split needs to be tracked the same way the
+failing counts already are. Keep the raw totals available where a consumer might
+still want them.
 
 Acceptance criteria
 
-A BytesN<N> size change is reported as a distinct, clearly worded finding.
+A report whose only critical finding is suppressed does not show a bare
+Critical: 1 next to a PASSED verdict.
 
-The classification applies to struct fields, parameters, return types, and
-union case payloads.
+The active and suppressed portions of each severity are distinguishable in
+text, Markdown, and JSON.
 
-A change between BytesN and an unrelated type still falls through to the
-generic finding.
+The verdict logic is unchanged; only the presentation of counts changes.
 
-The new category has remediation guidance and unit tests in src/diff.rs.
+Tests cover a report with suppressed findings across all three formats.
 Getting started
 Fork this repository, clone your fork, and add this repo as upstream:
 
@@ -37,8 +43,8 @@ cd soroban-upgrade-safeguard
 git remote add upstream https://github.com/ShippedLabs/soroban-upgrade-safeguard.git
 Create a branch for this issue:
 
-git checkout -b feat/classify-bytesn-size-changes
+git checkout -b fix/suppressed-counts-in-summary
 Suggested commit message:
 
-feat: report BytesN size changes as a distinct finding
-Run cargo fmt --check, cargo clippy, and cargo test
+fix: reflect suppression in the displayed severity counts
+Run cargo fmt --check, cargo clippy, and cargo test before pushing, then
