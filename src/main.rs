@@ -220,6 +220,14 @@ struct Args {
     /// Suppress timestamps in report output for deterministic/snapshot testing
     #[arg(long)]
     no_timestamp: bool,
+
+    /// Sample storage entries and perform empirical validation.
+    #[arg(long)]
+    empirical: bool,
+
+    /// Path to a JSON file containing captured ledger/storage entries for offline validation.
+    #[arg(long, value_name = "EMPIRICAL_FILE")]
+    empirical_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -581,6 +589,10 @@ fn run_batch(
                         explain: args.explain,
                         strict: args.strict,
                         no_timestamp: args.no_timestamp,
+                        empirical: args.empirical || args.empirical_file.is_some(),
+                        empirical_file: args.empirical_file.as_deref(),
+                        contract_id: None,
+                        rpc_url: None,
                     },
                     progress,
                 ) {
@@ -891,6 +903,10 @@ fn run_single(
                 explain: args.explain,
                 strict: args.strict,
                 no_timestamp: args.no_timestamp,
+                empirical: args.empirical || args.empirical_file.is_some(),
+                empirical_file: args.empirical_file.as_deref(),
+                contract_id: old_source,
+                rpc_url: args.rpc_url.as_deref(),
             },
             progress,
         )?;
@@ -1122,6 +1138,10 @@ struct ContractComparison<'a> {
     explain: bool,
     strict: bool,
     no_timestamp: bool,
+    empirical: bool,
+    empirical_file: Option<&'a Path>,
+    contract_id: Option<&'a str>,
+    rpc_url: Option<&'a str>,
 }
 
 fn compare_contracts(
@@ -1137,6 +1157,10 @@ fn compare_contracts(
         explain,
         strict,
         no_timestamp,
+        empirical,
+        empirical_file,
+        contract_id,
+        rpc_url,
     } = comparison;
     let old_meta = parser::extract_metadata(old_bytes)?;
     let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
@@ -1173,6 +1197,58 @@ fn compare_contracts(
         .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash());
 
     report.no_timestamp = *no_timestamp;
+
+    let mut empirical_findings = Vec::new();
+    let mut is_empirical = false;
+
+    if *empirical {
+        is_empirical = true;
+        let mut entries = Vec::new();
+
+        if let Some(file_path) = empirical_file {
+            progress(format!("📖 Loading empirical storage entries from: {}", file_path.display()));
+            match soroban_upgrade_safeguard::empirical::load_empirical_entries(file_path) {
+                Ok(loaded) => {
+                    progress(format!("✅ Loaded {} storage entries from file", loaded.len()));
+                    entries = loaded;
+                }
+                Err(e) => {
+                    progress(format!("❌ Failed to load empirical storage file: {}", e));
+                    return Err(anyhow::anyhow!("Empirical validation error: {}", e));
+                }
+            }
+        } else if let (Some(cid), Some(rpc)) = (contract_id, rpc_url) {
+            progress(format!("🌐 Fetching contract instance storage from RPC..."));
+            match loader::fetch_instance_storage_from_rpc(cid, rpc) {
+                Ok(loaded) => {
+                    progress(format!("✅ Fetched {} instance storage entries from RPC", loaded.len()));
+                    entries = loaded;
+                }
+                Err(e) => {
+                    progress(format!("⚠️  Failed to fetch instance storage from RPC: {}", e));
+                    progress(format!("Limits: Stellar RPC does not support wildcard ledger enumeration. Degrading gracefully."));
+                }
+            }
+        } else {
+            progress(format!("⚠️  Empirical mode requested, but no local file (--empirical-file) or RPC source (--contract-id and --rpc-url) was provided."));
+        }
+
+        // Run empirical checks
+        let structural_findings: Vec<diff::Finding> = diff_report.findings.clone();
+        empirical_findings = soroban_upgrade_safeguard::empirical::run_empirical_check(
+            &old_spec,
+            &new_spec,
+            &entries,
+            &structural_findings,
+        );
+    }
+
+    report.empirical = is_empirical;
+    report.empirical_findings = empirical_findings;
+
+    if report.empirical_findings.iter().any(|ef| !ef.is_success) {
+        report.is_safe = false;
+    }
 
     Ok(report)
 }

@@ -5,6 +5,9 @@ use stellar_xdr::curr::{
 
 use crate::diff::Finding;
 use crate::spec::ContractSpec;
+use serde_json::Value;
+use stellar_xdr::curr::{LedgerEntry, LedgerEntryData, Limits, ReadXdr};
+use std::path::Path;
 
 /// An empirical finding representing the validation result of a specific storage entry.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -14,6 +17,65 @@ pub struct EmpiricalFinding {
     pub path: String,
     pub error: Option<String>,
     pub is_success: bool,
+}
+
+/// Helper to load storage entries from a JSON file offline.
+pub fn load_empirical_entries(path: &Path) -> Result<Vec<ContractDataEntry>, crate::error::Error> {
+    let content = std::fs::read_to_string(path).map_err(|e| crate::error::Error::FileAccess {
+        path: path.to_path_buf(),
+        details: format!("Failed to read empirical file: {}", e),
+        source: Some(Box::new(e)),
+    })?;
+
+    let val: Value = serde_json::from_str(&content).map_err(|e| crate::error::Error::XdrDecoding {
+        entry_index: None,
+        byte_offset: None,
+        details: format!("Failed to parse empirical JSON: {}", e),
+        source: Some(Box::new(e)),
+    })?;
+
+    let mut raw_strings = Vec::new();
+    if let Some(arr) = val.as_array() {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                raw_strings.push(s.to_string());
+            } else if let Some(xdr_val) = v.get("xdr").and_then(|x| x.as_str()) {
+                raw_strings.push(xdr_val.to_string());
+            }
+        }
+    } else if let Some(entries) = val.get("entries").and_then(|e| e.as_array()) {
+        for v in entries {
+            if let Some(s) = v.as_str() {
+                raw_strings.push(s.to_string());
+            } else if let Some(xdr_val) = v.get("xdr").and_then(|x| x.as_str()) {
+                raw_strings.push(xdr_val.to_string());
+            }
+        }
+    } else {
+        return Err(crate::error::Error::InvalidInput {
+            details: "Empirical JSON must be an array of strings or contain an 'entries' array".to_string(),
+        });
+    }
+
+    let mut contract_entries = Vec::new();
+    for (i, raw_b64) in raw_strings.iter().enumerate() {
+        if let Ok(entry) = LedgerEntry::from_xdr_base64(raw_b64, Limits::none()) {
+            if let LedgerEntryData::ContractData(cd) = entry.data {
+                contract_entries.push(cd);
+            }
+        } else if let Ok(cd) = ContractDataEntry::from_xdr_base64(raw_b64, Limits::none()) {
+            contract_entries.push(cd);
+        } else {
+            return Err(crate::error::Error::XdrDecoding {
+                entry_index: Some(i),
+                byte_offset: None,
+                details: format!("Failed to decode base64 XDR as LedgerEntry or ContractDataEntry: {}", raw_b64),
+                source: None,
+            });
+        }
+    }
+
+    Ok(contract_entries)
 }
 
 /// Helper to check if a type is an Option.
