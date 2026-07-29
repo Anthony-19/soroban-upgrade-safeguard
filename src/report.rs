@@ -33,6 +33,12 @@ pub struct SafetyReport {
     pub info_count: usize,
     /// Number of findings (of any severity) acknowledged by a suppression rule.
     pub suppressed_count: usize,
+    /// Number of suppressed Critical findings.
+    pub suppressed_critical_count: usize,
+    /// Number of suppressed Warning findings.
+    pub suppressed_warning_count: usize,
+    /// Number of suppressed Info findings.
+    pub suppressed_info_count: usize,
     pub total_findings: usize,
     pub is_safe: bool,
     pub findings_by_category: HashMap<String, Vec<ReportedFinding>>,
@@ -49,6 +55,19 @@ pub struct SeverityCounts {
     pub critical: usize,
     pub warning: usize,
     pub info: usize,
+    /// Suppressed Critical findings (0 when none).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub suppressed_critical: usize,
+    /// Suppressed Warning findings (0 when none).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub suppressed_warning: usize,
+    /// Suppressed Info findings (0 when none).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub suppressed_info: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// A machine-readable view of a [`SafetyReport`] for `--format json`.
@@ -80,6 +99,55 @@ impl SafetyReport {
         Self::with_suppressions(diff, &SuppressionConfig::default(), false, false)
     }
 
+    /// Build a no-op report: the old and new WASM binaries were byte-identical
+    /// so the full analysis pipeline was skipped.
+    pub fn noop(old_wasm_size: usize, new_wasm_size: usize) -> Self {
+        use crate::suppression::SuppressionConfig;
+
+        Self {
+            critical_count: 0,
+            warning_count: 0,
+            info_count: 0,
+            suppressed_count: 0,
+            filtered_count: 0,
+            severity_overridden_count: 0,
+            verdict_changed_by_override: false,
+            suppressed_critical_count: 0,
+            suppressed_warning_count: 0,
+            suppressed_info_count: 0,
+            total_findings: 0,
+            is_safe: true,
+            findings_by_category: HashMap::new(),
+            strict: false,
+            settings: ReportSettings {
+                strict: false,
+                explain: false,
+                max_suppressions: None,
+                allow_targetless: None,
+                max_xdr_depth: ResourcePolicy::default().max_xdr_depth,
+                max_xdr_len: ResourcePolicy::default().max_xdr_len,
+                max_entries: ResourcePolicy::default().max_entries,
+                max_walk_depth: ResourcePolicy::default().max_walk_depth,
+            },
+            scope: AnalysisScope::default(),
+            baseline_source: None,
+            verified_code_hash: None,
+            category_filter: CategoryFilter::default(),
+            old_spec_summary: None,
+            new_spec_summary: None,
+            metrics: Some(BuildMetrics::new(
+                old_wasm_size,
+                new_wasm_size,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            )),
+            unmatched_suppressions: Vec::new(),
+            baseline_diff: None,
+            diff_types: false,
+            use_color: false,
+            is_noop: true,
+        }
+    }
+
     /// Compute a safety report, applying a suppression config.
     ///
     /// Every finding is still listed; those matched by a rule are flagged as
@@ -100,6 +168,9 @@ impl SafetyReport {
         let mut warning_count = 0;
         let mut info_count = 0;
         let mut suppressed_count = 0;
+        let mut suppressed_critical_count = 0;
+        let mut suppressed_warning_count = 0;
+        let mut suppressed_info_count = 0;
         let mut failing_critical_count = 0;
         let mut failing_warning_count = 0;
         let mut findings_by_category: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
@@ -141,6 +212,11 @@ impl SafetyReport {
 
             if suppressed {
                 suppressed_count += 1;
+                match finding.severity {
+                    Severity::Critical => suppressed_critical_count += 1,
+                    Severity::Warning => suppressed_warning_count += 1,
+                    Severity::Info => suppressed_info_count += 1,
+                }
             } else {
                 match finding.severity {
                     Severity::Critical => failing_critical_count += 1,
@@ -177,6 +253,9 @@ impl SafetyReport {
             warning_count,
             info_count,
             suppressed_count,
+            suppressed_critical_count,
+            suppressed_warning_count,
+            suppressed_info_count,
             total_findings: diff.findings.len(),
             is_safe,
             findings_by_category,
@@ -192,16 +271,44 @@ impl SafetyReport {
     ///   or `Struct Field Added` explicitly to `minor` because they represent changes
     ///   that are not strictly breaking for all contexts, but require caller adjustments
     ///   or data migrations).
-    /// - `Info` findings present -> `minor` (additive, non-breaking changes).
+    /// - `Info` findings present that are additive (e.g. new functions, new types) -> `minor`.
+    /// - `Info` findings present that are only documentation changes -> `patch`.
     /// - No findings -> `patch` (identical interface).
     pub fn recommended_bump(&self) -> &'static str {
         if self.critical_count > 0 {
             "major"
-        } else if self.warning_count > 0 || self.info_count > 0 {
+        } else if self.warning_count > 0 {
             "minor"
+        } else if self.info_count > 0 {
+            if self.has_non_documentation_info_findings() {
+                "minor"
+            } else {
+                "patch"
+            }
         } else {
             "patch"
         }
+    }
+
+    /// Returns `true` when at least one Info-severity finding is not a
+    /// non-functional documentation change (e.g. reworded doc comments).
+    fn has_non_documentation_info_findings(&self) -> bool {
+        const DOC_CATEGORIES: &[&str] = &[
+            "Function Documentation Changed",
+            "Struct Documentation Changed",
+            "Enum Documentation Changed",
+        ];
+
+        for findings in self.findings_by_category.values() {
+            for reported in findings {
+                if reported.finding.severity == Severity::Info
+                    && !DOC_CATEGORIES.contains(&reported.finding.category.as_str())
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Build a serializable, machine-readable view of this report.
@@ -210,9 +317,12 @@ impl SafetyReport {
             is_safe: self.is_safe,
             strict: self.strict,
             counts: SeverityCounts {
-                critical: self.critical_count,
-                warning: self.warning_count,
-                info: self.info_count,
+                critical: self.critical_count - self.suppressed_critical_count,
+                warning: self.warning_count - self.suppressed_warning_count,
+                info: self.info_count - self.suppressed_info_count,
+                suppressed_critical: self.suppressed_critical_count,
+                suppressed_warning: self.suppressed_warning_count,
+                suppressed_info: self.suppressed_info_count,
             },
             critical_root_count: self.critical_root_count,
             cascade_critical_count: self.cascade_critical_count,
@@ -258,7 +368,8 @@ impl SafetyReport {
             "❌ FAILED (Critical breaking changes detected)"
                 .red()
                 .bold()
-        };
+            );
+        }
         output.push_str(&format!("Status: {}\n", status));
 
         let root_crit = self.critical_root_count;
@@ -273,22 +384,16 @@ impl SafetyReport {
         } else {
             format!("Critical: {}", root_crit.to_string().red().bold())
         };
-        let warn_str = if self.warning_count > 0 {
-            self.warning_count.to_string().yellow().bold()
+        let warn_str = if active_warning > 0 {
+            fmt_count(active_warning, self.suppressed_warning_count).yellow().bold()
         } else {
-            self.warning_count.to_string().normal()
+            fmt_count(active_warning, self.suppressed_warning_count).normal()
         };
-        let info_str = self.info_count.to_string().blue();
+        let info_str = fmt_count(active_info, self.suppressed_info_count).blue();
 
         output.push_str(&format!("{}\n", crit_label));
         output.push_str(&format!("Warnings: {}\n", warn_str));
         output.push_str(&format!("Info:     {}\n", info_str));
-        if self.suppressed_count > 0 {
-            output.push_str(&format!(
-                "Suppressed: {}\n",
-                self.suppressed_count.to_string().magenta().bold()
-            ));
-        }
         let bump = self.recommended_bump();
         let bump_str = match bump {
             "major" => "major".red().bold(),
@@ -455,6 +560,18 @@ impl SafetyReport {
         output.push_str(&format!("## Status: {}\n\n", status));
 
         output.push_str("### Summary Table\n\n");
+        let active_critical = self.critical_count - self.suppressed_critical_count;
+        let active_warning = self.warning_count - self.suppressed_warning_count;
+        let active_info = self.info_count - self.suppressed_info_count;
+
+        let fmt_count = |active: usize, suppressed: usize| -> String {
+            if suppressed > 0 {
+                format!("{} ({} suppressed)", active, suppressed)
+            } else {
+                active.to_string()
+            }
+        };
+
         output.push_str("| Finding Severity | Count |\n");
         output.push_str("| :--- | :--- |\n");
         if self.cascade_critical_count > 0 {
@@ -481,6 +598,41 @@ impl SafetyReport {
         output.push_str("---\n\n");
 
         if self.total_findings == 0 {
+            if self.is_noop {
+                output.push_str("**No-op upgrade detected**: the old and new WASM binaries are byte-identical.\n\n");
+                output.push_str("The full analysis pipeline was skipped because there are no differences to report.\n");
+            } else {
+                output.push_str("No relevant changes detected. The exported interface is identical in its exports and types.\n");
+            }
+        }
+
+        if let Some(source) = &self.baseline_source {
+            output.push_str(&format!("**Baseline Source**: `{}`\n\n", source));
+        }
+        if let Some(hash) = &self.verified_code_hash {
+            output.push_str(&format!("**Verified Code Hash**: `{}`\n\n", hash));
+        }
+        if let Some(bd) = &self.baseline_diff {
+            output.push_str(&format!(
+                "**Baseline**: {} new, {} persisting, {} resolved (vs. tool v{}){}\n\n",
+                bd.new_count,
+                bd.persisting_count,
+                bd.resolved.len(),
+                bd.baseline_tool_version,
+                if bd.fail_on_new_only {
+                    " — verdict reflects new findings only"
+                } else {
+                    ""
+                },
+            ));
+        }
+
+        output.push_str("---\n\n");
+
+        if self.total_findings == 0 {
+            output.push_str("No relevant changes detected. The exported interface is identical in its exports and types.\n\n");
+            output.push_str(&format!("> {}\n", STORAGE_NOT_VERIFIED_NOTE));
+            self.append_metrics_markdown(&mut output);
             output.push_str("No relevant changes detected. The upgrade is identical in its exports and types.\n");
             return output;
         }
@@ -616,6 +768,7 @@ pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
         "Error Enum Case Value Changed" => Some("This is a breaking change. Modifying error case values breaks error-code compatibility. Revert the value change."),
         "Error Enum Case Added" => Some("No action required. Ensure clients can handle the new error case gracefully."),
         "Cascading Layout Break" => Some("This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type."),
+        "BytesN Size Changed" => Some("This is a breaking change. Changing the size of a fixed-size byte array alters its binary encoding. Revert the size or migrate data that depends on the original byte length."),
         _ => None,
     }
 }
@@ -715,11 +868,31 @@ mod tests {
 
     #[test]
     fn test_recommended_semver_bump() {
+        use crate::diff::Finding;
+
+        fn make_finding(severity: Severity, category: &str) -> ReportedFinding {
+            ReportedFinding {
+                finding: Finding {
+                    severity,
+                    category: category.to_string(),
+                    message: String::new(),
+                    type_name: None,
+                    target: None,
+                },
+                suppressed: false,
+                suppression_reason: None,
+                remediation: None,
+            }
+        }
+
         let mut report = SafetyReport {
             critical_count: 0,
             warning_count: 0,
             info_count: 0,
             suppressed_count: 0,
+            suppressed_critical_count: 0,
+            suppressed_warning_count: 0,
+            suppressed_info_count: 0,
             total_findings: 0,
             is_safe: true,
             findings_by_category: std::collections::HashMap::new(),
@@ -731,13 +904,32 @@ mod tests {
         // Identical upgrade -> patch
         assert_eq!(report.recommended_bump(), "patch");
 
-        // Info findings -> minor
+        // Additive Info findings -> minor
         report.info_count = 1;
+        report.findings_by_category.insert(
+            "Function Added".to_string(),
+            vec![make_finding(Severity::Info, "Function Added")],
+        );
         assert_eq!(report.recommended_bump(), "minor");
+
+        // Documentation-only Info findings -> patch
+        report.info_count = 1;
+        report.warning_count = 0;
+        report.critical_count = 0;
+        report.findings_by_category.clear();
+        report.findings_by_category.insert(
+            "Function Documentation Changed".to_string(),
+            vec![make_finding(
+                Severity::Info,
+                "Function Documentation Changed",
+            )],
+        );
+        assert_eq!(report.recommended_bump(), "patch");
 
         // Warning findings -> minor
         report.info_count = 0;
         report.warning_count = 1;
+        report.findings_by_category.clear();
         assert_eq!(report.recommended_bump(), "minor");
 
         // Critical findings -> major (even if other findings are present)
