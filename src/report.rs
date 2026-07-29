@@ -7,6 +7,15 @@ use std::collections::{HashMap, HashSet};
 
 pub use crate::render::SeverityCounts;
 
+/// The status of a compatibility axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AxisStatus {
+    Passed,
+    Warning,
+    Failed,
+}
+
 /// A finding as it appears in the report, augmented with suppression state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportedFinding {
@@ -374,11 +383,32 @@ fn contract_identity_label(name: Option<&str>, version: Option<&str>) -> String 
 }
 
 impl SafetyReport {
-    pub fn new(diff: &DiffReport) -> Self {
-        Self::with_suppressions(diff, &SuppressionConfig::default(), false, false)
+    pub fn new(
+        diff: &DiffReport,
+        old_spec: &crate::spec::ContractSpec,
+        new_spec: &crate::spec::ContractSpec,
+    ) -> Self {
+        Self::with_suppressions(
+            diff,
+            &SuppressionConfig::default(),
+            false,
+            false,
+            old_spec,
+            new_spec,
+        )
     }
 
     pub fn noop(old_wasm_size: usize, new_wasm_size: usize) -> Self {
+        let mut axis_verdicts = HashMap::new();
+        axis_verdicts.insert(crate::diff::CompatibilityAxis::StorageLayout, AxisStatus::Passed);
+        axis_verdicts.insert(crate::diff::CompatibilityAxis::CallAbi, AxisStatus::Passed);
+        axis_verdicts.insert(crate::diff::CompatibilityAxis::EventIndexer, AxisStatus::Passed);
+        axis_verdicts.insert(crate::diff::CompatibilityAxis::SourceLevel, AxisStatus::Passed);
+
+        let mut gated_axes = HashSet::new();
+        gated_axes.insert(crate::diff::CompatibilityAxis::StorageLayout);
+        gated_axes.insert(crate::diff::CompatibilityAxis::CallAbi);
+
         Self {
             critical_count: 0,
             warning_count: 0,
@@ -414,6 +444,8 @@ impl SafetyReport {
         suppressions: &SuppressionConfig,
         explain: bool,
         strict: bool,
+        old_spec: &crate::spec::ContractSpec,
+        new_spec: &crate::spec::ContractSpec,
     ) -> Self {
         let mut critical_count = 0;
         let mut warning_count = 0;
@@ -422,11 +454,34 @@ impl SafetyReport {
         let mut suppressed_critical_count = 0;
         let mut suppressed_warning_count = 0;
         let mut suppressed_info_count = 0;
-        let mut failing_critical_count = 0;
-        let mut failing_warning_count = 0;
         let mut findings_by_category: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
         let mut critical_root_count = 0;
         let mut cascade_critical_count = 0;
+
+        let mut axis_verdicts = HashMap::new();
+        axis_verdicts.insert(crate::diff::CompatibilityAxis::StorageLayout, AxisStatus::Passed);
+        axis_verdicts.insert(crate::diff::CompatibilityAxis::CallAbi, AxisStatus::Passed);
+        axis_verdicts.insert(crate::diff::CompatibilityAxis::EventIndexer, AxisStatus::Passed);
+        axis_verdicts.insert(crate::diff::CompatibilityAxis::SourceLevel, AxisStatus::Passed);
+
+        let mut gated_axes = HashSet::new();
+        let axes_list = vec![
+            crate::diff::CompatibilityAxis::StorageLayout,
+            crate::diff::CompatibilityAxis::CallAbi,
+            crate::diff::CompatibilityAxis::EventIndexer,
+            crate::diff::CompatibilityAxis::SourceLevel,
+        ];
+        for axis in axes_list {
+            let is_gated = strict || match axis {
+                crate::diff::CompatibilityAxis::StorageLayout => suppressions.policy.gate_storage_layout,
+                crate::diff::CompatibilityAxis::CallAbi => suppressions.policy.gate_call_abi,
+                crate::diff::CompatibilityAxis::EventIndexer => suppressions.policy.gate_event_indexer,
+                crate::diff::CompatibilityAxis::SourceLevel => suppressions.policy.gate_source_level,
+            };
+            if is_gated {
+                gated_axes.insert(axis);
+            }
+        }
 
         let mut suppressed_root_types: HashSet<String> = HashSet::new();
         for finding in &diff.findings {
@@ -466,12 +521,6 @@ impl SafetyReport {
                     Severity::Warning => suppressed_warning_count += 1,
                     Severity::Info => suppressed_info_count += 1,
                 }
-            } else {
-                match finding.severity {
-                    Severity::Critical => failing_critical_count += 1,
-                    Severity::Warning => failing_warning_count += 1,
-                    _ => {}
-                }
             }
 
             let remediation = if explain {
@@ -480,22 +529,64 @@ impl SafetyReport {
                 None
             };
 
+            // Retrieve or inherit axes
+            let axes = if let Some(ref rt) = finding.root_target {
+                diff.findings
+                    .iter()
+                    .find(|f| f.target.as_deref() == Some(rt))
+                    .map(|f| crate::diff::classify_finding_axes(&f.category, f.type_name.as_deref(), old_spec, new_spec))
+                    .unwrap_or_else(|| {
+                        crate::diff::classify_finding_axes(
+                            &finding.category,
+                            finding.type_name.as_deref(),
+                            old_spec,
+                            new_spec,
+                        )
+                    })
+            } else {
+                crate::diff::classify_finding_axes(
+                    &finding.category,
+                    finding.type_name.as_deref(),
+                    old_spec,
+                    new_spec,
+                )
+            };
+
+            if !suppressed {
+                for axis in &axes {
+                    let is_gated = strict || match axis {
+                        crate::diff::CompatibilityAxis::StorageLayout => suppressions.policy.gate_storage_layout,
+                        crate::diff::CompatibilityAxis::CallAbi => suppressions.policy.gate_call_abi,
+                        crate::diff::CompatibilityAxis::EventIndexer => suppressions.policy.gate_event_indexer,
+                        crate::diff::CompatibilityAxis::SourceLevel => suppressions.policy.gate_source_level,
+                    };
+
+                    let new_status = if is_gated {
+                        AxisStatus::Failed
+                    } else {
+                        AxisStatus::Warning
+                    };
+
+                    let current = axis_verdicts.entry(*axis).or_insert(AxisStatus::Passed);
+                    if *current == AxisStatus::Passed || (*current == AxisStatus::Warning && new_status == AxisStatus::Failed) {
+                        *current = new_status;
+                    }
+                }
+            }
+
             findings_by_category
                 .entry(finding.category.clone())
                 .or_default()
                 .push(ReportedFinding {
                     finding: finding.clone(),
+                    axes,
                     suppressed,
                     suppression_reason: rule.and_then(|r| r.reason.clone()),
                     remediation,
                 });
         }
 
-        let is_safe = if strict {
-            failing_critical_count == 0 && failing_warning_count == 0
-        } else {
-            failing_critical_count == 0
-        };
+        let is_safe = !axis_verdicts.values().any(|&status| status == AxisStatus::Failed);
 
         Self {
             critical_count,
@@ -577,6 +668,31 @@ impl SafetyReport {
         } else {
             chrono_now_rfc3339()
         };
+
+        let mut findings_by_axis = BTreeMap::new();
+        findings_by_axis.insert(crate::diff::CompatibilityAxis::StorageLayout, Vec::new());
+        findings_by_axis.insert(crate::diff::CompatibilityAxis::CallAbi, Vec::new());
+        findings_by_axis.insert(crate::diff::CompatibilityAxis::EventIndexer, Vec::new());
+        findings_by_axis.insert(crate::diff::CompatibilityAxis::SourceLevel, Vec::new());
+
+        for category_findings in self.findings_by_category.values() {
+            for reported in category_findings {
+                for axis in &reported.axes {
+                    if let Some(list) = findings_by_axis.get_mut(axis) {
+                        list.push(reported.clone());
+                    }
+                }
+            }
+        }
+
+        for list in findings_by_axis.values_mut() {
+            list.sort_by(|a, b| {
+                a.finding
+                    .category
+                    .cmp(&b.finding.category)
+                    .then_with(|| a.finding.target.cmp(&b.finding.target))
+            });
+        }
 
         RenderableReport {
             report_schema_version: REPORT_SCHEMA_VERSION,
@@ -820,12 +936,14 @@ mod tests {
             ReportedFinding {
                 finding: Finding {
                     severity,
+                    axes: Vec::new(),
                     category: category.to_string(),
                     message: String::new(),
                     type_name: None,
                     target: None,
                     root_target: None,
                 },
+                axes: Vec::new(),
                 suppressed: false,
                 suppression_reason: None,
                 remediation: None,
@@ -888,6 +1006,7 @@ mod tests {
         let mut diff = DiffReport::default();
         diff.findings.push(Finding {
             severity: Severity::Critical,
+            axes: Vec::new(),
             category: "Struct Field Type Changed".to_string(),
             message: "Type 'Data' field 'amount' changed from i64 to i128".to_string(),
             type_name: Some("Data".to_string()),
@@ -896,6 +1015,7 @@ mod tests {
         });
         diff.findings.push(Finding {
             severity: Severity::Critical,
+            axes: Vec::new(),
             category: "Cascading Layout Break".to_string(),
             message: "Type 'Outer' layout is broken because it embeds modified type 'Data'".to_string(),
             type_name: Some("Outer".to_string()),
@@ -904,7 +1024,7 @@ mod tests {
         });
 
         let report =
-            SafetyReport::with_suppressions(&diff, &SuppressionConfig::default(), false, false);
+            SafetyReport::with_suppressions(&diff, &SuppressionConfig::default(), false, false, &crate::spec::ContractSpec::default(), &crate::spec::ContractSpec::default());
 
         assert_eq!(report.critical_root_count, 1);
         assert_eq!(report.cascade_critical_count, 1);
@@ -917,6 +1037,7 @@ mod tests {
         let mut diff = DiffReport::default();
         diff.findings.push(Finding {
             severity: Severity::Critical,
+            axes: Vec::new(),
             category: "Struct Field Type Changed".to_string(),
             message: "Type 'Data' field 'amount' changed".to_string(),
             type_name: Some("Data".to_string()),
@@ -925,6 +1046,7 @@ mod tests {
         });
         diff.findings.push(Finding {
             severity: Severity::Critical,
+            axes: Vec::new(),
             category: "Cascading Layout Break".to_string(),
             message: "Type 'Outer' layout is broken".to_string(),
             type_name: Some("Outer".to_string()),
@@ -942,7 +1064,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = SafetyReport::with_suppressions(&diff, &suppressions, false, false);
+        let report = SafetyReport::with_suppressions(&diff, &suppressions, false, false, &crate::spec::ContractSpec::default(), &crate::spec::ContractSpec::default());
 
         let root_finding = report
             .findings_by_category
@@ -967,6 +1089,7 @@ mod tests {
         let mut diff = DiffReport::default();
         diff.findings.push(Finding {
             severity: Severity::Critical,
+            axes: Vec::new(),
             category: "Struct Field Type Changed".to_string(),
             message: "Type 'Data' field 'amount' changed".to_string(),
             type_name: Some("Data".to_string()),
@@ -975,6 +1098,7 @@ mod tests {
         });
         diff.findings.push(Finding {
             severity: Severity::Critical,
+            axes: Vec::new(),
             category: "Cascading Layout Break".to_string(),
             message: "Type 'Outer' layout is broken".to_string(),
             type_name: Some("Outer".to_string()),
@@ -991,7 +1115,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = SafetyReport::with_suppressions(&diff, &suppressions, false, false);
+        let report = SafetyReport::with_suppressions(&diff, &suppressions, false, false, &crate::spec::ContractSpec::default(), &crate::spec::ContractSpec::default());
 
         let root_finding = &report
             .findings_by_category

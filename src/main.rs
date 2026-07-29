@@ -665,6 +665,20 @@ fn run_batch(
             new_spec_summary: Some("(contract missing from new deployment)".to_string()),
             scope: report::AnalysisScope::default(),
             metrics: None,
+            axis_verdicts: {
+                let mut verdicts = std::collections::HashMap::new();
+                verdicts.insert(diff::CompatibilityAxis::CallAbi, report::AxisStatus::Failed);
+                verdicts.insert(diff::CompatibilityAxis::StorageLayout, report::AxisStatus::Passed);
+                verdicts.insert(diff::CompatibilityAxis::EventIndexer, report::AxisStatus::Passed);
+                verdicts.insert(diff::CompatibilityAxis::SourceLevel, report::AxisStatus::Passed);
+                verdicts
+            },
+            gated_axes: {
+                let mut gated = std::collections::HashSet::new();
+                gated.insert(diff::CompatibilityAxis::CallAbi);
+                gated.insert(diff::CompatibilityAxis::StorageLayout);
+                gated
+            },
             findings_by_category: {
                 let mut map = std::collections::HashMap::new();
                 map.insert(
@@ -672,6 +686,7 @@ fn run_batch(
                     vec![report::ReportedFinding {
                         finding: diff::Finding {
                             severity: diff::Severity::Critical,
+                            axes: vec![diff::CompatibilityAxis::CallAbi],
                             category: "contract-missing-from-new".to_string(),
                             message: format!(
                                 "'{}' exists in the old directory but was not found in the new directory. \
@@ -683,6 +698,7 @@ fn run_batch(
                             target: Some(gap.name.clone()),
                             root_target: None,
                         },
+                        axes: vec![diff::CompatibilityAxis::CallAbi],
                         suppressed: false,
                         suppression_reason: None,
                         remediation: Some(format!(
@@ -817,6 +833,20 @@ fn synthesize_error_report(name: &str, error_message: &str, strict: bool, no_tim
         new_spec_summary: Some("(analysis failed)".to_string()),
         scope: report::AnalysisScope::default(),
         metrics: None,
+        axis_verdicts: {
+            let mut verdicts = std::collections::HashMap::new();
+            verdicts.insert(diff::CompatibilityAxis::CallAbi, report::AxisStatus::Failed);
+            verdicts.insert(diff::CompatibilityAxis::StorageLayout, report::AxisStatus::Passed);
+            verdicts.insert(diff::CompatibilityAxis::EventIndexer, report::AxisStatus::Passed);
+            verdicts.insert(diff::CompatibilityAxis::SourceLevel, report::AxisStatus::Passed);
+            verdicts
+        },
+        gated_axes: {
+            let mut gated = std::collections::HashSet::new();
+            gated.insert(diff::CompatibilityAxis::CallAbi);
+            gated.insert(diff::CompatibilityAxis::StorageLayout);
+            gated
+        },
         findings_by_category: {
             let mut map = std::collections::HashMap::new();
             map.insert(
@@ -824,6 +854,7 @@ fn synthesize_error_report(name: &str, error_message: &str, strict: bool, no_tim
                 vec![report::ReportedFinding {
                     finding: diff::Finding {
                         severity: diff::Severity::Critical,
+                        axes: vec![diff::CompatibilityAxis::CallAbi],
                         category: "analysis-error".to_string(),
                         message: format!(
                             "Analysis of '{}' failed: {}", name, error_message
@@ -832,6 +863,7 @@ fn synthesize_error_report(name: &str, error_message: &str, strict: bool, no_tim
                         target: Some(name.to_string()),
                         root_target: None,
                     },
+                    axes: vec![diff::CompatibilityAxis::CallAbi],
                     suppressed: false,
                     suppression_reason: None,
                     remediation: Some(
@@ -1348,7 +1380,7 @@ fn compare_contracts(
         &mut diff_report,
     );
 
-    let mut report = report::SafetyReport::with_suppressions(&diff_report, suppressions, *explain, *strict)
+    let mut report = report::SafetyReport::with_suppressions(&diff_report, suppressions, *explain, *strict, &old_spec, &new_spec)
         .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash());
 
     report.no_timestamp = *no_timestamp;

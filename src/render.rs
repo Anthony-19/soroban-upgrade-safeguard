@@ -255,6 +255,30 @@ impl RenderableReport {
         };
         output.push_str(&format!("Status: {}\n", status));
 
+        output.push_str("\nCompatibility Verdicts:\n");
+        let axes_in_order = vec![
+            crate::diff::CompatibilityAxis::StorageLayout,
+            crate::diff::CompatibilityAxis::CallAbi,
+            crate::diff::CompatibilityAxis::EventIndexer,
+            crate::diff::CompatibilityAxis::SourceLevel,
+        ];
+        for axis in axes_in_order {
+            let axis_status = self.axis_verdicts.get(&axis).cloned().unwrap_or(crate::report::AxisStatus::Passed);
+            let status_str = match axis_status {
+                crate::report::AxisStatus::Passed => "✅ PASSED".green().bold(),
+                crate::report::AxisStatus::Warning => "⚠️ WARNING (Non-gated)".yellow().bold(),
+                crate::report::AxisStatus::Failed => "❌ FAILED".red().bold(),
+            };
+            let label = match axis {
+                crate::diff::CompatibilityAxis::StorageLayout => "Storage Layout",
+                crate::diff::CompatibilityAxis::CallAbi => "Call ABI",
+                crate::diff::CompatibilityAxis::EventIndexer => "Event & Indexer",
+                crate::diff::CompatibilityAxis::SourceLevel => "Source Level",
+            };
+            output.push_str(&format!("  - {:<18} {}\n", label, status_str));
+        }
+        output.push('\n');
+
         let crit_str = if self.counts.critical > 0 {
             self.counts.critical.to_string().red().bold()
         } else {
@@ -299,14 +323,31 @@ impl RenderableReport {
             return output;
         }
 
-        for category in self.ordered_categories() {
+        for axis in &[
+            crate::diff::CompatibilityAxis::StorageLayout,
+            crate::diff::CompatibilityAxis::CallAbi,
+            crate::diff::CompatibilityAxis::EventIndexer,
+            crate::diff::CompatibilityAxis::SourceLevel,
+        ] {
+            let group = match self.findings_by_axis.get(axis) {
+                Some(g) if !g.is_empty() => g,
+                _ => continue,
+            };
+
+            let label = match axis {
+                crate::diff::CompatibilityAxis::StorageLayout => "STORAGE LAYOUT COMPATIBILITY",
+                crate::diff::CompatibilityAxis::CallAbi => "CALL ABI COMPATIBILITY",
+                crate::diff::CompatibilityAxis::EventIndexer => "EVENT & INDEXER COMPATIBILITY",
+                crate::diff::CompatibilityAxis::SourceLevel => "SOURCE LEVEL COMPATIBILITY",
+            };
+
             output.push_str(
-                &format!("--- [{}] ---\n", category.to_ascii_uppercase())
+                &format!("--- [{}] ---\n", label)
                     .magenta()
                     .bold()
                     .to_string(),
             );
-            let group = &self.findings_by_category[category];
+
             for reported in group {
                 let finding = &reported.finding;
 
@@ -318,15 +359,6 @@ impl RenderableReport {
                     if let Some(reason) = &reported.suppression_reason {
                         output
                             .push_str(&format!("    ↳ reason: {}\n", reason).dimmed().to_string());
-                    }
-                    if explain {
-                        if let Some(remediation) = &reported.remediation {
-                            output.push_str(
-                                &format!("    ↳ guidance: {}\n", remediation)
-                                    .dimmed()
-                                    .to_string(),
-                            );
-                        }
                     }
                     continue;
                 }
@@ -420,7 +452,6 @@ impl RenderableReport {
         output
     }
 
-    /// Render the structured Markdown output.
     pub fn to_markdown(&self) -> String {
         let mut output = String::new();
         output.push_str("# Soroban Upgrade Safety Report\n\n");
@@ -431,6 +462,35 @@ impl RenderableReport {
             "❌ FAILED (Critical breaking changes detected)"
         };
         output.push_str(&format!("## Status: {}\n\n", status));
+
+        output.push_str("### Compatibility Verdicts\n\n");
+        output.push_str("| Compatibility Axis | Status | Gated |\n");
+        output.push_str("| :--- | :--- | :--- |\n");
+
+        let axes_in_order = vec![
+            crate::diff::CompatibilityAxis::StorageLayout,
+            crate::diff::CompatibilityAxis::CallAbi,
+            crate::diff::CompatibilityAxis::EventIndexer,
+            crate::diff::CompatibilityAxis::SourceLevel,
+        ];
+
+        for axis in axes_in_order {
+            let status = self.axis_verdicts.get(&axis).cloned().unwrap_or(crate::report::AxisStatus::Passed);
+            let status_str = match status {
+                crate::report::AxisStatus::Passed => "✅ PASSED",
+                crate::report::AxisStatus::Warning => "⚠️ WARNING",
+                crate::report::AxisStatus::Failed => "❌ FAILED",
+            };
+            let label = match axis {
+                crate::diff::CompatibilityAxis::StorageLayout => "Storage Layout",
+                crate::diff::CompatibilityAxis::CallAbi => "Call ABI",
+                crate::diff::CompatibilityAxis::EventIndexer => "Event & Indexer",
+                crate::diff::CompatibilityAxis::SourceLevel => "Source Level",
+            };
+            let gated = if self.gated_axes.contains(&axis) { "Yes" } else { "No" };
+            output.push_str(&format!("| **{}** | {} | {} |\n", label, status_str, gated));
+        }
+        output.push('\n');
 
         output.push_str("### Summary Table\n\n");
         output.push_str("| Finding Severity | Count |\n");
@@ -458,9 +518,25 @@ impl RenderableReport {
             return output;
         }
 
-        for category in self.ordered_categories() {
-            output.push_str(&format!("### {}\n\n", category));
-            let group = &self.findings_by_category[category];
+        for axis in &[
+            crate::diff::CompatibilityAxis::StorageLayout,
+            crate::diff::CompatibilityAxis::CallAbi,
+            crate::diff::CompatibilityAxis::EventIndexer,
+            crate::diff::CompatibilityAxis::SourceLevel,
+        ] {
+            let group = match self.findings_by_axis.get(axis) {
+                Some(g) if !g.is_empty() => g,
+                _ => continue,
+            };
+
+            let label = match axis {
+                crate::diff::CompatibilityAxis::StorageLayout => "Storage Layout Compatibility",
+                crate::diff::CompatibilityAxis::CallAbi => "Call ABI Compatibility",
+                crate::diff::CompatibilityAxis::EventIndexer => "Event & Indexer Compatibility",
+                crate::diff::CompatibilityAxis::SourceLevel => "Source Level Compatibility",
+            };
+
+            output.push_str(&format!("### {}\n\n", label));
             for reported in group {
                 let finding = &reported.finding;
 
@@ -547,10 +623,12 @@ mod tests {
     fn finding(severity: Severity, category: &str, message: &str) -> Finding {
         Finding {
             severity,
+            axes: Vec::new(),
             category: category.to_string(),
             message: message.to_string(),
             type_name: None,
             target: Some("thing".to_string()),
+            root_target: None,
         }
     }
 
