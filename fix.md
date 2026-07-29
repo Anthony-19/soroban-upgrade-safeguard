@@ -1,35 +1,50 @@
-When a field or parameter is a container such as Vec<T>, Map<K, V>,
-Option<T>, or a tuple, and only the inner type changes, src/diff.rs reports the
-change by stringifying the entire outer type on each side.
+SafetyReport::with_suppressions in src/report.rs increments critical_count,
+warning_count, and info_count for every finding regardless of suppression, and
+tracks the failing (unsuppressed) counts separately only to decide is_safe.
 
-So a field going from Map<Address, u32> to Map<Address, u64> produces:
+The summary the user reads prints the raw counts. So a run where the only critical
+finding is suppressed shows:
 
-type changed from `Map<Address, u32>` to `Map<Address, u64>`
-leaving the reader to diff two signatures by eye to find that only the value type
-changed. For deeply nested types such as Vec<Map<Address, Vec<u32>>> this gets
-progressively harder to read, which defeats the point of a message that is
-supposed to make the change obvious.
+Status: ✅ PASSED
+Critical: 1
+That reads as a contradiction. The verdict says safe, the count says one critical.
+A reviewer has no way to tell from the numbers that the critical was acknowledged,
+short of reading every finding line for the [SUPPRESSED] marker.
 
 Expected behaviour
-The finding should point at the specific inner type that changed rather than
-restating the whole outer signature, while still giving enough context to locate
-it.
+The displayed counts should make the suppressed portion legible, so the numbers
+next to the verdict cannot contradict it. At minimum the active (failing) count
+should be distinguishable from the suppressed count.
 
 Suggested approach
-When the outer type constructors match and differ only in a type argument, recurse
-to describe the innermost difference, for example "the value type of Map changed
-from u32 to u64". Keep the full-signature form as a fallback for cases where the
-outer constructors themselves differ. This is presentation only and should not
-change severity or which findings are produced.
+Show the active and suppressed portions separately, for example an active critical
+count with the suppressed count called out alongside, in the text summary, the
+Markdown summary table, and the JSON counts. The report already carries
+suppressed_count; the per-severity split needs to be tracked the same way the
+failing counts already are. Keep the raw totals available where a consumer might
+still want them.
 
 Acceptance criteria
 
-A change confined to an inner type of a container names the inner type that
-changed rather than restating the whole signature.
+A report whose only critical finding is suppressed does not show a bare
+Critical: 1 next to a PASSED verdict.
 
-A change to the outer constructor itself still reports clearly.
+The active and suppressed portions of each severity are distinguishable in
+text, Markdown, and JSON.
 
-Severity and the set of findings produced are unchanged.
+The verdict logic is unchanged; only the presentation of counts changes.
 
-Unit tests in src/diff.rs cover nested Vec, Map, Option, and tuple
-cases.
+Tests cover a report with suppressed findings across all three formats.
+Getting started
+Fork this repository, clone your fork, and add this repo as upstream:
+
+git clone https://github.com/<your-username>/soroban-upgrade-safeguard.git
+cd soroban-upgrade-safeguard
+git remote add upstream https://github.com/ShippedLabs/soroban-upgrade-safeguard.git
+Create a branch for this issue:
+
+git checkout -b fix/suppressed-counts-in-summary
+Suggested commit message:
+
+fix: reflect suppression in the displayed severity counts
+Run cargo fmt --check, cargo clippy, and cargo test before pushing, then

@@ -33,6 +33,12 @@ pub struct SafetyReport {
     pub info_count: usize,
     /// Number of findings (of any severity) acknowledged by a suppression rule.
     pub suppressed_count: usize,
+    /// Number of suppressed Critical findings.
+    pub suppressed_critical_count: usize,
+    /// Number of suppressed Warning findings.
+    pub suppressed_warning_count: usize,
+    /// Number of suppressed Info findings.
+    pub suppressed_info_count: usize,
     pub total_findings: usize,
     pub is_safe: bool,
     pub findings_by_category: HashMap<String, Vec<ReportedFinding>>,
@@ -99,6 +105,19 @@ pub struct SeverityCounts {
     pub critical: usize,
     pub warning: usize,
     pub info: usize,
+    /// Suppressed Critical findings (0 when none).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub suppressed_critical: usize,
+    /// Suppressed Warning findings (0 when none).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub suppressed_warning: usize,
+    /// Suppressed Info findings (0 when none).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub suppressed_info: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// A machine-readable view of a [`SafetyReport`] for `--format json`.
@@ -188,6 +207,8 @@ impl SafetyReport {
             severity_overridden_count: 0,
             verdict_changed_by_override: false,
             suppressed_critical_count: 0,
+            suppressed_warning_count: 0,
+            suppressed_info_count: 0,
             total_findings: 0,
             is_safe: true,
             findings_by_category: HashMap::new(),
@@ -237,6 +258,9 @@ impl SafetyReport {
         let mut warning_count = 0;
         let mut info_count = 0;
         let mut suppressed_count = 0;
+        let mut suppressed_critical_count = 0;
+        let mut suppressed_warning_count = 0;
+        let mut suppressed_info_count = 0;
         let mut failing_critical_count = 0;
         let mut failing_warning_count = 0;
         let mut findings_by_category: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
@@ -252,6 +276,11 @@ impl SafetyReport {
             let suppressed = rule.is_some();
             if suppressed {
                 suppressed_count += 1;
+                match finding.severity {
+                    Severity::Critical => suppressed_critical_count += 1,
+                    Severity::Warning => suppressed_warning_count += 1,
+                    Severity::Info => suppressed_info_count += 1,
+                }
             } else {
                 match finding.severity {
                     Severity::Critical => failing_critical_count += 1,
@@ -288,6 +317,9 @@ impl SafetyReport {
             warning_count,
             info_count,
             suppressed_count,
+            suppressed_critical_count,
+            suppressed_warning_count,
+            suppressed_info_count,
             total_findings: diff.findings.len(),
             is_safe,
             findings_by_category,
@@ -428,9 +460,12 @@ impl SafetyReport {
             is_safe: self.is_safe,
             strict: self.strict,
             counts: SeverityCounts {
-                critical: self.critical_count,
-                warning: self.warning_count,
-                info: self.info_count,
+                critical: self.critical_count - self.suppressed_critical_count,
+                warning: self.warning_count - self.suppressed_warning_count,
+                info: self.info_count - self.suppressed_info_count,
+                suppressed_critical: self.suppressed_critical_count,
+                suppressed_warning: self.suppressed_warning_count,
+                suppressed_info: self.suppressed_info_count,
             },
             suppressed_count: self.suppressed_count,
             total_findings: self.total_findings,
@@ -545,27 +580,33 @@ impl SafetyReport {
         }
         output.push_str(&format!("Status: {}\n", status));
 
-        let crit_str = if self.critical_count > 0 {
-            self.critical_count.to_string().red().bold()
-        } else {
-            self.critical_count.to_string().green()
+        let active_critical = self.critical_count - self.suppressed_critical_count;
+        let active_warning = self.warning_count - self.suppressed_warning_count;
+        let active_info = self.info_count - self.suppressed_info_count;
+
+        let fmt_count = |active: usize, suppressed: usize| -> String {
+            if suppressed > 0 {
+                format!("{} ({} suppressed)", active, suppressed)
+            } else {
+                active.to_string()
+            }
         };
-        let warn_str = if self.warning_count > 0 {
-            self.warning_count.to_string().yellow().bold()
+
+        let crit_str = if active_critical > 0 {
+            fmt_count(active_critical, self.suppressed_critical_count).red().bold()
         } else {
-            self.warning_count.to_string().normal()
+            fmt_count(active_critical, self.suppressed_critical_count).green()
         };
-        let info_str = self.info_count.to_string().blue();
+        let warn_str = if active_warning > 0 {
+            fmt_count(active_warning, self.suppressed_warning_count).yellow().bold()
+        } else {
+            fmt_count(active_warning, self.suppressed_warning_count).normal()
+        };
+        let info_str = fmt_count(active_info, self.suppressed_info_count).blue();
 
         output.push_str(&format!("Critical: {}\n", crit_str));
         output.push_str(&format!("Warnings: {}\n", warn_str));
         output.push_str(&format!("Info:     {}\n", info_str));
-        if self.suppressed_count > 0 {
-            output.push_str(&format!(
-                "Suppressed: {}\n",
-                self.suppressed_count.to_string().magenta().bold()
-            ));
-        }
         let bump = self.recommended_bump();
         let bump_str = match bump {
             "major" => "major".red().bold(),
@@ -704,14 +745,23 @@ impl SafetyReport {
         }
 
         output.push_str("### Summary Table\n\n");
+        let active_critical = self.critical_count - self.suppressed_critical_count;
+        let active_warning = self.warning_count - self.suppressed_warning_count;
+        let active_info = self.info_count - self.suppressed_info_count;
+
+        let fmt_count = |active: usize, suppressed: usize| -> String {
+            if suppressed > 0 {
+                format!("{} ({} suppressed)", active, suppressed)
+            } else {
+                active.to_string()
+            }
+        };
+
         output.push_str("| Finding Severity | Count |\n");
         output.push_str("| :--- | :--- |\n");
-        output.push_str(&format!("| **Critical** | {} |\n", self.critical_count));
-        output.push_str(&format!("| **Warning** | {} |\n", self.warning_count));
-        output.push_str(&format!("| **Info** | {} |\n", self.info_count));
-        if self.suppressed_count > 0 {
-            output.push_str(&format!("| **Suppressed** | {} |\n", self.suppressed_count));
-        }
+        output.push_str(&format!("| **Critical** | {} |\n", fmt_count(active_critical, self.suppressed_critical_count)));
+        output.push_str(&format!("| **Warning** | {} |\n", fmt_count(active_warning, self.suppressed_warning_count)));
+        output.push_str(&format!("| **Info** | {} |\n", fmt_count(active_info, self.suppressed_info_count)));
         output.push_str(&format!(
             "\n**Recommended SemVer Bump**: `{}`\n\n",
             self.recommended_bump()
@@ -844,6 +894,7 @@ pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
         "Error Enum Case Value Changed" => Some("This is a breaking change. Modifying error case values breaks error-code compatibility. Revert the value change."),
         "Error Enum Case Added" => Some("No action required. Ensure clients can handle the new error case gracefully."),
         "Cascading Layout Break" => Some("This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type."),
+        "BytesN Size Changed" => Some("This is a breaking change. Changing the size of a fixed-size byte array alters its binary encoding. Revert the size or migrate data that depends on the original byte length."),
         _ => None,
     }
 }
@@ -965,6 +1016,9 @@ mod tests {
             warning_count: 0,
             info_count: 0,
             suppressed_count: 0,
+            suppressed_critical_count: 0,
+            suppressed_warning_count: 0,
+            suppressed_info_count: 0,
             total_findings: 0,
             is_safe: true,
             findings_by_category: std::collections::HashMap::new(),
