@@ -109,9 +109,7 @@ impl SafetyReport {
         // First pass: identify root-cause types whose direct finding is suppressed.
         let mut suppressed_root_types: HashSet<String> = HashSet::new();
         for finding in &diff.findings {
-            if finding.root_target.is_none()
-                && suppressions.matching_rule(finding).is_some()
-            {
+            if finding.root_target.is_none() && suppressions.matching_rule(finding).is_some() {
                 if let Some(ref tn) = finding.type_name {
                     suppressed_root_types.insert(tn.clone());
                 }
