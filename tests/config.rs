@@ -947,3 +947,35 @@ fn test_suppressions_expiry_date_bounds() {
     let resolved_leap = ResolvedConfig::resolve(args_leap).unwrap();
     assert_eq!(resolved_leap.suppressions.rules.len(), 1);
 }
+
+#[test]
+fn test_parse_policy_config_defaults() {
+    use soroban_upgrade_safeguard::suppression::SuppressionConfig;
+    let toml_str = r#"
+        [[suppress]]
+        category = "Struct Field Removed"
+        reason = "Acknowledge"
+    "#;
+    let config = SuppressionConfig::from_toml_str(toml_str).unwrap();
+    assert!(config.policy.gate_storage_layout);
+    assert!(config.policy.gate_call_abi);
+    assert!(!config.policy.gate_event_indexer);
+    assert!(!config.policy.gate_source_level);
+}
+
+#[test]
+fn test_parse_custom_policy_config() {
+    use soroban_upgrade_safeguard::suppression::SuppressionConfig;
+    let toml_str = r#"
+        [policy]
+        gate_storage_layout = false
+        gate_call_abi = false
+        gate_event_indexer = true
+        gate_source_level = true
+    "#;
+    let config = SuppressionConfig::from_toml_str(toml_str).unwrap();
+    assert!(!config.policy.gate_storage_layout);
+    assert!(!config.policy.gate_call_abi);
+    assert!(config.policy.gate_event_indexer);
+    assert!(config.policy.gate_source_level);
+}
