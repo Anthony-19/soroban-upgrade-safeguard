@@ -733,7 +733,7 @@ fn test_suppressions_fingerprint_mismatch_validation() {
         target: Some("ConfigData.threshold".to_string()),
         message: "Field threshold removed".to_string(),
         severity: soroban_upgrade_safeguard::diff::Severity::Critical,
-        classification: None,
+        root_target: None,
     };
 
     let matching_rule = resolved.suppressions.matching_rule(&finding);

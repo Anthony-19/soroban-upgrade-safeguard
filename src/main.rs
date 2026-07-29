@@ -86,90 +86,7 @@ struct Args {
     new_dir: Option<PathBuf>,
 }
 
-<<<<<<< HEAD
-/// Resolve the effective [`ResourcePolicy`]: built-in defaults, overlaid by the
-/// `[limits]` table in the config file, overlaid by any `--max-*` CLI flags
-/// (flags win). `config_path` is the same file the suppression config is read
-/// from, if any.
-fn resolve_policy(args: &Args, config_path: Option<&Path>) -> Result<ResourcePolicy> {
-    let mut policy = ResourcePolicy::default();
-
-    if let Some(path) = config_path {
-        if let Some(file_limits) = LimitsConfig::load_optional(path)? {
-            policy = file_limits.apply_to(policy);
-        }
-    }
-
-    // CLI flags take precedence over the file and defaults.
-    if let Some(v) = args.max_xdr_depth {
-        policy.max_xdr_depth = v;
-    }
-    if let Some(v) = args.max_xdr_len {
-        policy.max_xdr_len = v;
-    }
-    if let Some(v) = args.max_entries {
-        policy.max_entries = v;
-    }
-    if let Some(v) = args.max_walk_depth {
-        policy.max_walk_depth = v;
-    }
-
-    Ok(policy)
-}
-
-/// Write `content` to a file if `output_path` is `Some`, otherwise print it
-/// to stdout. Writing to a file is atomic: the full string is rendered before
-/// any file is opened, so a failed comparison never leaves a partial file.
-///
-/// When a file path is used, a progress message is emitted via `progress` so
-/// the user can see where the report landed.
-fn emit_report_output(
-    content: &str,
-    output_path: Option<&std::path::Path>,
-    progress: &impl Fn(String),
-) -> Result<()> {
-    if let Some(path) = output_path {
-        std::fs::write(path, content)
-            .with_context(|| format!("Failed to write report to '{}'", path.display()))?;
-        progress(format!("✅ Report written to: {}", path.display()));
-    } else {
-        println!("{}", content);
-    }
-    Ok(())
-}
-
-/// Exit codes:
-/// - `0`: safe (no breaking changes, or all suppressed).
-/// - `1`: breaking changes detected, or a generic/IO/parse error.
-/// - `2`: a resource-limit violation on untrusted input (distinct so CI can tell
-///   "input was rejected as adversarial" apart from "the upgrade is unsafe").
-fn main() {
-    match run() {
-        Ok(()) => {}
-        Err(err) => {
-            if let Some(limit_err) = find_limit_error(&err) {
-                eprintln!("⛔ Resource limit exceeded: {limit_err}");
-                eprintln!(
-                    "   The input was rejected as potentially adversarial before it could \
-                     exhaust memory or the stack."
-                );
-                eprintln!(
-                    "   Raise the relevant limit via the [limits] table in .safeguard.toml or a \
-                     --max-* flag (see README)."
-                );
-                std::process::exit(2);
-            }
-            // Preserve anyhow's full error-chain formatting for everything else.
-            eprintln!("Error: {err:?}");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn run() -> Result<()> {
-=======
 fn main() -> Result<()> {
->>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
     let args = Args::parse();
 
     if should_disable_color(
@@ -196,17 +113,8 @@ fn main() -> Result<()> {
 
     // In JSON or Markdown mode, decorative progress goes to stderr so stdout
     // stays a single, pristine document. In text mode it stays on stdout
-<<<<<<< HEAD
-    // exactly as before. An explicit output file also keeps stdout empty in
-    // text mode: the report is in that file and all progress belongs on stderr
-    // rather than alongside it.
-    let clean_stdout = args.output.is_some()
-        || args.format == OutputFormat::Json
-        || args.format == OutputFormat::Markdown;
-=======
     // exactly as before.
     let clean_stdout = args.format == OutputFormat::Json || args.format == OutputFormat::Markdown;
->>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
     let progress = |line: String| {
         if clean_stdout {
             eprintln!("{line}");
@@ -262,41 +170,6 @@ fn main() -> Result<()> {
             let old_wasm = loader::load_wasm(&pair.old)?;
             let new_wasm = loader::load_wasm(&pair.new)?;
 
-<<<<<<< HEAD
-            match outcome {
-                Ok(mut report) => {
-                    if !all_categories.is_empty() {
-                        report.apply_category_filter(&category_filter);
-                    }
-                    if !report.is_safe {
-                        overall_safe = false;
-                    }
-                    results.insert(contract_name, report);
-                }
-                Err(err) => {
-                    overall_safe = false;
-                    let limit = find_limit_error(&err);
-                    let is_limit = limit.is_some();
-                    if is_limit {
-                        any_limit_violation = true;
-                    }
-                    let message = match limit {
-                        Some(limit_err) => limit_err.to_string(),
-                        None => format!("{err:#}"),
-                    };
-                    progress(format!(
-                        "  {} {}",
-                        if is_limit {
-                            "⛔ Resource limit exceeded:".red().bold()
-                        } else {
-                            "⚠️  Failed:".red().bold()
-                        },
-                        message
-                    ));
-                    failed.insert(contract_name, PairFailure { message, is_limit });
-                }
-            }
-=======
             let report = compare_contracts(
                 &ContractComparison {
                     old_bytes: &old_wasm.bytes,
@@ -309,69 +182,13 @@ fn main() -> Result<()> {
                 },
                 &progress,
             )?;
->>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
 
             if !report.is_safe {
                 overall_safe = false;
             }
 
-<<<<<<< HEAD
-        // Detect dependencies on contracts absent from this batch.
-        let known_contracts: std::collections::HashSet<String> = results.keys().cloned().collect();
-        let missing = dep_graph.missing_contracts(&known_contracts);
-        let missing_findings_list = missing_contract_findings(&missing);
-        if !missing_findings_list.is_empty() {
-            progress(format!(
-                "\n⚠️  {} dependency contract(s) not present in this batch:",
-                missing.len()
-            ));
-            for name in &missing {
-                progress(format!("   - {}", name));
-            }
-            overall_safe = false;
-        }
-
-        // Collect per-contract raw findings for propagation.
-        let mut per_contract_findings: std::collections::HashMap<
-            String,
-            Vec<soroban_upgrade_safeguard::diff::Finding>,
-        > = std::collections::HashMap::new();
-        for (name, report) in &results {
-            let all: Vec<_> = report
-                .findings_by_category
-                .values()
-                .flat_map(|v| v.iter().map(|rf| rf.finding.clone()))
-                .collect();
-            per_contract_findings.insert(name.clone(), all);
-        }
-
-        let cross_findings: Vec<CrossContractFinding> = dep_graph.propagate(&per_contract_findings);
-
-        // Cross-contract criticals always fail; warnings only fail under --strict.
-        let cross_critical_count = cross_findings
-            .iter()
-            .filter(|f| f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Critical)
-            .count();
-        let cross_warning_count = cross_findings
-            .iter()
-            .filter(|f| f.finding.severity == soroban_upgrade_safeguard::diff::Severity::Warning)
-            .count();
-        if cross_critical_count > 0 {
-            overall_safe = false;
-        }
-        if args.strict && cross_warning_count > 0 {
-            overall_safe = false;
-        }
-
-        if !cross_findings.is_empty() {
-            progress(format!(
-                "\n🔗 {} cross-contract finding(s) propagated from dependency analysis.",
-                cross_findings.len()
-            ));
-=======
             results.insert(contract_name, report);
             progress("\n----------------------------------------\n".to_string());
->>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
         }
 
         match args.format {
@@ -381,52 +198,6 @@ fn main() -> Result<()> {
                     results_json.insert(name.clone(), serde_json::to_value(report.to_json())?);
                 }
 
-<<<<<<< HEAD
-                let mut failed_json = serde_json::Map::new();
-                for (name, failure) in &failed {
-                    failed_json.insert(
-                        name.clone(),
-                        serde_json::json!({
-                            "error": failure.message,
-                            "limit_violation": failure.is_limit,
-                        }),
-                    );
-                }
-
-                // Cross-contract findings grouped by affected contract.
-                let mut cross_by_contract: serde_json::Map<String, serde_json::Value> =
-                    serde_json::Map::new();
-                for cf in &cross_findings {
-                    cross_by_contract
-                        .entry(cf.affected_contract.clone())
-                        .or_insert_with(|| serde_json::json!([]))
-                        .as_array_mut()
-                        .unwrap()
-                        .push(serde_json::to_value(cf)?);
-                }
-
-                let infra_findings: Vec<serde_json::Value> = cycle_findings_list
-                    .iter()
-                    .chain(missing_findings_list.iter())
-                    .map(serde_json::to_value)
-                    .collect::<Result<_, _>>()?;
-
-                // Overall recommended bump: the most severe bump across all
-                // pairs in the batch, since batch mode compares a whole set
-                // of contracts that ship together.
-                let bump_rank = |bump: &str| match bump {
-                    "major" => 2,
-                    "minor" => 1,
-                    _ => 0,
-                };
-                let overall_bump = results
-                    .values()
-                    .map(|report| report.recommended_bump())
-                    .max_by_key(|bump| bump_rank(bump))
-                    .unwrap_or("patch");
-
-=======
->>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
                 let batch_json = serde_json::json!({
                     "is_safe": overall_safe,
                     "strict": args.strict,
@@ -602,37 +373,6 @@ fn main() -> Result<()> {
         &progress,
     )?;
 
-<<<<<<< HEAD
-    // Render the report to a string first so --output can write it atomically.
-    let rendered = match args.format {
-        OutputFormat::Json => serde_json::to_string_pretty(&safety_report.to_json())?,
-        OutputFormat::Markdown => safety_report.generate_summary_markdown(),
-        OutputFormat::Text => safety_report.generate_summary_text(args.explain),
-        OutputFormat::GithubActions => safety_report.generate_summary_github_actions(None),
-    };
-
-    // Write the report — either to a file (--output) or to stdout.
-    if let Some(ref output_path) = args.output {
-        std::fs::write(output_path, &rendered)
-            .with_context(|| format!("Failed to write report to '{}'", output_path.display()))?;
-        progress(format!("✅ Report written to: {}", output_path.display()));
-    } else {
-        println!("{}", rendered);
-    }
-
-    // Warn about suppression rules that never matched any finding.
-    // Goes to stderr so it does not pollute the report on stdout.
-    for rule in &safety_report.unmatched_suppressions {
-        let target_part = rule
-            .target
-            .as_deref()
-            .map(|t| format!(", target='{}'", t))
-            .unwrap_or_default();
-        eprintln!(
-            "⚠️  Suppression rule never matched any finding: category='{}'{} — possible typo or stale rule.",
-            rule.rule_id, target_part
-        );
-=======
     match args.format {
         OutputFormat::Json => {
             // Single JSON document to stdout; no decorative text, no ANSI codes.
@@ -647,7 +387,6 @@ fn main() -> Result<()> {
         OutputFormat::Text => {
             println!("{}", safety_report.generate_summary_text(args.explain));
         }
->>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
     }
 
     if !safety_report.is_safe {

@@ -37,12 +37,7 @@
 use std::fs;
 use std::path::Path;
 
-<<<<<<< HEAD
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-=======
 use serde::Deserialize;
->>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
 
 use crate::diff::Finding;
 use crate::error::Error;
@@ -51,16 +46,7 @@ use crate::error::Error;
 pub const DEFAULT_CONFIG_FILE: &str = ".safeguard.toml";
 
 /// A parsed suppression config: a flat list of reviewed acknowledgements.
-<<<<<<< HEAD
-///
-/// `deny_unknown_fields` is deliberate: this is the one config file that can
-/// turn the safety gate off, so a mistyped key (`targets`, `[[suppression]]`)
-/// must be a loud parse error rather than a silently dropped rule.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-=======
 #[derive(Debug, Clone, Default, Deserialize)]
->>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
 pub struct SuppressionConfig {
     /// The acknowledged findings, one `[[suppress]]` table per entry.
     #[serde(default, rename = "suppress")]
@@ -68,15 +54,7 @@ pub struct SuppressionConfig {
 }
 
 /// A single whitelisted finding, keyed by category and (optionally) target.
-<<<<<<< HEAD
-///
-/// `deny_unknown_fields` guards against a typo (e.g. `targets` for `target`)
-/// silently changing what the rule matches.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-=======
 #[derive(Debug, Clone, Deserialize)]
->>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
 pub struct SuppressionRule {
     /// The finding category to match exactly (e.g. `"Struct Field Type Changed"`).
     pub category: String,
@@ -137,18 +115,6 @@ impl SuppressionConfig {
         self.rules.iter().find(|rule| rule.matches(finding))
     }
 
-<<<<<<< HEAD
-    /// Return the first rule that matches `finding` together with its index, if any.
-    /// The index is used by the report layer to track which rules were used.
-    pub fn matching_rule_with_index(&self, finding: &Finding) -> Option<(usize, &SuppressionRule)> {
-        self.rules
-            .iter()
-            .enumerate()
-            .find(|(_, rule)| rule.matches(finding))
-    }
-
-=======
->>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
     /// Whether any rule matches `finding`.
     pub fn is_suppressed(&self, finding: &Finding) -> bool {
         self.matching_rule(finding).is_some()
@@ -168,6 +134,7 @@ mod tests {
             message: "irrelevant to matching".to_string(),
             type_name: target.map(|t| t.split('.').next().unwrap().to_string()),
             target: target.map(|t| t.to_string()),
+            root_target: None,
         }
     }
 

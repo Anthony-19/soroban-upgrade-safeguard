@@ -379,7 +379,7 @@ pub fn cycle_findings(cycles: &[Vec<String>]) -> Vec<Finding> {
                 ),
                 type_name: None,
                 target: Some(cycle[0].clone()),
-                classification: None,
+                root_target: None,
             }
         })
         .collect()
@@ -403,7 +403,7 @@ pub fn missing_contract_findings(missing: &[&str]) -> Vec<Finding> {
             ),
             type_name: None,
             target: Some(name.to_string()),
-            classification: None,
+            root_target: None,
         })
         .collect()
 }
@@ -438,7 +438,7 @@ mod tests {
             message: format!("Breaking change in {}", target),
             type_name: None,
             target: Some(target.to_string()),
-            classification: None,
+            root_target: None,
         }
     }
 
@@ -449,7 +449,7 @@ mod tests {
             message: format!("Warning change in {}", target),
             type_name: None,
             target: Some(target.to_string()),
-            classification: None,
+            root_target: None,
         }
     }
 
@@ -460,7 +460,7 @@ mod tests {
             message: format!("Info change in {}", target),
             type_name: None,
             target: Some(target.to_string()),
-            classification: None,
+            root_target: None,
         }
     }
 

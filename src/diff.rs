@@ -1,13 +1,6 @@
 use crate::mapper::LayoutMapper;
-<<<<<<< HEAD
-use crate::parser::{ContractEnvMeta, ContractMeta, RUST_VERSION_KEY, SDK_VERSION_KEY};
-use crate::rename::{match_renames, Rename};
-use crate::spec::ContractSpec;
-use schemars::JsonSchema;
-=======
 use crate::parser::ContractEnvMeta;
 use crate::spec::ContractSpec;
->>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
 use serde::Serialize;
 use stellar_xdr::curr::{
     ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef, ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0,
@@ -47,6 +40,9 @@ pub struct Finding {
     /// `None` for findings that are not tied to a single named entity (for
     /// example environment-metadata changes).
     pub target: Option<String>,
+    /// For cascade findings, the `target` of the root cause finding.
+    /// `None` for direct (non-cascade) findings.
+    pub root_target: Option<String>,
 }
 
 /// Holds all findings from a comparison of two contract specs.
@@ -94,355 +90,9 @@ pub fn compare(old: &ContractSpec, new: &ContractSpec) -> DiffReport {
     report
 }
 
-<<<<<<< HEAD
-/// Run the full structural diff bounded by `policy`.
-///
-/// This is the function the canonical pipeline ([`crate::lib`]) calls. It
-/// runs the same stages as [`compare_with_classification`] but also enforces
-/// the recursive type-walk depth limit from `policy`, returning a typed
-/// [`crate::limits::LimitError`] when a type graph exceeds the configured
-/// bound rather than overflowing the stack.
-pub fn compare_with_policy(
-    old: &ContractSpec,
-    new: &ContractSpec,
-    policy: &crate::limits::ResourcePolicy,
-) -> Result<DiffReport, crate::limits::LimitError> {
-    let mut report = DiffReport::default();
-
-    compare_functions(old, new, &mut report);
-    compare_structs(old, new, &ClassificationConfig::none(), &mut report);
-    compare_enums(old, new, &ClassificationConfig::none(), &mut report);
-    compare_unions(old, new, &ClassificationConfig::none(), &mut report);
-    compare_error_enums(old, new, &ClassificationConfig::none(), &mut report);
-
-    // Cascade detection uses the LayoutMapper which enforces the walk-depth
-    // limit. If the graph exceeds it we surface a LimitError rather than
-    // overflowing the stack.
-    detect_cascading_layout_breaks_with_policy(old, &mut report, policy)?;
-
-    Ok(report)
-}
-
-/// Category label for duplicate spec entries that are byte-identical across sections.
-pub const SPEC_DUPLICATE_CATEGORY: &str = "Spec Entry Duplicate";
-/// Category label for duplicate spec entries that conflict (different definitions).
-pub const SPEC_CONFLICT_CATEGORY: &str = "Spec Entry Conflict";
-
-/// Inject findings for duplicate spec entries detected during `ContractSpec::from_entries_checked`.
-///
-/// Identical duplicates (same definition in multiple sections) become `Info`
-/// findings unless `compat_duplicates` is `true`, in which case they are
-/// silently dropped. Conflicting duplicates (different definitions) always
-/// become `Critical` findings.
-pub fn report_duplicate_spec_entries(
-    side: &str,
-    duplicates: &[crate::spec::DuplicateEntry],
-    section_count: usize,
-    report: &mut DiffReport,
-    compat_duplicates: bool,
-) {
-    for dup in duplicates {
-        if dup.is_identical {
-            if compat_duplicates {
-                continue;
-            }
-            report.findings.push(Finding {
-                severity: Severity::Info,
-                category: SPEC_DUPLICATE_CATEGORY.to_string(),
-                message: format!(
-                    "{} build: {} '{}' appears in {} of {} contractspecv0 section(s) with an \
-                     identical definition. The WASM is non-canonical but safe to use.",
-                    side,
-                    dup.kind.label(),
-                    dup.name,
-                    dup.sections.len(),
-                    section_count,
-                ),
-                type_name: Some(dup.name.clone()),
-                target: Some(dup.name.clone()),
-                classification: None,
-            });
-        } else {
-            report.findings.push(Finding {
-                severity: Severity::Critical,
-                category: SPEC_CONFLICT_CATEGORY.to_string(),
-                message: format!(
-                    "{} build: {} '{}' has conflicting definitions across contractspecv0 \
-                     sections {:?}. The spec is ambiguous and the build cannot be trusted.",
-                    side,
-                    dup.kind.label(),
-                    dup.name,
-                    dup.sections,
-                ),
-                type_name: Some(dup.name.clone()),
-                target: Some(dup.name.clone()),
-                classification: None,
-            });
-        }
-    }
-}
-
-/// Compare two resolved storage schemas through the same diff engine used for
-/// the exported interface, returning a `DiffReport` with the storage findings.
-pub fn compare_storage_schemas(
-    old: &crate::storage_schema::ResolvedStorageSchema,
-    new: &crate::storage_schema::ResolvedStorageSchema,
-) -> DiffReport {
-    compare_with_classification(&old.spec, &new.spec, &ClassificationConfig::none())
-}
-
-/// Inject `Info` findings for schema references the resolver could not match
-/// against the exported spec. These are not errors — they just cap the coverage
-/// claim so the report cannot overstate what was verified.
-pub fn report_unresolved_storage_references(unresolved: &[String], report: &mut DiffReport) {
-    for name in unresolved {
-        report.findings.push(Finding {
-            severity: Severity::Info,
-            category: ENVIRONMENT_CATEGORY.to_string(),
-            message: format!(
-                "Storage schema references type '{}' which could not be resolved against \
-                 the exported spec. Coverage for this type is not guaranteed.",
-                name
-            ),
-            type_name: Some(name.clone()),
-            target: Some(name.clone()),
-            classification: None,
-        });
-    }
-}
-
 /// Category label for contract environment metadata findings.
 pub const ENVIRONMENT_CATEGORY: &str = "Environment";
 
-/// Every category string this crate can emit.
-///
-/// Categories are **purely structural**: they describe what changed in the
-/// shape of the contract, never how a type was classified. There is no
-/// `"Event …"` category — event-ness is reported separately in
-/// [`Finding::classification`] and affects only wording and remediation. That
-/// keeps a suppression key (`category` + `target`) stable across changes to the
-/// classification config, so reclassifying a type can never silently suppress
-/// or un-suppress a real breaking change.
-///
-/// Pre-1.0 event-flavored names are still accepted in suppression configs and
-/// mapped onto these by [`crate::suppression::stable_category`].
-///
-/// This list is the single inventory the tests check against: every entry must
-/// have remediation guidance, and every category literal emitted by this module
-/// must appear here.
-pub const ALL_CATEGORIES: &[&str] = &[
-    ENVIRONMENT_CATEGORY,
-    // Functions and their signatures.
-    "Function Removed",
-    "Function Added",
-    "Function Documentation Changed",
-    "Function Signature Changed",
-    "Parameter Renamed",
-    "Parameter Reordered",
-    "Parameter Type Changed",
-    "Return Type Changed",
-    // Type identity.
-    "Type Renamed",
-    "Type Renamed With Changes",
-    // Structs.
-    "Struct Removed",
-    "Struct Added",
-    "Struct Documentation Changed",
-    "Struct Field Removed",
-    "Struct Field Added",
-    "Struct Field Reordered",
-    "Struct Field Type Changed",
-    // Enums.
-    "Enum Removed",
-    "Enum Added",
-    "Enum Documentation Changed",
-    "Enum Case Removed",
-    "Enum Case Added",
-    "Enum Case Value Changed",
-    // Unions.
-    "Union Removed",
-    "Union Added",
-    "Union Case Removed",
-    "Union Case Added",
-    "Union Case Reordered",
-    "Union Case Type Changed",
-    // Error enums.
-    "Error Enum Removed",
-    "Error Enum Added",
-    "Error Enum Case Removed",
-    "Error Enum Case Added",
-    "Error Enum Case Value Changed",
-    // Cascades.
-    "Cascading Layout Break",
-    // WASM host function imports.
-    "Host Import Added",
-    "Host Import Removed",
-    // Contract metadata (`contractmetav0`) provenance and author keys.
-    "Metadata SDK Version Changed",
-    "Metadata Compiler Version Changed",
-    "Metadata Key Added",
-    "Metadata Key Removed",
-    "Metadata Key Changed",
-    // Spec-section integrity and storage-schema coverage.
-    "Duplicate Spec Entry",
-    "Unresolved Storage Reference",
-    // Binary export section vs. declared spec.
-    "Export Removed",
-    "Export Added",
-    "Export Spec Mismatch",
-    // Duplicate / conflicting spec entries.
-    "Spec Entry Duplicate",
-    "Spec Entry Conflict",
-];
-
-/// Compare the binary export sections of two WASM builds.
-///
-/// A function present in the old binary's export section but absent from the new
-/// one is a breaking change — callers that invoke by name will get a missing
-/// export at runtime. A function present in the new binary but absent from the
-/// old one is informational (new export available).
-///
-/// Additionally, any name that appears in the `contractspecv0` spec but NOT in
-/// the binary's export section (or vice versa) indicates a spec/binary mismatch
-/// that should be visible.
-///
-/// `old_exports` and `new_exports` are the `exported_function_names` sets from
-/// [`crate::parser::SorobanMetadata`]. `old_spec_fns` and `new_spec_fns` are
-/// the function name sets from the respective [`crate::spec::ContractSpec`].
-pub fn compare_exports(
-    old_exports: &std::collections::BTreeSet<String>,
-    new_exports: &std::collections::BTreeSet<String>,
-    old_spec_fns: &std::collections::HashSet<String>,
-    new_spec_fns: &std::collections::HashSet<String>,
-    report: &mut DiffReport,
-) {
-    // 1. Exports present in the old binary but removed in the new binary.
-    for name in old_exports {
-        if !new_exports.contains(name) {
-            report.findings.push(Finding {
-                severity: Severity::Critical,
-                category: "Export Removed".to_string(),
-                message: format!(
-                    "Exported function '{}' is present in the old binary but absent from \
-                     the new binary. On-chain callers will get a missing-export error at runtime.",
-                    name
-                ),
-                type_name: None,
-                target: Some(name.clone()),
-                classification: None,
-            });
-        }
-    }
-
-    // 2. Exports present in the new binary but absent from the old binary.
-    for name in new_exports {
-        if !old_exports.contains(name) {
-            report.findings.push(Finding {
-                severity: Severity::Info,
-                category: "Export Added".to_string(),
-                message: format!(
-                    "New exported function '{}' appeared in the binary export section.",
-                    name
-                ),
-                type_name: None,
-                target: Some(name.clone()),
-                classification: None,
-            });
-        }
-    }
-
-    // 3. Each build's declared spec must agree with the functions the binary
-    // actually exports. Check both sides: an inconsistent baseline is useful
-    // diagnostic information too, and an inconsistent candidate is unsafe.
-    for (side, exports, spec_fns) in [
-        ("old", old_exports, old_spec_fns),
-        ("new", new_exports, new_spec_fns),
-    ] {
-        for name in spec_fns {
-            if !exports.contains(name) {
-                report.findings.push(Finding {
-                    severity: Severity::Critical,
-                    category: "Export Spec Mismatch".to_string(),
-                    message: format!(
-                        "Function '{}' is declared in the {} contract spec but is NOT present in \
-                         that binary's export section. Callers following the spec will fail at runtime.",
-                        name, side
-                    ),
-                    type_name: None,
-                    target: Some(name.clone()),
-                    classification: None,
-                });
-            }
-        }
-        for name in exports {
-            if !spec_fns.contains(name) {
-                report.findings.push(Finding {
-                    severity: Severity::Critical,
-                    category: "Export Spec Mismatch".to_string(),
-                    message: format!(
-                        "Function '{}' is exported by the {} binary but is NOT declared in \
-                         that contract spec. The spec does not reflect all callable entry-points.",
-                        name, side
-                    ),
-                    type_name: None,
-                    target: Some(name.clone()),
-                    classification: None,
-                });
-            }
-        }
-    }
-}
-
-/// Compare WASM host-function import sections between two builds.
-///
-/// Host imports represent functions the Soroban host must provide (e.g.
-/// `env::*` functions). An import present in the old binary but absent from
-/// the new one is a removal (Info); a new import is also Info. No severity
-/// is Critical because these are SDK-version changes, not user-facing breaks.
-pub fn compare_wasm_imports(
-    old_imports: &[(String, String)],
-    new_imports: &[(String, String)],
-    report: &mut DiffReport,
-) {
-    use std::collections::BTreeSet;
-
-    let old_set: BTreeSet<(&str, &str)> = old_imports
-        .iter()
-        .map(|(m, n)| (m.as_str(), n.as_str()))
-        .collect();
-    let new_set: BTreeSet<(&str, &str)> = new_imports
-        .iter()
-        .map(|(m, n)| (m.as_str(), n.as_str()))
-        .collect();
-
-    for (module, name) in old_set.difference(&new_set) {
-        report.findings.push(Finding {
-            severity: Severity::Info,
-            category: "Host Import Removed".to_string(),
-            message: format!("Host import '{module}.{name}' was removed."),
-            type_name: None,
-            target: Some(format!("{module}.{name}")),
-            classification: None,
-        });
-    }
-
-    for (module, name) in new_set.difference(&old_set) {
-        report.findings.push(Finding {
-            severity: Severity::Info,
-            category: "Host Import Added".to_string(),
-            message: format!("Host import '{module}.{name}' was added."),
-            type_name: None,
-            target: Some(format!("{module}.{name}")),
-            classification: None,
-        });
-    }
-}
-
-=======
-/// Category label for contract environment metadata findings.
-pub const ENVIRONMENT_CATEGORY: &str = "Environment";
-
->>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
 /// Compare decoded environment metadata between two contract builds.
 pub fn compare_env_metadata(
     old: Option<&ContractEnvMeta>,
@@ -460,6 +110,7 @@ pub fn compare_env_metadata(
                 message: format_env_metadata_change(old_meta, new_meta),
                 type_name: None,
                 target: None,
+                root_target: None,
             });
         }
     }
@@ -538,6 +189,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                     ),
                     type_name: None,
                     target: Some(name.clone()),
+                    root_target: None,
                 });
             }
             Some(new_fn) => {
@@ -560,6 +212,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                         message,
                         type_name: None,
                         target: Some(name.clone()),
+                        root_target: None,
                     });
                 }
             }
@@ -575,6 +228,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                 message: format!("New function '{}' added.", name),
                 type_name: None,
                 target: Some(name.clone()),
+                root_target: None,
             });
         }
     }
@@ -603,6 +257,7 @@ fn check_function_signature(
             ),
             type_name: None,
             target: Some(name.to_string()),
+            root_target: None,
         });
         return; // No point comparing individual params if count differs
     }
@@ -632,6 +287,7 @@ fn check_function_signature(
             ),
             type_name: None,
             target: Some(name.to_string()),
+            root_target: None,
         });
 
         // Check for genuine type changes by matching parameter name.
@@ -657,6 +313,7 @@ fn check_function_signature(
                         ),
                         type_name: None,
                         target: Some(format!("{}.{}", name, p_name)),
+                        root_target: None,
                     });
                 }
             }
@@ -677,6 +334,7 @@ fn check_function_signature(
                     ),
                     type_name: None,
                     target: Some(format!("{}.{}", name, old_name)),
+                    root_target: None,
                 });
             }
 
@@ -694,6 +352,7 @@ fn check_function_signature(
                     ),
                     type_name: None,
                     target: Some(format!("{}.{}", name, old_name)),
+                    root_target: None,
                 });
             }
         }
@@ -715,6 +374,7 @@ fn check_function_signature(
             ),
             type_name: None,
             target: Some(name.to_string()),
+            root_target: None,
         });
     } else {
         for (i, (old_out, new_out)) in old_outputs.iter().zip(new_outputs.iter()).enumerate() {
@@ -731,6 +391,7 @@ fn check_function_signature(
                     ),
                     type_name: None,
                     target: Some(name.to_string()),
+                    root_target: None,
                 });
             }
         }
@@ -763,6 +424,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                     ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
+                    root_target: None,
                 });
             }
             Some(new_struct) => {
@@ -785,6 +447,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                         message,
                         type_name: Some(name.clone()),
                         target: Some(name.clone()),
+                        root_target: None,
                     });
                 }
             }
@@ -800,6 +463,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                 message: format!("New struct '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
+                root_target: None,
             });
         }
     }
@@ -839,6 +503,7 @@ fn check_struct_fields(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
     }
@@ -860,6 +525,7 @@ fn check_struct_fields(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
 
@@ -879,6 +545,7 @@ fn check_struct_fields(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
     }
@@ -897,6 +564,7 @@ fn check_struct_fields(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, new_field.name)),
+                root_target: None,
             });
         }
     }
@@ -922,6 +590,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                     ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
+                    root_target: None,
                 });
             }
             Some(new_enum) => {
@@ -944,6 +613,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                         message,
                         type_name: Some(name.clone()),
                         target: Some(name.clone()),
+                        root_target: None,
                     });
                 }
             }
@@ -959,6 +629,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                 message: format!("New enum '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
+                root_target: None,
             });
         }
     }
@@ -997,6 +668,7 @@ fn check_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, old_name)),
+                    root_target: None,
                 });
             }
             Some(new_case) => {
@@ -1012,6 +684,7 @@ fn check_enum_cases(
                         ),
                         type_name: Some(name.to_string()),
                         target: Some(format!("{}.{}", name, old_name)),
+                        root_target: None,
                     });
                 }
             }
@@ -1032,6 +705,7 @@ fn check_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, new_name)),
+                    root_target: None,
                 });
             }
         }
@@ -1052,6 +726,7 @@ fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepor
                     ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
+                    root_target: None,
                 });
             }
             Some(new_union) => {
@@ -1068,6 +743,7 @@ fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepor
                 message: format!("New union '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
+                root_target: None,
             });
         }
     }
@@ -1099,6 +775,7 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
     }
@@ -1118,6 +795,7 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
 
@@ -1135,6 +813,7 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
     }
@@ -1152,6 +831,7 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, union_case_name(new_case))),
+                root_target: None,
             });
         }
     }
@@ -1204,6 +884,7 @@ fn compare_error_enums(old: &ContractSpec, new: &ContractSpec, report: &mut Diff
                     ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
+                    root_target: None,
                 });
             }
             Some(new_error_enum) => {
@@ -1220,6 +901,7 @@ fn compare_error_enums(old: &ContractSpec, new: &ContractSpec, report: &mut Diff
                 message: format!("New error enum '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
+                root_target: None,
             });
         }
     }
@@ -1249,6 +931,7 @@ fn check_error_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, old_name)),
+                    root_target: None,
                 });
             }
             Some(new_case) if old_case.value != new_case.value => {
@@ -1262,6 +945,7 @@ fn check_error_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, old_name)),
+                    root_target: None,
                 });
             }
             _ => {}
@@ -1280,6 +964,7 @@ fn check_error_enum_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, new_name)),
+                root_target: None,
             });
         }
     }
@@ -1301,21 +986,24 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
         }
     }
 
-    // A queue for transitive breaks
-    let mut queue: Vec<String> = broken_types.into_iter().collect();
+    // A queue for transitive breaks: (type_name, root_target)
+    let mut queue: Vec<(String, String)> = broken_types
+        .into_iter()
+        .map(|t| (t.clone(), t))
+        .collect();
     let mut i = 0;
-    let mut cascaded = std::collections::HashSet::new();
+    let mut cascaded: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
 
     while i < queue.len() {
-        let current_broken_type = queue[i].clone();
+        let (current_broken_type, root) = queue[i].clone();
         i += 1;
 
         if let Some(dependents) = reverse_deps.get(&current_broken_type) {
             for dep in dependents {
-                // Ignore if it was the original broken type
-                if !cascaded.contains(dep) {
-                    cascaded.insert(dep.clone());
-                    queue.push(dep.clone());
+                let key = (dep.clone(), root.clone());
+                if !cascaded.contains(&key) {
+                    cascaded.insert(key);
+                    queue.push((dep.clone(), root.clone()));
 
                     report.findings.push(Finding {
                         severity: Severity::Critical,
@@ -1327,6 +1015,7 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
                         ),
                         type_name: Some(dep.clone()),
                         target: Some(dep.clone()),
+                        root_target: Some(root.clone()),
                     });
                 }
             }
@@ -1334,73 +1023,10 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
     }
 }
 
-<<<<<<< HEAD
-/// Policy-aware variant of [`detect_cascading_layout_breaks`].
-///
-/// Uses [`crate::mapper::LayoutMapper::new_with_policy`] so the walk is bounded
-/// by `policy.max_walk_depth`. Returns a [`crate::limits::LimitError`] if the
-/// type graph is deeper than the configured limit.
-fn detect_cascading_layout_breaks_with_policy(
-    old: &ContractSpec,
-    report: &mut DiffReport,
-    policy: &ResourcePolicy,
-) -> Result<(), LimitError> {
-    let old_mapper = LayoutMapper::new_with_policy(old, policy);
-    let reverse_deps = old_mapper.try_build_reverse_dependencies()?;
-
-    let mut broken_types = std::collections::HashSet::new();
-    for finding in &report.findings {
-        if finding.severity == Severity::Critical {
-            if let Some(ref name) = finding.type_name {
-                broken_types.insert(name.clone());
-            }
-        }
-    }
-
-    let mut queue: Vec<String> = broken_types.into_iter().collect();
-    let mut i = 0;
-    let mut cascaded = std::collections::HashSet::new();
-
-    while i < queue.len() {
-        let current_broken_type = queue[i].clone();
-        i += 1;
-
-        if let Some(dependents) = reverse_deps.get(&current_broken_type) {
-            for dep in dependents {
-                if !cascaded.contains(dep) {
-                    cascaded.insert(dep.clone());
-                    queue.push(dep.clone());
-
-                    report.findings.push(Finding {
-                        severity: Severity::Critical,
-                        category: "Cascading Layout Break".to_string(),
-                        message: format!(
-                            "Type '{}' layout is broken because it embeds modified type '{}'. \
-                             Stored data for '{}' is no longer compatible.",
-                            dep, current_broken_type, dep
-                        ),
-                        type_name: Some(dep.clone()),
-                        target: Some(dep.clone()),
-                        classification: None,
-                    });
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::{BTreeSet, HashSet};
-    use stellar_xdr::curr::{ScEnvMetaEntry, ScMetaEntry, ScMetaV0, ScSpecTypeUdt, StringM, VecM};
-=======
 #[cfg(test)]
 mod tests {
     use super::*;
     use stellar_xdr::curr::{ScEnvMetaEntry, ScSpecTypeUdt, StringM, VecM};
->>>>>>> c63f1bddec211d5f042ed4554ca9b55e041ccb00
 
     /// Helper: build a minimal ContractSpec with the given structs.
     fn spec_with_structs(structs: Vec<(&str, Vec<(&str, ScSpecTypeDef)>)>) -> ContractSpec {
@@ -1511,6 +1137,7 @@ mod tests {
                 .to_string(),
             type_name: Some("Child".to_string()),
             target: Some("Child".to_string()),
+            root_target: None,
         });
 
         // Run cascade detection against the old spec
@@ -1544,6 +1171,7 @@ mod tests {
             message: "Function 'do_stuff' was removed.".to_string(),
             type_name: None,
             target: Some("do_stuff".to_string()),
+            root_target: None,
         });
 
         detect_cascading_layout_breaks(&old, &mut report);

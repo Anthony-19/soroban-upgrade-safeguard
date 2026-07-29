@@ -34,6 +34,7 @@ fn make_finding(severity: Severity, category: &str, target: &str) -> Finding {
         } else {
             Some(target.to_string())
         },
+        root_target: None,
     }
 }
 
