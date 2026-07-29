@@ -29,7 +29,7 @@ use crate::report::ReportedFinding;
 pub const REPORT_SCHEMA_VERSION: u32 = 1;
 
 /// Provenance metadata embedded in every report for auditability.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Provenance {
     /// Tool version from crate metadata (CARGO_PKG_VERSION).
     pub tool_version: String,

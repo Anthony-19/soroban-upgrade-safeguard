@@ -26,6 +26,29 @@ enum OutputFormat {
     Markdown,
 }
 
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutputFormat::Text => write!(f, "text"),
+            OutputFormat::Json => write!(f, "json"),
+            OutputFormat::Markdown => write!(f, "markdown"),
+        }
+    }
+}
+
+impl std::str::FromStr for OutputFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "text" => Ok(OutputFormat::Text),
+            "json" => Ok(OutputFormat::Json),
+            "markdown" | "md" => Ok(OutputFormat::Markdown),
+            _ => Err(format!("Unknown format '{s}'. Supported: text, json, markdown")),
+        }
+    }
+}
+
 impl OutputFormat {
     fn file_extension(&self) -> &'static str {
         match self {
@@ -38,7 +61,9 @@ impl OutputFormat {
 
 /// A single output specification: a format and an optional file path.
 /// When `path` is `None`, output goes to stdout.
+#[derive(Clone, Debug)]
 struct OutputSpec {
+
     format: OutputFormat,
     path: Option<PathBuf>,
 }
@@ -417,10 +442,10 @@ fn run_batch(
     args: &Args,
     outputs: &[OutputSpec],
     suppressions: &SuppressionConfig,
-    progress: &impl Fn(String),
+    progress: &dyn Fn(String),
 ) -> Result<()> {
-    let pairs = if let Some(manifest_path) = &args.manifest {
-        parse_manifest(manifest_path)?
+    let (pairs, mut gaps) = if let Some(manifest_path) = &args.manifest {
+        (parse_manifest(manifest_path)?, Vec::new())
     } else {
         scan_directories(
             args.old_dir.as_ref().unwrap(),
@@ -430,12 +455,96 @@ fn run_batch(
 
     progress("🔍 Soroban Upgrade Safeguard (Batch Mode)".to_string());
     progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
-    progress(format!("Loaded {} pair(s) for comparison.\n", pairs.len()));
+    progress(format!(
+        "Loaded {} pair(s) for comparison. {} old-only contract(s) will be flagged.\n",
+        pairs.len(),
+        gaps.len()
+    ));
 
     let mut results = std::collections::BTreeMap::new();
     let mut overall_safe = true;
     let mut seen_names = std::collections::BTreeSet::new();
+    let gap_count = gaps.len();
+    let total = pairs.len() + gap_count;
 
+    // Process each gap (old contract missing from new directory) as a Critical failure
+    for gap in gaps.drain(..) {
+        if !seen_names.insert(gap.name.clone()) {
+            anyhow::bail!(
+                "Duplicate contract name '{}' found in batch input; names must be unique",
+                gap.name
+            );
+        }
+        progress(format!(
+            "📦 [{}/{}] Gap: '{}' exists in old directory but NOT in new directory",
+            results.len() + 1,
+            total,
+            gap.name.bold().red()
+        ));
+
+        let gap_report = report::SafetyReport {
+            critical_count: 1,
+            warning_count: 0,
+            info_count: 0,
+            suppressed_count: 0,
+            suppressed_critical_count: 0,
+            suppressed_warning_count: 0,
+            suppressed_info_count: 0,
+            total_findings: 1,
+            is_safe: false,
+            strict: args.strict,
+            critical_root_count: 1,
+            cascade_critical_count: 0,
+            old_interface_hash: None,
+            new_interface_hash: None,
+            no_timestamp: args.no_timestamp,
+            old_spec_summary: None,
+            new_spec_summary: Some("(contract missing from new deployment)".to_string()),
+            scope: report::AnalysisScope::default(),
+            metrics: None,
+            findings_by_category: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(
+                    "contract-missing-from-new".to_string(),
+                    vec![report::ReportedFinding {
+                        finding: diff::Finding {
+                            severity: diff::Severity::Critical,
+                            category: "contract-missing-from-new".to_string(),
+                            message: format!(
+                                "'{}' exists in the old directory but was not found in the new directory. \
+                                 This contract would be removed from the deployment, breaking all clients \
+                                 that depend on it.",
+                                gap.name
+                            ),
+                            type_name: None,
+                            target: Some(gap.name.clone()),
+                            root_target: None,
+                        },
+                        suppressed: false,
+                        suppression_reason: None,
+                        remediation: Some(format!(
+                            "Ensure the .wasm for '{}' is present in the new directory, or add it to \
+                             the --suppressions file if removal is intentional.",
+                            gap.name
+                        )),
+                    }],
+                );
+                map
+            },
+        };
+
+        render_to_outputs(&gap_report, outputs, args.explain, Some(&gap.name), progress)?;
+
+        if let Some(output_dir) = args.per_contract_output_dir.as_deref() {
+            let content = render_single(&gap_report, args.format.unwrap_or(OutputFormat::Text), args.explain)?;
+            write_report_file(output_dir, &gap.name, args.format.unwrap_or(OutputFormat::Text), &content)?;
+        }
+
+        results.insert(gap.name, gap_report);
+        overall_safe = false;
+    }
+
+    // Process each regular pair with error-handling (per-pair failures do not abort the batch)
     for (i, pair) in pairs.iter().enumerate() {
         let default_name = format!("pair_{}", i + 1);
         let contract_name = pair.name.clone().unwrap_or_else(|| {
@@ -455,33 +564,51 @@ fn run_batch(
 
         progress(format!(
             "📦 [{}/{}] Comparing contract pair: {}",
-            i + 1,
-            pairs.len(),
+            i + 1 + gaps.len(),
+            total,
             contract_name.bold()
         ));
 
-        let old_wasm = loader::load_wasm(&pair.old)?;
-        let new_wasm = loader::load_wasm(&pair.new)?;
-
-        let report = compare_contracts(
-            &ContractComparison {
-                old_bytes: &old_wasm.bytes,
-                old_path: &old_wasm.path,
-                new_bytes: &new_wasm.bytes,
-                new_path: &new_wasm.path,
-                suppressions,
-                explain: args.explain,
-                strict: args.strict,
-                no_timestamp: args.no_timestamp,
-            },
-            progress,
-        )?;
+        let report = match (loader::load_wasm(&pair.old), loader::load_wasm(&pair.new)) {
+            (Ok(old_wasm), Ok(new_wasm)) => {
+                match compare_contracts(
+                    &ContractComparison {
+                        old_bytes: &old_wasm.bytes,
+                        old_path: &old_wasm.path,
+                        new_bytes: &new_wasm.bytes,
+                        new_path: &new_wasm.path,
+                        suppressions,
+                        explain: args.explain,
+                        strict: args.strict,
+                        no_timestamp: args.no_timestamp,
+                    },
+                    progress,
+                ) {
+                    Ok(report) => report,
+                    Err(e) => {
+                        progress(format!(
+                            "  ⚠️  Comparison failed for '{}': {}",
+                            contract_name,
+                            e.to_string().red()
+                        ));
+                        synthesize_error_report(&contract_name, &e.to_string(), args.strict, args.no_timestamp)
+                    }
+                }
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                progress(format!(
+                    "  ⚠️  Failed to load contract files for '{}': {}",
+                    contract_name,
+                    e.to_string().red()
+                ));
+                synthesize_error_report(&contract_name, &e.to_string(), args.strict, args.no_timestamp)
+            }
+        };
 
         if !report.is_safe {
             overall_safe = false;
         }
 
-        // Write per-contract outputs
         render_to_outputs(&report, outputs, args.explain, Some(&contract_name), progress)?;
 
         if let Some(output_dir) = args.per_contract_output_dir.as_deref() {
@@ -493,7 +620,7 @@ fn run_batch(
         progress("\n----------------------------------------\n".to_string());
     }
 
-    render_batch_summary(&results, overall_safe, pairs.len(), args.strict, outputs, progress)?;
+    render_batch_summary(&results, overall_safe, total, args.strict, outputs, progress)?;
 
     if !overall_safe {
         std::process::exit(1);
@@ -502,13 +629,61 @@ fn run_batch(
     Ok(())
 }
 
+fn synthesize_error_report(name: &str, error_message: &str, strict: bool, no_timestamp: bool) -> report::SafetyReport {
+    report::SafetyReport {
+        critical_count: 1,
+        warning_count: 0,
+        info_count: 0,
+        suppressed_count: 0,
+        suppressed_critical_count: 0,
+        suppressed_warning_count: 0,
+        suppressed_info_count: 0,
+        total_findings: 1,
+        is_safe: false,
+        strict,
+        critical_root_count: 1,
+        cascade_critical_count: 0,
+        old_interface_hash: None,
+        new_interface_hash: None,
+        no_timestamp,
+        old_spec_summary: None,
+        new_spec_summary: Some("(analysis failed)".to_string()),
+        scope: report::AnalysisScope::default(),
+        metrics: None,
+        findings_by_category: {
+            let mut map = std::collections::HashMap::new();
+            map.insert(
+                "analysis-error".to_string(),
+                vec![report::ReportedFinding {
+                    finding: diff::Finding {
+                        severity: diff::Severity::Critical,
+                        category: "analysis-error".to_string(),
+                        message: format!(
+                            "Analysis of '{}' failed: {}", name, error_message
+                        ),
+                        type_name: None,
+                        target: Some(name.to_string()),
+                        root_target: None,
+                    },
+                    suppressed: false,
+                    suppression_reason: None,
+                    remediation: Some(
+                        "Check the contract paths and ensure both WASM files exist and are valid Soroban contracts.".to_string()
+                    ),
+                }],
+            );
+            map
+        },
+    }
+}
+
 fn render_batch_summary(
     results: &std::collections::BTreeMap<String, report::SafetyReport>,
     overall_safe: bool,
     total_pairs: usize,
     strict: bool,
     outputs: &[OutputSpec],
-    progress: &impl Fn(String),
+    progress: &dyn Fn(String),
 ) -> Result<()> {
     for output in outputs {
         let content = match output.format {
@@ -618,7 +793,7 @@ fn run_single(
     args: &Args,
     outputs: &[OutputSpec],
     suppressions: &SuppressionConfig,
-    progress: &impl Fn(String),
+    progress: &dyn Fn(String),
 ) -> Result<()> {
     let (old_source, new_wasm_path) = match (args.wasm_paths.len(), &args.contract_id) {
         (2, None) => (None, &args.wasm_paths[1]),
@@ -681,7 +856,7 @@ fn run_single(
         Vec::new()
     };
 
-    let run_comparison = |progress: &impl Fn(String)| -> Result<bool> {
+    let run_comparison = |progress: &dyn Fn(String)| -> Result<bool> {
         progress("🔍 Soroban Upgrade Safeguard".to_string());
         progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
 
@@ -753,7 +928,7 @@ fn render_to_outputs(
     outputs: &[OutputSpec],
     explain: bool,
     contract_name: Option<&str>,
-    progress: &impl Fn(String),
+    progress: &dyn Fn(String),
 ) -> Result<()> {
     for output in outputs {
         let content = render_single(report, output.format, explain)?;
@@ -907,7 +1082,7 @@ fn run_watch_mode(
     _args: &Args,
     _outputs: &[OutputSpec],
     _suppressions: &SuppressionConfig,
-    _run_comparison: impl Fn(&impl Fn(String)) -> Result<bool>,
+    _run_comparison: impl Fn(&dyn Fn(String)) -> Result<bool>,
 ) -> Result<()> {
     eprintln!("Warning: --watch is not available in this build. Rebuild with the 'watch' feature enabled.");
     Ok(())
@@ -951,7 +1126,7 @@ struct ContractComparison<'a> {
 
 fn compare_contracts(
     comparison: &ContractComparison<'_>,
-    progress: &impl Fn(String),
+    progress: &dyn Fn(String),
 ) -> Result<report::SafetyReport> {
     let ContractComparison {
         old_bytes,
@@ -1019,7 +1194,13 @@ fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {
     )
 }
 
-fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>> {
+#[allow(dead_code)]
+struct GapContract {
+    name: String,
+    old_path: PathBuf,
+}
+
+fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<(Vec<ContractPair>, Vec<GapContract>)> {
     if !old_dir.is_dir() {
         anyhow::bail!("Old directory '{}' is not a directory", old_dir.display());
     }
@@ -1028,38 +1209,38 @@ fn scan_directories(old_dir: &Path, new_dir: &Path) -> Result<Vec<ContractPair>>
     }
 
     let mut pairs = Vec::new();
+    let mut gaps = Vec::new();
     for entry in std::fs::read_dir(old_dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("wasm") {
             let filename = path.file_name().unwrap();
             let new_path = new_dir.join(filename);
+            let name = path.file_stem().and_then(|s| s.to_str()).map(String::from);
             if new_path.exists() {
-                let name = path.file_stem().and_then(|s| s.to_str()).map(String::from);
                 pairs.push(ContractPair {
                     old: path,
                     new: new_path,
                     name,
                 });
             } else {
-                eprintln!(
-                    "⚠️  Warning: Match not found for '{}' in new directory '{}'",
-                    filename.to_string_lossy(),
-                    new_dir.display()
-                );
+                let gap_name = name.unwrap_or_else(|| filename.to_string_lossy().to_string());
+                gaps.push(GapContract {
+                    name: gap_name,
+                    old_path: path,
+                });
             }
         }
     }
 
-    if pairs.is_empty() {
+    if pairs.is_empty() && gaps.is_empty() {
         anyhow::bail!(
-            "No matching .wasm contract pairs found between '{}' and '{}'",
-            old_dir.display(),
-            new_dir.display()
+            "No .wasm files found in '{}'",
+            old_dir.display()
         );
     }
 
-    Ok(pairs)
+    Ok((pairs, gaps))
 }
 
 fn render_report(
