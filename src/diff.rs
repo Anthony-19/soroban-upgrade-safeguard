@@ -1181,6 +1181,7 @@ pub fn detect_type_kind_changes(old: &ContractSpec, new: &ContractSpec, report: 
             ),
             type_name: Some(name.clone()),
             target: Some(name),
+            root_target: None,
         });
     }
 }
@@ -1986,6 +1987,9 @@ mod tests {
             finding.message.contains("from struct to enum"),
             "message should name both kinds, got: {}",
             finding.message
+        );
+    }
+
     // ---------------------------------------------------------------
     // describe_nested_type_change unit tests
     // ---------------------------------------------------------------
@@ -2091,6 +2095,10 @@ mod tests {
             findings[0].message.contains("from enum to union"),
             "message should name both kinds, got: {}",
             findings[0].message
+        );
+    }
+
+    #[test]
     fn nested_type_change_deeply_nested() {
         // Vec<Option<Map<Address, u32>>> -> Vec<Option<Map<Address, u64>>>
         let inner_map = |value: ScSpecTypeDef| {
@@ -2188,6 +2196,10 @@ mod tests {
                 .iter()
                 .any(|f| f.category == "Event Definition Removed"),
             "the event-flavored removal must be retracted too"
+        );
+    }
+
+    #[test]
     fn nested_type_change_outer_constructor_differs() {
         // Vec<u32> -> Option<u32> — different outer constructors
         let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
@@ -2315,6 +2327,10 @@ mod tests {
                 .any(|f| f.category == "Cascading Layout Break"
                     && f.target.as_deref() == Some("Wrapper")),
             "a kind change must cascade to types embedding it"
+        );
+    }
+
+    #[test]
     fn field_type_change_map_shows_concise_message() {
         let make_map = |value: ScSpecTypeDef| {
             ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
@@ -2452,6 +2468,9 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(names_in_order(&compare(&old, &new)), first);
         }
+    }
+
+    #[test]
     fn bytesn_parameter_change_gets_specific_category() {
         let old = spec_with_functions(vec![("test", vec![("x", bytesn(32))])]);
         let new = spec_with_functions(vec![("test", vec![("x", bytesn(64))])]);
