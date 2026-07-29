@@ -403,6 +403,8 @@ impl SafetyReport {
                 old_wasm_size, new_wasm_size,
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             )),
+            empirical: false,
+            empirical_findings: Vec::new(),
         }
     }
 
@@ -516,6 +518,8 @@ impl SafetyReport {
             new_spec_summary: None,
             scope: AnalysisScope::default(),
             metrics: None,
+            empirical: false,
+            empirical_findings: Vec::new(),
         }
     }
 
@@ -598,6 +602,8 @@ impl SafetyReport {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            empirical: self.empirical,
+            empirical_findings: self.empirical_findings.clone(),
         }
     }
 
