@@ -295,12 +295,18 @@ fn check_function_signature(
                         severity: Severity::Critical,
                         category: "Parameter Type Changed".to_string(),
                         message: format!(
-                            "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
+                            "Function '{}': parameter {} ('{}') {}.",
                             name,
                             i,
                             p_name,
-                            crate::mapper::type_to_string(&old_input.type_),
-                            crate::mapper::type_to_string(new_type)
+                            describe_nested_type_change(&old_input.type_, new_type)
+                                .unwrap_or_else(|| {
+                                    format!(
+                                        "type changed from `{}` to `{}`",
+                                        crate::mapper::type_to_string(&old_input.type_),
+                                        crate::mapper::type_to_string(new_type)
+                                    )
+                                })
                         ),
                         type_name: None,
                         target: Some(format!("{}.{}", name, p_name)),
@@ -332,12 +338,18 @@ fn check_function_signature(
                     severity: Severity::Critical,
                     category: "Parameter Type Changed".to_string(),
                     message: format!(
-                        "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
+                        "Function '{}': parameter {} ('{}') {}.",
                         name,
                         i,
                         old_name,
-                        crate::mapper::type_to_string(&old_input.type_),
-                        crate::mapper::type_to_string(&new_input.type_)
+                        describe_nested_type_change(&old_input.type_, &new_input.type_)
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "type changed from `{}` to `{}`",
+                                    crate::mapper::type_to_string(&old_input.type_),
+                                    crate::mapper::type_to_string(&new_input.type_)
+                                )
+                            })
                     ),
                     type_name: None,
                     target: Some(format!("{}.{}", name, old_name)),
@@ -370,11 +382,17 @@ fn check_function_signature(
                     severity: Severity::Critical,
                     category: "Return Type Changed".to_string(),
                     message: format!(
-                        "Function '{}': return type {} changed from `{}` to `{}`.",
+                        "Function '{}': return type {} {}.",
                         name,
                         i,
-                        crate::mapper::type_to_string(old_out),
-                        crate::mapper::type_to_string(new_out)
+                        describe_nested_type_change(old_out, new_out)
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "changed from `{}` to `{}`",
+                                    crate::mapper::type_to_string(old_out),
+                                    crate::mapper::type_to_string(new_out)
+                                )
+                            })
                     ),
                     type_name: None,
                     target: Some(name.to_string()),
@@ -516,13 +534,19 @@ fn check_struct_fields(
                 severity: Severity::Critical,
                 category: format!("{} Type Changed", category_prefix),
                 message: format!(
-                    "{} '{}': field '{}' (position {}) type changed from `{}` to `{}`.",
+                    "{} '{}': field '{}' (position {}) {}.",
                     msg_prefix,
                     name,
                     old_name,
                     i,
-                    crate::mapper::type_to_string(&old_field.type_),
-                    crate::mapper::type_to_string(&new_field.type_)
+                    describe_nested_type_change(&old_field.type_, &new_field.type_)
+                        .unwrap_or_else(|| {
+                            format!(
+                                "type changed from `{}` to `{}`",
+                                crate::mapper::type_to_string(&old_field.type_),
+                                crate::mapper::type_to_string(&new_field.type_)
+                            )
+                        })
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
@@ -773,12 +797,18 @@ fn check_union_cases(
                 severity: Severity::Critical,
                 category: "Union Case Type Changed".to_string(),
                 message: format!(
-                    "Union '{}': case '{}' (position {}) type changed from `{}` to `{}`.",
+                    "Union '{}': case '{}' (position {}) {}.",
                     name,
                     old_name,
                     i,
-                    union_case_type_signature(old_case),
-                    union_case_type_signature(new_case)
+                    describe_union_case_type_change(old_case, new_case)
+                        .unwrap_or_else(|| {
+                            format!(
+                                "type changed from `{}` to `{}`",
+                                union_case_type_signature(old_case),
+                                union_case_type_signature(new_case)
+                            )
+                        })
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
@@ -978,6 +1008,127 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
                 }
             }
         }
+    }
+}
+
+/// When two `ScSpecUdtUnionCaseV0` values are both tuples with the same length
+/// and differ only in one inner type, produce a concise description of the
+/// innermost difference.  Returns `None` when the outer structures differ,
+/// signalling the caller to fall back to the full-signature form.
+fn describe_union_case_type_change(
+    old: &ScSpecUdtUnionCaseV0,
+    new: &ScSpecUdtUnionCaseV0,
+) -> Option<String> {
+    match (old, new) {
+        (ScSpecUdtUnionCaseV0::TupleV0(a), ScSpecUdtUnionCaseV0::TupleV0(b)) => {
+            let a_types: &[ScSpecTypeDef] = a.type_.as_ref();
+            let b_types: &[ScSpecTypeDef] = b.type_.as_ref();
+            if a_types.len() != b_types.len() {
+                return None;
+            }
+            for (i, (at, bt)) in a_types.iter().zip(b_types.iter()).enumerate() {
+                if at != bt {
+                    return describe_nested_type_change(at, bt).or_else(|| {
+                        Some(format!(
+                            "payload type at index {} changed from `{}` to `{}`",
+                            i,
+                            crate::mapper::type_to_string(at),
+                            crate::mapper::type_to_string(bt),
+                        ))
+                    });
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// When two `ScSpecTypeDef` values share the same container shape (e.g. both are
+/// `Vec`) and differ only in a type argument, produce a concise description of
+/// the innermost difference.  Returns `None` when the outer constructors
+/// themselves differ, signalling the caller to fall back to the full-signature
+/// form (e.g.  `"type changed from \`Map<Address, u32>\` to \`Map<Address, u64>\`"`).
+fn describe_nested_type_change(old: &ScSpecTypeDef, new: &ScSpecTypeDef) -> Option<String> {
+    if old == new {
+        return None;
+    }
+    match (old, new) {
+        (ScSpecTypeDef::Option(a), ScSpecTypeDef::Option(b)) => {
+            describe_nested_type_change(&a.value_type, &b.value_type).or_else(|| {
+                Some(format!(
+                    "the inner type of Option changed from `{}` to `{}`",
+                    crate::mapper::type_to_string(&a.value_type),
+                    crate::mapper::type_to_string(&b.value_type),
+                ))
+            })
+        }
+        (ScSpecTypeDef::Vec(a), ScSpecTypeDef::Vec(b)) => {
+            describe_nested_type_change(&a.element_type, &b.element_type).or_else(|| {
+                Some(format!(
+                    "the element type of Vec changed from `{}` to `{}`",
+                    crate::mapper::type_to_string(&a.element_type),
+                    crate::mapper::type_to_string(&b.element_type),
+                ))
+            })
+        }
+        (ScSpecTypeDef::Map(a), ScSpecTypeDef::Map(b)) => {
+            if a.key_type != b.key_type {
+                return describe_nested_type_change(&a.key_type, &b.key_type).or_else(|| {
+                    Some(format!(
+                        "the key type of Map changed from `{}` to `{}`",
+                        crate::mapper::type_to_string(&a.key_type),
+                        crate::mapper::type_to_string(&b.key_type),
+                    ))
+                });
+            }
+            describe_nested_type_change(&a.value_type, &b.value_type).or_else(|| {
+                Some(format!(
+                    "the value type of Map changed from `{}` to `{}`",
+                    crate::mapper::type_to_string(&a.value_type),
+                    crate::mapper::type_to_string(&b.value_type),
+                ))
+            })
+        }
+        (ScSpecTypeDef::Result(a), ScSpecTypeDef::Result(b)) => {
+            if a.ok_type != b.ok_type {
+                return describe_nested_type_change(&a.ok_type, &b.ok_type).or_else(|| {
+                    Some(format!(
+                        "the ok type of Result changed from `{}` to `{}`",
+                        crate::mapper::type_to_string(&a.ok_type),
+                        crate::mapper::type_to_string(&b.ok_type),
+                    ))
+                });
+            }
+            describe_nested_type_change(&a.error_type, &b.error_type).or_else(|| {
+                Some(format!(
+                    "the error type of Result changed from `{}` to `{}`",
+                    crate::mapper::type_to_string(&a.error_type),
+                    crate::mapper::type_to_string(&b.error_type),
+                ))
+            })
+        }
+        (ScSpecTypeDef::Tuple(a), ScSpecTypeDef::Tuple(b)) => {
+            let a_types: &[ScSpecTypeDef] = a.value_types.as_ref();
+            let b_types: &[ScSpecTypeDef] = b.value_types.as_ref();
+            if a_types.len() != b_types.len() {
+                return None;
+            }
+            for (i, (at, bt)) in a_types.iter().zip(b_types.iter()).enumerate() {
+                if at != bt {
+                    return describe_nested_type_change(at, bt).or_else(|| {
+                        Some(format!(
+                            "type at index {} of tuple changed from `{}` to `{}`",
+                            i,
+                            crate::mapper::type_to_string(at),
+                            crate::mapper::type_to_string(bt),
+                        ))
+                    });
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -1492,5 +1643,214 @@ mod tests {
         let tf = type_finding.unwrap();
         assert_eq!(tf.severity, Severity::Critical);
         assert!(tf.message.contains("parameter 0 ('a') type changed")); // Index in old is 0
+    }
+
+    // ---------------------------------------------------------------
+    // describe_nested_type_change unit tests
+    // ---------------------------------------------------------------
+    #[test]
+    fn nested_type_change_option() {
+        let old = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+            value_type: ScSpecTypeDef::U32,
+        }));
+        let new = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+            value_type: ScSpecTypeDef::U64,
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some("the inner type of Option changed from `u32` to `u64`".to_string())
+        );
+    }
+
+    #[test]
+    fn nested_type_change_vec() {
+        let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+            element_type: ScSpecTypeDef::U32,
+        }));
+        let new = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+            element_type: ScSpecTypeDef::U64,
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some("the element type of Vec changed from `u32` to `u64`".to_string())
+        );
+    }
+
+    #[test]
+    fn nested_type_change_map_value() {
+        let old = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+            key_type: ScSpecTypeDef::Address,
+            value_type: ScSpecTypeDef::U32,
+        }));
+        let new = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+            key_type: ScSpecTypeDef::Address,
+            value_type: ScSpecTypeDef::U64,
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some(
+                "the value type of Map changed from `u32` to `u64`"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn nested_type_change_map_key() {
+        let old = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+            key_type: ScSpecTypeDef::Symbol,
+            value_type: ScSpecTypeDef::U32,
+        }));
+        let new = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+            key_type: ScSpecTypeDef::String,
+            value_type: ScSpecTypeDef::U32,
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some("the key type of Map changed from `Symbol` to `String`".to_string())
+        );
+    }
+
+    #[test]
+    fn nested_type_change_tuple() {
+        let make_tuple = |types: Vec<ScSpecTypeDef>| {
+            ScSpecTypeDef::Tuple(Box::new(stellar_xdr::curr::ScSpecTypeTuple {
+                value_types: stellar_xdr::curr::VecM::try_from(types).unwrap(),
+            }))
+        };
+        let old = make_tuple(vec![ScSpecTypeDef::U32, ScSpecTypeDef::U64]);
+        let new = make_tuple(vec![ScSpecTypeDef::U32, ScSpecTypeDef::I128]);
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some(
+                "type at index 1 of tuple changed from `u64` to `i128`"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn nested_type_change_deeply_nested() {
+        // Vec<Option<Map<Address, u32>>> -> Vec<Option<Map<Address, u64>>>
+        let inner_map = |value: ScSpecTypeDef| {
+            ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+                key_type: ScSpecTypeDef::Address,
+                value_type: value,
+            }))
+        };
+        let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+            element_type: ScSpecTypeDef::Option(Box::new(
+                stellar_xdr::curr::ScSpecTypeOption {
+                    value_type: inner_map(ScSpecTypeDef::U32),
+                },
+            )),
+        }));
+        let new = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+            element_type: ScSpecTypeDef::Option(Box::new(
+                stellar_xdr::curr::ScSpecTypeOption {
+                    value_type: inner_map(ScSpecTypeDef::U64),
+                },
+            )),
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some(
+                "the value type of Map changed from `u32` to `u64`"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn nested_type_change_outer_constructor_differs() {
+        // Vec<u32> -> Option<u32> — different outer constructors
+        let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+            element_type: ScSpecTypeDef::U32,
+        }));
+        let new = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+            value_type: ScSpecTypeDef::U32,
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(desc, None);
+    }
+
+    // ---------------------------------------------------------------
+    // Integration tests: type-change messages use concise format
+    // ---------------------------------------------------------------
+    #[test]
+    fn field_type_change_vec_shows_concise_message() {
+        let old = spec_with_structs(vec![("Data", vec![(
+            "values",
+            ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+                element_type: ScSpecTypeDef::U32,
+            })),
+        )])]);
+        let new = spec_with_structs(vec![("Data", vec![(
+            "values",
+            ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+                element_type: ScSpecTypeDef::U64,
+            })),
+        )])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Type Changed")
+            .expect("Expected field type change");
+        assert!(
+            fc.message.contains("the element type of Vec changed from `u32` to `u64`"),
+            "Message was: {}",
+            fc.message
+        );
+    }
+
+    #[test]
+    fn field_type_change_map_shows_concise_message() {
+        let make_map = |value: ScSpecTypeDef| {
+            ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+                key_type: ScSpecTypeDef::Address,
+                value_type: value,
+            }))
+        };
+        let old = spec_with_structs(vec![("Data", vec![("balances", make_map(ScSpecTypeDef::U32))])]);
+        let new = spec_with_structs(vec![("Data", vec![("balances", make_map(ScSpecTypeDef::U64))])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Type Changed")
+            .expect("Expected field type change");
+        assert!(
+            fc.message.contains("the value type of Map changed from `u32` to `u64`"),
+            "Message was: {}",
+            fc.message
+        );
+    }
+
+    #[test]
+    fn field_type_change_primitive_shows_full_message() {
+        // u32 -> i128 — primitive change, should use full fallback format
+        let old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::I128)])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Type Changed")
+            .expect("Expected field type change");
+        assert!(
+            fc.message.contains("type changed from `u32` to `i128`"),
+            "Message was: {}",
+            fc.message
+        );
     }
 }
