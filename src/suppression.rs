@@ -134,6 +134,7 @@ mod tests {
             message: "irrelevant to matching".to_string(),
             type_name: target.map(|t| t.split('.').next().unwrap().to_string()),
             target: target.map(|t| t.to_string()),
+            root_target: None,
         }
     }
 

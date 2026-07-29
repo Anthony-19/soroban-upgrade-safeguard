@@ -602,49 +602,6 @@ pub fn compare_wasm_files_with_storage_schemas(
         },
     )
 }
-//! # Soroban Upgrade Safeguard
-//!
-//! Library for analyzing and validating Soroban smart-contract upgrades on the
-//! Stellar network. It detects breaking changes in storage layout, function
-//! signatures, and event schemas before an upgrade is deployed.
-//!
-//! The crate is split into focused modules that form an analysis pipeline:
-//!
-//! - [`loader`] reads and validates raw WASM binaries from disk.
-//! - [`parser`] extracts the Soroban `contractspecv0` custom section and decodes
-//!   its XDR entries.
-//! - [`spec`] organizes the decoded entries into a [`spec::ContractSpec`].
-//! - [`mapper`] builds type-dependency graphs used for cascade detection.
-//! - [`diff`] compares two specs and produces a list of findings.
-//! - [`report`] aggregates findings into a [`report::SafetyReport`].
-//!
-//! The exported spec only describes a contract's *callable surface*. Storage
-//! compatibility is governed by internal storage-key and value types that need
-//! not appear in it at all, so [`storage_schema`] defines an opt-in manifest in
-//! which a team declares those types for analysis.
-//!
-//! Most callers only need the two top-level helpers, [`compare_wasm_files`] and
-//! [`compare_wasm_bytes`], which run the whole pipeline and return a structured
-//! [`report::SafetyReport`]. The individual modules are public so that more
-//! specialized tools (CI bots, dashboards, custom checks) can reuse any single
-//! stage without shelling out to the CLI binary.
-//!
-//! # Example
-//!
-//! ```no_run
-//! use std::path::Path;
-//!
-//! let report = soroban_upgrade_safeguard::compare_wasm_files(
-//!     Path::new("./wasm/v1.wasm"),
-//!     Path::new("./wasm/v2.wasm"),
-//! )?;
-//!
-//! if !report.is_safe {
-//!     eprintln!("Upgrade is unsafe: {} critical issue(s)", report.critical_count);
-//! }
-//! # Ok::<(), anyhow::Error>(())
-//! ```
-
 pub mod baseline;
 pub mod builder;
 pub mod classification;

@@ -29,15 +29,51 @@ fn write_config(name: &str, contents: &str) -> PathBuf {
     path
 }
 
+fn all_critical_suppressions() -> &'static str {
+    r#"
+    [[suppress]]
+    category = "Event Enum Case Value Changed"
+    target   = "StatusEvent.Paused"
+    reason   = "Reviewed: indexers already updated."
+
+    [[suppress]]
+    category = "Function Signature Changed"
+    target   = "initialize"
+    reason   = "Planned re-init for the v2 migration."
+
+    [[suppress]]
+    category = "Struct Field Removed"
+    target   = "ConfigData.threshold"
+    "#
+}
+
+fn temp_dir(name: &str) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "{}-{}",
+        name,
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&path).expect("failed to create temp dir");
+    path
+}
+
 /// Run the binary in JSON mode comparing `v1 -> v2`, optionally with a config.
 /// Returns (parsed JSON, exit code).
 fn run(config: Option<&PathBuf>) -> (Value, i32) {
+    run_ext(config, &[], None)
+}
+
+fn run_ext(config: Option<&PathBuf>, extra_args: &[&str], cwd: Option<&PathBuf>) -> (Value, i32) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"));
     cmd.arg(wasm("v1.wasm"))
         .arg(wasm("v2.wasm"))
         .args(["--format", "json"]);
     if let Some(path) = config {
         cmd.args(["--config".as_ref(), path.as_os_str()]);
+    }
+    cmd.args(extra_args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
     }
 
     let output = cmd.output().expect("failed to run binary");
@@ -66,25 +102,34 @@ fn findings(json: &Value) -> Vec<(String, Option<String>, bool)> {
 }
 
 #[test]
-fn suppressing_all_criticals_passes_but_still_lists_them() {
+fn rule_id_based_suppression_matches_stable_identifier() {
     let config = write_config(
-        "all",
+        "rule-id",
         r#"
         [[suppress]]
-        category = "Event Enum Case Value Changed"
-        target   = "StatusEvent.Paused"
-        reason   = "Reviewed: indexers already updated."
-
-        [[suppress]]
-        category = "Function Signature Changed"
-        target   = "initialize"
-        reason   = "Planned re-init for the v2 migration."
-
-        [[suppress]]
-        category = "Struct Field Removed"
-        target   = "ConfigData.threshold"
+        rule_id = "struct_field_removed"
+        target  = "ConfigData.threshold"
+        reason  = "Reviewed storage migration"
         "#,
     );
+
+    let (json, code) = run(Some(&config));
+
+    assert_eq!(code, 0, "suppressing by rule_id should pass the run");
+    assert_eq!(json["suppressed_count"].as_u64().unwrap(), 1);
+    assert!(
+        findings(&json)
+            .iter()
+            .any(|(c, t, s)| c == "Struct Field Removed"
+                && t.as_deref() == Some("ConfigData.threshold")
+                && *s),
+        "the removed field must appear as suppressed when matched by rule_id"
+    );
+}
+
+#[test]
+fn suppressing_all_criticals_passes_but_still_lists_them() {
+    let config = write_config("all", all_critical_suppressions());
 
     let (json, code) = run(Some(&config));
 
@@ -107,6 +152,56 @@ fn suppressing_all_criticals_passes_but_still_lists_them() {
             && t.as_deref() == Some("ConfigData.threshold")
             && *s),
         "the removed field must appear, flagged suppressed"
+    );
+}
+
+#[test]
+fn default_config_is_auto_loaded_without_no_config() {
+    let cwd = temp_dir("auto-load-default-config");
+    std::fs::write(cwd.join(".safeguard.toml"), all_critical_suppressions())
+        .expect("failed to write default config");
+
+    let (json, code) = run_ext(None, &[], Some(&cwd));
+
+    assert_eq!(code, 0, "default .safeguard.toml should still load");
+    assert_eq!(json["is_safe"], Value::Bool(true));
+    assert_eq!(json["suppressed_count"].as_u64().unwrap(), 3);
+}
+
+#[test]
+fn no_config_ignores_auto_loaded_default_config() {
+    let cwd = temp_dir("no-config-ignores-default");
+    std::fs::write(cwd.join(".safeguard.toml"), all_critical_suppressions())
+        .expect("failed to write default config");
+
+    let (json, code) = run_ext(None, &["--no-config"], Some(&cwd));
+
+    assert_eq!(code, 1, "--no-config should expose unsuppressed criticals");
+    assert_eq!(json["is_safe"], Value::Bool(false));
+    assert_eq!(json["suppressed_count"].as_u64().unwrap(), 0);
+    assert_eq!(json["counts"]["critical"].as_u64().unwrap(), 3);
+}
+
+#[test]
+fn no_config_conflicts_with_explicit_config() {
+    let config = write_config("conflict", all_critical_suppressions());
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg(wasm("v1.wasm"))
+        .arg(wasm("v2.wasm"))
+        .args(["--format", "json"])
+        .args(["--config".as_ref(), config.as_os_str()])
+        .arg("--no-config")
+        .output()
+        .expect("failed to run binary");
+
+    assert!(
+        !output.status.success(),
+        "--no-config and --config should be rejected together"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--config") && stderr.contains("--no-config"),
+        "conflict error should mention both flags: {stderr}"
     );
 }
 
