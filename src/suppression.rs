@@ -131,6 +131,15 @@ pub struct SuppressionRule {
 }
 
 impl SuppressionRule {
+    /// Create a new suppression rule.
+    pub fn new(category: impl Into<String>, target: Option<impl Into<String>>, reason: Option<impl Into<String>>) -> Self {
+        SuppressionRule {
+            category: category.into(),
+            target: target.map(|s| s.into()),
+            reason: reason.map(|s| s.into()),
+        }
+    }
+
     /// Get the category to match.
     pub fn category(&self) -> &str {
         &self.category

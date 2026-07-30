@@ -16,10 +16,7 @@ fn wasm(name: &str) -> PathBuf {
 
 #[test]
 fn multi_format_output_to_files() {
-    let tmp = std::env::temp_dir().join(format!(
-        "safeguard_multi_test_{}",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("safeguard_multi_test_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
 

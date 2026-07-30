@@ -293,8 +293,14 @@ impl AnalysisScope {
 
     pub fn storage_status_line(&self) -> String {
         match &self.storage_schema {
-            StorageScopeState::Analyzed { key_types, value_types } => {
-                format!("Storage layout analyzed ({} key types, {} value types)", key_types, value_types)
+            StorageScopeState::Analyzed {
+                key_types,
+                value_types,
+            } => {
+                format!(
+                    "Storage layout analyzed ({} key types, {} value types)",
+                    key_types, value_types
+                )
             }
             StorageScopeState::NotAnalyzed => {
                 "Storage layout: NOT analyzed (use a storage schema manifest)".to_string()
@@ -305,15 +311,14 @@ impl AnalysisScope {
 
 /// Whether storage schema analysis was performed.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum StorageScopeState {
+    #[default]
     NotAnalyzed,
-    Analyzed { key_types: usize, value_types: usize },
-}
-
-impl Default for StorageScopeState {
-    fn default() -> Self {
-        StorageScopeState::NotAnalyzed
-    }
+    Analyzed {
+        key_types: usize,
+        value_types: usize,
+    },
 }
 
 /// Build metrics for the report.
@@ -334,6 +339,7 @@ pub struct BuildMetrics {
 }
 
 impl BuildMetrics {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         old_wasm_size: usize,
         new_wasm_size: usize,
@@ -365,6 +371,7 @@ impl BuildMetrics {
     }
 }
 
+#[allow(dead_code)]
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
@@ -373,6 +380,7 @@ fn is_zero(n: &usize) -> bool {
 pub type SafetyReportJson = RenderableReport;
 
 /// Format a contract identity label from optional name and version strings.
+#[allow(dead_code)]
 fn contract_identity_label(name: Option<&str>, version: Option<&str>) -> String {
     match (name, version) {
         (Some(n), Some(v)) => format!("{} v{}", n, v),
@@ -430,8 +438,18 @@ impl SafetyReport {
             new_spec_summary: None,
             scope: AnalysisScope::default(),
             metrics: Some(BuildMetrics::new(
-                old_wasm_size, new_wasm_size,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                old_wasm_size,
+                new_wasm_size,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
             )),
             empirical: false,
             empirical_findings: Vec::new(),
@@ -704,8 +722,12 @@ impl SafetyReport {
             is_safe: self.is_safe,
             strict: self.strict,
             counts: SeverityCounts {
-                critical: self.critical_count.saturating_sub(self.suppressed_critical_count),
-                warning: self.warning_count.saturating_sub(self.suppressed_warning_count),
+                critical: self
+                    .critical_count
+                    .saturating_sub(self.suppressed_critical_count),
+                warning: self
+                    .warning_count
+                    .saturating_sub(self.suppressed_warning_count),
                 info: self.info_count.saturating_sub(self.suppressed_info_count),
             },
             suppressed_count: self.suppressed_count,
@@ -737,54 +759,10 @@ impl SafetyReport {
 }
 
 /// Returns remediation/explanation guidance for a given finding category.
+///
+/// Delegates to [`FindingCategory`] which is the single source of truth.
 pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
-    match category {
-        "Environment" => Some("Verify that the target network supports the new protocol version and adjust any SDK/tooling dependencies accordingly."),
-        "Function Removed" => Some("This is a breaking change. If the function is no longer needed, deprecate it in client integrations. Otherwise, restore the function signature."),
-        "Function Documentation Changed" => Some("No code changes required. Ensure client/consumer integrations are aware of the updated documentation/behavior."),
-        "Function Added" => Some("No action required. Inform client integrations about the availability of the new function."),
-        "Function Signature Changed" => Some("This is a breaking change. Update call sites, SDKs, and tests to match the new parameter structure."),
-        "Parameter Renamed" => Some("This is a breaking change for named-argument RPC systems. Update all client integrations to use the new parameter name."),
-        "Parameter Reordered" => Some("This is a breaking change. Reordering parameters breaks positional RPC invocation. Restore the original parameter order."),
-        "Parameter Type Changed" => Some("This is a breaking change. Update caller arguments and client SDKs to match the new parameter type."),
-        "Return Type Changed" => Some("This is a breaking change. Update caller expectations and client SDKs to match the new return type."),
-        "Event Definition Removed" => Some("This is a breaking change. Update or remove downstream event indexing or monitoring systems that consume this event."),
-        "Struct Removed" => Some("This is a breaking change. Ensure no stored data or active interfaces reference this struct. If they do, restore the struct."),
-        "Struct Documentation Changed" => Some("No code changes required. Ensure documentation changes are aligned with the struct's intended usage."),
-        "Struct Added" => Some("No action required. New structs can be safely integrated into storage layouts or interface parameters."),
-        "Struct Field Removed" => Some("This is a breaking change. Removing fields breaks serialized storage layouts. Restore the field or perform a state migration."),
-        "Event Field Removed" => Some("This is a breaking change. Update event indexers and consumers that expect this field to be present."),
-        "Struct Field Reordered" => Some("This is a breaking change. Reordering fields breaks positional serialization layouts. Restore the original field order."),
-        "Event Field Reordered" => Some("This is a breaking change. Update event indexers and consumers to handle the new positional field order."),
-        "Struct Field Type Changed" => Some("This is a breaking change. Changing field types breaks layout serialization. Revert the type change or migrate existing data."),
-        "Event Field Type Changed" => Some("This is a breaking change. Update event indexers and consumers to handle the new field type."),
-        "Struct Field Added" => Some("Warning: Ensure existing storage entries are migrated or initialized with correct default values for the new field."),
-        "Event Enum Removed" => Some("This is a breaking change. Downstream event consumers or indexers relying on this enum will fail. Restore the enum."),
-        "Enum Removed" => Some("This is a breaking change. Stored data or parameters using this enum will be invalid. Restore the enum."),
-        "Enum Documentation Changed" => Some("No code changes required. Ensure the updated docs are clear for consumers."),
-        "Enum Added" => Some("No action required. Ensure consumers are aware of the new enum type if needed."),
-        "Enum Case Removed" => Some("This is a breaking change. On-chain data or parameters using this case will be invalid. Restore the case."),
-        "Event Enum Case Removed" => Some("This is a breaking change. Downstream event indexers or consumers relying on this case will fail. Restore the case."),
-        "Enum Case Value Changed" => Some("This is a breaking change. Modifying case values breaks serialization/deserialization. Revert the value change."),
-        "Event Enum Case Value Changed" => Some("This is a breaking change. Downstream event indexers or consumers relying on these values will fail. Revert the value change."),
-        "Enum Case Added" => Some("No action required. Ensure consumers can handle the new case gracefully."),
-        "Event Enum Case Added" => Some("No action required. Update event indexers and consumers to handle the new event enum case if necessary."),
-        "Union Removed" => Some("This is a breaking change. Stored data or parameters using this union will be invalid. Restore the union."),
-        "Union Added" => Some("No action required. Ensure consumers are aware of the new union type if needed."),
-        "Union Case Removed" => Some("This is a breaking change. On-chain data using this union case will be invalid. Restore the case."),
-        "Union Case Reordered" => Some("This is a breaking change. Reordering union cases breaks positional discriminant serialization. Restore the original case order."),
-        "Union Case Type Changed" => Some("This is a breaking change. Changing union case payload types breaks layout serialization. Revert the type change or migrate existing data."),
-        "Union Case Added" => Some("No action required. Ensure consumers can handle the new union case gracefully."),
-        "Error Enum Removed" => Some("This is a breaking change. Clients matching on these error codes will break. Restore the error enum."),
-        "Error Enum Added" => Some("No action required. Inform client integrations about the new error enum if needed."),
-        "Error Enum Case Removed" => Some("This is a breaking change. Clients matching on this error code will break. Restore the case."),
-        "Error Enum Case Value Changed" => Some("This is a breaking change. Modifying error case values breaks error-code compatibility. Revert the value change."),
-        "Error Enum Case Added" => Some("No action required. Ensure clients can handle the new error case gracefully."),
-        "Cascading Layout Break" => Some("This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type."),
-        "Type Kind Changed" => Some("This is a breaking change. The type kept its name but is now a different kind of type (struct, enum, union, or error enum), so its serialized layout changed entirely. Stored data written as the old kind cannot be decoded as the new one. Restore the original kind, or migrate the stored data and give the replacement a new name."),
-        "BytesN Size Changed" => Some("This is a breaking change. Changing the size of a fixed-size byte array alters its binary encoding. Revert the size or migrate data that depends on the original byte length."),
-        _ => None,
-    }
+    crate::category::FindingCategory::find_by_name(category).map(|c| c.remediation())
 }
 
 /// Return the current UTC time as an RFC 3339 / ISO 8601 string.
@@ -831,99 +809,36 @@ fn chrono_now_rfc3339() -> String {
 
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        year, month, day, hour, minute, second, nanos / 1_000_000
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        nanos / 1_000_000
     )
 }
 
 fn is_leap_year(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Verify that every documented category in the reference page can be
+    /// resolved by `get_remediation_guidance`.  The true single-source-of-truth
+    /// test lives in `category.rs` (`generated_markdown_matches_committed_file`);
+    /// this just guards the delegation wrapper.
     #[test]
-    fn test_every_emitted_category_has_guidance() {
-        let diff_rs_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("diff.rs");
-        let content = std::fs::read_to_string(diff_rs_path).expect("Failed to read src/diff.rs");
-
-        let mut checked_categories = std::collections::HashSet::new();
-
-        for line in content.lines() {
-            if line.contains("category:") {
-                if line.contains("ENVIRONMENT_CATEGORY") {
-                    checked_categories.insert("Environment".to_string());
-                    continue;
-                }
-
-                if line.contains("TYPE_KIND_CHANGED_CATEGORY") {
-                    checked_categories.insert(crate::diff::TYPE_KIND_CHANGED_CATEGORY.to_string());
-                    continue;
-                }
-
-                let mut chars = line.chars().peekable();
-                while let Some(c) = chars.next() {
-                    if c == '"' {
-                        let mut literal = String::new();
-                        while let Some(&nc) = chars.peek() {
-                            if nc == '"' {
-                                chars.next();
-                                break;
-                            }
-                            literal.push(chars.next().unwrap());
-                        }
-                        if !literal.is_empty() {
-                            if literal.contains("{}") {
-                                let suffixes = vec![
-                                    "Removed", "Reordered", "Type Changed",
-                                    "Value Changed", "Added",
-                                ];
-                                for suffix in suffixes {
-                                    if literal == format!("{{}} {}", suffix) {
-                                        let prefixes = match suffix {
-                                            "Reordered" | "Type Changed" => {
-                                                vec!["Struct Field", "Event Field"]
-                                            }
-                                            "Value Changed" | "Added" => {
-                                                vec!["Enum Case", "Event Enum Case"]
-                                            }
-                                            "Removed" => vec![
-                                                "Struct Field", "Event Field",
-                                                "Enum Case", "Event Enum Case",
-                                            ],
-                                            _ => unreachable!(),
-                                        };
-                                        for prefix in prefixes {
-                                            checked_categories
-                                                .insert(format!("{} {}", prefix, suffix));
-                                        }
-                                    }
-                                }
-                            } else {
-                                checked_categories.insert(literal);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        checked_categories.remove("TOTALLY CUSTOM CATEGORY");
-
-        assert!(
-            !checked_categories.is_empty(),
-            "Sanity check: should have found categories"
-        );
-
-        for cat in &checked_categories {
-            let guidance = get_remediation_guidance(cat);
+    fn test_remediation_guidance_resolves_known_categories() {
+        for cat in crate::category::FindingCategory::all() {
+            let guidance = get_remediation_guidance(cat.as_str());
             assert!(
                 guidance.is_some(),
-                "Category '{}' does not have remediation guidance!",
-                cat
+                "get_remediation_guidance('{}') returned None",
+                cat.as_str()
             );
         }
     }
@@ -988,7 +903,10 @@ mod tests {
         report.findings_by_category.clear();
         report.findings_by_category.insert(
             "Function Documentation Changed".to_string(),
-            vec![make_finding(Severity::Info, "Function Documentation Changed")],
+            vec![make_finding(
+                Severity::Info,
+                "Function Documentation Changed",
+            )],
         );
         assert_eq!(report.recommended_bump(), "patch");
 
@@ -1017,7 +935,8 @@ mod tests {
             severity: Severity::Critical,
             axes: Vec::new(),
             category: "Cascading Layout Break".to_string(),
-            message: "Type 'Outer' layout is broken because it embeds modified type 'Data'".to_string(),
+            message: "Type 'Outer' layout is broken because it embeds modified type 'Data'"
+                .to_string(),
             type_name: Some("Outer".to_string()),
             target: Some("Outer".to_string()),
             root_target: Some("Data".to_string()),

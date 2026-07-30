@@ -1,3 +1,4 @@
+use crate::category::FindingCategory;
 use crate::mapper::LayoutMapper;
 use crate::parser::ContractEnvMeta;
 use crate::spec::ContractSpec;
@@ -466,7 +467,7 @@ pub fn compare_env_metadata(
             let severity = env_metadata_change_severity(old_meta, new_meta);
             report.findings.push(Finding {
                 severity,
-                category: ENVIRONMENT_CATEGORY.to_string(),
+                category: FindingCategory::Environment.as_str().to_string(),
                 message: format_env_metadata_change(old_meta, new_meta),
                 type_name: None,
                 target: None,
@@ -542,7 +543,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
             None => {
                 report.findings.push(Finding {
                     severity: Severity::Critical,
-                    category: "Function Removed".to_string(),
+                    category: FindingCategory::FunctionRemoved.as_str().to_string(),
                     message: format!(
                         "Function '{}' was removed. Existing callers will break.",
                         name
@@ -568,7 +569,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
 
                     report.findings.push(Finding {
                         severity: Severity::Info,
-                        category: "Function Documentation Changed".to_string(),
+                        category: FindingCategory::FunctionDocumentationChanged.as_str().to_string(),
                         message,
                         type_name: None,
                         target: Some(name.clone()),
@@ -584,7 +585,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
         if !old.functions.contains_key(name) {
             report.findings.push(Finding {
                 severity: Severity::Info,
-                category: "Function Added".to_string(),
+                category: FindingCategory::FunctionAdded.as_str().to_string(),
                 message: format!("New function '{}' added.", name),
                 type_name: None,
                 target: Some(name.clone()),
@@ -608,7 +609,7 @@ fn check_function_signature(
     if old_inputs.len() != new_inputs.len() {
         report.findings.push(Finding {
             severity: Severity::Critical,
-            category: "Function Signature Changed".to_string(),
+            category: FindingCategory::FunctionSignatureChanged.as_str().to_string(),
             message: format!(
                 "Function '{}': parameter count changed from {} to {}.",
                 name,
@@ -640,7 +641,7 @@ fn check_function_signature(
     if is_reordered {
         report.findings.push(Finding {
             severity: Severity::Critical,
-            category: "Parameter Reordered".to_string(),
+            category: FindingCategory::ParameterReordered.as_str().to_string(),
             message: format!(
                 "Function '{}': parameters reordered. The set of parameter names is unchanged but their order differs.",
                 name
@@ -660,24 +661,24 @@ fn check_function_signature(
             let p_name = old_input.name.to_string();
             if let Some(new_type) = new_by_name.get(&p_name) {
                 if !types_equal(&old_input.type_, new_type) {
-                    let (category, detail) =
-                        if let Some(bytesn_msg) =
-                            describe_bytesn_size_change(&old_input.type_, new_type)
-                        {
-                            ("BytesN Size Changed".to_string(), bytesn_msg)
-                        } else {
-                            (
-                                "Parameter Type Changed".to_string(),
-                                describe_nested_type_change(&old_input.type_, new_type)
-                                    .unwrap_or_else(|| {
-                                        format!(
-                                            "type changed from `{}` to `{}`",
-                                            crate::mapper::type_to_string(&old_input.type_),
-                                            crate::mapper::type_to_string(new_type)
-                                        )
-                                    }),
-                            )
-                        };
+                    let (category, detail) = if let Some(bytesn_msg) =
+                        describe_bytesn_size_change(&old_input.type_, new_type)
+                    {
+                        (FindingCategory::BytesNSizeChanged.as_str().to_string(), bytesn_msg)
+                    } else {
+                        (
+                            FindingCategory::ParameterTypeChanged.as_str().to_string(),
+                            describe_nested_type_change(&old_input.type_, new_type).unwrap_or_else(
+                                || {
+                                    format!(
+                                        "type changed from `{}` to `{}`",
+                                        crate::mapper::type_to_string(&old_input.type_),
+                                        crate::mapper::type_to_string(new_type)
+                                    )
+                                },
+                            ),
+                        )
+                    };
                     report.findings.push(Finding {
                         severity: Severity::Critical,
                         category,
@@ -701,7 +702,7 @@ fn check_function_signature(
             if old_name != new_name {
                 report.findings.push(Finding {
                     severity: Severity::Warning,
-                    category: "Parameter Renamed".to_string(),
+                    category: FindingCategory::ParameterRenamed.as_str().to_string(),
                     message: format!(
                         "Function '{}': parameter {} renamed from '{}' to '{}'.",
                         name, i, old_name, new_name
@@ -713,24 +714,23 @@ fn check_function_signature(
             }
 
             if !types_equal(&old_input.type_, &new_input.type_) {
-                let (category, detail) =
-                    if let Some(bytesn_msg) =
-                        describe_bytesn_size_change(&old_input.type_, &new_input.type_)
-                    {
-                        ("BytesN Size Changed".to_string(), bytesn_msg)
-                    } else {
-                        (
-                            "Parameter Type Changed".to_string(),
-                            describe_nested_type_change(&old_input.type_, &new_input.type_)
-                                .unwrap_or_else(|| {
-                                    format!(
-                                        "type changed from `{}` to `{}`",
-                                        crate::mapper::type_to_string(&old_input.type_),
-                                        crate::mapper::type_to_string(&new_input.type_)
-                                    )
-                                }),
-                        )
-                    };
+                let (category, detail) = if let Some(bytesn_msg) =
+                    describe_bytesn_size_change(&old_input.type_, &new_input.type_)
+                {
+                    (FindingCategory::BytesNSizeChanged.as_str().to_string(), bytesn_msg)
+                } else {
+                    (
+                        FindingCategory::ParameterTypeChanged.as_str().to_string(),
+                        describe_nested_type_change(&old_input.type_, &new_input.type_)
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "type changed from `{}` to `{}`",
+                                    crate::mapper::type_to_string(&old_input.type_),
+                                    crate::mapper::type_to_string(&new_input.type_)
+                                )
+                            }),
+                    )
+                };
                 report.findings.push(Finding {
                     severity: Severity::Critical,
                     category,
@@ -753,7 +753,7 @@ fn check_function_signature(
     if old_outputs.len() != new_outputs.len() {
         report.findings.push(Finding {
             severity: Severity::Critical,
-            category: "Return Type Changed".to_string(),
+            category: FindingCategory::ReturnTypeChanged.as_str().to_string(),
             message: format!(
                 "Function '{}': return type count changed from {} to {}.",
                 name,
@@ -769,11 +769,11 @@ fn check_function_signature(
             if !types_equal(old_out, new_out) {
                 let (category, detail) =
                     if let Some(bytesn_msg) = describe_bytesn_size_change(old_out, new_out) {
-                        ("BytesN Size Changed".to_string(), bytesn_msg)
+                        (FindingCategory::BytesNSizeChanged.as_str().to_string(), bytesn_msg)
                     } else {
                         (
-                            "Return Type Changed".to_string(),
-                            describe_nested_type_change(old_out, new_out).unwrap_or_else(|| {
+                        FindingCategory::ReturnTypeChanged.as_str().to_string(),
+                        describe_nested_type_change(old_out, new_out).unwrap_or_else(|| {
                                 format!(
                                     "changed from `{}` to `{}`",
                                     crate::mapper::type_to_string(old_out),
@@ -810,9 +810,9 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                 report.findings.push(Finding {
                     severity: Severity::Critical,
                     category: if is_evt {
-                        "Event Definition Removed".to_string()
+                        FindingCategory::EventDefinitionRemoved.as_str().to_string()
                     } else {
-                        "Struct Removed".to_string()
+                        FindingCategory::StructRemoved.as_str().to_string()
                     },
                     message: format!(
                         "{} '{}' was removed. Storage or systems relying on this type will break.",
@@ -840,7 +840,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
 
                     report.findings.push(Finding {
                         severity: Severity::Info,
-                        category: "Struct Documentation Changed".to_string(),
+                        category: FindingCategory::StructDocumentationChanged.as_str().to_string(),
                         message,
                         type_name: Some(name.clone()),
                         target: Some(name.clone()),
@@ -856,7 +856,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
         if !old.structs.contains_key(name) {
             report.findings.push(Finding {
                 severity: Severity::Info,
-                category: "Struct Added".to_string(),
+                category: FindingCategory::StructAdded.as_str().to_string(),
                 message: format!("New struct '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
@@ -879,21 +879,20 @@ fn check_struct_fields(
     let old_fields: &[ScSpecUdtStructFieldV0] = old_struct.fields.as_ref();
     let new_fields: &[ScSpecUdtStructFieldV0] = new_struct.fields.as_ref();
     let is_evt = is_event(name);
-    let category_prefix = if is_evt {
-        "Event Schema"
-    } else {
-        "Struct Field"
-    };
     let msg_prefix = if is_evt { "Event schema" } else { "Struct" };
 
     // Check for removed fields
     for old_field in old_fields {
         let old_name = old_field.name.to_string();
         let still_exists = new_fields.iter().any(|f| f.name.to_string() == old_name);
-        if !still_exists {
-            report.findings.push(Finding {
-                severity: Severity::Critical,
-                category: format!("{} Removed", category_prefix),
+            if !still_exists {
+                report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category: if is_evt {
+                        FindingCategory::EventSchemaRemoved.as_str().to_string()
+                    } else {
+                        FindingCategory::StructFieldRemoved.as_str().to_string()
+                    },
                 message: format!(
                     "{} '{}': field '{}' was removed. Backwards compatibility is broken.",
                     msg_prefix, name, old_name
@@ -911,10 +910,14 @@ fn check_struct_fields(
         let new_name = new_field.name.to_string();
 
         // Field at the same position has a different name — reordering detected
-        if old_name != new_name {
-            report.findings.push(Finding {
-                severity: Severity::Critical,
-                category: format!("{} Reordered", category_prefix),
+            if old_name != new_name {
+                report.findings.push(Finding {
+                    severity: Severity::Critical,
+                    category: if is_evt {
+                        FindingCategory::EventSchemaReordered.as_str().to_string()
+                    } else {
+                        FindingCategory::StructFieldReordered.as_str().to_string()
+                    },
                 message: format!(
                     "{} '{}': field at position {} changed from '{}' to '{}'. \
                      Positional serialization breaks layout compatibility.",
@@ -929,23 +932,27 @@ fn check_struct_fields(
         // Field type changed
         if !types_equal(&old_field.type_, &new_field.type_) {
             let (category, detail) =
-                if let Some(bytesn_msg) =
-                    describe_bytesn_size_change(&old_field.type_, &new_field.type_)
+                if let Some(bytesn_msg) = describe_bytesn_size_change(&old_field.type_, &new_field.type_)
                 {
-                    ("BytesN Size Changed".to_string(), bytesn_msg)
-                } else {
-                    (
-                        format!("{} Type Changed", category_prefix),
-                        describe_nested_type_change(&old_field.type_, &new_field.type_)
-                            .unwrap_or_else(|| {
-                                format!(
-                                    "type changed from `{}` to `{}`",
-                                    crate::mapper::type_to_string(&old_field.type_),
-                                    crate::mapper::type_to_string(&new_field.type_)
-                                )
-                            }),
-                    )
-                };
+                    (FindingCategory::BytesNSizeChanged.as_str().to_string(), bytesn_msg)
+            } else {
+                (
+                    if is_evt {
+                        FindingCategory::EventSchemaTypeChanged.as_str().to_string()
+                    } else {
+                        FindingCategory::StructFieldTypeChanged.as_str().to_string()
+                    },
+                    describe_nested_type_change(&old_field.type_, &new_field.type_).unwrap_or_else(
+                        || {
+                            format!(
+                                "type changed from `{}` to `{}`",
+                                crate::mapper::type_to_string(&old_field.type_),
+                                crate::mapper::type_to_string(&new_field.type_)
+                            )
+                        },
+                    ),
+                )
+            };
             report.findings.push(Finding {
                 severity: Severity::Critical,
                 category,
@@ -965,7 +972,7 @@ fn check_struct_fields(
         for new_field in &new_fields[old_fields.len()..] {
             report.findings.push(Finding {
                 severity: Severity::Warning,
-                category: "Struct Field Added".to_string(),
+                category: FindingCategory::StructFieldAdded.as_str().to_string(),
                 message: format!(
                     "Struct '{}': new field '{}' appended. \
                      Existing storage entries won't have this field — ensure migration handles defaults.",
@@ -989,9 +996,9 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                 report.findings.push(Finding {
                     severity: Severity::Critical,
                     category: if is_evt {
-                        "Event Enum Removed".to_string()
+                        FindingCategory::EventEnumRemoved.as_str().to_string()
                     } else {
-                        "Enum Removed".to_string()
+                        FindingCategory::EnumRemoved.as_str().to_string()
                     },
                     message: format!(
                         "{} '{}' was removed. Data using this type will be invalid.",
@@ -1019,7 +1026,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
 
                     report.findings.push(Finding {
                         severity: Severity::Info,
-                        category: "Enum Documentation Changed".to_string(),
+                        category: FindingCategory::EnumDocumentationChanged.as_str().to_string(),
                         message,
                         type_name: Some(name.clone()),
                         target: Some(name.clone()),
@@ -1035,7 +1042,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
         if !old.enums.contains_key(name) {
             report.findings.push(Finding {
                 severity: Severity::Info,
-                category: "Enum Added".to_string(),
+                category: FindingCategory::EnumAdded.as_str().to_string(),
                 message: format!("New enum '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
@@ -1053,11 +1060,6 @@ fn check_enum_cases(
     report: &mut DiffReport,
 ) {
     let is_evt = is_event(name);
-    let category_prefix = if is_evt {
-        "Event Enum Case"
-    } else {
-        "Enum Case"
-    };
     let msg_prefix = if is_evt { "Event enum" } else { "Enum" };
     let old_cases: &[ScSpecUdtEnumCaseV0] = old_enum.cases.as_ref();
     let new_cases: &[ScSpecUdtEnumCaseV0] = new_enum.cases.as_ref();
@@ -1070,7 +1072,11 @@ fn check_enum_cases(
                 // The case was removed entirely
                 report.findings.push(Finding {
                     severity: Severity::Critical,
-                    category: format!("{} Removed", category_prefix),
+                    category: if is_evt {
+                        FindingCategory::EventEnumCaseRemoved.as_str().to_string()
+                    } else {
+                        FindingCategory::EnumCaseRemoved.as_str().to_string()
+                    },
                     message: format!(
                         "{} '{}': case '{}' (value: {}) was removed. \
                          On-chain data or events relying on this value will be invalid.",
@@ -1086,7 +1092,11 @@ fn check_enum_cases(
                 if old_case.value != new_case.value {
                     report.findings.push(Finding {
                         severity: Severity::Critical,
-                        category: format!("{} Value Changed", category_prefix),
+                        category: if is_evt {
+                            FindingCategory::EventEnumCaseValueChanged.as_str().to_string()
+                        } else {
+                            FindingCategory::EnumCaseValueChanged.as_str().to_string()
+                        },
                         message: format!(
                             "{} '{}': case '{}' value changed from {} to {}. \
                              This breaks data serialization.",
@@ -1108,7 +1118,11 @@ fn check_enum_cases(
             if !old_cases.iter().any(|c| c.name.to_string() == new_name) {
                 report.findings.push(Finding {
                     severity: Severity::Info,
-                    category: format!("{} Added", category_prefix),
+                    category: if is_evt {
+                        FindingCategory::EventEnumCaseAdded.as_str().to_string()
+                    } else {
+                        FindingCategory::EnumCaseAdded.as_str().to_string()
+                    },
                     message: format!(
                         "{} '{}': new case '{}' (value {}) added.",
                         msg_prefix, name, new_name, new_case.value
@@ -1129,7 +1143,7 @@ fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepor
             None => {
                 report.findings.push(Finding {
                     severity: Severity::Critical,
-                    category: "Union Removed".to_string(),
+                    category: FindingCategory::UnionRemoved.as_str().to_string(),
                     message: format!(
                         "Union '{}' was removed. Data using this type will be invalid.",
                         name
@@ -1149,7 +1163,7 @@ fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepor
         if !old.unions.contains_key(name) {
             report.findings.push(Finding {
                 severity: Severity::Info,
-                category: "Union Added".to_string(),
+                category: FindingCategory::UnionAdded.as_str().to_string(),
                 message: format!("New union '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
@@ -1178,7 +1192,7 @@ fn check_union_cases(
         if !still_exists {
             report.findings.push(Finding {
                 severity: Severity::Critical,
-                category: "Union Case Removed".to_string(),
+                category: FindingCategory::UnionCaseRemoved.as_str().to_string(),
                 message: format!(
                     "Union '{}': case '{}' was removed. Backwards compatibility is broken.",
                     name, old_name
@@ -1197,7 +1211,7 @@ fn check_union_cases(
         if old_name != new_name {
             report.findings.push(Finding {
                 severity: Severity::Critical,
-                category: "Union Case Reordered".to_string(),
+                category: FindingCategory::UnionCaseReordered.as_str().to_string(),
                 message: format!(
                     "Union '{}': case at position {} changed from '{}' to '{}'. \
                      Positional discriminant breaks layout compatibility.",
@@ -1212,10 +1226,10 @@ fn check_union_cases(
         if !union_cases_equal(old_case, new_case) {
             let (category, detail) =
                 if let Some(bytesn_msg) = union_case_bytesn_size_change(old_case, new_case) {
-                    ("BytesN Size Changed".to_string(), bytesn_msg)
+                    (FindingCategory::BytesNSizeChanged.as_str().to_string(), bytesn_msg)
                 } else {
                     (
-                        "Union Case Type Changed".to_string(),
+                        FindingCategory::UnionCaseTypeChanged.as_str().to_string(),
                         describe_union_case_type_change(old_case, new_case).unwrap_or_else(|| {
                             format!(
                                 "type changed from `{}` to `{}`",
@@ -1243,7 +1257,7 @@ fn check_union_cases(
         for new_case in &new_cases[old_cases.len()..] {
             report.findings.push(Finding {
                 severity: Severity::Info,
-                category: "Union Case Added".to_string(),
+                category: FindingCategory::UnionCaseAdded.as_str().to_string(),
                 message: format!(
                     "Union '{}': new case '{}' ({}) added.",
                     name,
@@ -1298,7 +1312,7 @@ fn compare_error_enums(old: &ContractSpec, new: &ContractSpec, report: &mut Diff
             None => {
                 report.findings.push(Finding {
                     severity: Severity::Critical,
-                    category: "Error Enum Removed".to_string(),
+                    category: FindingCategory::ErrorEnumRemoved.as_str().to_string(),
                     message: format!(
                         "Error enum '{}' was removed. Clients matching on these errors will break.",
                         name
@@ -1318,7 +1332,7 @@ fn compare_error_enums(old: &ContractSpec, new: &ContractSpec, report: &mut Diff
         if !old.error_enums.contains_key(name) {
             report.findings.push(Finding {
                 severity: Severity::Info,
-                category: "Error Enum Added".to_string(),
+                category: FindingCategory::ErrorEnumAdded.as_str().to_string(),
                 message: format!("New error enum '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
@@ -1344,7 +1358,7 @@ fn check_error_enum_cases(
             None => {
                 report.findings.push(Finding {
                     severity: Severity::Critical,
-                    category: "Error Enum Case Removed".to_string(),
+                    category: FindingCategory::ErrorEnumCaseRemoved.as_str().to_string(),
                     message: format!(
                         "Error enum '{}': case '{}' (value: {}) was removed. \
                          Clients matching on this error code will break.",
@@ -1358,7 +1372,7 @@ fn check_error_enum_cases(
             Some(new_case) if old_case.value != new_case.value => {
                 report.findings.push(Finding {
                     severity: Severity::Critical,
-                    category: "Error Enum Case Value Changed".to_string(),
+                    category: FindingCategory::ErrorEnumCaseValueChanged.as_str().to_string(),
                     message: format!(
                         "Error enum '{}': case '{}' value changed from {} to {}. \
                          This breaks error-code compatibility.",
@@ -1378,7 +1392,7 @@ fn check_error_enum_cases(
         if !old_cases.iter().any(|c| c.name.to_string() == new_name) {
             report.findings.push(Finding {
                 severity: Severity::Info,
-                category: "Error Enum Case Added".to_string(),
+                category: FindingCategory::ErrorEnumCaseAdded.as_str().to_string(),
                 message: format!(
                     "Error enum '{}': new case '{}' (value {}) added.",
                     name, new_name, new_case.value
@@ -1392,8 +1406,9 @@ fn check_error_enum_cases(
 }
 
 /// Uses dependency graphing to figure out if storage layout changes cascade to other types.
-/// Category label for a user-defined type whose name survived but whose kind
-/// changed (for example a struct that became an enum).
+///
+/// The category string for a type-kind change.  Kept as a convenience alias for
+/// external users; the single source of truth is `FindingCategory::TypeKindChanged`.
 pub const TYPE_KIND_CHANGED_CATEGORY: &str = "Type Kind Changed";
 
 /// Which of the five spec maps a user-defined type lives in.
@@ -1517,7 +1532,7 @@ pub fn detect_type_kind_changes(old: &ContractSpec, new: &ContractSpec, report: 
 
         report.findings.push(Finding {
             severity: Severity::Critical,
-            category: TYPE_KIND_CHANGED_CATEGORY.to_string(),
+                category: FindingCategory::TypeKindChanged.as_str().to_string(),
             message: format!(
                 "Type '{}' changed from {} to {}. Stored data and client \
                  decoders written against the {} layout cannot read the {} \
@@ -1570,7 +1585,7 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
 
                     report.findings.push(Finding {
                         severity: Severity::Critical,
-                        category: "Cascading Layout Break".to_string(),
+                        category: FindingCategory::CascadingLayoutBreak.as_str().to_string(),
                         message: format!(
                             "Type '{}' layout is broken because it embeds modified type '{}'. \
                              Stored data for '{}' is no longer compatible.",
@@ -1882,7 +1897,7 @@ mod tests {
         // Simulate a function-level Critical finding with type_name: None
         report.findings.push(Finding {
             severity: Severity::Critical,
-            category: "Function Removed".to_string(),
+            category: FindingCategory::FunctionRemoved.as_str().to_string(),
             message: "Function 'do_stuff' was removed.".to_string(),
             type_name: None,
             target: Some("do_stuff".to_string()),
@@ -2058,7 +2073,7 @@ mod tests {
         assert_eq!(report.findings.len(), 1);
         let finding = &report.findings[0];
         assert_eq!(finding.severity, Severity::Warning);
-        assert_eq!(finding.category, ENVIRONMENT_CATEGORY);
+        assert_eq!(finding.category, FindingCategory::Environment.as_str());
         assert!(finding
             .message
             .contains("protocol interface version changed"));
@@ -2074,7 +2089,7 @@ mod tests {
         assert_eq!(report.findings.len(), 1);
         let finding = &report.findings[0];
         assert_eq!(finding.severity, Severity::Info);
-        assert_eq!(finding.category, ENVIRONMENT_CATEGORY);
+        assert_eq!(finding.category, FindingCategory::Environment.as_str());
     }
 
     #[test]
@@ -2308,7 +2323,7 @@ mod tests {
             .findings
             .iter()
             .filter(|f| {
-                f.category == TYPE_KIND_CHANGED_CATEGORY && f.target.as_deref() == Some(name)
+                f.category == FindingCategory::TypeKindChanged.as_str() && f.target.as_deref() == Some(name)
             })
             .collect()
     }
@@ -2345,10 +2360,10 @@ mod tests {
     #[test]
     fn nested_type_change_option() {
         let old = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
-            value_type: ScSpecTypeDef::U32,
+            value_type: Box::new(ScSpecTypeDef::U32),
         }));
         let new = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
-            value_type: ScSpecTypeDef::U64,
+            value_type: Box::new(ScSpecTypeDef::U64),
         }));
         let desc = describe_nested_type_change(&old, &new);
         assert_eq!(
@@ -2360,10 +2375,10 @@ mod tests {
     #[test]
     fn nested_type_change_vec() {
         let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-            element_type: ScSpecTypeDef::U32,
+            element_type: Box::new(ScSpecTypeDef::U32),
         }));
         let new = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-            element_type: ScSpecTypeDef::U64,
+            element_type: Box::new(ScSpecTypeDef::U64),
         }));
         let desc = describe_nested_type_change(&old, &new);
         assert_eq!(
@@ -2375,32 +2390,29 @@ mod tests {
     #[test]
     fn nested_type_change_map_value() {
         let old = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
-            key_type: ScSpecTypeDef::Address,
-            value_type: ScSpecTypeDef::U32,
+            key_type: Box::new(ScSpecTypeDef::Address),
+            value_type: Box::new(ScSpecTypeDef::U32),
         }));
         let new = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
-            key_type: ScSpecTypeDef::Address,
-            value_type: ScSpecTypeDef::U64,
+            key_type: Box::new(ScSpecTypeDef::Address),
+            value_type: Box::new(ScSpecTypeDef::U64),
         }));
         let desc = describe_nested_type_change(&old, &new);
         assert_eq!(
             desc,
-            Some(
-                "the value type of Map changed from `u32` to `u64`"
-                    .to_string()
-            )
+            Some("the value type of Map changed from `u32` to `u64`".to_string())
         );
     }
 
     #[test]
     fn nested_type_change_map_key() {
         let old = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
-            key_type: ScSpecTypeDef::Symbol,
-            value_type: ScSpecTypeDef::U32,
+            key_type: Box::new(ScSpecTypeDef::Symbol),
+            value_type: Box::new(ScSpecTypeDef::U32),
         }));
         let new = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
-            key_type: ScSpecTypeDef::String,
-            value_type: ScSpecTypeDef::U32,
+            key_type: Box::new(ScSpecTypeDef::String),
+            value_type: Box::new(ScSpecTypeDef::U32),
         }));
         let desc = describe_nested_type_change(&old, &new);
         assert_eq!(
@@ -2421,10 +2433,7 @@ mod tests {
         let desc = describe_nested_type_change(&old, &new);
         assert_eq!(
             desc,
-            Some(
-                "type at index 1 of tuple changed from `u64` to `i128`"
-                    .to_string()
-            )
+            Some("type at index 1 of tuple changed from `u64` to `i128`".to_string())
         );
     }
 
@@ -2452,31 +2461,24 @@ mod tests {
         // Vec<Option<Map<Address, u32>>> -> Vec<Option<Map<Address, u64>>>
         let inner_map = |value: ScSpecTypeDef| {
             ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
-                key_type: ScSpecTypeDef::Address,
-                value_type: value,
+                key_type: Box::new(ScSpecTypeDef::Address),
+                value_type: Box::new(value),
             }))
         };
         let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-            element_type: ScSpecTypeDef::Option(Box::new(
-                stellar_xdr::curr::ScSpecTypeOption {
-                    value_type: inner_map(ScSpecTypeDef::U32),
-                },
-            )),
+            element_type: Box::new(ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+                value_type: Box::new(inner_map(ScSpecTypeDef::U32)),
+            }))),
         }));
         let new = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-            element_type: ScSpecTypeDef::Option(Box::new(
-                stellar_xdr::curr::ScSpecTypeOption {
-                    value_type: inner_map(ScSpecTypeDef::U64),
-                },
-            )),
+            element_type: Box::new(ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+                value_type: Box::new(inner_map(ScSpecTypeDef::U64)),
+            }))),
         }));
         let desc = describe_nested_type_change(&old, &new);
         assert_eq!(
             desc,
-            Some(
-                "the value type of Map changed from `u32` to `u64`"
-                    .to_string()
-            )
+            Some("the value type of Map changed from `u32` to `u64`".to_string())
         );
     }
 
@@ -2508,7 +2510,7 @@ mod tests {
             .filter(|f| f.target.as_deref() == Some("Status"))
             .map(|f| f.category.as_str())
             .collect();
-        assert_eq!(about_status, vec![TYPE_KIND_CHANGED_CATEGORY]);
+        assert_eq!(about_status, vec![FindingCategory::TypeKindChanged.as_str()]);
     }
 
     #[test]
@@ -2552,10 +2554,10 @@ mod tests {
     fn nested_type_change_outer_constructor_differs() {
         // Vec<u32> -> Option<u32> — different outer constructors
         let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-            element_type: ScSpecTypeDef::U32,
+            element_type: Box::new(ScSpecTypeDef::U32),
         }));
         let new = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
-            value_type: ScSpecTypeDef::U32,
+            value_type: Box::new(ScSpecTypeDef::U32),
         }));
         let desc = describe_nested_type_change(&old, &new);
         assert_eq!(desc, None);
@@ -2566,18 +2568,24 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn field_type_change_vec_shows_concise_message() {
-        let old = spec_with_structs(vec![("Data", vec![(
-            "values",
-            ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-                element_type: ScSpecTypeDef::U32,
-            })),
-        )])]);
-        let new = spec_with_structs(vec![("Data", vec![(
-            "values",
-            ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-                element_type: ScSpecTypeDef::U64,
-            })),
-        )])]);
+        let old = spec_with_structs(vec![(
+            "Data",
+            vec![(
+                "values",
+                ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+                    element_type: Box::new(ScSpecTypeDef::U32),
+                })),
+            )],
+        )]);
+        let new = spec_with_structs(vec![(
+            "Data",
+            vec![(
+                "values",
+                ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+                    element_type: Box::new(ScSpecTypeDef::U64),
+                })),
+            )],
+        )]);
 
         let report = compare(&old, &new);
         let fc = report
@@ -2586,7 +2594,8 @@ mod tests {
             .find(|f| f.category == "Struct Field Type Changed")
             .expect("Expected field type change");
         assert!(
-            fc.message.contains("the element type of Vec changed from `u32` to `u64`"),
+            fc.message
+                .contains("the element type of Vec changed from `u32` to `u64`"),
             "Message was: {}",
             fc.message
         );
@@ -2683,12 +2692,18 @@ mod tests {
     fn field_type_change_map_shows_concise_message() {
         let make_map = |value: ScSpecTypeDef| {
             ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
-                key_type: ScSpecTypeDef::Address,
-                value_type: value,
+                key_type: Box::new(ScSpecTypeDef::Address),
+                value_type: Box::new(value),
             }))
         };
-        let old = spec_with_structs(vec![("Data", vec![("balances", make_map(ScSpecTypeDef::U32))])]);
-        let new = spec_with_structs(vec![("Data", vec![("balances", make_map(ScSpecTypeDef::U64))])]);
+        let old = spec_with_structs(vec![(
+            "Data",
+            vec![("balances", make_map(ScSpecTypeDef::U32))],
+        )]);
+        let new = spec_with_structs(vec![(
+            "Data",
+            vec![("balances", make_map(ScSpecTypeDef::U64))],
+        )]);
 
         let report = compare(&old, &new);
         let fc = report
@@ -2697,7 +2712,8 @@ mod tests {
             .find(|f| f.category == "Struct Field Type Changed")
             .expect("Expected field type change");
         assert!(
-            fc.message.contains("the value type of Map changed from `u32` to `u64`"),
+            fc.message
+                .contains("the value type of Map changed from `u32` to `u64`"),
             "Message was: {}",
             fc.message
         );
@@ -2782,7 +2798,8 @@ mod tests {
             .find(|f| f.category == "Struct Field Type Changed")
             .expect("Expected generic Struct Field Type Changed");
         assert!(
-            fc.message.contains("type changed from `BytesN<32>` to `String`"),
+            fc.message
+                .contains("type changed from `BytesN<32>` to `String`"),
             "Message was: {}",
             fc.message
         );
@@ -2806,7 +2823,7 @@ mod tests {
             report
                 .findings
                 .iter()
-                .filter(|f| f.category == TYPE_KIND_CHANGED_CATEGORY)
+                .filter(|f| f.category == FindingCategory::TypeKindChanged.as_str())
                 .map(|f| f.target.clone().unwrap())
                 .collect()
         };
