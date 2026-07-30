@@ -46,25 +46,73 @@ use crate::error::Error;
 pub const DEFAULT_CONFIG_FILE: &str = ".safeguard.toml";
 
 /// A parsed suppression config: a flat list of reviewed acknowledgements.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SuppressionConfig {
     /// The acknowledged findings, one `[[suppress]]` table per entry.
     #[serde(default, rename = "suppress")]
+    #[cfg(feature = "unstable")]
     pub rules: Vec<SuppressionRule>,
+    /// The acknowledged findings, one `[[suppress]]` table per entry.
+    #[serde(default, rename = "suppress")]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) rules: Vec<SuppressionRule>,
+}
+
+impl SuppressionConfig {
+    /// Get reference to raw slice of rules.
+    pub fn rules(&self) -> &[SuppressionRule] {
+        &self.rules
+    }
 }
 
 /// A single whitelisted finding, keyed by category and (optionally) target.
+#[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SuppressionRule {
     /// The finding category to match exactly (e.g. `"Struct Field Type Changed"`).
+    #[cfg(feature = "unstable")]
     pub category: String,
+    /// The finding category to match exactly (e.g. `"Struct Field Type Changed"`).
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) category: String,
+
     /// The exact [`Finding::target`] to match. When omitted, the rule matches
     /// only findings whose target is `None`.
     #[serde(default)]
+    #[cfg(feature = "unstable")]
     pub target: Option<String>,
+    /// The exact [`Finding::target`] to match. When omitted, the rule matches
+    /// only findings whose target is `None`.
+    #[serde(default)]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) target: Option<String>,
+
     /// An optional human-readable justification, surfaced in the report.
     #[serde(default)]
+    #[cfg(feature = "unstable")]
     pub reason: Option<String>,
+    /// An optional human-readable justification, surfaced in the report.
+    #[serde(default)]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) reason: Option<String>,
+}
+
+impl SuppressionRule {
+    /// Get the category to match.
+    pub fn category(&self) -> &str {
+        &self.category
+    }
+
+    /// Get the target entity name if specified.
+    pub fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
+    /// Get the human-readable reason/justification.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
 }
 
 impl SuppressionRule {
@@ -181,6 +229,7 @@ mod tests {
             message: "irrelevant to matching".to_string(),
             type_name: target.map(|t| t.split('.').next().unwrap().to_string()),
             target: target.map(|t| t.to_string()),
+            root_target: None,
         }
     }
 
