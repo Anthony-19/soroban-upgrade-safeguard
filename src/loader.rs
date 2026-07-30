@@ -1,8 +1,9 @@
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use ring::digest::{digest, SHA256};
 use stellar_xdr::curr::{
-    ContractExecutable, Hash, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyContractCode,
+    ContractDataEntry, ContractExecutable, Hash, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyContractCode,
     LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
 };
 use wasmparser::Parser;
@@ -48,13 +49,40 @@ pub fn load_wasm(path: &Path) -> Result<WasmModule, Error> {
         source: Some(Box::new(e)),
     })?;
 
+    wasm_module_from_bytes(
+        bytes,
+        path.to_path_buf(),
+        path.to_string_lossy().into_owned(),
+    )
+}
+
+/// Reads a WASM binary from stdin, validates it like a file input, and labels
+/// the source as `-` in diagnostics and reports.
+pub fn load_wasm_from_stdin(stdin: &mut impl Read) -> Result<WasmModule, Error> {
+    let mut bytes = Vec::new();
+    stdin
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::FileAccess {
+            path: PathBuf::from("-"),
+            details: "Failed to read stdin".to_string(),
+            source: Some(Box::new(e)),
+        })?;
+
+    wasm_module_from_bytes(bytes, PathBuf::from("-"), "-".to_string())
+}
+
+fn wasm_module_from_bytes(
+    bytes: Vec<u8>,
+    validation_path: PathBuf,
+    display_path: String,
+) -> Result<WasmModule, Error> {
     // 3. Validate the WASM magic header (0x00 0x61 0x73 0x6d)
     if bytes.len() < 4 || &bytes[0..4] != b"\0asm" {
         return Err(Error::WasmValidation {
-            path: Some(path.to_path_buf()),
+            path: Some(validation_path),
             details: format!(
                 "'{}' does not appear to be a valid WASM binary (bad magic bytes)",
-                path.display()
+                display_path
             ),
             byte_offset: None,
             source: None,
@@ -63,15 +91,14 @@ pub fn load_wasm(path: &Path) -> Result<WasmModule, Error> {
 
     // 4. Do a full structural parse to detect any deeper format errors
     validate_wasm_structure(&bytes).map_err(|e| Error::WasmValidation {
-        path: Some(path.to_path_buf()),
-        details: format!("WASM validation failed for '{}'", path.display()),
+        path: Some(validation_path),
+        details: format!("WASM validation failed for '{}'", display_path),
         byte_offset: None,
         source: Some(Box::new(e)),
     })?;
 
     Ok(WasmModule {
-        path: path.to_string_lossy().into_owned(),
-        sha256: sha256_hex(&bytes),
+        path: display_path,
         bytes,
     })
 }
@@ -342,4 +369,103 @@ fn query_rpc(
     }
 
     Ok(response)
+}
+
+/// Fetches instance storage entries of a deployed contract from Stellar RPC.
+pub fn fetch_instance_storage_from_rpc(
+    contract_id: &str,
+    rpc_url: &str,
+) -> Result<Vec<ContractDataEntry>, Error> {
+    let strkey = stellar_strkey::Strkey::from_string(contract_id).map_err(|e| Error::InvalidInput {
+        details: format!("Invalid contract ID '{}': {}", contract_id, e),
+    })?;
+
+    let contract_bytes = match strkey {
+        stellar_strkey::Strkey::Contract(c) => c.0,
+        _ => {
+            return Err(Error::InvalidInput {
+                details: format!("Provided ID '{}' is not a valid contract ID", contract_id),
+            })
+        }
+    };
+
+    let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
+        contract: ScAddress::Contract(Hash(contract_bytes)),
+        key: ScVal::LedgerKeyContractInstance,
+        durability: stellar_xdr::curr::ContractDataDurability::Persistent,
+    });
+
+    let key_b64 = ledger_key
+        .to_xdr_base64(Limits::none())
+        .map_err(|e| Error::XdrDecoding {
+            entry_index: None,
+            byte_offset: None,
+            details: format!("Failed to serialize LedgerKey to base64: {}", e),
+            source: Some(Box::new(e)),
+        })?;
+
+    let response = query_rpc(
+        rpc_url,
+        "getLedgerEntries",
+        serde_json::json!({
+            "keys": [key_b64]
+        }),
+    )?;
+
+    let entries = response["result"]["entries"]
+        .as_array()
+        .ok_or_else(|| Error::RpcProtocol {
+            rpc_url: rpc_url.to_string(),
+            code: 0,
+            message: "RPC response did not contain 'entries' array".to_string(),
+        })?;
+
+    if entries.is_empty() {
+        return Err(Error::RpcProtocol {
+            rpc_url: rpc_url.to_string(),
+            code: 0,
+            message: format!("Contract '{}' not found on-chain", contract_id),
+        });
+    }
+
+    let entry_xdr_b64 = entries[0]["xdr"]
+        .as_str()
+        .ok_or_else(|| Error::RpcProtocol {
+            rpc_url: rpc_url.to_string(),
+            code: 0,
+            message: "RPC response entry missing 'xdr' field".to_string(),
+        })?;
+
+    let entry = LedgerEntry::from_xdr_base64(entry_xdr_b64, Limits::none()).map_err(|e| {
+        Error::XdrDecoding {
+            entry_index: Some(0),
+            byte_offset: None,
+            details: format!("Failed to deserialize LedgerEntry XDR: {}", e),
+            source: Some(Box::new(e)),
+        }
+    })?;
+
+    let contract_data = match entry.data {
+        LedgerEntryData::ContractData(cd) => cd,
+        _ => {
+            return Err(Error::RpcProtocol {
+                rpc_url: rpc_url.to_string(),
+                code: 0,
+                message: "Unexpected ledger entry type returned for contract instance".to_string(),
+            })
+        }
+    };
+
+    let instance = match contract_data.val {
+        ScVal::ContractInstance(inst) => inst,
+        _ => {
+            return Err(Error::RpcProtocol {
+                rpc_url: rpc_url.to_string(),
+                code: 0,
+                message: "Expected ScVal::ContractInstance in contract data".to_string(),
+            })
+        }
+    };
+
+    Ok(instance.storage.map(|s| s.to_vec()).unwrap_or_default())
 }

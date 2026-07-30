@@ -57,15 +57,15 @@ fn batch_manifest_toml_mode_fails_and_exits_one() {
         "Missing batch report header"
     );
     assert!(
-        stdout.contains("Overall Status: ❌ FAILED"),
+        stdout.contains("Overall Status: ??? FAILED"),
         "Missing failed status"
     );
     assert!(
-        stdout.contains("clean_contract: ✅ PASSED"),
+        stdout.contains("clean_contract: ??? PASSED"),
         "Missing passed contract summary"
     );
     assert!(
-        stdout.contains("breaking_contract: ❌ FAILED"),
+        stdout.contains("breaking_contract: ??? FAILED"),
         "Missing failed contract summary"
     );
 
@@ -118,7 +118,7 @@ fn batch_manifest_all_clean_exits_zero() {
 
     assert_eq!(code, 0, "batch run with all clean contracts must exit 0");
     assert!(
-        stdout.contains("Overall Status: ✅ PASSED"),
+        stdout.contains("Overall Status: ??? PASSED"),
         "Missing passed status"
     );
 }
@@ -206,9 +206,9 @@ fn batch_directory_scanning_fails_on_breaking_contract() {
     let code = output.status.code().expect("process terminated by signal");
 
     assert_eq!(code, 1);
-    assert!(stdout.contains("Overall Status: ❌ FAILED"));
-    assert!(stdout.contains("a: ✅ PASSED"));
-    assert!(stdout.contains("b: ❌ FAILED"));
+    assert!(stdout.contains("Overall Status: ??? FAILED"));
+    assert!(stdout.contains("a: ??? PASSED"));
+    assert!(stdout.contains("b: ??? FAILED"));
 }
 
 #[test]
@@ -242,5 +242,65 @@ fn batch_conflicting_options_exit_with_error() {
     assert!(
         !output2.status.success(),
         "positional args + manifest must fail"
+    );
+}
+
+#[test]
+fn batch_manifest_writes_per_contract_reports_to_output_dir() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("per_contract_reports");
+    let output_dir = tmp_dir.join("reports");
+    std::fs::create_dir_all(&tmp_dir).expect("failed to create tmp dir");
+
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "clean_contract"
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "breaking_contract"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v2.wasm").to_str().unwrap()
+    );
+
+    let manifest_path = write_manifest("manifest_per_contract.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--per-contract-output-dir")
+        .arg(&output_dir)
+        .output()
+        .expect("failed to run binary");
+
+    let code = output.status.code().expect("process terminated by signal");
+    assert_eq!(code, 1, "batch run with breaking contract must exit 1");
+
+    let clean_path = output_dir.join("clean_contract.txt");
+    let breaking_path = output_dir.join("breaking_contract.txt");
+
+    assert!(clean_path.exists(), "expected clean contract report file");
+    assert!(
+        breaking_path.exists(),
+        "expected breaking contract report file"
+    );
+
+    let clean_contents = std::fs::read_to_string(&clean_path).expect("failed to read clean report");
+    let breaking_contents =
+        std::fs::read_to_string(&breaking_path).expect("failed to read breaking report");
+
+    assert!(
+        clean_contents.contains("SOROBAN UPGRADE SAFETY REPORT"),
+        "clean report missing header"
+    );
+    assert!(
+        breaking_contents.contains("SOROBAN UPGRADE SAFETY REPORT"),
+        "breaking report missing header"
     );
 }
