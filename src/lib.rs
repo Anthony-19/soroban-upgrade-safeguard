@@ -1,4 +1,9 @@
 #[cfg(feature = "unstable")]
+pub mod category;
+#[cfg(not(feature = "unstable"))]
+mod category;
+
+#[cfg(feature = "unstable")]
 pub mod color;
 #[cfg(not(feature = "unstable"))]
 mod color;
