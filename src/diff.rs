@@ -21,6 +21,27 @@ pub enum Severity {
     Info,
 }
 
+/// A compatibility axis along which findings can be categorized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompatibilityAxis {
+    StorageLayout,
+    CallAbi,
+    EventIndexer,
+    SourceLevel,
+}
+
+impl CompatibilityAxis {
+    pub fn default_severity(&self) -> Severity {
+        match self {
+            CompatibilityAxis::StorageLayout => Severity::Critical,
+            CompatibilityAxis::CallAbi => Severity::Critical,
+            CompatibilityAxis::EventIndexer => Severity::Warning,
+            CompatibilityAxis::SourceLevel => Severity::Info,
+        }
+    }
+}
+
 /// A single finding from the comparison analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
@@ -125,6 +146,37 @@ impl Finding {
     }
 }
 
+impl Finding {
+    pub fn new(
+        axes: Vec<CompatibilityAxis>,
+        category: String,
+        message: String,
+        type_name: Option<String>,
+        target: Option<String>,
+        root_target: Option<String>,
+    ) -> Self {
+        let severity = axes
+            .iter()
+            .map(|a| a.default_severity())
+            .max_by_key(|s| match s {
+                Severity::Critical => 3,
+                Severity::Warning => 2,
+                Severity::Info => 1,
+            })
+            .unwrap_or(Severity::Info);
+
+        Self {
+            severity,
+            axes,
+            category,
+            message,
+            type_name,
+            target,
+            root_target,
+        }
+    }
+}
+
 /// Holds all findings from a comparison of two contract specs.
 #[derive(Debug, Default)]
 pub struct DiffReport {
@@ -173,8 +225,234 @@ pub fn compare(old: &ContractSpec, new: &ContractSpec) -> DiffReport {
 
     detect_cascading_layout_breaks(old, &mut report);
 
+    // Post-process to assign axes and legacy severity
+    for finding in &mut report.findings {
+        finding.axes = classify_finding_axes(
+            &finding.category,
+            finding.type_name.as_deref(),
+            old,
+            new,
+        );
+        finding.severity = finding.axes
+            .iter()
+            .map(|a| a.default_severity())
+            .max_by_key(|s| match s {
+                Severity::Critical => 3,
+                Severity::Warning => 2,
+                Severity::Info => 1,
+            })
+            .unwrap_or(Severity::Info);
+    }
+
     report
 }
+
+/// Recursively check if type_def references target_name directly or transitively in spec.
+fn references_type(type_def: &ScSpecTypeDef, target_name: &str, spec: &ContractSpec) -> bool {
+    match type_def {
+        ScSpecTypeDef::Udt(udt) => {
+            let udt_name = udt.name.to_string();
+            if udt_name == target_name {
+                return true;
+            }
+            if let Some(st) = spec.structs.get(&udt_name) {
+                for field in &st.fields {
+                    if let ScSpecTypeDef::Udt(ref f_udt) = field.type_ {
+                        if f_udt.name.to_string() == udt_name {
+                            continue;
+                        }
+                    }
+                    if references_type(&field.type_, target_name, spec) {
+                        return true;
+                    }
+                }
+            }
+            if let Some(un) = spec.unions.get(&udt_name) {
+                for case in &un.cases {
+                    match case {
+                        stellar_xdr::curr::ScSpecUdtUnionCaseV0::TupleV0(t) => {
+                            for ty in &t.type_ {
+                                if let ScSpecTypeDef::Udt(ref f_udt) = ty {
+                                    if f_udt.name.to_string() == udt_name {
+                                        continue;
+                                    }
+                                }
+                                if references_type(ty, target_name, spec) {
+                                    return true;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            false
+        }
+        ScSpecTypeDef::Option(opt) => references_type(&opt.value_type, target_name, spec),
+        ScSpecTypeDef::Result(res) => {
+            references_type(&res.ok_type, target_name, spec)
+                || references_type(&res.error_type, target_name, spec)
+        }
+        ScSpecTypeDef::Vec(v) => references_type(&v.element_type, target_name, spec),
+        ScSpecTypeDef::Map(m) => {
+            references_type(&m.key_type, target_name, spec)
+                || references_type(&m.value_type, target_name, spec)
+        }
+        ScSpecTypeDef::Tuple(t) => t.value_types.iter().any(|ty| references_type(ty, target_name, spec)),
+        _ => false,
+    }
+}
+
+/// Helper to check if type_name is used in any function signatures.
+fn is_type_used_in_functions(type_name: &str, spec: &ContractSpec) -> bool {
+    for (_, func) in &spec.functions {
+        for input in &func.inputs {
+            if references_type(&input.type_, type_name, spec) {
+                return true;
+            }
+        }
+        for output in &func.outputs {
+            if references_type(output, type_name, spec) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Helper to check if type_name is used in any events.
+fn is_type_used_in_events(type_name: &str, spec: &ContractSpec) -> bool {
+    if type_name.to_lowercase().contains("event") {
+        return true;
+    }
+    for (name, _) in &spec.structs {
+        if name.to_lowercase().contains("event")
+            && references_type(
+                &ScSpecTypeDef::Udt(stellar_xdr::curr::ScSpecTypeUdt {
+                    name: name.try_into().unwrap(),
+                }),
+                type_name,
+                spec,
+            )
+        {
+            return true;
+        }
+    }
+    for (name, _) in &spec.unions {
+        if name.to_lowercase().contains("event")
+            && references_type(
+                &ScSpecTypeDef::Udt(stellar_xdr::curr::ScSpecTypeUdt {
+                    name: name.try_into().unwrap(),
+                }),
+                type_name,
+                spec,
+            )
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Classify a finding into explicit compatibility axes based on its category and type usage.
+pub fn classify_finding_axes(
+    category: &str,
+    type_name: Option<&str>,
+    old_spec: &ContractSpec,
+    new_spec: &ContractSpec,
+) -> Vec<CompatibilityAxis> {
+    let mut axes = Vec::new();
+
+    match category {
+        "Environment" => {
+            axes.push(CompatibilityAxis::CallAbi);
+        }
+
+        "Function Removed"
+        | "Function Added"
+        | "Function Signature Changed"
+        | "Parameter Reordered"
+        | "Parameter Type Changed"
+        | "Return Type Changed" => {
+            axes.push(CompatibilityAxis::CallAbi);
+        }
+
+        "Parameter Renamed" => {
+            axes.push(CompatibilityAxis::SourceLevel);
+        }
+
+        "Event Definition Removed"
+        | "Event Field Removed"
+        | "Event Field Reordered"
+        | "Event Field Type Changed"
+        | "Event Enum Removed"
+        | "Event Enum Case Removed"
+        | "Event Enum Case Value Changed"
+        | "Event Enum Case Added" => {
+            axes.push(CompatibilityAxis::EventIndexer);
+        }
+
+        "Error Enum Removed"
+        | "Error Enum Added"
+        | "Error Enum Case Removed"
+        | "Error Enum Case Value Changed"
+        | "Error Enum Case Added" => {
+            axes.push(CompatibilityAxis::CallAbi);
+        }
+
+        _ => {
+            if let Some(t_name) = type_name {
+                let is_used_in_abi = is_type_used_in_functions(t_name, old_spec)
+                    || is_type_used_in_functions(t_name, new_spec);
+                let is_used_in_event = is_type_used_in_events(t_name, old_spec)
+                    || is_type_used_in_events(t_name, new_spec);
+
+                if is_used_in_abi {
+                    axes.push(CompatibilityAxis::CallAbi);
+                }
+                if is_used_in_event {
+                    axes.push(CompatibilityAxis::EventIndexer);
+                }
+
+                let is_layout_break = matches!(
+                    category,
+                    "Struct Removed"
+                        | "Struct Field Removed"
+                        | "Struct Field Reordered"
+                        | "Struct Field Type Changed"
+                        | "Enum Removed"
+                        | "Enum Case Removed"
+                        | "Enum Case Value Changed"
+                        | "Union Removed"
+                        | "Union Case Removed"
+                        | "Union Case Reordered"
+                        | "Union Case Type Changed"
+                        | "Cascading Layout Break"
+                        | "Type Kind Changed"
+                );
+
+                if is_layout_break {
+                    axes.push(CompatibilityAxis::StorageLayout);
+                }
+
+                if category.contains("Documentation Changed") {
+                    axes.push(CompatibilityAxis::SourceLevel);
+                }
+            } else {
+                axes.push(CompatibilityAxis::StorageLayout);
+            }
+        }
+    }
+
+    if axes.is_empty() {
+        axes.push(CompatibilityAxis::StorageLayout);
+    }
+
+    axes
+}
+
+/// Category label for contract environment metadata findings.
+pub const ENVIRONMENT_CATEGORY: &str = "Environment";
 
 /// Compare decoded environment metadata between two contract builds.
 pub fn compare_env_metadata(
