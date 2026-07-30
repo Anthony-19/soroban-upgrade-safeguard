@@ -1,7 +1,7 @@
 use crate::mapper::LayoutMapper;
 use crate::parser::ContractEnvMeta;
 use crate::spec::ContractSpec;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use stellar_xdr::curr::{
     ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef, ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0,
     ScSpecUdtErrorEnumCaseV0, ScSpecUdtErrorEnumV0, ScSpecUdtStructFieldV0, ScSpecUdtStructV0,
@@ -9,7 +9,10 @@ use stellar_xdr::curr::{
 };
 
 /// Severity of a detected issue.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// `Deserialize` is derived so a previously emitted JSON report can be read
+/// back and re-rendered (see [`crate::render`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Critical,
@@ -18,15 +21,36 @@ pub enum Severity {
 }
 
 /// A single finding from the comparison analysis.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
+    #[cfg(feature = "unstable")]
     pub severity: Severity,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) severity: Severity,
+
+    #[cfg(feature = "unstable")]
     pub category: String,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) category: String,
+
+    #[cfg(feature = "unstable")]
     pub message: String,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) message: String,
+
     /// The name of the affected UDT (struct/enum/union), if this finding
     /// relates to a specific type.  Used by cascade-detection so it never
     /// needs to re-parse `message`.
+    #[serde(default)]
+    #[cfg(feature = "unstable")]
     pub type_name: Option<String>,
+    /// The name of the affected UDT (struct/enum/union), if this finding
+    /// relates to a specific type.  Used by cascade-detection so it never
+    /// needs to re-parse `message`.
+    #[serde(default)]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) type_name: Option<String>,
+
     /// A stable, structured identifier for the exact entity this finding is
     /// about, independent of the human-readable `message`. It is the key used
     /// by the suppression config to match a finding precisely:
@@ -39,7 +63,65 @@ pub struct Finding {
     ///
     /// `None` for findings that are not tied to a single named entity (for
     /// example environment-metadata changes).
+    #[serde(default)]
+    #[cfg(feature = "unstable")]
     pub target: Option<String>,
+    /// A stable, structured identifier for the exact entity this finding is
+    /// about, independent of the human-readable `message`. It is the key used
+    /// by the suppression config to match a finding precisely:
+    ///
+    /// - functions: the function name (e.g. `transfer`)
+    /// - function parameters: `function.param` (e.g. `transfer.to`)
+    /// - types (struct/enum removed/added, cascades): the type name (e.g. `Data`)
+    /// - struct fields: `Type.field` (e.g. `Data.amount`)
+    /// - enum cases: `Enum.case` (e.g. `Status.Active`)
+    ///
+    /// `None` for findings that are not tied to a single named entity (for
+    /// example environment-metadata changes).
+    #[serde(default)]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) target: Option<String>,
+
+    /// For cascade findings, the `target` of the root cause finding.
+    /// `None` for direct (non-cascade) findings.
+    #[cfg(feature = "unstable")]
+    pub root_target: Option<String>,
+    /// For cascade findings, the `target` of the root cause finding.
+    /// `None` for direct (non-cascade) findings.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) root_target: Option<String>,
+}
+
+impl Finding {
+    /// Get the severity of the finding.
+    pub fn severity(&self) -> &Severity {
+        &self.severity
+    }
+
+    /// Get the category of the finding.
+    pub fn category(&self) -> &str {
+        &self.category
+    }
+
+    /// Get the message of the finding.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Get the type name associated with this finding, if any.
+    pub fn type_name(&self) -> Option<&str> {
+        self.type_name.as_deref()
+    }
+
+    /// Get the stable, structured target identifier of the finding, if any.
+    pub fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
+    /// Get the root target of the cascading break, if any.
+    pub fn root_target(&self) -> Option<&str> {
+        self.root_target.as_deref()
+    }
 }
 
 /// Holds all findings from a comparison of two contract specs.
@@ -82,6 +164,12 @@ pub fn compare(old: &ContractSpec, new: &ContractSpec) -> DiffReport {
     compare_unions(old, new, &mut report);
     compare_error_enums(old, new, &mut report);
 
+    // Must run after the per-kind passes, which each see only their own map and
+    // so mistake a kind change for an unrelated removal plus addition, and
+    // before cascade detection, so a type that changed kind still propagates to
+    // everything embedding it.
+    detect_type_kind_changes(old, new, &mut report);
+
     detect_cascading_layout_breaks(old, &mut report);
 
     report
@@ -107,6 +195,7 @@ pub fn compare_env_metadata(
                 message: format_env_metadata_change(old_meta, new_meta),
                 type_name: None,
                 target: None,
+                root_target: None,
             });
         }
     }
@@ -185,6 +274,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                     ),
                     type_name: None,
                     target: Some(name.clone()),
+                    root_target: None,
                 });
             }
             Some(new_fn) => {
@@ -207,6 +297,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                         message,
                         type_name: None,
                         target: Some(name.clone()),
+                        root_target: None,
                     });
                 }
             }
@@ -222,6 +313,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                 message: format!("New function '{}' added.", name),
                 type_name: None,
                 target: Some(name.clone()),
+                root_target: None,
             });
         }
     }
@@ -250,6 +342,7 @@ fn check_function_signature(
             ),
             type_name: None,
             target: Some(name.to_string()),
+            root_target: None,
         });
         return; // No point comparing individual params if count differs
     }
@@ -279,6 +372,7 @@ fn check_function_signature(
             ),
             type_name: None,
             target: Some(name.to_string()),
+            root_target: None,
         });
 
         // Check for genuine type changes by matching parameter name.
@@ -291,19 +385,34 @@ fn check_function_signature(
             let p_name = old_input.name.to_string();
             if let Some(new_type) = new_by_name.get(&p_name) {
                 if !types_equal(&old_input.type_, new_type) {
+                    let (category, detail) =
+                        if let Some(bytesn_msg) =
+                            describe_bytesn_size_change(&old_input.type_, new_type)
+                        {
+                            ("BytesN Size Changed".to_string(), bytesn_msg)
+                        } else {
+                            (
+                                "Parameter Type Changed".to_string(),
+                                describe_nested_type_change(&old_input.type_, new_type)
+                                    .unwrap_or_else(|| {
+                                        format!(
+                                            "type changed from `{}` to `{}`",
+                                            crate::mapper::type_to_string(&old_input.type_),
+                                            crate::mapper::type_to_string(new_type)
+                                        )
+                                    }),
+                            )
+                        };
                     report.findings.push(Finding {
                         severity: Severity::Critical,
-                        category: "Parameter Type Changed".to_string(),
+                        category,
                         message: format!(
-                            "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
-                            name,
-                            i,
-                            p_name,
-                            crate::mapper::type_to_string(&old_input.type_),
-                            crate::mapper::type_to_string(new_type)
+                            "Function '{}': parameter {} ('{}') {}.",
+                            name, i, p_name, detail
                         ),
                         type_name: None,
                         target: Some(format!("{}.{}", name, p_name)),
+                        root_target: None,
                     });
                 }
             }
@@ -324,23 +433,39 @@ fn check_function_signature(
                     ),
                     type_name: None,
                     target: Some(format!("{}.{}", name, old_name)),
+                    root_target: None,
                 });
             }
 
             if !types_equal(&old_input.type_, &new_input.type_) {
+                let (category, detail) =
+                    if let Some(bytesn_msg) =
+                        describe_bytesn_size_change(&old_input.type_, &new_input.type_)
+                    {
+                        ("BytesN Size Changed".to_string(), bytesn_msg)
+                    } else {
+                        (
+                            "Parameter Type Changed".to_string(),
+                            describe_nested_type_change(&old_input.type_, &new_input.type_)
+                                .unwrap_or_else(|| {
+                                    format!(
+                                        "type changed from `{}` to `{}`",
+                                        crate::mapper::type_to_string(&old_input.type_),
+                                        crate::mapper::type_to_string(&new_input.type_)
+                                    )
+                                }),
+                        )
+                    };
                 report.findings.push(Finding {
                     severity: Severity::Critical,
-                    category: "Parameter Type Changed".to_string(),
+                    category,
                     message: format!(
-                        "Function '{}': parameter {} ('{}') type changed from `{}` to `{}`.",
-                        name,
-                        i,
-                        old_name,
-                        crate::mapper::type_to_string(&old_input.type_),
-                        crate::mapper::type_to_string(&new_input.type_)
+                        "Function '{}': parameter {} ('{}') {}.",
+                        name, i, old_name, detail
                     ),
                     type_name: None,
                     target: Some(format!("{}.{}", name, old_name)),
+                    root_target: None,
                 });
             }
         }
@@ -362,22 +487,33 @@ fn check_function_signature(
             ),
             type_name: None,
             target: Some(name.to_string()),
+            root_target: None,
         });
     } else {
         for (i, (old_out, new_out)) in old_outputs.iter().zip(new_outputs.iter()).enumerate() {
             if !types_equal(old_out, new_out) {
+                let (category, detail) =
+                    if let Some(bytesn_msg) = describe_bytesn_size_change(old_out, new_out) {
+                        ("BytesN Size Changed".to_string(), bytesn_msg)
+                    } else {
+                        (
+                            "Return Type Changed".to_string(),
+                            describe_nested_type_change(old_out, new_out).unwrap_or_else(|| {
+                                format!(
+                                    "changed from `{}` to `{}`",
+                                    crate::mapper::type_to_string(old_out),
+                                    crate::mapper::type_to_string(new_out)
+                                )
+                            }),
+                        )
+                    };
                 report.findings.push(Finding {
                     severity: Severity::Critical,
-                    category: "Return Type Changed".to_string(),
-                    message: format!(
-                        "Function '{}': return type {} changed from `{}` to `{}`.",
-                        name,
-                        i,
-                        crate::mapper::type_to_string(old_out),
-                        crate::mapper::type_to_string(new_out)
-                    ),
+                    category,
+                    message: format!("Function '{}': return type {} {}.", name, i, detail),
                     type_name: None,
                     target: Some(name.to_string()),
+                    root_target: None,
                 });
             }
         }
@@ -410,6 +546,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                     ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
+                    root_target: None,
                 });
             }
             Some(new_struct) => {
@@ -432,6 +569,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                         message,
                         type_name: Some(name.clone()),
                         target: Some(name.clone()),
+                        root_target: None,
                     });
                 }
             }
@@ -447,6 +585,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                 message: format!("New struct '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
+                root_target: None,
             });
         }
     }
@@ -486,6 +625,7 @@ fn check_struct_fields(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
     }
@@ -507,25 +647,40 @@ fn check_struct_fields(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
 
         // Field type changed
         if !types_equal(&old_field.type_, &new_field.type_) {
+            let (category, detail) =
+                if let Some(bytesn_msg) =
+                    describe_bytesn_size_change(&old_field.type_, &new_field.type_)
+                {
+                    ("BytesN Size Changed".to_string(), bytesn_msg)
+                } else {
+                    (
+                        format!("{} Type Changed", category_prefix),
+                        describe_nested_type_change(&old_field.type_, &new_field.type_)
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "type changed from `{}` to `{}`",
+                                    crate::mapper::type_to_string(&old_field.type_),
+                                    crate::mapper::type_to_string(&new_field.type_)
+                                )
+                            }),
+                    )
+                };
             report.findings.push(Finding {
                 severity: Severity::Critical,
-                category: format!("{} Type Changed", category_prefix),
+                category,
                 message: format!(
-                    "{} '{}': field '{}' (position {}) type changed from `{}` to `{}`.",
-                    msg_prefix,
-                    name,
-                    old_name,
-                    i,
-                    crate::mapper::type_to_string(&old_field.type_),
-                    crate::mapper::type_to_string(&new_field.type_)
+                    "{} '{}': field '{}' (position {}) {}.",
+                    msg_prefix, name, old_name, i, detail
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
     }
@@ -544,6 +699,7 @@ fn check_struct_fields(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, new_field.name)),
+                root_target: None,
             });
         }
     }
@@ -569,6 +725,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                     ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
+                    root_target: None,
                 });
             }
             Some(new_enum) => {
@@ -591,6 +748,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                         message,
                         type_name: Some(name.clone()),
                         target: Some(name.clone()),
+                        root_target: None,
                     });
                 }
             }
@@ -606,6 +764,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                 message: format!("New enum '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
+                root_target: None,
             });
         }
     }
@@ -644,6 +803,7 @@ fn check_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, old_name)),
+                    root_target: None,
                 });
             }
             Some(new_case) => {
@@ -659,6 +819,7 @@ fn check_enum_cases(
                         ),
                         type_name: Some(name.to_string()),
                         target: Some(format!("{}.{}", name, old_name)),
+                        root_target: None,
                     });
                 }
             }
@@ -679,6 +840,7 @@ fn check_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, new_name)),
+                    root_target: None,
                 });
             }
         }
@@ -699,6 +861,7 @@ fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepor
                     ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
+                    root_target: None,
                 });
             }
             Some(new_union) => {
@@ -715,6 +878,7 @@ fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepor
                 message: format!("New union '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
+                root_target: None,
             });
         }
     }
@@ -746,6 +910,7 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
     }
@@ -765,23 +930,36 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
 
         if !union_cases_equal(old_case, new_case) {
+            let (category, detail) =
+                if let Some(bytesn_msg) = union_case_bytesn_size_change(old_case, new_case) {
+                    ("BytesN Size Changed".to_string(), bytesn_msg)
+                } else {
+                    (
+                        "Union Case Type Changed".to_string(),
+                        describe_union_case_type_change(old_case, new_case).unwrap_or_else(|| {
+                            format!(
+                                "type changed from `{}` to `{}`",
+                                union_case_type_signature(old_case),
+                                union_case_type_signature(new_case)
+                            )
+                        }),
+                    )
+                };
             report.findings.push(Finding {
                 severity: Severity::Critical,
-                category: "Union Case Type Changed".to_string(),
+                category,
                 message: format!(
-                    "Union '{}': case '{}' (position {}) type changed from `{}` to `{}`.",
-                    name,
-                    old_name,
-                    i,
-                    union_case_type_signature(old_case),
-                    union_case_type_signature(new_case)
+                    "Union '{}': case '{}' (position {}) {}.",
+                    name, old_name, i, detail
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                root_target: None,
             });
         }
     }
@@ -799,6 +977,7 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, union_case_name(new_case))),
+                root_target: None,
             });
         }
     }
@@ -851,6 +1030,7 @@ fn compare_error_enums(old: &ContractSpec, new: &ContractSpec, report: &mut Diff
                     ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
+                    root_target: None,
                 });
             }
             Some(new_error_enum) => {
@@ -867,6 +1047,7 @@ fn compare_error_enums(old: &ContractSpec, new: &ContractSpec, report: &mut Diff
                 message: format!("New error enum '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
+                root_target: None,
             });
         }
     }
@@ -896,6 +1077,7 @@ fn check_error_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, old_name)),
+                    root_target: None,
                 });
             }
             Some(new_case) if old_case.value != new_case.value => {
@@ -909,6 +1091,7 @@ fn check_error_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, old_name)),
+                    root_target: None,
                 });
             }
             _ => {}
@@ -927,12 +1110,156 @@ fn check_error_enum_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, new_name)),
+                root_target: None,
             });
         }
     }
 }
 
 /// Uses dependency graphing to figure out if storage layout changes cascade to other types.
+/// Category label for a user-defined type whose name survived but whose kind
+/// changed (for example a struct that became an enum).
+pub const TYPE_KIND_CHANGED_CATEGORY: &str = "Type Kind Changed";
+
+/// Which of the five spec maps a user-defined type lives in.
+///
+/// The per-kind comparison passes each look at a single map, so they cannot see
+/// that a name moved between maps. This enum is what lets
+/// [`detect_type_kind_changes`] reason across them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UdtKind {
+    Struct,
+    Enum,
+    Union,
+    ErrorEnum,
+}
+
+impl UdtKind {
+    /// Human-readable label used in finding messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            UdtKind::Struct => "struct",
+            UdtKind::Enum => "enum",
+            UdtKind::Union => "union",
+            UdtKind::ErrorEnum => "error enum",
+        }
+    }
+
+    /// The categories a per-kind pass emits when a type of this kind vanishes
+    /// from the new spec.
+    ///
+    /// Two are possible for structs and enums because the event-naming
+    /// convention picks a different label for the same underlying removal.
+    fn removal_categories(self) -> &'static [&'static str] {
+        match self {
+            UdtKind::Struct => &["Struct Removed", "Event Definition Removed"],
+            UdtKind::Enum => &["Enum Removed", "Event Enum Removed"],
+            UdtKind::Union => &["Union Removed"],
+            UdtKind::ErrorEnum => &["Error Enum Removed"],
+        }
+    }
+
+    /// The category a per-kind pass emits when a type of this kind appears in
+    /// the new spec.
+    fn addition_category(self) -> &'static str {
+        match self {
+            UdtKind::Struct => "Struct Added",
+            UdtKind::Enum => "Enum Added",
+            UdtKind::Union => "Union Added",
+            UdtKind::ErrorEnum => "Error Enum Added",
+        }
+    }
+}
+
+/// The kind a name is defined as in `spec`, if it is defined at all.
+///
+/// A name resolves to at most one kind: Rust type names are unique within a
+/// contract, so the maps cannot both claim it.
+fn udt_kind_of(spec: &ContractSpec, name: &str) -> Option<UdtKind> {
+    if spec.structs.contains_key(name) {
+        Some(UdtKind::Struct)
+    } else if spec.enums.contains_key(name) {
+        Some(UdtKind::Enum)
+    } else if spec.unions.contains_key(name) {
+        Some(UdtKind::Union)
+    } else if spec.error_enums.contains_key(name) {
+        Some(UdtKind::ErrorEnum)
+    } else {
+        None
+    }
+}
+
+/// Report a user-defined type whose name persists but whose kind changed.
+///
+/// `compare_structs`, `compare_enums`, `compare_unions`, and
+/// `compare_error_enums` each consult only their own map. When `Status` is a
+/// struct in the old build and an enum in the new one, `compare_structs` sees a
+/// struct that disappeared and reports a critical `Struct Removed`, while
+/// `compare_enums` sees a brand-new enum and reports an informational
+/// `Enum Added`. Nothing connects the two, and the informational half badly
+/// understates the change: the type did not appear from nowhere, it replaced a
+/// struct of the same name, which invalidates any stored data of that type.
+///
+/// This pass replaces that pair with a single critical finding. It runs after
+/// the per-kind passes so it can retract their output, matching on `target`
+/// (which is the bare type name for whole-type findings) rather than on message
+/// text. Member-level findings such as `Status.field` are never retracted,
+/// because their target carries a `Type.member` suffix.
+///
+/// There is currently no type-level rename detection in this module; if one is
+/// added it must skip names handled here, so that a single change is not
+/// reported as both a rename and a kind change.
+pub fn detect_type_kind_changes(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport) {
+    let mut changed: Vec<(String, UdtKind, UdtKind)> = old
+        .structs
+        .keys()
+        .chain(old.enums.keys())
+        .chain(old.unions.keys())
+        .chain(old.error_enums.keys())
+        .filter_map(|name| {
+            let old_kind = udt_kind_of(old, name)?;
+            let new_kind = udt_kind_of(new, name)?;
+            (old_kind != new_kind).then(|| (name.clone(), old_kind, new_kind))
+        })
+        .collect();
+
+    // The spec maps have no inherent order, so sort for a deterministic report.
+    changed.sort();
+
+    for (name, old_kind, new_kind) in changed {
+        // Drop the spurious removal/addition pair the per-kind passes produced
+        // for this name. Anything else about the type is left alone.
+        report.findings.retain(|finding| {
+            if finding.target.as_deref() != Some(name.as_str()) {
+                return true;
+            }
+            let is_stale_removal = old_kind
+                .removal_categories()
+                .contains(&finding.category.as_str());
+            let is_stale_addition = finding.category == new_kind.addition_category();
+            !(is_stale_removal || is_stale_addition)
+        });
+
+        report.findings.push(Finding {
+            severity: Severity::Critical,
+            category: TYPE_KIND_CHANGED_CATEGORY.to_string(),
+            message: format!(
+                "Type '{}' changed from {} to {}. Stored data and client \
+                 decoders written against the {} layout cannot read the {} \
+                 that replaced it.",
+                name,
+                old_kind.label(),
+                new_kind.label(),
+                old_kind.label(),
+                new_kind.label(),
+            ),
+            type_name: Some(name.clone()),
+            target: Some(name),
+            root_target: None,
+        });
+    }
+}
+
 fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
     let old_mapper = LayoutMapper::new(old);
     let reverse_deps = old_mapper.build_reverse_dependencies();
@@ -948,21 +1275,23 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
         }
     }
 
-    // A queue for transitive breaks
-    let mut queue: Vec<String> = broken_types.into_iter().collect();
+    // A queue for transitive breaks: (type_name, root_target)
+    let mut queue: Vec<(String, String)> =
+        broken_types.into_iter().map(|t| (t.clone(), t)).collect();
     let mut i = 0;
-    let mut cascaded = std::collections::HashSet::new();
+    let mut cascaded: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
 
     while i < queue.len() {
-        let current_broken_type = queue[i].clone();
+        let (current_broken_type, root) = queue[i].clone();
         i += 1;
 
         if let Some(dependents) = reverse_deps.get(&current_broken_type) {
             for dep in dependents {
-                // Ignore if it was the original broken type
-                if !cascaded.contains(dep) {
-                    cascaded.insert(dep.clone());
-                    queue.push(dep.clone());
+                let key = (dep.clone(), root.clone());
+                if !cascaded.contains(&key) {
+                    cascaded.insert(key);
+                    queue.push((dep.clone(), root.clone()));
 
                     report.findings.push(Finding {
                         severity: Severity::Critical,
@@ -974,10 +1303,163 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
                         ),
                         type_name: Some(dep.clone()),
                         target: Some(dep.clone()),
+                        root_target: Some(root.clone()),
                     });
                 }
             }
         }
+    }
+}
+
+/// When two `ScSpecUdtUnionCaseV0` values are both tuples with the same length
+/// and differ only in one inner type, produce a concise description of the
+/// innermost difference.  Returns `None` when the outer structures differ,
+/// signalling the caller to fall back to the full-signature form.
+fn describe_union_case_type_change(
+    old: &ScSpecUdtUnionCaseV0,
+    new: &ScSpecUdtUnionCaseV0,
+) -> Option<String> {
+    match (old, new) {
+        (ScSpecUdtUnionCaseV0::TupleV0(a), ScSpecUdtUnionCaseV0::TupleV0(b)) => {
+            let a_types: &[ScSpecTypeDef] = a.type_.as_ref();
+            let b_types: &[ScSpecTypeDef] = b.type_.as_ref();
+            if a_types.len() != b_types.len() {
+                return None;
+            }
+            for (i, (at, bt)) in a_types.iter().zip(b_types.iter()).enumerate() {
+                if at != bt {
+                    return describe_nested_type_change(at, bt).or_else(|| {
+                        Some(format!(
+                            "payload type at index {} changed from `{}` to `{}`",
+                            i,
+                            crate::mapper::type_to_string(at),
+                            crate::mapper::type_to_string(bt),
+                        ))
+                    });
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// When two `ScSpecTypeDef` values share the same container shape (e.g. both are
+/// `Vec`) and differ only in a type argument, produce a concise description of
+/// the innermost difference.  Returns `None` when the outer constructors
+/// themselves differ, signalling the caller to fall back to the full-signature
+/// form (e.g.  `"type changed from \`Map<Address, u32>\` to \`Map<Address, u64>\`"`).
+fn describe_nested_type_change(old: &ScSpecTypeDef, new: &ScSpecTypeDef) -> Option<String> {
+    if old == new {
+        return None;
+    }
+    match (old, new) {
+        (ScSpecTypeDef::Option(a), ScSpecTypeDef::Option(b)) => {
+            describe_nested_type_change(&a.value_type, &b.value_type).or_else(|| {
+                Some(format!(
+                    "the inner type of Option changed from `{}` to `{}`",
+                    crate::mapper::type_to_string(&a.value_type),
+                    crate::mapper::type_to_string(&b.value_type),
+                ))
+            })
+        }
+        (ScSpecTypeDef::Vec(a), ScSpecTypeDef::Vec(b)) => {
+            describe_nested_type_change(&a.element_type, &b.element_type).or_else(|| {
+                Some(format!(
+                    "the element type of Vec changed from `{}` to `{}`",
+                    crate::mapper::type_to_string(&a.element_type),
+                    crate::mapper::type_to_string(&b.element_type),
+                ))
+            })
+        }
+        (ScSpecTypeDef::Map(a), ScSpecTypeDef::Map(b)) => {
+            if a.key_type != b.key_type {
+                return describe_nested_type_change(&a.key_type, &b.key_type).or_else(|| {
+                    Some(format!(
+                        "the key type of Map changed from `{}` to `{}`",
+                        crate::mapper::type_to_string(&a.key_type),
+                        crate::mapper::type_to_string(&b.key_type),
+                    ))
+                });
+            }
+            describe_nested_type_change(&a.value_type, &b.value_type).or_else(|| {
+                Some(format!(
+                    "the value type of Map changed from `{}` to `{}`",
+                    crate::mapper::type_to_string(&a.value_type),
+                    crate::mapper::type_to_string(&b.value_type),
+                ))
+            })
+        }
+        (ScSpecTypeDef::Result(a), ScSpecTypeDef::Result(b)) => {
+            if a.ok_type != b.ok_type {
+                return describe_nested_type_change(&a.ok_type, &b.ok_type).or_else(|| {
+                    Some(format!(
+                        "the ok type of Result changed from `{}` to `{}`",
+                        crate::mapper::type_to_string(&a.ok_type),
+                        crate::mapper::type_to_string(&b.ok_type),
+                    ))
+                });
+            }
+            describe_nested_type_change(&a.error_type, &b.error_type).or_else(|| {
+                Some(format!(
+                    "the error type of Result changed from `{}` to `{}`",
+                    crate::mapper::type_to_string(&a.error_type),
+                    crate::mapper::type_to_string(&b.error_type),
+                ))
+            })
+        }
+        (ScSpecTypeDef::Tuple(a), ScSpecTypeDef::Tuple(b)) => {
+            let a_types: &[ScSpecTypeDef] = a.value_types.as_ref();
+            let b_types: &[ScSpecTypeDef] = b.value_types.as_ref();
+            if a_types.len() != b_types.len() {
+                return None;
+            }
+            for (i, (at, bt)) in a_types.iter().zip(b_types.iter()).enumerate() {
+                if at != bt {
+                    return describe_nested_type_change(at, bt).or_else(|| {
+                        Some(format!(
+                            "type at index {} of tuple changed from `{}` to `{}`",
+                            i,
+                            crate::mapper::type_to_string(at),
+                            crate::mapper::type_to_string(bt),
+                        ))
+                    });
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn describe_bytesn_size_change(old: &ScSpecTypeDef, new: &ScSpecTypeDef) -> Option<String> {
+    match (old, new) {
+        (ScSpecTypeDef::BytesN(a), ScSpecTypeDef::BytesN(b)) if a.n != b.n => {
+            Some(format!("size of BytesN changed from {} to {}", a.n, b.n))
+        }
+        _ => None,
+    }
+}
+
+fn union_case_bytesn_size_change(
+    old: &ScSpecUdtUnionCaseV0,
+    new: &ScSpecUdtUnionCaseV0,
+) -> Option<String> {
+    match (old, new) {
+        (ScSpecUdtUnionCaseV0::TupleV0(a), ScSpecUdtUnionCaseV0::TupleV0(b)) => {
+            let a_types: &[ScSpecTypeDef] = a.type_.as_ref();
+            let b_types: &[ScSpecTypeDef] = b.type_.as_ref();
+            if a_types.len() != b_types.len() {
+                return None;
+            }
+            for (i, (at, bt)) in a_types.iter().zip(b_types.iter()).enumerate() {
+                if let Some(msg) = describe_bytesn_size_change(at, bt) {
+                    return Some(format!("{} in payload type at index {}", msg, i));
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -1095,6 +1577,7 @@ mod tests {
                 .to_string(),
             type_name: Some("Child".to_string()),
             target: Some("Child".to_string()),
+            root_target: None,
         });
 
         // Run cascade detection against the old spec
@@ -1128,6 +1611,7 @@ mod tests {
             message: "Function 'do_stuff' was removed.".to_string(),
             type_name: None,
             target: Some("do_stuff".to_string()),
+            root_target: None,
         });
 
         detect_cascading_layout_breaks(&old, &mut report);
@@ -1492,5 +1976,589 @@ mod tests {
         let tf = type_finding.unwrap();
         assert_eq!(tf.severity, Severity::Critical);
         assert!(tf.message.contains("parameter 0 ('a') type changed")); // Index in old is 0
+    }
+
+    // --- Type kind changes (#250) -------------------------------------------
+
+    fn insert_struct(spec: &mut ContractSpec, name: &str) {
+        spec.structs.insert(
+            name.to_string(),
+            ScSpecUdtStructV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: name.try_into().unwrap(),
+                fields: VecM::default(),
+            },
+        );
+    }
+
+    fn insert_enum(spec: &mut ContractSpec, name: &str) {
+        spec.enums.insert(
+            name.to_string(),
+            ScSpecUdtEnumV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: name.try_into().unwrap(),
+                cases: VecM::default(),
+            },
+        );
+    }
+
+    fn insert_union(spec: &mut ContractSpec, name: &str) {
+        spec.unions.insert(
+            name.to_string(),
+            ScSpecUdtUnionV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: name.try_into().unwrap(),
+                cases: VecM::default(),
+            },
+        );
+    }
+
+    fn insert_error_enum(spec: &mut ContractSpec, name: &str) {
+        spec.error_enums.insert(
+            name.to_string(),
+            ScSpecUdtErrorEnumV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: name.try_into().unwrap(),
+                cases: VecM::default(),
+            },
+        );
+    }
+
+    fn kind_change_findings<'a>(report: &'a DiffReport, name: &str) -> Vec<&'a Finding> {
+        report
+            .findings
+            .iter()
+            .filter(|f| {
+                f.category == TYPE_KIND_CHANGED_CATEGORY && f.target.as_deref() == Some(name)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn struct_to_enum_is_a_single_breaking_kind_change() {
+        let mut old = ContractSpec::default();
+        insert_struct(&mut old, "Status");
+        let mut new = ContractSpec::default();
+        insert_enum(&mut new, "Status");
+
+        let report = compare(&old, &new);
+
+        let findings = kind_change_findings(&report, "Status");
+        assert_eq!(
+            findings.len(),
+            1,
+            "expected exactly one kind-change finding"
+        );
+
+        let finding = findings[0];
+        assert_eq!(finding.severity, Severity::Critical);
+        assert_eq!(finding.type_name.as_deref(), Some("Status"));
+        assert!(
+            finding.message.contains("from struct to enum"),
+            "message should name both kinds, got: {}",
+            finding.message
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // describe_nested_type_change unit tests
+    // ---------------------------------------------------------------
+    #[test]
+    fn nested_type_change_option() {
+        let old = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+            value_type: ScSpecTypeDef::U32,
+        }));
+        let new = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+            value_type: ScSpecTypeDef::U64,
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some("the inner type of Option changed from `u32` to `u64`".to_string())
+        );
+    }
+
+    #[test]
+    fn nested_type_change_vec() {
+        let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+            element_type: ScSpecTypeDef::U32,
+        }));
+        let new = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+            element_type: ScSpecTypeDef::U64,
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some("the element type of Vec changed from `u32` to `u64`".to_string())
+        );
+    }
+
+    #[test]
+    fn nested_type_change_map_value() {
+        let old = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+            key_type: ScSpecTypeDef::Address,
+            value_type: ScSpecTypeDef::U32,
+        }));
+        let new = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+            key_type: ScSpecTypeDef::Address,
+            value_type: ScSpecTypeDef::U64,
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some(
+                "the value type of Map changed from `u32` to `u64`"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn nested_type_change_map_key() {
+        let old = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+            key_type: ScSpecTypeDef::Symbol,
+            value_type: ScSpecTypeDef::U32,
+        }));
+        let new = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+            key_type: ScSpecTypeDef::String,
+            value_type: ScSpecTypeDef::U32,
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some("the key type of Map changed from `Symbol` to `String`".to_string())
+        );
+    }
+
+    #[test]
+    fn nested_type_change_tuple() {
+        let make_tuple = |types: Vec<ScSpecTypeDef>| {
+            ScSpecTypeDef::Tuple(Box::new(stellar_xdr::curr::ScSpecTypeTuple {
+                value_types: stellar_xdr::curr::VecM::try_from(types).unwrap(),
+            }))
+        };
+        let old = make_tuple(vec![ScSpecTypeDef::U32, ScSpecTypeDef::U64]);
+        let new = make_tuple(vec![ScSpecTypeDef::U32, ScSpecTypeDef::I128]);
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some(
+                "type at index 1 of tuple changed from `u64` to `i128`"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn enum_to_union_is_a_single_breaking_kind_change() {
+        let mut old = ContractSpec::default();
+        insert_enum(&mut old, "Payload");
+        let mut new = ContractSpec::default();
+        insert_union(&mut new, "Payload");
+
+        let report = compare(&old, &new);
+
+        let findings = kind_change_findings(&report, "Payload");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Critical);
+        assert!(
+            findings[0].message.contains("from enum to union"),
+            "message should name both kinds, got: {}",
+            findings[0].message
+        );
+    }
+
+    #[test]
+    fn nested_type_change_deeply_nested() {
+        // Vec<Option<Map<Address, u32>>> -> Vec<Option<Map<Address, u64>>>
+        let inner_map = |value: ScSpecTypeDef| {
+            ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+                key_type: ScSpecTypeDef::Address,
+                value_type: value,
+            }))
+        };
+        let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+            element_type: ScSpecTypeDef::Option(Box::new(
+                stellar_xdr::curr::ScSpecTypeOption {
+                    value_type: inner_map(ScSpecTypeDef::U32),
+                },
+            )),
+        }));
+        let new = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+            element_type: ScSpecTypeDef::Option(Box::new(
+                stellar_xdr::curr::ScSpecTypeOption {
+                    value_type: inner_map(ScSpecTypeDef::U64),
+                },
+            )),
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(
+            desc,
+            Some(
+                "the value type of Map changed from `u32` to `u64`"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn kind_change_replaces_the_spurious_removal_and_addition() {
+        let mut old = ContractSpec::default();
+        insert_struct(&mut old, "Status");
+        let mut new = ContractSpec::default();
+        insert_enum(&mut new, "Status");
+
+        let report = compare(&old, &new);
+
+        // The removal `compare_structs` produced and the addition
+        // `compare_enums` produced must both be gone.
+        for category in ["Struct Removed", "Enum Added"] {
+            assert!(
+                !report
+                    .findings
+                    .iter()
+                    .any(|f| f.category == category && f.target.as_deref() == Some("Status")),
+                "'{category}' should have been replaced by the kind change"
+            );
+        }
+
+        // And nothing else should be reported about `Status`.
+        let about_status: Vec<&str> = report
+            .findings
+            .iter()
+            .filter(|f| f.target.as_deref() == Some("Status"))
+            .map(|f| f.category.as_str())
+            .collect();
+        assert_eq!(about_status, vec![TYPE_KIND_CHANGED_CATEGORY]);
+    }
+
+    #[test]
+    fn kind_change_to_error_enum_is_detected() {
+        let mut old = ContractSpec::default();
+        insert_union(&mut old, "Outcome");
+        let mut new = ContractSpec::default();
+        insert_error_enum(&mut new, "Outcome");
+
+        let report = compare(&old, &new);
+
+        assert_eq!(kind_change_findings(&report, "Outcome").len(), 1);
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.category == "Union Removed" || f.category == "Error Enum Added"));
+    }
+
+    #[test]
+    fn event_named_struct_to_enum_retracts_the_event_removal_variant() {
+        // `is_event` gives a struct named "...Event" a different removal
+        // category, which the retraction must also cover.
+        let mut old = ContractSpec::default();
+        insert_struct(&mut old, "TransferEvent");
+        let mut new = ContractSpec::default();
+        insert_enum(&mut new, "TransferEvent");
+
+        let report = compare(&old, &new);
+
+        assert_eq!(kind_change_findings(&report, "TransferEvent").len(), 1);
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.category == "Event Definition Removed"),
+            "the event-flavored removal must be retracted too"
+        );
+    }
+
+    #[test]
+    fn nested_type_change_outer_constructor_differs() {
+        // Vec<u32> -> Option<u32> — different outer constructors
+        let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+            element_type: ScSpecTypeDef::U32,
+        }));
+        let new = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+            value_type: ScSpecTypeDef::U32,
+        }));
+        let desc = describe_nested_type_change(&old, &new);
+        assert_eq!(desc, None);
+    }
+
+    // ---------------------------------------------------------------
+    // Integration tests: type-change messages use concise format
+    // ---------------------------------------------------------------
+    #[test]
+    fn field_type_change_vec_shows_concise_message() {
+        let old = spec_with_structs(vec![("Data", vec![(
+            "values",
+            ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+                element_type: ScSpecTypeDef::U32,
+            })),
+        )])]);
+        let new = spec_with_structs(vec![("Data", vec![(
+            "values",
+            ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+                element_type: ScSpecTypeDef::U64,
+            })),
+        )])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Type Changed")
+            .expect("Expected field type change");
+        assert!(
+            fc.message.contains("the element type of Vec changed from `u32` to `u64`"),
+            "Message was: {}",
+            fc.message
+        );
+    }
+
+    #[test]
+    fn a_genuine_removal_is_still_reported() {
+        // A type that really did disappear, with no replacement of another
+        // kind, must keep its plain removal finding.
+        let mut old = ContractSpec::default();
+        insert_struct(&mut old, "Gone");
+        let new = ContractSpec::default();
+
+        let report = compare(&old, &new);
+
+        assert!(kind_change_findings(&report, "Gone").is_empty());
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.category == "Struct Removed" && f.target.as_deref() == Some("Gone")));
+    }
+
+    #[test]
+    fn a_genuine_addition_is_still_reported() {
+        let old = ContractSpec::default();
+        let mut new = ContractSpec::default();
+        insert_enum(&mut new, "Fresh");
+
+        let report = compare(&old, &new);
+
+        assert!(kind_change_findings(&report, "Fresh").is_empty());
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.category == "Enum Added" && f.target.as_deref() == Some("Fresh")));
+    }
+
+    #[test]
+    fn an_unchanged_kind_produces_no_kind_change() {
+        let mut old = ContractSpec::default();
+        insert_struct(&mut old, "Same");
+        let mut new = ContractSpec::default();
+        insert_struct(&mut new, "Same");
+
+        let report = compare(&old, &new);
+        assert!(kind_change_findings(&report, "Same").is_empty());
+    }
+
+    #[test]
+    fn kind_change_does_not_retract_member_level_findings() {
+        // A struct `Data` loses a field *and* another type changes kind. The
+        // field finding targets `Data.amount`, so it must survive.
+        let mut old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::I128)])]);
+        insert_struct(&mut old, "Status");
+
+        let mut new = spec_with_structs(vec![("Data", vec![])]);
+        insert_enum(&mut new, "Status");
+
+        let report = compare(&old, &new);
+
+        assert_eq!(kind_change_findings(&report, "Status").len(), 1);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.target.as_deref() == Some("Data.amount")),
+            "member-level findings must not be retracted"
+        );
+    }
+
+    #[test]
+    fn kind_change_cascades_to_embedding_types() {
+        // `Wrapper` embeds `Status`. When `Status` changes kind, `Wrapper`'s
+        // stored layout breaks too, so cascade detection must still fire.
+        let mut old = spec_with_structs(vec![("Wrapper", vec![("status", udt("Status"))])]);
+        insert_struct(&mut old, "Status");
+
+        let mut new = spec_with_structs(vec![("Wrapper", vec![("status", udt("Status"))])]);
+        insert_enum(&mut new, "Status");
+
+        let report = compare(&old, &new);
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.category == "Cascading Layout Break"
+                    && f.target.as_deref() == Some("Wrapper")),
+            "a kind change must cascade to types embedding it"
+        );
+    }
+
+    #[test]
+    fn field_type_change_map_shows_concise_message() {
+        let make_map = |value: ScSpecTypeDef| {
+            ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+                key_type: ScSpecTypeDef::Address,
+                value_type: value,
+            }))
+        };
+        let old = spec_with_structs(vec![("Data", vec![("balances", make_map(ScSpecTypeDef::U32))])]);
+        let new = spec_with_structs(vec![("Data", vec![("balances", make_map(ScSpecTypeDef::U64))])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Type Changed")
+            .expect("Expected field type change");
+        assert!(
+            fc.message.contains("the value type of Map changed from `u32` to `u64`"),
+            "Message was: {}",
+            fc.message
+        );
+    }
+
+    #[test]
+    fn field_type_change_primitive_shows_full_message() {
+        // u32 -> i128 — primitive change, should use full fallback format
+        let old = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::U32)])]);
+        let new = spec_with_structs(vec![("Data", vec![("amount", ScSpecTypeDef::I128)])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Type Changed")
+            .expect("Expected field type change");
+        assert!(
+            fc.message.contains("type changed from `u32` to `i128`"),
+            "Message was: {}",
+            fc.message
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // BytesN size change unit tests
+    // ---------------------------------------------------------------
+    fn bytesn(n: u32) -> ScSpecTypeDef {
+        ScSpecTypeDef::BytesN(stellar_xdr::curr::ScSpecTypeBytesN { n })
+    }
+
+    #[test]
+    fn bytesn_size_change_detected() {
+        let desc = describe_bytesn_size_change(&bytesn(32), &bytesn(64));
+        assert_eq!(
+            desc,
+            Some("size of BytesN changed from 32 to 64".to_string())
+        );
+    }
+
+    #[test]
+    fn bytesn_same_size_no_change() {
+        let desc = describe_bytesn_size_change(&bytesn(32), &bytesn(32));
+        assert_eq!(desc, None);
+    }
+
+    #[test]
+    fn bytesn_to_unrelated_no_change() {
+        let desc = describe_bytesn_size_change(&bytesn(32), &ScSpecTypeDef::U64);
+        assert_eq!(desc, None);
+    }
+
+    #[test]
+    fn bytesn_struct_field_gets_specific_category() {
+        let old = spec_with_structs(vec![("Data", vec![("key", bytesn(32))])]);
+        let new = spec_with_structs(vec![("Data", vec![("key", bytesn(64))])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "BytesN Size Changed")
+            .expect("Expected a BytesN Size Changed finding");
+        assert!(
+            fc.message.contains("size of BytesN changed from 32 to 64"),
+            "Message was: {}",
+            fc.message
+        );
+        assert_eq!(fc.severity, Severity::Critical);
+        assert_eq!(fc.target.as_deref(), Some("Data.key"));
+    }
+
+    #[test]
+    fn bytesn_field_change_to_unrelated_uses_generic_category() {
+        let old = spec_with_structs(vec![("Data", vec![("key", bytesn(32))])]);
+        let new = spec_with_structs(vec![("Data", vec![("key", ScSpecTypeDef::String)])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "Struct Field Type Changed")
+            .expect("Expected generic Struct Field Type Changed");
+        assert!(
+            fc.message.contains("type changed from `BytesN<32>` to `String`"),
+            "Message was: {}",
+            fc.message
+        );
+    }
+
+    #[test]
+    fn multiple_kind_changes_are_reported_deterministically() {
+        let mut old = ContractSpec::default();
+        insert_struct(&mut old, "Beta");
+        insert_struct(&mut old, "Alpha");
+        insert_union(&mut old, "Gamma");
+
+        let mut new = ContractSpec::default();
+        insert_enum(&mut new, "Beta");
+        insert_enum(&mut new, "Alpha");
+        insert_enum(&mut new, "Gamma");
+
+        // The spec maps have no inherent order; the emitted order must not
+        // depend on it, so repeated runs have to agree.
+        let names_in_order = |report: &DiffReport| -> Vec<String> {
+            report
+                .findings
+                .iter()
+                .filter(|f| f.category == TYPE_KIND_CHANGED_CATEGORY)
+                .map(|f| f.target.clone().unwrap())
+                .collect()
+        };
+
+        let first = names_in_order(&compare(&old, &new));
+        assert_eq!(first, vec!["Alpha", "Beta", "Gamma"]);
+
+        for _ in 0..5 {
+            assert_eq!(names_in_order(&compare(&old, &new)), first);
+        }
+    }
+
+    #[test]
+    fn bytesn_parameter_change_gets_specific_category() {
+        let old = spec_with_functions(vec![("test", vec![("x", bytesn(32))])]);
+        let new = spec_with_functions(vec![("test", vec![("x", bytesn(64))])]);
+
+        let report = compare(&old, &new);
+        let fc = report
+            .findings
+            .iter()
+            .find(|f| f.category == "BytesN Size Changed")
+            .expect("Expected a BytesN Size Changed finding");
+        assert!(
+            fc.message.contains("size of BytesN changed from 32 to 64"),
+            "Message was: {}",
+            fc.message
+        );
     }
 }

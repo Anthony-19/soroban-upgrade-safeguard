@@ -11,15 +11,61 @@ use stellar_xdr::curr::{
 #[derive(Debug, Default)]
 pub struct ContractSpec {
     /// Contract functions, keyed by name.
+    #[cfg(feature = "unstable")]
     pub functions: HashMap<String, ScSpecFunctionV0>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) functions: HashMap<String, ScSpecFunctionV0>,
+
     /// User-defined structs, keyed by name.
+    #[cfg(feature = "unstable")]
     pub structs: HashMap<String, ScSpecUdtStructV0>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) structs: HashMap<String, ScSpecUdtStructV0>,
+
     /// User-defined enums, keyed by name.
+    #[cfg(feature = "unstable")]
     pub enums: HashMap<String, ScSpecUdtEnumV0>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) enums: HashMap<String, ScSpecUdtEnumV0>,
+
     /// User-defined unions (tagged enums with data), keyed by name.
+    #[cfg(feature = "unstable")]
     pub unions: HashMap<String, ScSpecUdtUnionV0>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) unions: HashMap<String, ScSpecUdtUnionV0>,
+
     /// Error enums, keyed by name.
+    #[cfg(feature = "unstable")]
     pub error_enums: HashMap<String, ScSpecUdtErrorEnumV0>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) error_enums: HashMap<String, ScSpecUdtErrorEnumV0>,
+}
+
+impl ContractSpec {
+    /// Get the contract functions, keyed by name.
+    pub fn functions(&self) -> &HashMap<String, ScSpecFunctionV0> {
+        &self.functions
+    }
+
+    /// Get the user-defined structs, keyed by name.
+    pub fn structs(&self) -> &HashMap<String, ScSpecUdtStructV0> {
+        &self.structs
+    }
+
+    /// Get the user-defined enums, keyed by name.
+    pub fn enums(&self) -> &HashMap<String, ScSpecUdtEnumV0> {
+        &self.enums
+    }
+
+    /// Get the user-defined unions, keyed by name.
+    pub fn unions(&self) -> &HashMap<String, ScSpecUdtUnionV0> {
+        &self.unions
+    }
+
+    /// Get the error enums, keyed by name.
+    pub fn error_enums(&self) -> &HashMap<String, ScSpecUdtErrorEnumV0> {
+        &self.error_enums
+    }
 }
 
 impl ContractSpec {
