@@ -55,6 +55,14 @@ pub enum FindingCategory {
     CascadingLayoutBreak,
 }
 
+impl std::str::FromStr for FindingCategory {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        FindingCategory::find_by_name(s).ok_or(())
+    }
+}
+
 impl FindingCategory {
     /// The exact category string used in findings and suppression rules.
     /// These strings are **stable** — renaming a variant here changes
@@ -489,7 +497,7 @@ impl FindingCategory {
     }
 
     /// Look up a variant by its exact category string.
-    pub fn from_str(s: &str) -> Option<FindingCategory> {
+    pub fn find_by_name(s: &str) -> Option<FindingCategory> {
         FindingCategory::all().iter().find(|c| c.as_str() == s).copied()
     }
 
@@ -575,7 +583,7 @@ mod tests {
     fn from_str_roundtrips_all_categories() {
         for cat in FindingCategory::all() {
             let s = cat.as_str();
-            let back = FindingCategory::from_str(s);
+            let back = FindingCategory::find_by_name(s);
             assert_eq!(back, Some(*cat), "from_str('{}') did not round-trip", s);
         }
     }

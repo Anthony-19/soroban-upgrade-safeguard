@@ -17,7 +17,7 @@ path = "src/main.rs"
 wasmparser = "0.201.0"
 
 # Stellar/Soroban XDR
-stellar-xdr = { version = "21.2.0", features = ["std", "curr", "arbitrary", "base64"] }
+stellar-xdr = { version = "21.2.0", features = ["std", "curr", "base64"] }
 stellar-strkey = "0.0.8"
 
 # CLI and Utilities

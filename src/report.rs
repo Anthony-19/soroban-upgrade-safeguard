@@ -302,18 +302,14 @@ impl AnalysisScope {
 
 /// Whether storage schema analysis was performed.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum StorageScopeState {
+    #[default]
     NotAnalyzed,
     Analyzed {
         key_types: usize,
         value_types: usize,
     },
-}
-
-impl Default for StorageScopeState {
-    fn default() -> Self {
-        StorageScopeState::NotAnalyzed
-    }
 }
 
 /// Build metrics for the report.
@@ -334,6 +330,7 @@ pub struct BuildMetrics {
 }
 
 impl BuildMetrics {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         old_wasm_size: usize,
         new_wasm_size: usize,
@@ -365,6 +362,7 @@ impl BuildMetrics {
     }
 }
 
+#[allow(dead_code)]
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
@@ -373,6 +371,7 @@ fn is_zero(n: &usize) -> bool {
 pub type SafetyReportJson = RenderableReport;
 
 /// Format a contract identity label from optional name and version strings.
+#[allow(dead_code)]
 fn contract_identity_label(name: Option<&str>, version: Option<&str>) -> String {
     match (name, version) {
         (Some(n), Some(v)) => format!("{} v{}", n, v),
@@ -641,7 +640,7 @@ impl SafetyReport {
 ///
 /// Delegates to [`FindingCategory`] which is the single source of truth.
 pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
-    crate::category::FindingCategory::from_str(category).map(|c| c.remediation())
+    crate::category::FindingCategory::find_by_name(category).map(|c| c.remediation())
 }
 
 /// Return the current UTC time as an RFC 3339 / ISO 8601 string.
@@ -699,7 +698,7 @@ fn chrono_now_rfc3339() -> String {
 }
 
 fn is_leap_year(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 #[cfg(test)]

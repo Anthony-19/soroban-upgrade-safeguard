@@ -3,7 +3,6 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use soroban_upgrade_safeguard::{
     color::{should_disable_color, ColorMode},
@@ -898,7 +897,7 @@ fn run_single(
     let watch_paths: Vec<PathBuf> = if args.watch {
         let mut paths = Vec::new();
         if !is_batch_mode(args) {
-            if old_source.is_none() && args.wasm_paths.len() >= 1 {
+            if old_source.is_none() && !args.wasm_paths.is_empty() {
                 let p = args.wasm_paths[0].clone();
                 if !is_stdin_wasm_path(&p) {
                     paths.push(p);
@@ -1308,6 +1307,7 @@ fn scan_directories(
     Ok((pairs, gaps))
 }
 
+#[allow(dead_code)]
 fn render_report(
     report: &report::SafetyReport,
     format: OutputFormat,

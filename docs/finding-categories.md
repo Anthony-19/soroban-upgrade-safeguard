@@ -1,12 +1,8 @@
 # Finding Category Reference
 
-Every category that the comparison analysis may emit, grouped by
-domain, with its default severity, what triggers it, and
-remediation guidance.
+Every category that the comparison analysis may emit, grouped by domain, with its default severity, what triggers it, and remediation guidance.
 
-> **Note**: For suppression rules, match on the exact **category string** shown in the table.
-> See [Suppressing Known Breaking Changes](../docs/documentation.md#suppressing-known-breaking-changes)
-> for details.
+> **Note**: For suppression rules, match on the exact **category string** shown in the table. See [Suppressing Known Breaking Changes](../docs/documentation.md#suppressing-known-breaking-changes) for details.
 
 | Category | Default Severity | Trigger | Remediation |
 | --- | --- | --- | --- |
