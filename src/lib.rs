@@ -9,6 +9,13 @@ pub mod color;
 mod color;
 
 #[cfg(feature = "unstable")]
+pub mod dependency;
+#[cfg(not(feature = "unstable"))]
+mod dependency;
+#[cfg(not(feature = "unstable"))]
+mod color;
+
+#[cfg(feature = "unstable")]
 pub mod diff;
 #[cfg(not(feature = "unstable"))]
 mod diff;

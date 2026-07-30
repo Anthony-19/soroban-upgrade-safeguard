@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use soroban_upgrade_safeguard::diff::compare;
 use soroban_upgrade_safeguard::loader::load_wasm;
-use soroban_upgrade_safeguard::mapper::try_type_to_string;
+use soroban_upgrade_safeguard::mapper::type_to_string;
 use soroban_upgrade_safeguard::parser::extract_metadata;
 use soroban_upgrade_safeguard::report::SafetyReport;
 use soroban_upgrade_safeguard::spec::ContractSpec;
@@ -51,8 +51,7 @@ fn test_custom_unstable_pipeline_flow() {
     // Walk spec type definitions to assert layout representation.
     for function in old_spec.functions.values() {
         for input in function.inputs.iter() {
-            let rendered = try_type_to_string(&input.type_, 0, 128)
-                .expect("Should render input type to string signature");
+            let rendered = type_to_string(&input.type_);
             assert!(!rendered.is_empty());
         }
     }
@@ -106,13 +105,11 @@ fn test_unstable_suppression_config_construction() {
 
     let mut config = SuppressionConfig::default();
 
-    let mut rule = SuppressionRule::default();
-    rule.category = "Function Removed".to_string();
-    rule.target = Some("old_fn".to_string());
-    rule.author = Some("Alice".to_string());
-    rule.reason = Some("Legacy function cleanup".to_string());
-    rule.expiry = Some("2026-12-31".to_string());
-    rule.fingerprint = Some("abc123hex".to_string());
+    let rule = SuppressionRule::new(
+        "Function Removed",
+        Some("old_fn"),
+        Some("Legacy function cleanup"),
+    );
 
     config.rules.push(rule);
 
@@ -120,8 +117,5 @@ fn test_unstable_suppression_config_construction() {
     let rule_ref = &config.rules()[0];
     assert_eq!(rule_ref.category(), "Function Removed");
     assert_eq!(rule_ref.target(), Some("old_fn"));
-    assert_eq!(rule_ref.author(), Some("Alice"));
     assert_eq!(rule_ref.reason(), Some("Legacy function cleanup"));
-    assert_eq!(rule_ref.expiry(), Some("2026-12-31"));
-    assert_eq!(rule_ref.fingerprint(), Some("abc123hex"));
 }

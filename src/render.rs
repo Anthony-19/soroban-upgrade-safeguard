@@ -480,6 +480,7 @@ mod tests {
             message: message.to_string(),
             type_name: None,
             target: Some("thing".to_string()),
+            root_target: None,
         }
     }
 

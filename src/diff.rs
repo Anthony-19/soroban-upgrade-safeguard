@@ -2082,10 +2082,10 @@ mod tests {
     #[test]
     fn nested_type_change_option() {
         let old = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
-            value_type: ScSpecTypeDef::U32,
+            value_type: Box::new(ScSpecTypeDef::U32),
         }));
         let new = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
-            value_type: ScSpecTypeDef::U64,
+            value_type: Box::new(ScSpecTypeDef::U64),
         }));
         let desc = describe_nested_type_change(&old, &new);
         assert_eq!(
@@ -2097,10 +2097,10 @@ mod tests {
     #[test]
     fn nested_type_change_vec() {
         let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-            element_type: ScSpecTypeDef::U32,
+            element_type: Box::new(ScSpecTypeDef::U32),
         }));
         let new = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-            element_type: ScSpecTypeDef::U64,
+            element_type: Box::new(ScSpecTypeDef::U64),
         }));
         let desc = describe_nested_type_change(&old, &new);
         assert_eq!(
@@ -2112,12 +2112,12 @@ mod tests {
     #[test]
     fn nested_type_change_map_value() {
         let old = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
-            key_type: ScSpecTypeDef::Address,
-            value_type: ScSpecTypeDef::U32,
+            key_type: Box::new(ScSpecTypeDef::Address),
+            value_type: Box::new(ScSpecTypeDef::U32),
         }));
         let new = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
-            key_type: ScSpecTypeDef::Address,
-            value_type: ScSpecTypeDef::U64,
+            key_type: Box::new(ScSpecTypeDef::Address),
+            value_type: Box::new(ScSpecTypeDef::U64),
         }));
         let desc = describe_nested_type_change(&old, &new);
         assert_eq!(
@@ -2129,12 +2129,12 @@ mod tests {
     #[test]
     fn nested_type_change_map_key() {
         let old = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
-            key_type: ScSpecTypeDef::Symbol,
-            value_type: ScSpecTypeDef::U32,
+            key_type: Box::new(ScSpecTypeDef::Symbol),
+            value_type: Box::new(ScSpecTypeDef::U32),
         }));
         let new = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
-            key_type: ScSpecTypeDef::String,
-            value_type: ScSpecTypeDef::U32,
+            key_type: Box::new(ScSpecTypeDef::String),
+            value_type: Box::new(ScSpecTypeDef::U32),
         }));
         let desc = describe_nested_type_change(&old, &new);
         assert_eq!(
@@ -2183,19 +2183,19 @@ mod tests {
         // Vec<Option<Map<Address, u32>>> -> Vec<Option<Map<Address, u64>>>
         let inner_map = |value: ScSpecTypeDef| {
             ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
-                key_type: ScSpecTypeDef::Address,
-                value_type: value,
+                key_type: Box::new(ScSpecTypeDef::Address),
+                value_type: Box::new(value),
             }))
         };
         let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-            element_type: ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
-                value_type: inner_map(ScSpecTypeDef::U32),
-            })),
+            element_type: Box::new(ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+                value_type: Box::new(inner_map(ScSpecTypeDef::U32)),
+            }))),
         }));
         let new = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-            element_type: ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
-                value_type: inner_map(ScSpecTypeDef::U64),
-            })),
+            element_type: Box::new(ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+                value_type: Box::new(inner_map(ScSpecTypeDef::U64)),
+            }))),
         }));
         let desc = describe_nested_type_change(&old, &new);
         assert_eq!(
@@ -2276,10 +2276,10 @@ mod tests {
     fn nested_type_change_outer_constructor_differs() {
         // Vec<u32> -> Option<u32> — different outer constructors
         let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-            element_type: ScSpecTypeDef::U32,
+            element_type: Box::new(ScSpecTypeDef::U32),
         }));
         let new = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
-            value_type: ScSpecTypeDef::U32,
+            value_type: Box::new(ScSpecTypeDef::U32),
         }));
         let desc = describe_nested_type_change(&old, &new);
         assert_eq!(desc, None);
@@ -2295,7 +2295,7 @@ mod tests {
             vec![(
                 "values",
                 ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-                    element_type: ScSpecTypeDef::U32,
+                    element_type: Box::new(ScSpecTypeDef::U32),
                 })),
             )],
         )]);
@@ -2304,7 +2304,7 @@ mod tests {
             vec![(
                 "values",
                 ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-                    element_type: ScSpecTypeDef::U64,
+                    element_type: Box::new(ScSpecTypeDef::U64),
                 })),
             )],
         )]);
@@ -2414,8 +2414,8 @@ mod tests {
     fn field_type_change_map_shows_concise_message() {
         let make_map = |value: ScSpecTypeDef| {
             ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
-                key_type: ScSpecTypeDef::Address,
-                value_type: value,
+                key_type: Box::new(ScSpecTypeDef::Address),
+                value_type: Box::new(value),
             }))
         };
         let old = spec_with_structs(vec![(
