@@ -89,12 +89,26 @@ pub struct SuppressionConfig {
     #[serde(default, rename = "suppress")]
     #[cfg(not(feature = "unstable"))]
     pub(crate) rules: Vec<SuppressionRule>,
+
+    /// Gating policy for compatibility axes.
+    #[serde(default)]
+    #[cfg(feature = "unstable")]
+    pub policy: PolicyConfig,
+    /// Gating policy for compatibility axes.
+    #[serde(default)]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) policy: PolicyConfig,
 }
 
 impl SuppressionConfig {
     /// Get reference to raw slice of rules.
     pub fn rules(&self) -> &[SuppressionRule] {
         &self.rules
+    }
+
+    /// Get the gating policy configuration.
+    pub fn policy(&self) -> &PolicyConfig {
+        &self.policy
     }
 }
 
