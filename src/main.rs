@@ -426,8 +426,14 @@ fn run_init(args: &InitArgs) -> Result<()> {
 
     // Collect unsuppressed findings (with empty suppression config)
     let empty_suppressions = SuppressionConfig::default();
-    let safety_report =
-        report::SafetyReport::with_suppressions(&diff_report, &empty_suppressions, false, false);
+    let safety_report = report::SafetyReport::with_suppressions(
+        &diff_report,
+        &empty_suppressions,
+        false,
+        false,
+        &old_spec,
+        &new_spec,
+    );
 
     // Extract findings from the report
     let mut findings: Vec<(String, String)> = Vec::new();
@@ -701,6 +707,8 @@ fn run_batch(
                 );
                 map
             },
+            empirical: false,
+            empirical_findings: Vec::new(),
         };
 
         render_to_outputs(
@@ -916,6 +924,8 @@ fn synthesize_error_report(
             );
             map
         },
+        empirical: false,
+        empirical_findings: Vec::new(),
     }
 }
 

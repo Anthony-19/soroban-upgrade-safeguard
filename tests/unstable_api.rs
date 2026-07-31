@@ -62,7 +62,7 @@ fn test_custom_unstable_pipeline_flow() {
 
     // 6. Stage: Safety Report
     // Aggregate raw findings and apply suppression rules into a final report.
-    let safety_report = SafetyReport::new(&diff_report);
+    let safety_report = SafetyReport::new(&diff_report, &old_spec, &new_spec);
 
     // Assert findings were generated from the comparison
     assert!(!safety_report.is_safe());

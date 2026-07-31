@@ -22,7 +22,7 @@ pub enum Severity {
 }
 
 /// A compatibility axis along which findings can be categorized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompatibilityAxis {
     StorageLayout,
@@ -49,6 +49,13 @@ pub struct Finding {
     pub severity: Severity,
     #[cfg(not(feature = "unstable"))]
     pub(crate) severity: Severity,
+
+    /// The compatibility axes this finding was classified under.
+    #[cfg(feature = "unstable")]
+    pub axes: Vec<CompatibilityAxis>,
+    /// The compatibility axes this finding was classified under.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) axes: Vec<CompatibilityAxis>,
 
     #[cfg(feature = "unstable")]
     pub category: String,
@@ -256,7 +263,7 @@ fn references_type(type_def: &ScSpecTypeDef, target_name: &str, spec: &ContractS
                 return true;
             }
             if let Some(st) = spec.structs.get(&udt_name) {
-                for field in &st.fields {
+                for field in st.fields.iter() {
                     if let ScSpecTypeDef::Udt(ref f_udt) = field.type_ {
                         if f_udt.name.to_string() == udt_name {
                             continue;
@@ -268,10 +275,10 @@ fn references_type(type_def: &ScSpecTypeDef, target_name: &str, spec: &ContractS
                 }
             }
             if let Some(un) = spec.unions.get(&udt_name) {
-                for case in &un.cases {
+                for case in un.cases.iter() {
                     match case {
                         stellar_xdr::curr::ScSpecUdtUnionCaseV0::TupleV0(t) => {
-                            for ty in &t.type_ {
+                            for ty in t.type_.iter() {
                                 if let ScSpecTypeDef::Udt(ref f_udt) = ty {
                                     if f_udt.name.to_string() == udt_name {
                                         continue;
@@ -306,12 +313,12 @@ fn references_type(type_def: &ScSpecTypeDef, target_name: &str, spec: &ContractS
 /// Helper to check if type_name is used in any function signatures.
 fn is_type_used_in_functions(type_name: &str, spec: &ContractSpec) -> bool {
     for (_, func) in &spec.functions {
-        for input in &func.inputs {
+        for input in func.inputs.iter() {
             if references_type(&input.type_, type_name, spec) {
                 return true;
             }
         }
-        for output in &func.outputs {
+        for output in func.outputs.iter() {
             if references_type(output, type_name, spec) {
                 return true;
             }
@@ -466,6 +473,7 @@ pub fn compare_env_metadata(
         (old_meta, new_meta) => {
             let severity = env_metadata_change_severity(old_meta, new_meta);
             report.findings.push(Finding {
+                axes: Vec::new(),
                 severity,
                 category: FindingCategory::Environment.as_str().to_string(),
                 message: format_env_metadata_change(old_meta, new_meta),
@@ -542,6 +550,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
         match new.functions.get(name) {
             None => {
                 report.findings.push(Finding {
+                    axes: Vec::new(),
                     severity: Severity::Critical,
                     category: FindingCategory::FunctionRemoved.as_str().to_string(),
                     message: format!(
@@ -568,6 +577,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                     };
 
                     report.findings.push(Finding {
+                        axes: Vec::new(),
                         severity: Severity::Info,
                         category: FindingCategory::FunctionDocumentationChanged.as_str().to_string(),
                         message,
@@ -584,6 +594,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
     for name in new.functions.keys() {
         if !old.functions.contains_key(name) {
             report.findings.push(Finding {
+                axes: Vec::new(),
                 severity: Severity::Info,
                 category: FindingCategory::FunctionAdded.as_str().to_string(),
                 message: format!("New function '{}' added.", name),
@@ -608,6 +619,7 @@ fn check_function_signature(
 
     if old_inputs.len() != new_inputs.len() {
         report.findings.push(Finding {
+            axes: Vec::new(),
             severity: Severity::Critical,
             category: FindingCategory::FunctionSignatureChanged.as_str().to_string(),
             message: format!(
@@ -640,6 +652,7 @@ fn check_function_signature(
 
     if is_reordered {
         report.findings.push(Finding {
+            axes: Vec::new(),
             severity: Severity::Critical,
             category: FindingCategory::ParameterReordered.as_str().to_string(),
             message: format!(
@@ -680,6 +693,7 @@ fn check_function_signature(
                         )
                     };
                     report.findings.push(Finding {
+                        axes: Vec::new(),
                         severity: Severity::Critical,
                         category,
                         message: format!(
@@ -701,6 +715,7 @@ fn check_function_signature(
 
             if old_name != new_name {
                 report.findings.push(Finding {
+                    axes: Vec::new(),
                     severity: Severity::Warning,
                     category: FindingCategory::ParameterRenamed.as_str().to_string(),
                     message: format!(
@@ -732,6 +747,7 @@ fn check_function_signature(
                     )
                 };
                 report.findings.push(Finding {
+                    axes: Vec::new(),
                     severity: Severity::Critical,
                     category,
                     message: format!(
@@ -752,6 +768,7 @@ fn check_function_signature(
 
     if old_outputs.len() != new_outputs.len() {
         report.findings.push(Finding {
+            axes: Vec::new(),
             severity: Severity::Critical,
             category: FindingCategory::ReturnTypeChanged.as_str().to_string(),
             message: format!(
@@ -783,6 +800,7 @@ fn check_function_signature(
                         )
                     };
                 report.findings.push(Finding {
+                    axes: Vec::new(),
                     severity: Severity::Critical,
                     category,
                     message: format!("Function '{}': return type {} {}.", name, i, detail),
@@ -808,6 +826,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
         match new.structs.get(name) {
             None => {
                 report.findings.push(Finding {
+                    axes: Vec::new(),
                     severity: Severity::Critical,
                     category: if is_evt {
                         FindingCategory::EventDefinitionRemoved.as_str().to_string()
@@ -839,6 +858,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                     };
 
                     report.findings.push(Finding {
+                        axes: Vec::new(),
                         severity: Severity::Info,
                         category: FindingCategory::StructDocumentationChanged.as_str().to_string(),
                         message,
@@ -855,6 +875,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
     for name in new.structs.keys() {
         if !old.structs.contains_key(name) {
             report.findings.push(Finding {
+                axes: Vec::new(),
                 severity: Severity::Info,
                 category: FindingCategory::StructAdded.as_str().to_string(),
                 message: format!("New struct '{}' added.", name),
@@ -887,6 +908,7 @@ fn check_struct_fields(
         let still_exists = new_fields.iter().any(|f| f.name.to_string() == old_name);
             if !still_exists {
                 report.findings.push(Finding {
+                    axes: Vec::new(),
                     severity: Severity::Critical,
                     category: if is_evt {
                         FindingCategory::EventSchemaRemoved.as_str().to_string()
@@ -912,6 +934,7 @@ fn check_struct_fields(
         // Field at the same position has a different name — reordering detected
             if old_name != new_name {
                 report.findings.push(Finding {
+                    axes: Vec::new(),
                     severity: Severity::Critical,
                     category: if is_evt {
                         FindingCategory::EventSchemaReordered.as_str().to_string()
@@ -954,6 +977,7 @@ fn check_struct_fields(
                 )
             };
             report.findings.push(Finding {
+                axes: Vec::new(),
                 severity: Severity::Critical,
                 category,
                 message: format!(
@@ -971,6 +995,7 @@ fn check_struct_fields(
     if new_fields.len() > old_fields.len() {
         for new_field in &new_fields[old_fields.len()..] {
             report.findings.push(Finding {
+                axes: Vec::new(),
                 severity: Severity::Warning,
                 category: FindingCategory::StructFieldAdded.as_str().to_string(),
                 message: format!(
@@ -994,6 +1019,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
         match new.enums.get(name) {
             None => {
                 report.findings.push(Finding {
+                    axes: Vec::new(),
                     severity: Severity::Critical,
                     category: if is_evt {
                         FindingCategory::EventEnumRemoved.as_str().to_string()
@@ -1025,6 +1051,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                     };
 
                     report.findings.push(Finding {
+                        axes: Vec::new(),
                         severity: Severity::Info,
                         category: FindingCategory::EnumDocumentationChanged.as_str().to_string(),
                         message,
@@ -1041,6 +1068,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
     for name in new.enums.keys() {
         if !old.enums.contains_key(name) {
             report.findings.push(Finding {
+                axes: Vec::new(),
                 severity: Severity::Info,
                 category: FindingCategory::EnumAdded.as_str().to_string(),
                 message: format!("New enum '{}' added.", name),
@@ -1071,6 +1099,7 @@ fn check_enum_cases(
             None => {
                 // The case was removed entirely
                 report.findings.push(Finding {
+                    axes: Vec::new(),
                     severity: Severity::Critical,
                     category: if is_evt {
                         FindingCategory::EventEnumCaseRemoved.as_str().to_string()
@@ -1091,6 +1120,7 @@ fn check_enum_cases(
                 // The case exists, but did its integer value change?
                 if old_case.value != new_case.value {
                     report.findings.push(Finding {
+                        axes: Vec::new(),
                         severity: Severity::Critical,
                         category: if is_evt {
                             FindingCategory::EventEnumCaseValueChanged.as_str().to_string()
@@ -1117,6 +1147,7 @@ fn check_enum_cases(
             let new_name = new_case.name.to_string();
             if !old_cases.iter().any(|c| c.name.to_string() == new_name) {
                 report.findings.push(Finding {
+                    axes: Vec::new(),
                     severity: Severity::Info,
                     category: if is_evt {
                         FindingCategory::EventEnumCaseAdded.as_str().to_string()
@@ -1142,6 +1173,7 @@ fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepor
         match new.unions.get(name) {
             None => {
                 report.findings.push(Finding {
+                    axes: Vec::new(),
                     severity: Severity::Critical,
                     category: FindingCategory::UnionRemoved.as_str().to_string(),
                     message: format!(
@@ -1162,6 +1194,7 @@ fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepor
     for name in new.unions.keys() {
         if !old.unions.contains_key(name) {
             report.findings.push(Finding {
+                axes: Vec::new(),
                 severity: Severity::Info,
                 category: FindingCategory::UnionAdded.as_str().to_string(),
                 message: format!("New union '{}' added.", name),
@@ -1191,6 +1224,7 @@ fn check_union_cases(
         let still_exists = new_cases.iter().any(|c| union_case_name(c) == old_name);
         if !still_exists {
             report.findings.push(Finding {
+                axes: Vec::new(),
                 severity: Severity::Critical,
                 category: FindingCategory::UnionCaseRemoved.as_str().to_string(),
                 message: format!(
@@ -1210,6 +1244,7 @@ fn check_union_cases(
 
         if old_name != new_name {
             report.findings.push(Finding {
+                axes: Vec::new(),
                 severity: Severity::Critical,
                 category: FindingCategory::UnionCaseReordered.as_str().to_string(),
                 message: format!(
@@ -1240,6 +1275,7 @@ fn check_union_cases(
                     )
                 };
             report.findings.push(Finding {
+                axes: Vec::new(),
                 severity: Severity::Critical,
                 category,
                 message: format!(
@@ -1256,6 +1292,7 @@ fn check_union_cases(
     if new_cases.len() > old_cases.len() {
         for new_case in &new_cases[old_cases.len()..] {
             report.findings.push(Finding {
+                axes: Vec::new(),
                 severity: Severity::Info,
                 category: FindingCategory::UnionCaseAdded.as_str().to_string(),
                 message: format!(
@@ -1311,6 +1348,7 @@ fn compare_error_enums(old: &ContractSpec, new: &ContractSpec, report: &mut Diff
         match new.error_enums.get(name) {
             None => {
                 report.findings.push(Finding {
+                    axes: Vec::new(),
                     severity: Severity::Critical,
                     category: FindingCategory::ErrorEnumRemoved.as_str().to_string(),
                     message: format!(
@@ -1331,6 +1369,7 @@ fn compare_error_enums(old: &ContractSpec, new: &ContractSpec, report: &mut Diff
     for name in new.error_enums.keys() {
         if !old.error_enums.contains_key(name) {
             report.findings.push(Finding {
+                axes: Vec::new(),
                 severity: Severity::Info,
                 category: FindingCategory::ErrorEnumAdded.as_str().to_string(),
                 message: format!("New error enum '{}' added.", name),
@@ -1357,6 +1396,7 @@ fn check_error_enum_cases(
         match new_cases.iter().find(|c| c.name.to_string() == old_name) {
             None => {
                 report.findings.push(Finding {
+                    axes: Vec::new(),
                     severity: Severity::Critical,
                     category: FindingCategory::ErrorEnumCaseRemoved.as_str().to_string(),
                     message: format!(
@@ -1371,6 +1411,7 @@ fn check_error_enum_cases(
             }
             Some(new_case) if old_case.value != new_case.value => {
                 report.findings.push(Finding {
+                    axes: Vec::new(),
                     severity: Severity::Critical,
                     category: FindingCategory::ErrorEnumCaseValueChanged.as_str().to_string(),
                     message: format!(
@@ -1391,6 +1432,7 @@ fn check_error_enum_cases(
         let new_name = new_case.name.to_string();
         if !old_cases.iter().any(|c| c.name.to_string() == new_name) {
             report.findings.push(Finding {
+                axes: Vec::new(),
                 severity: Severity::Info,
                 category: FindingCategory::ErrorEnumCaseAdded.as_str().to_string(),
                 message: format!(
@@ -1531,6 +1573,7 @@ pub fn detect_type_kind_changes(old: &ContractSpec, new: &ContractSpec, report: 
         });
 
         report.findings.push(Finding {
+            axes: Vec::new(),
             severity: Severity::Critical,
                 category: FindingCategory::TypeKindChanged.as_str().to_string(),
             message: format!(
@@ -1584,6 +1627,7 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
                     queue.push((dep.clone(), root.clone()));
 
                     report.findings.push(Finding {
+                        axes: Vec::new(),
                         severity: Severity::Critical,
                         category: FindingCategory::CascadingLayoutBreak.as_str().to_string(),
                         message: format!(
@@ -1861,6 +1905,7 @@ mod tests {
         // type_name is set correctly.
         let mut report = DiffReport::default();
         report.findings.push(Finding {
+            axes: Vec::new(),
             severity: Severity::Critical,
             category: "TOTALLY CUSTOM CATEGORY".to_string(),
             message: "This message has no quotes and mentions no type prefix whatsoever."
@@ -1896,6 +1941,7 @@ mod tests {
         let mut report = DiffReport::default();
         // Simulate a function-level Critical finding with type_name: None
         report.findings.push(Finding {
+            axes: Vec::new(),
             severity: Severity::Critical,
             category: FindingCategory::FunctionRemoved.as_str().to_string(),
             message: "Function 'do_stuff' was removed.".to_string(),
@@ -2033,7 +2079,7 @@ mod tests {
         assert!(found, "Expected an info finding for struct doc change");
 
         // Ensure info findings do not influence safety
-        let safety = crate::report::SafetyReport::new(&report);
+        let safety = crate::report::SafetyReport::new(&report, &old, &new);
         assert!(safety.is_safe);
         assert_eq!(safety.critical_count, 0);
     }
@@ -2099,7 +2145,8 @@ mod tests {
         let mut report = DiffReport::default();
         compare_env_metadata(Some(&old), Some(&new), &mut report);
 
-        let safety = crate::report::SafetyReport::new(&report);
+        let empty_spec = ContractSpec::default();
+        let safety = crate::report::SafetyReport::new(&report, &empty_spec, &empty_spec);
         assert!(safety.is_safe);
         assert_eq!(safety.critical_count, 0);
     }

@@ -21,6 +21,11 @@ pub mod diff;
 mod diff;
 
 #[cfg(feature = "unstable")]
+pub mod empirical;
+#[cfg(not(feature = "unstable"))]
+mod empirical;
+
+#[cfg(feature = "unstable")]
 pub mod error;
 #[cfg(not(feature = "unstable"))]
 mod error;

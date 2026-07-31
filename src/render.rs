@@ -17,13 +17,13 @@
 //!                       saved report.json ───┘  (RenderableReport::from_json_str)
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
-use crate::diff::Severity;
-use crate::report::ReportedFinding;
+use crate::diff::{CompatibilityAxis, Severity};
+use crate::report::{AxisStatus, ReportedFinding};
 
 /// Version of the JSON report shape.
 pub const REPORT_SCHEMA_VERSION: u32 = 1;
@@ -126,6 +126,15 @@ pub struct RenderableReport {
     /// Categories in a [`BTreeMap`] so the JSON key order is stable and
     /// diffable across runs.
     pub findings_by_category: BTreeMap<String, Vec<ReportedFinding>>,
+    /// Per-axis pass/warning/fail verdict.
+    #[serde(default)]
+    pub axis_verdicts: HashMap<CompatibilityAxis, AxisStatus>,
+    /// Axes whose findings gate `is_safe` (per policy and `--strict`).
+    #[serde(default)]
+    pub gated_axes: HashSet<CompatibilityAxis>,
+    /// Findings grouped by the compatibility axis they were classified under.
+    #[serde(default)]
+    pub findings_by_axis: BTreeMap<CompatibilityAxis, Vec<ReportedFinding>>,
     #[serde(default)]
     pub empirical: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -633,6 +642,7 @@ mod tests {
     use super::*;
     use crate::diff::{DiffReport, Finding};
     use crate::report::SafetyReport;
+    use crate::spec::ContractSpec;
 
     fn finding(severity: Severity, category: &str, message: &str) -> Finding {
         Finding {
@@ -658,7 +668,8 @@ mod tests {
                 finding(Severity::Info, "Function Added", "New function 'b' added."),
             ],
         };
-        SafetyReport::new(&diff)
+        let empty_spec = ContractSpec::default();
+        SafetyReport::new(&diff, &empty_spec, &empty_spec)
     }
 
     #[test]
@@ -692,11 +703,14 @@ mod tests {
                 "Function 'a' was removed.",
             )],
         };
+        let empty_spec = ContractSpec::default();
         let live = SafetyReport::with_suppressions(
             &diff,
             &crate::suppression::SuppressionConfig::default(),
             true,
             false,
+            &empty_spec,
+            &empty_spec,
         );
 
         let json = serde_json::to_string(&live.to_renderable()).unwrap();

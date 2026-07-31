@@ -3,7 +3,7 @@ use crate::interface_hash::InterfaceHash;
 use crate::render::{RenderableReport, REPORT_SCHEMA_VERSION};
 use crate::suppression::SuppressionConfig;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub use crate::render::SeverityCounts;
 
@@ -25,6 +25,15 @@ pub struct ReportedFinding {
     #[serde(flatten)]
     #[cfg(not(feature = "unstable"))]
     pub(crate) finding: Finding,
+
+    /// The compatibility axes this finding was classified under.
+    #[serde(default)]
+    #[cfg(feature = "unstable")]
+    pub axes: Vec<crate::diff::CompatibilityAxis>,
+    /// The compatibility axes this finding was classified under.
+    #[serde(default)]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) axes: Vec<crate::diff::CompatibilityAxis>,
 
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[cfg(feature = "unstable")]
@@ -51,6 +60,10 @@ pub struct ReportedFinding {
 impl ReportedFinding {
     pub fn finding(&self) -> &Finding {
         &self.finding
+    }
+
+    pub fn axes(&self) -> &[crate::diff::CompatibilityAxis] {
+        &self.axes
     }
 
     pub fn suppressed(&self) -> bool {
@@ -168,6 +181,34 @@ pub struct SafetyReport {
     pub metrics: Option<BuildMetrics>,
     #[cfg(not(feature = "unstable"))]
     pub(crate) metrics: Option<BuildMetrics>,
+
+    /// Per-axis pass/warning/fail verdict.
+    #[cfg(feature = "unstable")]
+    pub axis_verdicts: HashMap<crate::diff::CompatibilityAxis, AxisStatus>,
+    /// Per-axis pass/warning/fail verdict.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) axis_verdicts: HashMap<crate::diff::CompatibilityAxis, AxisStatus>,
+
+    /// Axes whose findings gate `is_safe` (per policy and `--strict`).
+    #[cfg(feature = "unstable")]
+    pub gated_axes: HashSet<crate::diff::CompatibilityAxis>,
+    /// Axes whose findings gate `is_safe` (per policy and `--strict`).
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) gated_axes: HashSet<crate::diff::CompatibilityAxis>,
+
+    /// Whether empirical (storage-sample) validation was performed.
+    #[cfg(feature = "unstable")]
+    pub empirical: bool,
+    /// Whether empirical (storage-sample) validation was performed.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) empirical: bool,
+
+    /// Findings from empirical validation, if performed.
+    #[cfg(feature = "unstable")]
+    pub empirical_findings: Vec<crate::empirical::EmpiricalFinding>,
+    /// Findings from empirical validation, if performed.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) empirical_findings: Vec<crate::empirical::EmpiricalFinding>,
 }
 
 impl SafetyReport {
@@ -253,6 +294,22 @@ impl SafetyReport {
 
     pub fn metrics(&self) -> Option<&BuildMetrics> {
         self.metrics.as_ref()
+    }
+
+    pub fn axis_verdicts(&self) -> &HashMap<crate::diff::CompatibilityAxis, AxisStatus> {
+        &self.axis_verdicts
+    }
+
+    pub fn gated_axes(&self) -> &HashSet<crate::diff::CompatibilityAxis> {
+        &self.gated_axes
+    }
+
+    pub fn empirical(&self) -> bool {
+        self.empirical
+    }
+
+    pub fn empirical_findings(&self) -> &[crate::empirical::EmpiricalFinding] {
+        &self.empirical_findings
     }
 }
 
@@ -451,6 +508,8 @@ impl SafetyReport {
                 0,
                 0,
             )),
+            axis_verdicts,
+            gated_axes,
             empirical: false,
             empirical_findings: Vec::new(),
         }
@@ -627,6 +686,8 @@ impl SafetyReport {
             new_spec_summary: None,
             scope: AnalysisScope::default(),
             metrics: None,
+            axis_verdicts,
+            gated_axes,
             empirical: false,
             empirical_findings: Vec::new(),
         }
@@ -740,6 +801,9 @@ impl SafetyReport {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            axis_verdicts: self.axis_verdicts.clone(),
+            gated_axes: self.gated_axes.clone(),
+            findings_by_axis,
             empirical: self.empirical,
             empirical_findings: self.empirical_findings.clone(),
         }
@@ -886,6 +950,10 @@ mod tests {
             new_spec_summary: None,
             scope: AnalysisScope::default(),
             metrics: None,
+            axis_verdicts: HashMap::new(),
+            gated_axes: HashSet::new(),
+            empirical: false,
+            empirical_findings: Vec::new(),
         };
 
         assert_eq!(report.recommended_bump(), "patch");
