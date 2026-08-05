@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use ring::digest::{digest, SHA256};
 use stellar_xdr::curr::{
     ContractDataEntry, ContractExecutable, ExtensionPoint, Hash, LedgerEntry, LedgerEntryData, LedgerKey,
     LedgerKeyContractCode, LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
@@ -14,6 +15,19 @@ use crate::error::Error;
 pub struct WasmModule {
     pub path: String,
     pub bytes: Vec<u8>,
+    /// Lowercase hex SHA-256 of `bytes`, computed at load time. Fingerprints the
+    /// exact bytecode analyzed so a report can be tied back to the build that
+    /// produced it. In RPC mode this equals the on-chain contract code hash.
+    pub sha256: String,
+}
+
+/// Compute the lowercase hex SHA-256 of a byte slice.
+///
+/// Used to fingerprint each analyzed WASM for provenance. Kept public so
+/// library callers and tests can reproduce the same identifier the report
+/// displays.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(digest(&SHA256, bytes).as_ref())
 }
 
 /// Reads a WASM file from disk, validates it is a valid WASM binary,
@@ -312,6 +326,7 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
 
     Ok(WasmModule {
         path: format!("stellar://{}", contract_id),
+        sha256: sha256_hex(&wasm_bytes),
         bytes: wasm_bytes,
     })
 }

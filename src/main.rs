@@ -1431,7 +1431,11 @@ fn compare_contracts(
         old_path,
         old_bytes.len()
     ));
-    progress(format!("     └─ {}", old_spec.summary().dimmed()));
+    progress(format!("     ├─ {}", old_spec.summary().dimmed()));
+    progress(format!(
+        "     └─ {}",
+        format!("sha256: {}", loader::sha256_hex(old_bytes)).dimmed()
+    ));
 
     let new_meta = parser::extract_metadata(new_bytes)?;
     let new_spec = spec::ContractSpec::from_entries(&new_meta.spec);
@@ -1441,7 +1445,11 @@ fn compare_contracts(
         new_path,
         new_bytes.len()
     ));
-    progress(format!("     └─ {}", new_spec.summary().dimmed()));
+    progress(format!("     ├─ {}", new_spec.summary().dimmed()));
+    progress(format!(
+        "     └─ {}",
+        format!("sha256: {}", loader::sha256_hex(new_bytes)).dimmed()
+    ));
 
     progress(format!(
         "\n{}",
