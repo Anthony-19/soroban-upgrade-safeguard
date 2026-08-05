@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use ring::digest::{digest, SHA256};
 use stellar_xdr::curr::{
-    ContractDataEntry, ContractExecutable, Hash, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyContractCode,
-    LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
+    ContractDataEntry, ContractExecutable, ExtensionPoint, Hash, LedgerEntry, LedgerEntryData, LedgerKey,
+    LedgerKeyContractCode, LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
 };
 use wasmparser::Parser;
 
@@ -467,5 +467,18 @@ pub fn fetch_instance_storage_from_rpc(
         }
     };
 
-    Ok(instance.storage.map(|s| s.to_vec()).unwrap_or_default())
+    Ok(instance
+        .storage
+        .map(|s| {
+            s.0.iter()
+                .map(|entry| ContractDataEntry {
+                    ext: ExtensionPoint::V0,
+                    contract: ScAddress::Contract(Hash(contract_bytes)),
+                    key: entry.key.clone(),
+                    durability: stellar_xdr::curr::ContractDataDurability::Persistent,
+                    val: entry.val.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default())
 }

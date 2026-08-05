@@ -193,7 +193,8 @@ The tool parses the `contractspecv0` custom sections from both WASM files, decod
 
 More detailed guides live in the [docs](docs/) folder:
 
-- [Documentation](docs/documentation.md): full explanation of how the analysis pipeline works, every detection category, severity levels, cascading layout breaks, and CI integration.
+- [Documentation](docs/documentation.md): full explanation of how the analysis pipeline works, severity levels, cascading layout breaks, and CI integration.
+- [Finding Category Reference](docs/finding-categories.md): every category emitted by the tool, with severity, trigger, and remediation guidance — the exact strings to use in suppression rules.
 - [Contributing](docs/contributing.md): development setup, project structure, testing, and how to add new detection rules.
 
 ## License

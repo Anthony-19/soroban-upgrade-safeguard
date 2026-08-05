@@ -1,5 +1,17 @@
 #[cfg(feature = "unstable")]
+pub mod category;
+#[cfg(not(feature = "unstable"))]
+mod category;
+
+#[cfg(feature = "unstable")]
 pub mod color;
+#[cfg(not(feature = "unstable"))]
+mod color;
+
+#[cfg(feature = "unstable")]
+pub mod dependency;
+#[cfg(not(feature = "unstable"))]
+mod dependency;
 #[cfg(not(feature = "unstable"))]
 mod color;
 
@@ -7,6 +19,11 @@ mod color;
 pub mod diff;
 #[cfg(not(feature = "unstable"))]
 mod diff;
+
+#[cfg(feature = "unstable")]
+pub mod empirical;
+#[cfg(not(feature = "unstable"))]
+mod empirical;
 
 #[cfg(feature = "unstable")]
 pub mod error;
@@ -80,7 +97,7 @@ pub fn compare_wasm_bytes(old_wasm: &[u8], new_wasm: &[u8]) -> Result<SafetyRepo
     let new_spec = ContractSpec::from_entries(&new_meta.spec);
 
     let diff_report = diff::compare(&old_spec, &new_spec);
-    Ok(SafetyReport::new(&diff_report)
+    Ok(SafetyReport::new(&diff_report, &old_spec, &new_spec)
         .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash()))
 }
 
@@ -104,7 +121,7 @@ pub fn compare_wasm_bytes_with_options(
     old_wasm: &[u8],
     new_wasm: &[u8],
     options: &CompareOptions<'_>,
-) -> Result<SafetyReport> {
+ ) -> Result<SafetyReport> {
     let empty_suppressions = SuppressionConfig::default();
     let suppressions = options.suppressions.unwrap_or(&empty_suppressions);
 
@@ -129,6 +146,8 @@ pub fn compare_wasm_bytes_with_options(
         suppressions,
         options.explain,
         options.strict,
+        &old_spec,
+        &new_spec,
     );
     safety_report.old_spec_summary = Some(old_spec.summary());
     safety_report.new_spec_summary = Some(new_spec.summary());

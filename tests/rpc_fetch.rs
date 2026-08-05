@@ -13,6 +13,9 @@ use std::process::Command;
 use std::sync::Arc;
 use std::thread;
 
+use soroban_upgrade_safeguard::error::ErrorKind;
+use soroban_upgrade_safeguard::loader::fetch_wasm_from_rpc;
+
 use stellar_xdr::curr::{
     ContractCodeEntry, ContractDataDurability, ContractDataEntry, ContractExecutable,
     ExtensionPoint, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt, Limits, ScAddress,
@@ -156,6 +159,100 @@ fn start_mock_rpc_not_found() -> (String, Arc<TcpListener>) {
 
     (addr, listener)
 }
+
+/// Build a JSON-RPC success response containing one ledger entry with the given XDR.
+fn build_rpc_success(xdr: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "latestLedger": 200,
+            "entries": [{
+                "key": "ignored",
+                "xdr": xdr,
+                "lastModifiedLedgerSeq": 100
+            }]
+        }
+    })
+}
+
+/// Build a JSON-RPC success response with an empty entries array.
+fn build_rpc_empty_entries() -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "latestLedger": 200,
+            "entries": []
+        }
+    })
+}
+
+/// Build a JSON-RPC error response.
+fn build_rpc_error(code: i64, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {
+            "code": code,
+            "message": message
+        }
+    })
+}
+
+/// A generic mock RPC server that returns the given JSON-RPC response bodies in
+/// order, one per incoming connection.  Binds to an ephemeral port.
+fn start_mock_rpc_with(responses: Vec<serde_json::Value>) -> (String, Arc<TcpListener>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock server");
+    let addr = listener.local_addr().unwrap().to_string();
+    let listener = Arc::new(listener);
+    let l = Arc::clone(&listener);
+
+    thread::spawn(move || {
+        for resp in responses {
+            if let Ok((mut stream, _)) = l.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let body = serde_json::to_string(&resp).unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        }
+    });
+
+    (addr, listener)
+}
+
+/// Build a LedgerEntry XDR (base64) for a contract instance whose executable is
+/// `StellarAsset` (i.e. a built-in asset contract with no WASM bytecode).
+fn build_stellar_asset_entry_xdr() -> String {
+    let entry = LedgerEntry {
+        last_modified_ledger_seq: 100,
+        data: LedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: ScAddress::Contract(Hash([0u8; 32])),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::ContractInstance(ScContractInstance {
+                executable: ContractExecutable::StellarAsset,
+                storage: None,
+            }),
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+    entry
+        .to_xdr_base64(Limits::none())
+        .expect("failed to encode StellarAsset instance entry")
+}
+
+// ---------------------------------------------------------------------------
+// Existing integration tests (via binary)
+// ---------------------------------------------------------------------------
 
 #[test]
 fn rpc_fetch_compares_on_chain_against_local() {
@@ -304,4 +401,118 @@ fn local_two_file_mode_still_works() {
 
     assert_eq!(json["is_safe"], Value::Bool(false));
     assert_eq!(output.status.code().unwrap(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Direct `fetch_wasm_from_rpc` unit tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fetch_wasm_from_rpc_happy_path() {
+    let code = wasm_bytes("v1.wasm");
+    let wasm_hash = [42u8; 32];
+
+    let instance_xdr = build_instance_entry_xdr(&wasm_hash);
+    let code_xdr = build_code_entry_xdr(&wasm_hash, &code);
+
+    let (addr, _listener) = start_mock_rpc_with(vec![
+        build_rpc_success(&instance_xdr),
+        build_rpc_success(&code_xdr),
+    ]);
+
+    let module = fetch_wasm_from_rpc(TEST_CONTRACT_ID, &format!("http://{}", addr))
+        .expect("happy path should succeed");
+
+    assert_eq!(module.path, format!("stellar://{}", TEST_CONTRACT_ID));
+    assert_eq!(module.bytes, code);
+}
+
+#[test]
+fn fetch_wasm_from_rpc_contract_not_found() {
+    let (addr, _listener) = start_mock_rpc_with(vec![build_rpc_empty_entries()]);
+
+    let err = fetch_wasm_from_rpc(TEST_CONTRACT_ID, &format!("http://{}", addr))
+        .expect_err("should fail when contract is not found");
+
+    assert_eq!(err.kind(), ErrorKind::RpcProtocol);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not found"),
+        "expected error to mention 'not found', got: {msg}"
+    );
+}
+
+#[test]
+fn fetch_wasm_from_rpc_stellar_asset() {
+    let instance_xdr = build_stellar_asset_entry_xdr();
+
+    // For StellarAsset the function returns before making the second call.
+    let (addr, _listener) = start_mock_rpc_with(vec![build_rpc_success(&instance_xdr)]);
+
+    let err = fetch_wasm_from_rpc(TEST_CONTRACT_ID, &format!("http://{}", addr))
+        .expect_err("should fail for StellarAsset contracts");
+
+    assert_eq!(err.kind(), ErrorKind::UnsupportedContract);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Stellar Asset"),
+        "expected error to mention 'Stellar Asset', got: {msg}"
+    );
+}
+
+#[test]
+fn fetch_wasm_from_rpc_code_entry_missing() {
+    let wasm_hash = [42u8; 32];
+    let instance_xdr = build_instance_entry_xdr(&wasm_hash);
+
+    // First call returns the instance, second call returns empty entries.
+    let (addr, _listener) = start_mock_rpc_with(vec![
+        build_rpc_success(&instance_xdr),
+        build_rpc_empty_entries(),
+    ]);
+
+    let err = fetch_wasm_from_rpc(TEST_CONTRACT_ID, &format!("http://{}", addr))
+        .expect_err("should fail when code entry is missing");
+
+    assert_eq!(err.kind(), ErrorKind::RpcProtocol);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("WASM code not found"),
+        "expected error to mention 'WASM code not found', got: {msg}"
+    );
+}
+
+#[test]
+fn fetch_wasm_from_rpc_malformed_xdr() {
+    let (addr, _listener) = start_mock_rpc_with(vec![serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "latestLedger": 200,
+            "entries": [{
+                "xdr": "this-is-not-valid-base64-xdr",
+                "key": "ignored"
+            }]
+        }
+    })]);
+
+    let err = fetch_wasm_from_rpc(TEST_CONTRACT_ID, &format!("http://{}", addr))
+        .expect_err("should fail on malformed XDR");
+
+    assert_eq!(err.kind(), ErrorKind::XdrDecoding);
+}
+
+#[test]
+fn fetch_wasm_from_rpc_json_rpc_error() {
+    let (addr, _listener) = start_mock_rpc_with(vec![build_rpc_error(-32000, "ledger not found")]);
+
+    let err = fetch_wasm_from_rpc(TEST_CONTRACT_ID, &format!("http://{}", addr))
+        .expect_err("should fail on JSON-RPC error");
+
+    assert_eq!(err.kind(), ErrorKind::RpcProtocol);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ledger not found"),
+        "expected error to contain the RPC error message, got: {msg}"
+    );
 }

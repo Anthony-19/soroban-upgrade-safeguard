@@ -369,6 +369,7 @@ pub fn cycle_findings(cycles: &[Vec<String>]) -> Vec<Finding> {
         .map(|cycle| {
             let path = cycle.join(" → ");
             Finding {
+                axes: Vec::new(),
                 severity: Severity::Warning,
                 category: "Cyclic Contract Dependency".to_string(),
                 message: format!(
@@ -394,6 +395,7 @@ pub fn missing_contract_findings(missing: &[&str]) -> Vec<Finding> {
     missing
         .iter()
         .map(|name| Finding {
+            axes: Vec::new(),
             severity: Severity::Warning,
             category: "Missing Dependency Contract".to_string(),
             message: format!(
@@ -434,6 +436,7 @@ mod tests {
     fn critical_finding(category: &str, target: &str) -> Finding {
         Finding {
             severity: Severity::Critical,
+            axes: Vec::new(),
             category: category.to_string(),
             message: format!("Breaking change in {}", target),
             type_name: None,
@@ -445,6 +448,7 @@ mod tests {
     fn warning_finding(category: &str, target: &str) -> Finding {
         Finding {
             severity: Severity::Warning,
+            axes: Vec::new(),
             category: category.to_string(),
             message: format!("Warning change in {}", target),
             type_name: None,
@@ -456,6 +460,7 @@ mod tests {
     fn info_finding(category: &str, target: &str) -> Finding {
         Finding {
             severity: Severity::Info,
+            axes: Vec::new(),
             category: category.to_string(),
             message: format!("Info change in {}", target),
             type_name: None,
