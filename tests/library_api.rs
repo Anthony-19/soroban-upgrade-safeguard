@@ -40,7 +40,8 @@ fn library_identical_upgrade_is_safe_from_files() {
 
     assert!(report.is_safe(), "identical builds must be safe");
     assert_eq!(
-        report.critical_count(), 0,
+        report.critical_count(),
+        0,
         "identical builds have no criticals"
     );
 }

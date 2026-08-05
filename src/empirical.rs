@@ -208,7 +208,7 @@ pub fn validate_scval_type(
         }
         ScSpecTypeDef::Vec(vec_def) => {
             match val {
-                ScVal::Vec(sc_vec) => {
+                ScVal::Vec(Some(sc_vec)) => {
                     for (i, elem) in sc_vec.0.iter().enumerate() {
                         validate_scval_type(elem, &vec_def.element_type, spec, &format!("{}[{}]", path, i))?;
                     }
@@ -219,7 +219,7 @@ pub fn validate_scval_type(
         }
         ScSpecTypeDef::Map(map_def) => {
             match val {
-                ScVal::Map(sc_map) => {
+                ScVal::Map(Some(sc_map)) => {
                     for (i, entry) in sc_map.0.iter().enumerate() {
                         validate_scval_type(&entry.key, &map_def.key_type, spec, &format!("{}.key[{}]", path, i))?;
                         validate_scval_type(&entry.val, &map_def.value_type, spec, &format!("{}.val[{}]", path, i))?;
@@ -231,7 +231,7 @@ pub fn validate_scval_type(
         }
         ScSpecTypeDef::Tuple(tuple_def) => {
             match val {
-                ScVal::Vec(sc_vec) => {
+                ScVal::Vec(Some(sc_vec)) => {
                     let elements = &sc_vec.0;
                     let expected_types = &tuple_def.value_types;
                     if elements.len() != expected_types.len() {
@@ -273,7 +273,7 @@ pub fn validate_scval_udt(
 ) -> Result<(), String> {
     if let Some(struct_def) = spec.structs.get(udt_name) {
         match val {
-            ScVal::Map(sc_map) => {
+            ScVal::Map(Some(sc_map)) => {
                 let entries = &sc_map.0;
                 for field in struct_def.fields.iter() {
                     let f_name = field.name.to_string();
@@ -296,7 +296,7 @@ pub fn validate_scval_udt(
                 }
                 Ok(())
             }
-            ScVal::Vec(sc_vec) => {
+            ScVal::Vec(Some(sc_vec)) => {
                 let elements = &sc_vec.0;
                 if elements.len() != struct_def.fields.len() {
                     return Err(format!("{}: struct field count mismatch (expected {}, got {})", path, struct_def.fields.len(), elements.len()));
@@ -318,7 +318,7 @@ pub fn validate_scval_udt(
                     Err(format!("{}: invalid enum variant '{}' for enum '{}'", path, name, udt_name))
                 }
             }
-            ScVal::Vec(sc_vec) => {
+            ScVal::Vec(Some(sc_vec)) => {
                 let elements = &sc_vec.0;
                 if elements.is_empty() {
                     return Err(format!("{}: empty vec for enum '{}'", path, udt_name));
@@ -368,7 +368,7 @@ pub fn validate_scval_udt(
                     None => Err(format!("{}: invalid union variant '{}' for union '{}'", path, name, udt_name)),
                 }
             }
-            ScVal::Vec(sc_vec) => {
+            ScVal::Vec(Some(sc_vec)) => {
                 let elements = &sc_vec.0;
                 if elements.is_empty() {
                     return Err(format!("{}: empty vec for union '{}'", path, udt_name));
@@ -426,13 +426,13 @@ pub fn find_scval_candidates(
         }
     }
     match val {
-        ScVal::Vec(sc_vec) => {
-            for elem in &sc_vec.0 {
+        ScVal::Vec(Some(sc_vec)) => {
+            for elem in sc_vec.0.iter() {
                 find_scval_candidates(elem, udt_name, old_spec, candidates);
             }
         }
-        ScVal::Map(sc_map) => {
-            for entry in &sc_map.0 {
+        ScVal::Map(Some(sc_map)) => {
+            for entry in sc_map.0.iter() {
                 find_scval_candidates(&entry.key, udt_name, old_spec, candidates);
                 find_scval_candidates(&entry.val, udt_name, old_spec, candidates);
             }
