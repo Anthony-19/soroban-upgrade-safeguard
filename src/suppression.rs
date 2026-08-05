@@ -222,6 +222,53 @@ impl SuppressionConfig {
     pub fn is_suppressed(&self, finding: &Finding) -> bool {
         self.matching_rule(finding).is_some()
     }
+
+    /// Validate the config on its own, without running a comparison.
+    ///
+    /// Parsing problems already surface at load time (see
+    /// [`Self::load_from_path`]); this second pass catches rules that parse but
+    /// can never match anything — most usefully a rule naming a `category` the
+    /// tool never emits, which would otherwise silently never fire. It needs no
+    /// WASM inputs, so a team can check a `.safeguard.toml` in isolation.
+    pub fn validate(&self) -> ConfigValidation {
+        let unknown_categories = self
+            .rules
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| !is_known_category(&rule.category))
+            .map(|(i, rule)| (i + 1, rule.category.clone()))
+            .collect();
+        ConfigValidation { unknown_categories }
+    }
+}
+
+/// Whether `category` is one the tool can actually emit as a finding category.
+///
+/// The valid set is shared with the report layer rather than duplicated: a
+/// category is recognized exactly when the report has remediation guidance for
+/// it, which by construction covers every category the diff stage emits. A rule
+/// naming anything outside this set can never match a real finding.
+pub fn is_known_category(category: &str) -> bool {
+    crate::report::get_remediation_guidance(category).is_some()
+}
+
+/// The outcome of [`SuppressionConfig::validate`].
+///
+/// A config is valid when this carries no problems. Today the only class of
+/// problem detected is a rule naming an unknown category, but the type leaves
+/// room to grow (e.g. rules that match nothing during a run).
+#[derive(Debug, Default)]
+pub struct ConfigValidation {
+    /// `(1-based rule number, category)` for every rule whose `category` the
+    /// tool never emits.
+    pub unknown_categories: Vec<(usize, String)>,
+}
+
+impl ConfigValidation {
+    /// Whether the config is free of detected problems.
+    pub fn is_valid(&self) -> bool {
+        self.unknown_categories.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -325,5 +372,68 @@ mod tests {
 
         assert!(config.is_suppressed(&finding("Function Removed", Some("legacy_init"))));
         assert!(!config.is_suppressed(&finding("Function Removed", Some("transfer"))));
+    }
+
+    #[test]
+    fn validate_accepts_a_config_of_known_categories() {
+        let config = SuppressionConfig::from_toml_str(
+            r#"
+            [[suppress]]
+            category = "Struct Field Removed"
+            target   = "Data.amount"
+
+            [[suppress]]
+            category = "Function Removed"
+            target   = "legacy_init"
+            "#,
+        )
+        .unwrap();
+
+        let validation = config.validate();
+        assert!(validation.is_valid());
+        assert!(validation.unknown_categories.is_empty());
+    }
+
+    #[test]
+    fn validate_flags_a_rule_with_an_unknown_category() {
+        // "Struct Field Reordded" is a misspelling of "Struct Field Reordered";
+        // the tool never emits it, so the rule could never match.
+        let config = SuppressionConfig::from_toml_str(
+            r#"
+            [[suppress]]
+            category = "Function Removed"
+            target   = "legacy_init"
+
+            [[suppress]]
+            category = "Struct Field Reordded"
+            target   = "Data.amount"
+            "#,
+        )
+        .unwrap();
+
+        let validation = config.validate();
+        assert!(!validation.is_valid());
+        assert_eq!(validation.unknown_categories.len(), 1);
+        // Reported as the 2nd rule, with the offending category.
+        assert_eq!(validation.unknown_categories[0].0, 2);
+        assert_eq!(validation.unknown_categories[0].1, "Struct Field Reordded");
+    }
+
+    #[test]
+    fn is_known_category_matches_the_emitted_set() {
+        assert!(is_known_category("Struct Field Removed"));
+        assert!(is_known_category("Environment"));
+        assert!(!is_known_category("Totally Made Up Category"));
+    }
+
+    #[test]
+    fn malformed_config_is_a_clear_specific_error() {
+        // A key with spaces is not valid TOML.
+        let err = SuppressionConfig::from_toml_str("this is not = valid").unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.to_lowercase().contains("suppression config"),
+            "error should name the suppression config, got: {message}"
+        );
     }
 }

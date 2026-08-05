@@ -165,23 +165,6 @@ struct Args {
     #[arg(long)]
     no_color: bool,
 
-    /// Suppress decorative and progress output; the report and exit code are unchanged.
-    #[arg(long)]
-    quiet: bool,
-
-    /// Control when ANSI color is used. --no-color overrides this option.
-    #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
-    color: ColorMode,
-
-    /// Allow HTTP connections for RPC when the host is localhost/127.0.0.1.
-    /// Without this flag only HTTPS URLs are accepted.
-    #[arg(long)]
-    allow_http_local: bool,
-
-    /// Expected SHA-256 hash (hex) of the on-chain WASM baseline.
-    #[arg(long, value_name = "HEX_HASH")]
-    expected_wasm_hash: Option<String>,
-
     /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
     #[arg(long, value_name = "MANIFEST_PATH")]
     manifest: Option<PathBuf>,
@@ -524,6 +507,12 @@ fn main() -> Result<()> {
         colored::control::set_override(false);
     } else if args.color == ColorMode::Always {
         colored::control::set_override(true);
+    }
+
+    // Config-validation mode: check a suppression config on its own and exit,
+    // before any WASM inputs are required.
+    if let Some(path) = &args.validate_config {
+        return validate_suppression_config(path);
     }
 
     let is_batch = args.manifest.is_some() || (args.old_dir.is_some() && args.new_dir.is_some());
@@ -1520,6 +1509,51 @@ fn compare_contracts(
     }
 
     Ok(report)
+}
+
+/// Validate a suppression config in isolation and exit with a status that
+/// reflects the outcome: `0` when the config is valid, `1` when it is malformed
+/// or names a category the tool never emits. Requires no WASM inputs.
+fn validate_suppression_config(path: &Path) -> Result<()> {
+    println!("Validating suppression config: {}", path.display());
+
+    // Parsing (and file-read) problems surface here as a clear, specific error.
+    let config = match SuppressionConfig::load_from_path(path) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("{}", format!("❌ {e}").red().bold());
+            std::process::exit(1);
+        }
+    };
+
+    println!("  Parsed {} rule(s).", config.rules.len());
+
+    let validation = config.validate();
+    if validation.is_valid() {
+        println!("{}", "✅ Config is valid.".green().bold());
+        return Ok(());
+    }
+
+    for (rule_number, category) in &validation.unknown_categories {
+        eprintln!(
+            "{}",
+            format!(
+                "❌ Rule #{rule_number}: unknown category '{category}' — the tool never emits \
+                 this category, so this rule can never match.",
+            )
+            .red()
+        );
+    }
+    eprintln!(
+        "{}",
+        format!(
+            "\n{} rule(s) name an unknown category. Fix the category name(s) above.",
+            validation.unknown_categories.len()
+        )
+        .red()
+        .bold()
+    );
+    std::process::exit(1);
 }
 
 fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {
