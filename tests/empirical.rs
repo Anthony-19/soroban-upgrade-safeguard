@@ -14,6 +14,7 @@ use soroban_upgrade_safeguard::diff::{Finding, Severity};
 
 fn make_contract_data_entry(key: ScVal, val: ScVal) -> ContractDataEntry {
     ContractDataEntry {
+        ext: stellar_xdr::curr::ExtensionPoint::V0,
         contract: ScAddress::Contract(stellar_xdr::curr::Hash([0; 32])),
         key,
         val,
@@ -55,13 +56,14 @@ fn test_struct_validation() {
         struct_name.clone(),
         ScSpecUdtStructV0 {
             doc: StringM::default(),
+            lib: StringM::default(),
             name: "MyStruct".try_into().unwrap(),
             fields: VecM::try_from(fields).unwrap(),
         },
     );
 
     // Map-based struct value representing { field_a: 42, field_b: 100 }
-    let struct_val = ScVal::Map(ScMap(
+    let struct_val = ScVal::Map(Some(ScMap(
         vec![
             ScMapEntry {
                 key: ScVal::Symbol("field_a".try_into().unwrap()),
@@ -77,7 +79,7 @@ fn test_struct_validation() {
         ]
         .try_into()
         .unwrap(),
-    ));
+    )));
 
     // Validate against old spec
     assert!(validate_scval_udt(&struct_val, "MyStruct", &old_spec, "struct_test").is_ok());
@@ -100,6 +102,7 @@ fn test_struct_validation() {
         struct_name.clone(),
         ScSpecUdtStructV0 {
             doc: StringM::default(),
+            lib: StringM::default(),
             name: "MyStruct".try_into().unwrap(),
             fields: VecM::try_from(new_fields).unwrap(),
         },
@@ -124,6 +127,7 @@ fn test_json_loading_and_empirical_check() {
         "Balance".to_string(),
         ScSpecUdtStructV0 {
             doc: StringM::default(),
+            lib: StringM::default(),
             name: "Balance".try_into().unwrap(),
             fields: VecM::try_from(fields).unwrap(),
         },
@@ -141,6 +145,7 @@ fn test_json_loading_and_empirical_check() {
         "Balance".to_string(),
         ScSpecUdtStructV0 {
             doc: StringM::default(),
+            lib: StringM::default(),
             name: "Balance".try_into().unwrap(),
             fields: VecM::try_from(new_fields).unwrap(),
         },
@@ -148,14 +153,14 @@ fn test_json_loading_and_empirical_check() {
 
     // Create entry key and value
     let key = ScVal::Symbol("my_balance".try_into().unwrap());
-    let val = ScVal::Map(ScMap(
+    let val = ScVal::Map(Some(ScMap(
         vec![ScMapEntry {
             key: ScVal::Symbol("amount".try_into().unwrap()),
             val: ScVal::U64(500),
         }]
         .try_into()
         .unwrap(),
-    ));
+    )));
 
     let entry = make_contract_data_entry(key, val);
     let entry_b64 = entry.to_xdr_base64(Limits::none()).unwrap();
@@ -173,6 +178,7 @@ fn test_json_loading_and_empirical_check() {
 
     // Run empirical check
     let structural_findings = vec![Finding {
+        axes: Vec::new(),
         severity: Severity::Critical,
         category: "Struct Field Type Changed".to_string(),
         message: "Struct field changed type".to_string(),

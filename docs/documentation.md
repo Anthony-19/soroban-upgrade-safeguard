@@ -638,6 +638,10 @@ Earlier versions folded the event guess into the category string itself. Those n
 
 New rules should use the stable names. `Error Enum …` categories are unrelated to events and were never remapped.
 
+> **Full reference**: The [Finding Category Reference](finding-categories.md) page
+> documents every category with its exact suppression string, default severity,
+> trigger description, and detailed remediation guidance.
+
 ## Rule Registry
 
 Every detection rule has a stable `rule_id` that is independent of the human

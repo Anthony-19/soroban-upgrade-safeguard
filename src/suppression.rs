@@ -45,6 +45,38 @@ use crate::error::Error;
 /// The default config file name looked up in the current working directory.
 pub const DEFAULT_CONFIG_FILE: &str = ".safeguard.toml";
 
+/// Gating policy configuration for compatibility axes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PolicyConfig {
+    #[serde(default = "default_true")]
+    pub gate_storage_layout: bool,
+    #[serde(default = "default_true")]
+    pub gate_call_abi: bool,
+    #[serde(default = "default_false")]
+    pub gate_event_indexer: bool,
+    #[serde(default = "default_false")]
+    pub gate_source_level: bool,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            gate_storage_layout: true,
+            gate_call_abi: true,
+            gate_event_indexer: false,
+            gate_source_level: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_false() -> bool {
+    false
+}
+
 /// A parsed suppression config: a flat list of reviewed acknowledgements.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -57,12 +89,26 @@ pub struct SuppressionConfig {
     #[serde(default, rename = "suppress")]
     #[cfg(not(feature = "unstable"))]
     pub(crate) rules: Vec<SuppressionRule>,
+
+    /// Gating policy for compatibility axes.
+    #[serde(default)]
+    #[cfg(feature = "unstable")]
+    pub policy: PolicyConfig,
+    /// Gating policy for compatibility axes.
+    #[serde(default)]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) policy: PolicyConfig,
 }
 
 impl SuppressionConfig {
     /// Get reference to raw slice of rules.
     pub fn rules(&self) -> &[SuppressionRule] {
         &self.rules
+    }
+
+    /// Get the gating policy configuration.
+    pub fn policy(&self) -> &PolicyConfig {
+        &self.policy
     }
 }
 
@@ -99,6 +145,15 @@ pub struct SuppressionRule {
 }
 
 impl SuppressionRule {
+    /// Create a new suppression rule.
+    pub fn new(category: impl Into<String>, target: Option<impl Into<String>>, reason: Option<impl Into<String>>) -> Self {
+        SuppressionRule {
+            category: category.into(),
+            target: target.map(|s| s.into()),
+            reason: reason.map(|s| s.into()),
+        }
+    }
+
     /// Get the category to match.
     pub fn category(&self) -> &str {
         &self.category
@@ -178,6 +233,7 @@ mod tests {
     fn finding(category: &str, target: Option<&str>) -> Finding {
         Finding {
             severity: Severity::Critical,
+            axes: Vec::new(),
             category: category.to_string(),
             message: "irrelevant to matching".to_string(),
             type_name: target.map(|t| t.split('.').next().unwrap().to_string()),

@@ -26,6 +26,7 @@ use soroban_upgrade_safeguard::diff::{Finding, Severity};
 fn make_finding(severity: Severity, category: &str, target: &str) -> Finding {
     Finding {
         severity,
+        axes: Vec::new(),
         category: category.to_string(),
         message: format!("{} on {}", category, target),
         type_name: None,
