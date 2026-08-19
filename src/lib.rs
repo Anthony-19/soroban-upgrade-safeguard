@@ -8,12 +8,12 @@ pub mod color;
 #[cfg(not(feature = "unstable"))]
 mod color;
 
+#[cfg(not(feature = "unstable"))]
+mod color;
 #[cfg(feature = "unstable")]
 pub mod dependency;
 #[cfg(not(feature = "unstable"))]
 mod dependency;
-#[cfg(not(feature = "unstable"))]
-mod color;
 
 #[cfg(feature = "unstable")]
 pub mod diff;
@@ -71,6 +71,11 @@ pub mod spec_json;
 mod spec_json;
 
 #[cfg(feature = "unstable")]
+pub mod storage_inference;
+#[cfg(not(feature = "unstable"))]
+mod storage_inference;
+
+#[cfg(feature = "unstable")]
 pub mod suppression;
 #[cfg(not(feature = "unstable"))]
 mod suppression;
@@ -121,7 +126,7 @@ pub fn compare_wasm_bytes_with_options(
     old_wasm: &[u8],
     new_wasm: &[u8],
     options: &CompareOptions<'_>,
- ) -> Result<SafetyReport> {
+) -> Result<SafetyReport> {
     let empty_suppressions = SuppressionConfig::default();
     let suppressions = options.suppressions.unwrap_or(&empty_suppressions);
 
