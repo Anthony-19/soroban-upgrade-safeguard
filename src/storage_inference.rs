@@ -23,6 +23,16 @@ pub enum Durability {
     Temporary,
 }
 
+impl Durability {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Instance => "instance",
+            Self::Persistent => "persistent",
+            Self::Temporary => "temporary",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageOperation {
@@ -180,6 +190,13 @@ pub fn infer_storage_with_limits(
                                 evidence: vec![format!("call {name}")],
                             });
                         }
+                    } else if matches!(op, Operator::CallIndirect { .. }) {
+                        result.gaps.push(CoverageGap {
+                            function: Some(function.clone()),
+                            reason: "indirect call prevents reliable storage reachability analysis"
+                                .into(),
+                            evidence: vec!["call_indirect".into()],
+                        });
                     }
                 }
                 current_function = Some(format!("function_{}", result.instruction_count));
@@ -252,5 +269,18 @@ mod tests {
             Some((StorageOperation::Set, Some(Durability::Instance)))
         );
         assert_eq!(classify_host_call("env::random"), None);
+    }
+
+    #[test]
+    fn classifies_all_supported_durabilities() {
+        assert_eq!(
+            classify_host_call("env::storage_get_persistent"),
+            Some((StorageOperation::Get, Some(Durability::Persistent)))
+        );
+        assert_eq!(
+            classify_host_call("env::storage_remove_temporary"),
+            Some((StorageOperation::Remove, Some(Durability::Temporary)))
+        );
+        assert_eq!(Durability::Instance.label(), "instance");
     }
 }

@@ -88,6 +88,7 @@ mod suppression;
 // Stable public API exports at the root
 pub use crate::diff::{Finding, Severity};
 pub use crate::report::{ReportedFinding, SafetyReport};
+pub use crate::storage_schema::{StorageReconciliation, StorageSchema, StorageSchemaComparison};
 
 use std::path::Path;
 
@@ -95,6 +96,35 @@ use anyhow::{Context, Result};
 
 use crate::spec::ContractSpec;
 use crate::suppression::SuppressionConfig;
+
+/// Infer and reconcile storage use for a single compiled contract.
+pub fn analyze_wasm_storage_schema(
+    wasm: &[u8],
+    schema: &StorageSchema,
+) -> Result<StorageReconciliation> {
+    let metadata =
+        parser::extract_metadata(wasm).context("Failed to analyze storage use in WASM")?;
+    Ok(schema.reconcile(&metadata.storage))
+}
+
+/// Infer and reconcile storage use for both sides of an upgrade.
+pub fn compare_wasm_storage_schemas(
+    old_wasm: &[u8],
+    old_schema: &StorageSchema,
+    new_wasm: &[u8],
+    new_schema: &StorageSchema,
+) -> Result<StorageSchemaComparison> {
+    let old = parser::extract_metadata(old_wasm)
+        .context("Failed to analyze storage use in the old WASM")?;
+    let new = parser::extract_metadata(new_wasm)
+        .context("Failed to analyze storage use in the new WASM")?;
+    Ok(storage_schema::compare_storage_schemas(
+        old_schema,
+        &old.storage,
+        new_schema,
+        &new.storage,
+    ))
+}
 
 /// Compare two Soroban contract builds supplied as raw WASM byte slices.
 pub fn compare_wasm_bytes(old_wasm: &[u8], new_wasm: &[u8]) -> Result<SafetyReport> {
