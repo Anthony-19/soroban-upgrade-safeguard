@@ -76,6 +76,11 @@ pub mod storage_inference;
 mod storage_inference;
 
 #[cfg(feature = "unstable")]
+pub mod storage_schema;
+#[cfg(not(feature = "unstable"))]
+mod storage_schema;
+
+#[cfg(feature = "unstable")]
 pub mod suppression;
 #[cfg(not(feature = "unstable"))]
 mod suppression;
