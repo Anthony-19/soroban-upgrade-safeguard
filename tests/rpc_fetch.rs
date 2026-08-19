@@ -111,7 +111,7 @@ fn start_mock_rpc(instance_xdr: String, code_xdr: String) -> (String, Arc<TcpLis
             let body_str = serde_json::to_string(&body).unwrap();
 
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
                 body_str.len(),
                 body_str
             );
@@ -147,7 +147,7 @@ fn start_mock_rpc_not_found() -> (String, Arc<TcpListener>) {
         });
         let body_str = serde_json::to_string(&body).unwrap();
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
             body_str.len(),
             body_str
         );
@@ -215,7 +215,7 @@ fn start_mock_rpc_with(responses: Vec<serde_json::Value>) -> (String, Arc<TcpLis
                 let _ = stream.read(&mut buf);
                 let body = serde_json::to_string(&resp).unwrap();
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
                     body.len(),
                     body
                 );
