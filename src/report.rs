@@ -15,10 +15,11 @@ pub enum AxisStatus {
     Warning,
     Failed,
 }
-
 /// A finding as it appears in the report, augmented with suppression state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportedFinding {
+    #[serde(default)]
+    pub rule_id: String,
     #[serde(flatten)]
     #[cfg(feature = "unstable")]
     pub finding: Finding,
@@ -27,11 +28,11 @@ pub struct ReportedFinding {
     pub(crate) finding: Finding,
 
     /// The compatibility axes this finding was classified under.
-    #[serde(default)]
+    #[serde(default, skip)]
     #[cfg(feature = "unstable")]
     pub axes: Vec<crate::diff::CompatibilityAxis>,
     /// The compatibility axes this finding was classified under.
-    #[serde(default)]
+    #[serde(default, skip)]
     #[cfg(not(feature = "unstable"))]
     pub(crate) axes: Vec<crate::diff::CompatibilityAxis>,
 
@@ -209,6 +210,22 @@ pub struct SafetyReport {
     /// Findings from empirical validation, if performed.
     #[cfg(not(feature = "unstable"))]
     pub(crate) empirical_findings: Vec<crate::empirical::EmpiricalFinding>,
+    #[cfg(feature = "unstable")]
+    pub settings: ReportSettings,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) settings: ReportSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ReportSettings {
+    pub strict: bool,
+    pub explain: bool,
+    pub max_suppressions: Option<usize>,
+    pub allow_targetless: Option<bool>,
+    pub max_xdr_depth: u32,
+    pub max_xdr_len: usize,
+    pub max_entries: usize,
+    pub max_walk_depth: usize,
 }
 
 impl SafetyReport {
@@ -367,8 +384,7 @@ impl AnalysisScope {
 }
 
 /// Whether storage schema analysis was performed.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub enum StorageScopeState {
     #[default]
     NotAnalyzed,
@@ -447,40 +463,35 @@ fn contract_identity_label(name: Option<&str>, version: Option<&str>) -> String 
     }
 }
 
-/// Rewrite the report's emoji markers as bracketed ASCII text markers.
-///
-/// The report leans on emoji to carry meaning — `🔴`/`🟡`/`🔵` for severity,
-/// `✅`/`❌` for the verdict, and `🔕` for suppressed findings. On a terminal,
-/// CI log viewer, or font that cannot render them, that signal degrades to
-/// boxes, question marks, or nothing. When the `--ascii` flag is set, every
-/// rendered format is passed through this function so the severity stays legible
-/// with both color and emoji disabled.
-///
-/// The replacements are chosen so the severity remains distinguishable without
-/// color: each severity keeps a distinct word (`[CRITICAL]`, `[WARN]`, `[INFO]`).
 pub fn asciify_markers(text: &str) -> String {
-    text
-        // Suppressed lines already contain the literal "[SUPPRESSED]" text, so
-        // strip the bell emoji and its trailing space rather than duplicate it.
-        .replace("🔕 ", "")
+    text.replace("🔕 ", "")
         .replace('🔕', "[SUPPRESSED]")
         .replace('🔴', "[CRITICAL]")
         .replace('🟡', "[WARN]")
         .replace('🔵', "[INFO]")
         .replace('✅', "[PASS]")
         .replace('❌', "[FAIL]")
-        // The warning sign renders as U+26A0 optionally followed by U+FE0F.
         .replace("⚠️", "[WARNING]")
         .replace('⚠', "[WARNING]")
 }
 
 impl SafetyReport {
-    pub fn new(
+    pub fn new(diff: &DiffReport) -> Self {
+        Self::with_suppressions(
+            diff,
+            &SuppressionConfig::default(),
+            false,
+            false,
+            &crate::limits::ResourcePolicy::default(),
+        )
+    }
+
+    pub fn new_with_specs(
         diff: &DiffReport,
         old_spec: &crate::spec::ContractSpec,
         new_spec: &crate::spec::ContractSpec,
     ) -> Self {
-        Self::with_suppressions(
+        Self::with_suppressions_with_specs(
             diff,
             &SuppressionConfig::default(),
             false,
@@ -492,10 +503,19 @@ impl SafetyReport {
 
     pub fn noop(old_wasm_size: usize, new_wasm_size: usize) -> Self {
         let mut axis_verdicts = HashMap::new();
-        axis_verdicts.insert(crate::diff::CompatibilityAxis::StorageLayout, AxisStatus::Passed);
+        axis_verdicts.insert(
+            crate::diff::CompatibilityAxis::StorageLayout,
+            AxisStatus::Passed,
+        );
         axis_verdicts.insert(crate::diff::CompatibilityAxis::CallAbi, AxisStatus::Passed);
-        axis_verdicts.insert(crate::diff::CompatibilityAxis::EventIndexer, AxisStatus::Passed);
-        axis_verdicts.insert(crate::diff::CompatibilityAxis::SourceLevel, AxisStatus::Passed);
+        axis_verdicts.insert(
+            crate::diff::CompatibilityAxis::EventIndexer,
+            AxisStatus::Passed,
+        );
+        axis_verdicts.insert(
+            crate::diff::CompatibilityAxis::SourceLevel,
+            AxisStatus::Passed,
+        );
 
         let mut gated_axes = HashSet::new();
         gated_axes.insert(crate::diff::CompatibilityAxis::StorageLayout);
@@ -539,11 +559,35 @@ impl SafetyReport {
             gated_axes,
             empirical: false,
             empirical_findings: Vec::new(),
+            settings: ReportSettings::default(),
         }
     }
 
     /// Compute a safety report, applying a suppression config.
     pub fn with_suppressions(
+        diff: &DiffReport,
+        suppressions: &SuppressionConfig,
+        explain: bool,
+        strict: bool,
+        policy: &crate::limits::ResourcePolicy,
+    ) -> Self {
+        let empty = crate::spec::ContractSpec::default();
+        let mut report =
+            Self::with_suppressions_with_specs(diff, suppressions, explain, strict, &empty, &empty);
+        report.settings = ReportSettings {
+            strict,
+            explain,
+            max_suppressions: suppressions.max_suppressions,
+            allow_targetless: suppressions.allow_targetless,
+            max_xdr_depth: policy.max_xdr_depth,
+            max_xdr_len: policy.max_xdr_len,
+            max_entries: policy.max_entries,
+            max_walk_depth: policy.max_walk_depth,
+        };
+        report
+    }
+
+    pub fn with_suppressions_with_specs(
         diff: &DiffReport,
         suppressions: &SuppressionConfig,
         explain: bool,
@@ -563,10 +607,19 @@ impl SafetyReport {
         let mut cascade_critical_count = 0;
 
         let mut axis_verdicts = HashMap::new();
-        axis_verdicts.insert(crate::diff::CompatibilityAxis::StorageLayout, AxisStatus::Passed);
+        axis_verdicts.insert(
+            crate::diff::CompatibilityAxis::StorageLayout,
+            AxisStatus::Passed,
+        );
         axis_verdicts.insert(crate::diff::CompatibilityAxis::CallAbi, AxisStatus::Passed);
-        axis_verdicts.insert(crate::diff::CompatibilityAxis::EventIndexer, AxisStatus::Passed);
-        axis_verdicts.insert(crate::diff::CompatibilityAxis::SourceLevel, AxisStatus::Passed);
+        axis_verdicts.insert(
+            crate::diff::CompatibilityAxis::EventIndexer,
+            AxisStatus::Passed,
+        );
+        axis_verdicts.insert(
+            crate::diff::CompatibilityAxis::SourceLevel,
+            AxisStatus::Passed,
+        );
 
         let mut gated_axes = HashSet::new();
         let axes_list = vec![
@@ -576,12 +629,19 @@ impl SafetyReport {
             crate::diff::CompatibilityAxis::SourceLevel,
         ];
         for axis in axes_list {
-            let is_gated = strict || match axis {
-                crate::diff::CompatibilityAxis::StorageLayout => suppressions.policy.gate_storage_layout,
-                crate::diff::CompatibilityAxis::CallAbi => suppressions.policy.gate_call_abi,
-                crate::diff::CompatibilityAxis::EventIndexer => suppressions.policy.gate_event_indexer,
-                crate::diff::CompatibilityAxis::SourceLevel => suppressions.policy.gate_source_level,
-            };
+            let is_gated = strict
+                || match axis {
+                    crate::diff::CompatibilityAxis::StorageLayout => {
+                        suppressions.policy.gate_storage_layout
+                    }
+                    crate::diff::CompatibilityAxis::CallAbi => suppressions.policy.gate_call_abi,
+                    crate::diff::CompatibilityAxis::EventIndexer => {
+                        suppressions.policy.gate_event_indexer
+                    }
+                    crate::diff::CompatibilityAxis::SourceLevel => {
+                        suppressions.policy.gate_source_level
+                    }
+                };
             if is_gated {
                 gated_axes.insert(axis);
             }
@@ -638,7 +698,14 @@ impl SafetyReport {
                 diff.findings
                     .iter()
                     .find(|f| f.target.as_deref() == Some(rt))
-                    .map(|f| crate::diff::classify_finding_axes(&f.category, f.type_name.as_deref(), old_spec, new_spec))
+                    .map(|f| {
+                        crate::diff::classify_finding_axes(
+                            &f.category,
+                            f.type_name.as_deref(),
+                            old_spec,
+                            new_spec,
+                        )
+                    })
                     .unwrap_or_else(|| {
                         crate::diff::classify_finding_axes(
                             &finding.category,
@@ -656,23 +723,51 @@ impl SafetyReport {
                 )
             };
 
-            if !suppressed {
+            // Environment metadata is reported for visibility, but it is not a
+            // contract compatibility finding and therefore cannot gate safety.
+            //
+            // `Info` findings describe backwards-compatible additions (a new
+            // function, a new union case), so they are never allowed to move an
+            // axis off `Passed`. `Warning` findings only fail under `--strict`;
+            // a `Critical` fails whenever its axis is gated.
+            if !suppressed
+                && finding.severity != Severity::Info
+                && finding.category != "Environment"
+            {
                 for axis in &axes {
-                    let is_gated = strict || match axis {
-                        crate::diff::CompatibilityAxis::StorageLayout => suppressions.policy.gate_storage_layout,
-                        crate::diff::CompatibilityAxis::CallAbi => suppressions.policy.gate_call_abi,
-                        crate::diff::CompatibilityAxis::EventIndexer => suppressions.policy.gate_event_indexer,
-                        crate::diff::CompatibilityAxis::SourceLevel => suppressions.policy.gate_source_level,
+                    let is_gated = strict
+                        || match axis {
+                            crate::diff::CompatibilityAxis::StorageLayout => {
+                                suppressions.policy.gate_storage_layout
+                            }
+                            crate::diff::CompatibilityAxis::CallAbi => {
+                                suppressions.policy.gate_call_abi
+                            }
+                            crate::diff::CompatibilityAxis::EventIndexer => {
+                                suppressions.policy.gate_event_indexer
+                            }
+                            crate::diff::CompatibilityAxis::SourceLevel => {
+                                suppressions.policy.gate_source_level
+                            }
+                        };
+
+                    // A Warning only fails the run under `--strict`; a Critical
+                    // fails wherever the policy gates its axis.
+                    let fails = match finding.severity {
+                        Severity::Critical => is_gated,
+                        _ => strict,
                     };
 
-                    let new_status = if is_gated {
+                    let new_status = if fails {
                         AxisStatus::Failed
                     } else {
                         AxisStatus::Warning
                     };
 
                     let current = axis_verdicts.entry(*axis).or_insert(AxisStatus::Passed);
-                    if *current == AxisStatus::Passed || (*current == AxisStatus::Warning && new_status == AxisStatus::Failed) {
+                    if *current == AxisStatus::Passed
+                        || (*current == AxisStatus::Warning && new_status == AxisStatus::Failed)
+                    {
                         *current = new_status;
                     }
                 }
@@ -682,6 +777,7 @@ impl SafetyReport {
                 .entry(finding.category.clone())
                 .or_default()
                 .push(ReportedFinding {
+                    rule_id: canonical_rule_id(&finding.category),
                     finding: finding.clone(),
                     axes,
                     suppressed,
@@ -690,7 +786,9 @@ impl SafetyReport {
                 });
         }
 
-        let is_safe = !axis_verdicts.values().any(|&status| status == AxisStatus::Failed);
+        let is_safe = !axis_verdicts
+            .values()
+            .any(|&status| status == AxisStatus::Failed);
 
         Self {
             critical_count,
@@ -717,6 +815,11 @@ impl SafetyReport {
             gated_axes,
             empirical: false,
             empirical_findings: Vec::new(),
+            settings: ReportSettings {
+                strict,
+                explain,
+                ..ReportSettings::default()
+            },
         }
     }
 
@@ -805,18 +908,18 @@ impl SafetyReport {
             provenance: crate::render::Provenance {
                 tool_version: env!("CARGO_PKG_VERSION").to_string(),
                 timestamp,
-                inputs: vec![],
+                inputs: [self.old_interface_hash, self.new_interface_hash]
+                    .into_iter()
+                    .flatten()
+                    .map(|hash| hash.to_hex())
+                    .collect(),
             },
             is_safe: self.is_safe,
             strict: self.strict,
             counts: SeverityCounts {
-                critical: self
-                    .critical_count
-                    .saturating_sub(self.suppressed_critical_count),
-                warning: self
-                    .warning_count
-                    .saturating_sub(self.suppressed_warning_count),
-                info: self.info_count.saturating_sub(self.suppressed_info_count),
+                critical: self.critical_count,
+                warning: self.warning_count,
+                info: self.info_count,
             },
             suppressed_count: self.suppressed_count,
             total_findings: self.total_findings,
@@ -828,374 +931,14 @@ impl SafetyReport {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-            axis_verdicts: self.axis_verdicts.clone(),
-            gated_axes: self.gated_axes.clone(),
+            axis_verdicts: self.axis_verdicts.iter().map(|(k, v)| (*k, *v)).collect(),
+            gated_axes: self.gated_axes.iter().copied().collect(),
             findings_by_axis,
             empirical: self.empirical,
             empirical_findings: self.empirical_findings.clone(),
         }
     }
 
-<<<<<<< HEAD
-    /// Generate a structured, human-readable text output for the CLI.
-    ///
-    /// When `ascii` is `true` (the `--ascii` flag), emoji severity/verdict
-    /// markers are replaced with bracketed text equivalents via
-    /// [`asciify_markers`] so the report stays legible on terminals that cannot
-    /// render emoji.
-    pub fn generate_summary_text(&self, explain: bool, ascii: bool) -> String {
-        let mut output = String::new();
-        output.push_str(
-            &"\n========================================\n"
-                .bold()
-                .to_string(),
-        );
-        output.push_str(
-            &"    SOROBAN UPGRADE SAFETY REPORT\n"
-                .bold()
-                .cyan()
-                .to_string(),
-        );
-        if self.strict {
-            output.push_str(&"    [STRICT MODE ACTIVE]\n".bold().yellow().to_string());
-        }
-        output.push_str(
-            &"========================================\n"
-                .bold()
-                .to_string(),
-        );
-
-        let status = if self.is_safe {
-            "✅ PASSED (No breaking changes detected)".green().bold()
-        } else if self.strict && self.critical_count == 0 {
-            "❌ FAILED (Warnings detected in strict mode)".red().bold()
-        } else {
-            "❌ FAILED (Critical breaking changes detected)"
-            self.failed_status_label().red().bold()
-        };
-        output.push_str(&format!("Status: {}\n", status));
-        // Show contract identity when available.
-        if self.old_contract_name.is_some()
-            || self.new_contract_name.is_some()
-            || self.old_contract_version.is_some()
-            || self.new_contract_version.is_some()
-        {
-            let old_label = contract_identity_label(
-                self.old_contract_name.as_deref(),
-                self.old_contract_version.as_deref(),
-            );
-            let new_label = contract_identity_label(
-                self.new_contract_name.as_deref(),
-                self.new_contract_version.as_deref(),
-            );
-            output.push_str(&format!("Contract: {} → {}\n", old_label, new_label));
-        }
-        output.push_str(&format!("Scope:  {}\n", self.scope.summary_line().dimmed()));
-        let storage_status = self.scope.storage_status_line();
-        let storage_status = if self.scope.storage_analyzed() {
-            storage_status.dimmed()
-        } else {
-            // No schema: make the "not analyzed" gap visible rather than dim.
-            storage_status.yellow()
-        };
-        output.push_str(&format!("        {}\n", storage_status));
-
-        // Spec-section integrity summary (non-zero section count or duplicates).
-        if self.scope.old_spec_section_count > 1 || self.scope.new_spec_section_count > 1 {
-            output.push_str(
-                &format!(
-                    "        Spec sections: old={}, new={} (multi-section WASMs detected)\n",
-                    self.scope.old_spec_section_count, self.scope.new_spec_section_count,
-                )
-                .yellow()
-                .to_string(),
-            );
-        }
-        let all_dups: Vec<String> = self
-            .scope
-            .old_duplicate_names
-            .iter()
-            .map(|n| format!("old:{n}"))
-            .chain(
-                self.scope
-                    .new_duplicate_names
-                    .iter()
-                    .map(|n| format!("new:{n}")),
-            )
-            .collect();
-        if !all_dups.is_empty() {
-            output.push_str(
-                &format!(
-                    "        Duplicate entries detected: {}\n",
-                    all_dups.join(", ")
-                )
-                .red()
-                .bold()
-        };
-        output.push_str(&format!("Status: {}\n", status));
-
-        let crit_str = if self.critical_count > 0 {
-            self.critical_count.to_string().red().bold()
-        } else {
-            self.critical_count.to_string().green()
-        };
-        let warn_str = if self.warning_count > 0 {
-            self.warning_count.to_string().yellow().bold()
-        } else {
-            self.warning_count.to_string().normal()
-        };
-        let info_str = self.info_count.to_string().blue();
-
-        output.push_str(&format!("Critical: {}\n", crit_str));
-        output.push_str(&format!("Warnings: {}\n", warn_str));
-        output.push_str(&format!("Info:     {}\n", info_str));
-        if self.suppressed_count > 0 {
-            output.push_str(&format!(
-                "Suppressed: {}\n",
-                self.suppressed_count.to_string().magenta().bold()
-            ));
-        }
-        let bump = self.recommended_bump();
-        let bump_str = match bump {
-            "major" => "major".red().bold(),
-            "minor" => "minor".yellow().bold(),
-            "patch" => "patch".green().bold(),
-            _ => bump.normal(),
-        };
-        output.push_str(&format!("Recommended Bump: {}\n", bump_str));
-        output.push_str(
-            &"----------------------------------------\n\n"
-                .dimmed()
-                .to_string(),
-        );
-
-        if self.total_findings == 0 {
-            if self.is_noop {
-                output.push_str(&"No-op upgrade detected: the old and new WASM binaries are byte-identical.\n".green().bold().to_string());
-                output.push_str(&"The full analysis pipeline was skipped because there are no differences to report.\n".green().to_string());
-            } else {
-                output.push_str(&"No relevant changes detected. The exported interface is identical in its exports and types.\n".green().to_string());
-            }
-            output.push_str(&format!("\n{}\n", STORAGE_NOT_VERIFIED_NOTE.dimmed()));
-            self.append_metrics_text(&mut output);
-            output.push_str(&"No relevant changes detected. The upgrade is identical in its exports and types.\n".green().to_string());
-            return if ascii { asciify_markers(&output) } else { output };
-        }
-
-        // Sort categories to have consistent output; surface Environment first.
-        let mut categories: Vec<&String> = self.findings_by_category.keys().collect();
-        categories.sort_by(|a, b| {
-            let rank = |name: &str| if name == "Environment" { 0 } else { 1 };
-            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
-        });
-
-        for category in categories {
-            output.push_str(
-                &format!("--- [{}] ---\n", category.to_ascii_uppercase())
-                    .magenta()
-                    .bold()
-                    .to_string(),
-            );
-            let group = self.findings_by_category.get(category).unwrap();
-            for reported in group {
-                let finding = &reported.finding;
-
-                if reported.suppressed {
-                    // Suppressed findings are still listed, but clearly marked
-                    // and dimmed so they read as acknowledged, not active.
-                    let label = format!("🔕 [SUPPRESSED] {}", finding.message)
-                        .dimmed()
-                        .to_string();
-                    output.push_str(&format!("{}\n", label));
-                    if let Some(reason) = &reported.suppression_reason {
-                        output
-                            .push_str(&format!("    ↳ reason: {}\n", reason).dimmed().to_string());
-                    }
-                    if explain {
-                        if let Some(remediation) = &reported.remediation {
-                            output.push_str(
-                                &format!("    ↳ guidance: {}\n", remediation)
-                                    .dimmed()
-                                    .to_string(),
-                            );
-                        }
-                    }
-                    continue;
-                }
-
-                let formatted = match finding.severity {
-                    Severity::Critical => format!("🔴 {}", finding.message).red(),
-                    Severity::Warning => format!("🟡 {}", finding.message).yellow(),
-                    Severity::Info => format!("🔵 {}", finding.message).cyan(),
-                };
-                output.push_str(&format!("{}\n", formatted));
-                if explain {
-                    if let Some(remediation) = &reported.remediation {
-                        output.push_str(
-                            &format!("    ↳ guidance: {}\n", remediation)
-                                .green()
-                                .to_string(),
-                        );
-                    }
-                }
-            }
-            output.push('\n');
-        }
-
-        if !self.is_safe {
-            if self.strict && self.critical_count == 0 {
-                output.push_str(
-                    &"⚠️  ACTION REQUIRED: Strict mode is active and warnings were detected.\n"
-                        .yellow()
-                        .bold()
-                        .to_string(),
-                );
-                output.push_str(
-                    &"These warnings must be resolved or strict mode disabled to proceed.\n"
-                        .yellow()
-                        .to_string(),
-                );
-            } else {
-                output.push_str(&"⚠️  ACTION REQUIRED: The new contract version modifies existing storage layouts or function interfaces.\n".red().bold().to_string());
-                output.push_str(&"Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n".red().to_string());
-            }
-        }
-
-        if ascii {
-            asciify_markers(&output)
-        } else {
-            output
-        }
-    }
-
-    /// Generate a structured Markdown output.
-    ///
-    /// When `ascii` is `true` (the `--ascii` flag), emoji markers are replaced
-    /// with bracketed text equivalents via [`asciify_markers`].
-    pub fn generate_summary_markdown(&self, ascii: bool) -> String {
-        let mut output = String::new();
-        output.push_str("# Soroban Upgrade Safety Report\n\n");
-
-        let status = if self.is_safe {
-            "✅ PASSED (No breaking changes detected)"
-        } else {
-            "❌ FAILED (Critical breaking changes detected)"
-        };
-        output.push_str(&format!("## Status: {}\n\n", status));
-
-        if self.old_contract_name.is_some()
-            || self.new_contract_name.is_some()
-            || self.old_contract_version.is_some()
-            || self.new_contract_version.is_some()
-        {
-            let old_label = contract_identity_label(
-                self.old_contract_name.as_deref(),
-                self.old_contract_version.as_deref(),
-            );
-            let new_label = contract_identity_label(
-                self.new_contract_name.as_deref(),
-                self.new_contract_version.as_deref(),
-            );
-            output.push_str(&format!("**Contract**: {} → {}\n\n", old_label, new_label));
-        }
-
-        output.push_str("### Summary Table\n\n");
-        output.push_str("| Finding Severity | Count |\n");
-        output.push_str("| :--- | :--- |\n");
-        output.push_str(&format!("| **Critical** | {} |\n", self.critical_count));
-        output.push_str(&format!("| **Warning** | {} |\n", self.warning_count));
-        output.push_str(&format!("| **Info** | {} |\n", self.info_count));
-        if self.suppressed_count > 0 {
-            output.push_str(&format!("| **Suppressed** | {} |\n", self.suppressed_count));
-        }
-        output.push_str(&format!(
-            "\n**Recommended SemVer Bump**: `{}`\n\n",
-            self.recommended_bump()
-        ));
-        output.push_str("---\n\n");
-
-        if self.total_findings == 0 {
-            if self.is_noop {
-                output.push_str("**No-op upgrade detected**: the old and new WASM binaries are byte-identical.\n\n");
-                output.push_str("The full analysis pipeline was skipped because there are no differences to report.\n");
-            } else {
-                output.push_str("No relevant changes detected. The exported interface is identical in its exports and types.\n");
-            }
-
-        if let Some(source) = &self.baseline_source {
-            output.push_str(&format!("**Baseline Source**: `{}`\n\n", source));
-        }
-        if let Some(hash) = &self.verified_code_hash {
-            output.push_str(&format!("**Verified Code Hash**: `{}`\n\n", hash));
-        }
-        if let Some(bd) = &self.baseline_diff {
-            output.push_str(&format!(
-                "**Baseline**: {} new, {} persisting, {} resolved (vs. tool v{}){}\n\n",
-                bd.new_count,
-                bd.persisting_count,
-                bd.resolved.len(),
-                bd.baseline_tool_version,
-                if bd.fail_on_new_only {
-                    " — verdict reflects new findings only"
-                } else {
-                    ""
-                },
-            ));
-        }
-
-        output.push_str("---\n\n");
-
-        if self.total_findings == 0 {
-            output.push_str("No relevant changes detected. The exported interface is identical in its exports and types.\n\n");
-            output.push_str(&format!("> {}\n", STORAGE_NOT_VERIFIED_NOTE));
-            self.append_metrics_markdown(&mut output);
-            output.push_str("No relevant changes detected. The upgrade is identical in its exports and types.\n");
-            return if ascii { asciify_markers(&output) } else { output };
-        }
-
-        // Sort categories to have consistent output; surface Environment first.
-        let mut categories: Vec<&String> = self.findings_by_category.keys().collect();
-        categories.sort_by(|a, b| {
-            let rank = |name: &str| if name == "Environment" { 0 } else { 1 };
-            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
-        });
-
-        for category in categories {
-            output.push_str(&format!("### {}\n\n", category));
-            let group = self.findings_by_category.get(category).unwrap();
-            for reported in group {
-                let finding = &reported.finding;
-
-                if reported.suppressed {
-                    output.push_str(&format!("- 🔕 **[SUPPRESSED]** {}\n", finding.message));
-                    if let Some(reason) = &reported.suppression_reason {
-                        output.push_str(&format!("  - ↳ reason: {}\n", reason));
-                    }
-                    continue;
-                }
-
-                let emoji = match finding.severity {
-                    Severity::Critical => "🔴",
-                    Severity::Warning => "🟡",
-                    Severity::Info => "🔵",
-                };
-                output.push_str(&format!("- {} {}\n", emoji, finding.message));
-            }
-            output.push('\n');
-        }
-
-        if !self.is_safe {
-            output.push_str("### ⚠️ Action Required\n\n");
-            output.push_str("- The new contract version modifies existing storage layouts or function interfaces.\n");
-            output.push_str("- Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n");
-        }
-
-        if ascii {
-            asciify_markers(&output)
-        } else {
-            output
-        }
-=======
     pub fn to_json(&self) -> RenderableReport {
         self.to_renderable()
     }
@@ -1206,15 +949,32 @@ impl SafetyReport {
 
     pub fn generate_summary_markdown(&self) -> String {
         self.to_renderable().to_markdown()
->>>>>>> main
     }
 }
 
 /// Returns remediation/explanation guidance for a given finding category.
 ///
-/// Delegates to [`FindingCategory`] which is the single source of truth.
+/// Delegates to [`crate::category::FindingCategory`] which is the single source
+/// of truth.
 pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
     crate::category::FindingCategory::find_by_name(category).map(|c| c.remediation())
+}
+
+fn canonical_rule_id(category: &str) -> String {
+    category
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
 }
 
 /// Return the current UTC time as an RFC 3339 / ISO 8601 string.
@@ -1223,8 +983,6 @@ fn chrono_now_rfc3339() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = now.as_secs();
-    let nanos = now.subsec_nanos();
-
     let mut days = secs / 86400;
     let time_secs = secs % 86400;
 
@@ -1260,14 +1018,8 @@ fn chrono_now_rfc3339() -> String {
     let second = time_secs % 60;
 
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        year,
-        month,
-        day,
-        hour,
-        minute,
-        second,
-        nanos / 1_000_000
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hour, minute, second
     )
 }
 
@@ -1301,6 +1053,7 @@ mod tests {
 
         fn make_finding(severity: Severity, category: &str) -> ReportedFinding {
             ReportedFinding {
+                rule_id: canonical_rule_id(category),
                 finding: Finding {
                     severity,
                     axes: Vec::new(),
@@ -1342,6 +1095,7 @@ mod tests {
             gated_axes: HashSet::new(),
             empirical: false,
             empirical_findings: Vec::new(),
+            settings: ReportSettings::default(),
         };
 
         assert_eq!(report.recommended_bump(), "patch");
@@ -1398,8 +1152,14 @@ mod tests {
             root_target: Some("Data".to_string()),
         });
 
-        let report =
-            SafetyReport::with_suppressions(&diff, &SuppressionConfig::default(), false, false, &crate::spec::ContractSpec::default(), &crate::spec::ContractSpec::default());
+        let report = SafetyReport::with_suppressions_with_specs(
+            &diff,
+            &SuppressionConfig::default(),
+            false,
+            false,
+            &crate::spec::ContractSpec::default(),
+            &crate::spec::ContractSpec::default(),
+        );
 
         assert_eq!(report.critical_root_count, 1);
         assert_eq!(report.cascade_critical_count, 1);
@@ -1439,7 +1199,14 @@ mod tests {
         )
         .unwrap();
 
-        let report = SafetyReport::with_suppressions(&diff, &suppressions, false, false, &crate::spec::ContractSpec::default(), &crate::spec::ContractSpec::default());
+        let report = SafetyReport::with_suppressions_with_specs(
+            &diff,
+            &suppressions,
+            false,
+            false,
+            &crate::spec::ContractSpec::default(),
+            &crate::spec::ContractSpec::default(),
+        );
 
         let root_finding = report
             .findings_by_category
@@ -1490,7 +1257,14 @@ mod tests {
         )
         .unwrap();
 
-        let report = SafetyReport::with_suppressions(&diff, &suppressions, false, false, &crate::spec::ContractSpec::default(), &crate::spec::ContractSpec::default());
+        let report = SafetyReport::with_suppressions_with_specs(
+            &diff,
+            &suppressions,
+            false,
+            false,
+            &crate::spec::ContractSpec::default(),
+            &crate::spec::ContractSpec::default(),
+        );
 
         let root_finding = &report
             .findings_by_category

@@ -498,7 +498,10 @@ impl FindingCategory {
 
     /// Look up a variant by its exact category string.
     pub fn find_by_name(s: &str) -> Option<FindingCategory> {
-        FindingCategory::all().iter().find(|c| c.as_str() == s).copied()
+        FindingCategory::all()
+            .iter()
+            .find(|c| c.as_str() == s)
+            .copied()
     }
 
     /// Generate the full finding-category reference as Markdown.
@@ -547,11 +550,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for cat in FindingCategory::all() {
             let s = cat.as_str();
-            assert!(
-                seen.insert(s),
-                "Duplicate category string: '{}'",
-                s
-            );
+            assert!(seen.insert(s), "Duplicate category string: '{}'", s);
         }
     }
 

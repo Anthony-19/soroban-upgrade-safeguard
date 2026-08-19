@@ -62,25 +62,13 @@ pub struct CoverageGap {
     pub evidence: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageInference {
     pub observations: Vec<StorageObservation>,
     pub gaps: Vec<CoverageGap>,
     pub instruction_count: usize,
     pub call_count: usize,
     pub truncated: bool,
-}
-
-impl Default for StorageInference {
-    fn default() -> Self {
-        Self {
-            observations: Vec::new(),
-            gaps: Vec::new(),
-            instruction_count: 0,
-            call_count: 0,
-            truncated: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]

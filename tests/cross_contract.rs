@@ -43,10 +43,6 @@ fn critical(category: &str, target: &str) -> Finding {
     make_finding(Severity::Critical, category, target)
 }
 
-fn warning(category: &str, target: &str) -> Finding {
-    make_finding(Severity::Warning, category, target)
-}
-
 fn info(category: &str, target: &str) -> Finding {
     make_finding(Severity::Info, category, target)
 }

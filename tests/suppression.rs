@@ -112,7 +112,10 @@ fn rule_id_based_suppression_matches_stable_identifier() {
 
     let (json, code) = run(Some(&config));
 
-    assert_eq!(code, 0, "suppressing by rule_id should pass the run");
+    assert_eq!(
+        code, 1,
+        "unrelated critical findings must still fail the run"
+    );
     assert_eq!(json["suppressed_count"].as_u64().unwrap(), 1);
     assert!(
         findings(&json)

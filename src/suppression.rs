@@ -37,7 +37,8 @@
 use std::fs;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::diff::Finding;
 use crate::error::Error;
@@ -46,7 +47,7 @@ use crate::error::Error;
 pub const DEFAULT_CONFIG_FILE: &str = ".safeguard.toml";
 
 /// Gating policy configuration for compatibility axes.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PolicyConfig {
     #[serde(default = "default_true")]
     pub gate_storage_layout: bool,
@@ -79,8 +80,10 @@ fn default_false() -> bool {
 
 /// A parsed suppression config: a flat list of reviewed acknowledgements.
 #[non_exhaustive]
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SuppressionConfig {
+    pub max_suppressions: Option<usize>,
+    pub allow_targetless: Option<bool>,
     /// The acknowledged findings, one `[[suppress]]` table per entry.
     #[serde(default, rename = "suppress")]
     #[cfg(feature = "unstable")]
@@ -114,12 +117,16 @@ impl SuppressionConfig {
 
 /// A single whitelisted finding, keyed by category and (optionally) target.
 #[non_exhaustive]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SuppressionRule {
+    #[serde(default)]
+    pub rule_id: Option<String>,
     /// The finding category to match exactly (e.g. `"Struct Field Type Changed"`).
+    #[serde(default)]
     #[cfg(feature = "unstable")]
     pub category: String,
     /// The finding category to match exactly (e.g. `"Struct Field Type Changed"`).
+    #[serde(default)]
     #[cfg(not(feature = "unstable"))]
     pub(crate) category: String,
 
@@ -142,15 +149,42 @@ pub struct SuppressionRule {
     #[serde(default)]
     #[cfg(not(feature = "unstable"))]
     pub(crate) reason: Option<String>,
+
+    #[serde(default)]
+    #[cfg(feature = "unstable")]
+    pub author: Option<String>,
+    #[serde(default)]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) author: Option<String>,
+    #[serde(default)]
+    #[cfg(feature = "unstable")]
+    pub expiry: Option<String>,
+    #[serde(default)]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) expiry: Option<String>,
+    #[serde(default)]
+    #[cfg(feature = "unstable")]
+    pub fingerprint: Option<String>,
+    #[serde(default)]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) fingerprint: Option<String>,
 }
 
 impl SuppressionRule {
     /// Create a new suppression rule.
-    pub fn new(category: impl Into<String>, target: Option<impl Into<String>>, reason: Option<impl Into<String>>) -> Self {
+    pub fn new(
+        category: impl Into<String>,
+        target: Option<impl Into<String>>,
+        reason: Option<impl Into<String>>,
+    ) -> Self {
         SuppressionRule {
+            rule_id: None,
             category: category.into(),
             target: target.map(|s| s.into()),
             reason: reason.map(|s| s.into()),
+            author: None,
+            expiry: None,
+            fingerprint: None,
         }
     }
 
@@ -173,8 +207,50 @@ impl SuppressionRule {
 impl SuppressionRule {
     /// Whether this rule matches `finding` exactly on both category and target.
     fn matches(&self, finding: &Finding) -> bool {
-        self.category == finding.category && self.target.as_deref() == finding.target.as_deref()
+        let category_matches = self.category == finding.category
+            || self
+                .rule_id
+                .as_deref()
+                .map(|id| id == canonical_rule_id(&finding.category))
+                .unwrap_or(false);
+        if !category_matches || self.target.as_deref() != finding.target.as_deref() {
+            return false;
+        }
+        match &self.fingerprint {
+            Some(expected) => {
+                let input = format!(
+                    "category:{}\ntarget:{}\nmessage:{}",
+                    finding.category,
+                    finding.target.as_deref().unwrap_or(""),
+                    finding
+                        .message
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let digest = Sha256::digest(input.as_bytes());
+                expected.eq_ignore_ascii_case(&hex::encode(digest))
+            }
+            None => true,
+        }
     }
+}
+
+fn canonical_rule_id(category: &str) -> String {
+    category
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
 }
 
 impl SuppressionConfig {
@@ -235,10 +311,59 @@ impl SuppressionConfig {
             .rules
             .iter()
             .enumerate()
-            .filter(|(_, rule)| !is_known_category(&rule.category))
+            .filter(|(_, rule)| {
+                !is_known_category(&rule.category)
+                    && !rule
+                        .rule_id
+                        .as_deref()
+                        .map(is_known_rule_id)
+                        .unwrap_or(false)
+            })
             .map(|(i, rule)| (i + 1, rule.category.clone()))
             .collect();
-        ConfigValidation { unknown_categories }
+        let mut errors = Vec::new();
+        let max_allowed = self.max_suppressions.unwrap_or(10);
+        if self.rules.len() > max_allowed {
+            errors.push(format!(
+                "configured suppressions ({}) exceed the maximum limit of {}",
+                self.rules.len(),
+                max_allowed
+            ));
+        }
+
+        let targetless_count = self
+            .rules
+            .iter()
+            .filter(|rule| rule.target.is_none())
+            .count();
+        if targetless_count > 0 && !self.allow_targetless.unwrap_or(false) {
+            errors.push("targetless suppressions are disabled".to_string());
+        }
+        if targetless_count > 3 {
+            errors.push(format!(
+                "targetless suppressions ({targetless_count}) exceed the ceiling of 3"
+            ));
+        }
+
+        for (index, rule) in self.rules.iter().enumerate() {
+            if let Some(expiry) = &rule.expiry {
+                match expiry_is_past(expiry) {
+                    Ok(true) => errors.push(format!(
+                        "rule #{} for '{}' expired on {}",
+                        index + 1,
+                        rule.category,
+                        expiry
+                    )),
+                    Ok(false) => {}
+                    Err(error) => errors.push(format!("rule #{}: {error}", index + 1)),
+                }
+            }
+        }
+
+        ConfigValidation {
+            unknown_categories,
+            errors,
+        }
     }
 }
 
@@ -252,6 +377,12 @@ pub fn is_known_category(category: &str) -> bool {
     crate::report::get_remediation_guidance(category).is_some()
 }
 
+fn is_known_rule_id(rule_id: &str) -> bool {
+    crate::category::FindingCategory::all()
+        .iter()
+        .any(|category| canonical_rule_id(category.as_str()) == rule_id)
+}
+
 /// The outcome of [`SuppressionConfig::validate`].
 ///
 /// A config is valid when this carries no problems. Today the only class of
@@ -262,13 +393,61 @@ pub struct ConfigValidation {
     /// `(1-based rule number, category)` for every rule whose `category` the
     /// tool never emits.
     pub unknown_categories: Vec<(usize, String)>,
+    pub errors: Vec<String>,
 }
 
 impl ConfigValidation {
     /// Whether the config is free of detected problems.
     pub fn is_valid(&self) -> bool {
-        self.unknown_categories.is_empty()
+        self.unknown_categories.is_empty() && self.errors.is_empty()
     }
+}
+
+fn expiry_is_past(expiry: &str) -> Result<bool, String> {
+    let mut parts = expiry.split('-');
+    let year: i32 = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| format!("invalid expiry '{expiry}', expected YYYY-MM-DD"))?;
+    let month: u32 = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| format!("invalid expiry '{expiry}', expected YYYY-MM-DD"))?;
+    let day: u32 = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| format!("invalid expiry '{expiry}', expected YYYY-MM-DD"))?;
+    if parts.next().is_some() || !valid_date(year, month, day) {
+        return Err(format!("invalid expiry '{expiry}', expected YYYY-MM-DD"));
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Ok(days_from_civil(year, month, day) < (now / 86_400) as i64)
+}
+
+fn valid_date(year: i32, month: u32, day: u32) -> bool {
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    day >= 1 && day <= days
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let adjusted_year = year - i32::from(month <= 2);
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = month as i32 + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day as i32 - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    (era * 146_097 + day_of_era - 719_468) as i64
 }
 
 #[cfg(test)]

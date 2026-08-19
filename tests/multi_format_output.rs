@@ -3,7 +3,7 @@
 //! These verify that the binary correctly emits the same analysis to
 //! multiple formats and destinations in a single run.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Absolute path to a fixture WASM under `tests/wasm/`.

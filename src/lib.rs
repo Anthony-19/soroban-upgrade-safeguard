@@ -8,8 +8,11 @@ pub mod color;
 #[cfg(not(feature = "unstable"))]
 mod color;
 
+#[cfg(feature = "unstable")]
+pub mod config;
 #[cfg(not(feature = "unstable"))]
-mod color;
+mod config;
+
 #[cfg(feature = "unstable")]
 pub mod dependency;
 #[cfg(not(feature = "unstable"))]
@@ -39,6 +42,11 @@ mod interface_hash;
 pub mod loader;
 #[cfg(not(feature = "unstable"))]
 mod loader;
+
+#[cfg(feature = "unstable")]
+pub mod limits;
+#[cfg(not(feature = "unstable"))]
+mod limits;
 
 #[cfg(feature = "unstable")]
 pub mod mapper;
@@ -137,8 +145,10 @@ pub fn compare_wasm_bytes(old_wasm: &[u8], new_wasm: &[u8]) -> Result<SafetyRepo
     let new_spec = ContractSpec::from_entries(&new_meta.spec);
 
     let diff_report = diff::compare(&old_spec, &new_spec);
-    Ok(SafetyReport::new(&diff_report, &old_spec, &new_spec)
-        .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash()))
+    Ok(
+        SafetyReport::new_with_specs(&diff_report, &old_spec, &new_spec)
+            .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash()),
+    )
 }
 
 /// Compare two Soroban contract builds read from WASM files on disk.
@@ -181,7 +191,7 @@ pub fn compare_wasm_bytes_with_options(
         &mut diff_report,
     );
 
-    let mut safety_report = SafetyReport::with_suppressions(
+    let mut safety_report = SafetyReport::with_suppressions_with_specs(
         &diff_report,
         suppressions,
         options.explain,

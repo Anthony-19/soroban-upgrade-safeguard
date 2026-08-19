@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 
 use ring::digest::{digest, SHA256};
 use stellar_xdr::curr::{
-    ContractDataEntry, ContractExecutable, ExtensionPoint, Hash, LedgerEntry, LedgerEntryData, LedgerKey,
-    LedgerKeyContractCode, LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
+    ContractDataEntry, ContractExecutable, ExtensionPoint, Hash, LedgerEntry, LedgerEntryData,
+    LedgerKey, LedgerKeyContractCode, LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal,
+    WriteXdr,
 };
 use wasmparser::Parser;
 
@@ -99,6 +100,7 @@ fn wasm_module_from_bytes(
 
     Ok(WasmModule {
         path: display_path,
+        sha256: sha256_hex(&bytes),
         bytes,
     })
 }
@@ -376,9 +378,10 @@ pub fn fetch_instance_storage_from_rpc(
     contract_id: &str,
     rpc_url: &str,
 ) -> Result<Vec<ContractDataEntry>, Error> {
-    let strkey = stellar_strkey::Strkey::from_string(contract_id).map_err(|e| Error::InvalidInput {
-        details: format!("Invalid contract ID '{}': {}", contract_id, e),
-    })?;
+    let strkey =
+        stellar_strkey::Strkey::from_string(contract_id).map_err(|e| Error::InvalidInput {
+            details: format!("Invalid contract ID '{}': {}", contract_id, e),
+        })?;
 
     let contract_bytes = match strkey {
         stellar_strkey::Strkey::Contract(c) => c.0,

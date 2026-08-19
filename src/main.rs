@@ -23,6 +23,8 @@ enum OutputFormat {
     Json,
     /// Markdown document suitable for PR descriptions and comments.
     Markdown,
+    /// GitHub Actions workflow annotations.
+    GithubActions,
 }
 
 impl std::fmt::Display for OutputFormat {
@@ -31,6 +33,7 @@ impl std::fmt::Display for OutputFormat {
             OutputFormat::Text => write!(f, "text"),
             OutputFormat::Json => write!(f, "json"),
             OutputFormat::Markdown => write!(f, "markdown"),
+            OutputFormat::GithubActions => write!(f, "github-actions"),
         }
     }
 }
@@ -43,8 +46,9 @@ impl std::str::FromStr for OutputFormat {
             "text" => Ok(OutputFormat::Text),
             "json" => Ok(OutputFormat::Json),
             "markdown" | "md" => Ok(OutputFormat::Markdown),
+            "github-actions" | "gha" => Ok(OutputFormat::GithubActions),
             _ => Err(format!(
-                "Unknown format '{s}'. Supported: text, json, markdown"
+                "Unknown format '{s}'. Supported: text, json, markdown, github-actions"
             )),
         }
     }
@@ -56,6 +60,7 @@ impl OutputFormat {
             OutputFormat::Json => "json",
             OutputFormat::Markdown => "md",
             OutputFormat::Text => "txt",
+            OutputFormat::GithubActions => "txt",
         }
     }
 }
@@ -66,12 +71,20 @@ impl OutputFormat {
 struct OutputSpec {
     format: OutputFormat,
     path: Option<PathBuf>,
+    inherit_format: bool,
 }
 
 impl std::str::FromStr for OutputSpec {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if is_windows_absolute_path(s) {
+            return Ok(OutputSpec {
+                format: OutputFormat::Text,
+                path: Some(PathBuf::from(s)),
+                inherit_format: true,
+            });
+        }
         if let Some((fmt, path)) = s.split_once(':') {
             let format: OutputFormat = fmt
                 .parse()
@@ -79,14 +92,38 @@ impl std::str::FromStr for OutputSpec {
             Ok(OutputSpec {
                 format,
                 path: Some(PathBuf::from(path)),
+                inherit_format: false,
+            })
+        } else if let Ok(format) = s.parse() {
+            Ok(OutputSpec {
+                format,
+                path: None,
+                inherit_format: false,
+            })
+        } else if looks_like_output_path(s) {
+            Ok(OutputSpec {
+                format: OutputFormat::Text,
+                path: Some(PathBuf::from(s)),
+                inherit_format: true,
             })
         } else {
-            let format: OutputFormat = s.parse().map_err(|_| {
-                format!("Invalid format '{s}'. Use 'format:path' or one of: text, json, markdown")
-            })?;
-            Ok(OutputSpec { format, path: None })
+            Err(format!(
+                "Invalid format '{s}'. Use a known format, FORMAT:PATH, or a file path"
+            ))
         }
     }
+}
+
+fn is_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
+fn looks_like_output_path(value: &str) -> bool {
+    value.contains(['/', '\\']) || Path::new(value).extension().is_some()
 }
 
 /// Output format for a re-rendered report. JSON is excluded: re-rendering a
@@ -130,9 +167,9 @@ struct Args {
     #[arg(long, value_enum)]
     format: Option<OutputFormat>,
 
-    /// Output specification(s) in FORMAT:PATH format (e.g. json:report.json).
-    /// Can be specified multiple times. FORMAT is one of: text, json, markdown.
-    #[arg(long, value_name = "FORMAT:PATH", num_args = 1)]
+    /// Output specification(s) in FORMAT:PATH format (e.g. json:report.json),
+    /// or a bare path whose format comes from --format. Can be repeated.
+    #[arg(long, value_name = "FORMAT:PATH|PATH", num_args = 1)]
     output: Vec<OutputSpec>,
 
     /// Stellar/Soroban Contract ID to fetch from on-chain (e.g. C...)
@@ -152,6 +189,10 @@ struct Args {
     /// Do not load any suppression config, including the default .safeguard.toml.
     #[arg(long, conflicts_with = "config")]
     no_config: bool,
+
+    /// Validate a suppression config without analyzing WASM inputs.
+    #[arg(long, value_name = "CONFIG")]
+    validate_config: Option<PathBuf>,
 
     /// Print a concise remediation explanation for each finding.
     #[arg(long)]
@@ -431,7 +472,7 @@ fn run_init(args: &InitArgs) -> Result<()> {
 
     // Collect unsuppressed findings (with empty suppression config)
     let empty_suppressions = SuppressionConfig::default();
-    let safety_report = report::SafetyReport::with_suppressions(
+    let safety_report = report::SafetyReport::with_suppressions_with_specs(
         &diff_report,
         &empty_suppressions,
         false,
@@ -469,12 +510,8 @@ fn run_init(args: &InitArgs) -> Result<()> {
         content.push_str("# No findings found. Your contracts are compatible!\n");
         content.push_str("# No suppression entries needed.\n");
     } else {
-        content.push_str(
-            "# Suppressions are commented out by default. Edit this file and\n",
-        );
-        content.push_str(
-            "# remove the '#' before each [[suppress]] block you want to apply.\n\n",
-        );
+        content.push_str("# Suppressions are commented out by default. Edit this file and\n");
+        content.push_str("# remove the '#' before each [[suppress]] block you want to apply.\n\n");
 
         for (category, target) in &findings {
             content.push_str(&format!(
@@ -493,10 +530,7 @@ fn run_init(args: &InitArgs) -> Result<()> {
     file.sync_all()?;
 
     println!("✅ Generated {}", config_path.display());
-    println!(
-        "📝 Found {} finding(s) requiring attention",
-        findings.len()
-    );
+    println!("📝 Found {} finding(s) requiring attention", findings.len());
     if findings.is_empty() {
         println!("🎉 No compatibility issues detected. No suppressions needed.");
     } else {
@@ -558,12 +592,19 @@ fn main() -> Result<()> {
         // User specified explicit outputs; --format still controls stdout if not
         // already covered by an --output spec.
         let has_stdout = args.output.iter().any(|o| o.path.is_none());
+        let has_inherited_file = args.output.iter().any(|o| o.inherit_format);
         let mut outputs = args.output.clone();
-        if !has_stdout {
+        for output in &mut outputs {
+            if output.inherit_format {
+                output.format = stdout_format;
+            }
+        }
+        if args.format.is_some() && !has_stdout && !has_inherited_file {
             // Add --format (or text) as stdout output
             outputs.push(OutputSpec {
                 format: stdout_format,
                 path: None,
+                inherit_format: false,
             });
         }
         outputs
@@ -571,6 +612,7 @@ fn main() -> Result<()> {
         vec![OutputSpec {
             format: stdout_format,
             path: None,
+            inherit_format: false,
         }]
     };
 
@@ -578,8 +620,13 @@ fn main() -> Result<()> {
     // Decorative progress goes to stderr when stdout is clean (JSON/Markdown to file
     // or when stdout format would produce a clean document), or when any file output
     // is requested alongside stdout in a clean format.
-    let stdout_is_clean = outputs.iter().any(|o| o.path.is_none())
-        && (stdout_format == OutputFormat::Json || stdout_format == OutputFormat::Markdown);
+    let stdout_is_clean = outputs.iter().any(|o| {
+        o.path.is_none()
+            && matches!(
+                o.format,
+                OutputFormat::Json | OutputFormat::Markdown | OutputFormat::GithubActions
+            )
+    });
     let clean_stdout = stdout_is_clean || has_non_stdout;
     let progress = |line: String| {
         if args.quiet {
@@ -676,9 +723,18 @@ fn run_batch(
             axis_verdicts: {
                 let mut verdicts = std::collections::HashMap::new();
                 verdicts.insert(diff::CompatibilityAxis::CallAbi, report::AxisStatus::Failed);
-                verdicts.insert(diff::CompatibilityAxis::StorageLayout, report::AxisStatus::Passed);
-                verdicts.insert(diff::CompatibilityAxis::EventIndexer, report::AxisStatus::Passed);
-                verdicts.insert(diff::CompatibilityAxis::SourceLevel, report::AxisStatus::Passed);
+                verdicts.insert(
+                    diff::CompatibilityAxis::StorageLayout,
+                    report::AxisStatus::Passed,
+                );
+                verdicts.insert(
+                    diff::CompatibilityAxis::EventIndexer,
+                    report::AxisStatus::Passed,
+                );
+                verdicts.insert(
+                    diff::CompatibilityAxis::SourceLevel,
+                    report::AxisStatus::Passed,
+                );
                 verdicts
             },
             gated_axes: {
@@ -692,6 +748,7 @@ fn run_batch(
                 map.insert(
                     "contract-missing-from-new".to_string(),
                     vec![report::ReportedFinding {
+                        rule_id: "contract_missing_from_new".to_string(),
                         finding: diff::Finding {
                             severity: diff::Severity::Critical,
                             axes: vec![diff::CompatibilityAxis::CallAbi],
@@ -720,12 +777,19 @@ fn run_batch(
             },
             empirical: false,
             empirical_findings: Vec::new(),
+            settings: report::ReportSettings::default(),
         };
 
+        let file_outputs: Vec<OutputSpec> = outputs
+            .iter()
+            .filter(|output| output.path.is_some())
+            .cloned()
+            .collect();
         render_to_outputs(
             &gap_report,
-            outputs,
+            &file_outputs,
             args.explain,
+            args.ascii,
             Some(&gap.name),
             progress,
         )?;
@@ -735,6 +799,7 @@ fn run_batch(
                 &gap_report,
                 args.format.unwrap_or(OutputFormat::Text),
                 args.explain,
+                args.ascii,
             )?;
             write_report_file(
                 output_dir,
@@ -827,10 +892,16 @@ fn run_batch(
             overall_safe = false;
         }
 
+        let file_outputs: Vec<OutputSpec> = outputs
+            .iter()
+            .filter(|output| output.path.is_some())
+            .cloned()
+            .collect();
         render_to_outputs(
             &report,
-            outputs,
+            &file_outputs,
             args.explain,
+            args.ascii,
             Some(&contract_name),
             progress,
         )?;
@@ -840,6 +911,7 @@ fn run_batch(
                 &report,
                 args.format.unwrap_or(OutputFormat::Text),
                 args.explain,
+                args.ascii,
             )?;
             write_report_file(
                 output_dir,
@@ -859,6 +931,7 @@ fn run_batch(
         total,
         args.strict,
         outputs,
+        args.ascii,
         progress,
     )?;
 
@@ -898,9 +971,18 @@ fn synthesize_error_report(
         axis_verdicts: {
             let mut verdicts = std::collections::HashMap::new();
             verdicts.insert(diff::CompatibilityAxis::CallAbi, report::AxisStatus::Failed);
-            verdicts.insert(diff::CompatibilityAxis::StorageLayout, report::AxisStatus::Passed);
-            verdicts.insert(diff::CompatibilityAxis::EventIndexer, report::AxisStatus::Passed);
-            verdicts.insert(diff::CompatibilityAxis::SourceLevel, report::AxisStatus::Passed);
+            verdicts.insert(
+                diff::CompatibilityAxis::StorageLayout,
+                report::AxisStatus::Passed,
+            );
+            verdicts.insert(
+                diff::CompatibilityAxis::EventIndexer,
+                report::AxisStatus::Passed,
+            );
+            verdicts.insert(
+                diff::CompatibilityAxis::SourceLevel,
+                report::AxisStatus::Passed,
+            );
             verdicts
         },
         gated_axes: {
@@ -914,6 +996,7 @@ fn synthesize_error_report(
             map.insert(
                 "analysis-error".to_string(),
                 vec![report::ReportedFinding {
+                    rule_id: "analysis_error".to_string(),
                     finding: diff::Finding {
                         severity: diff::Severity::Critical,
                         axes: vec![diff::CompatibilityAxis::CallAbi],
@@ -937,6 +1020,7 @@ fn synthesize_error_report(
         },
         empirical: false,
         empirical_findings: Vec::new(),
+        settings: report::ReportSettings::default(),
     }
 }
 
@@ -946,6 +1030,7 @@ fn render_batch_summary(
     total_pairs: usize,
     strict: bool,
     outputs: &[OutputSpec],
+    ascii: bool,
     progress: &dyn Fn(String),
 ) -> Result<()> {
     for output in outputs {
@@ -999,7 +1084,7 @@ fn render_batch_summary(
 
                 for (name, report) in results {
                     markdown.push_str(&format!("## Details: {}\n\n", name));
-                    let report_md = report.generate_summary_markdown(args.ascii);
+                    let report_md = report.generate_summary_markdown();
                     let stripped_md = report_md.replace("# Soroban Upgrade Safety Report\n\n", "");
                     markdown.push_str(&stripped_md);
                     markdown.push_str("\n---\n\n");
@@ -1007,10 +1092,9 @@ fn render_batch_summary(
 
                 // Convert the summary status markers this arm added directly
                 // (the inner detail sections were already rendered ASCII above).
-                if args.ascii {
+                if ascii {
                     markdown = report::asciify_markers(&markdown);
                 }
-                println!("{}", markdown);
                 markdown
             }
             OutputFormat::Text => {
@@ -1018,22 +1102,6 @@ fn render_batch_summary(
                 text.push_str("========================================\n");
                 text.push_str("    SOROBAN BATCH SAFETY REPORT\n");
                 text.push_str("========================================\n");
-
-                // ASCII-only verdict markers when emoji cannot be rendered.
-                let (pass_mark, fail_mark) = if args.ascii {
-                    ("[PASS]", "[FAIL]")
-                } else {
-                    ("✅", "❌")
-                };
-
-                let status = if overall_safe {
-                    format!("{pass_mark} PASSED (All contracts safe)")
-                        .green()
-                        .bold()
-                } else {
-                    format!("{fail_mark} FAILED (Some contracts have breaking changes)")
-                        .red()
-                        .bold()
                 let status = if overall_safe {
                     "✅ PASSED (All contracts safe)".green().bold().to_string()
                 } else {
@@ -1043,13 +1111,6 @@ fn render_batch_summary(
                         .to_string()
                 };
                 text.push_str(&format!("Overall Status: {}\n\n", status));
-
-                println!("Summary of Contracts:");
-                for (name, report) in &results {
-                    let status_str = if report.is_safe {
-                        format!("{pass_mark} PASSED").green()
-                    } else {
-                        format!("{fail_mark} FAILED").red().bold()
                 text.push_str("Summary of Contracts:\n");
                 for (name, report) in results {
                     let status_str = if report.is_safe() {
@@ -1072,11 +1133,32 @@ fn render_batch_summary(
 
                 for (name, report) in results {
                     text.push_str(&format!("=== Contract: {} ===\n", name.bold().magenta()));
-                    text.push_str(&report.generate_summary_text(false));
+                    let detail = report.generate_summary_text(false);
+                    if ascii {
+                        text.push_str(&report::asciify_markers(&detail));
+                    } else {
+                        text.push_str(&detail);
+                    }
                     text.push_str("========================================\n\n");
                 }
-
-                text
+                if ascii {
+                    report::asciify_markers(&text)
+                } else {
+                    text
+                }
+            }
+            OutputFormat::GithubActions => {
+                let mut output = String::new();
+                for (name, report) in results {
+                    output.push_str(&format!("::group::{name}\n"));
+                    output.push_str(&render_github_actions(report));
+                    output.push_str("::endgroup::\n");
+                }
+                output.push_str(&format!(
+                    "Soroban Upgrade Safeguard: {}\n",
+                    if overall_safe { "PASSED" } else { "FAILED" }
+                ));
+                output
             }
         };
 
@@ -1204,7 +1286,14 @@ fn run_single(
             progress,
         )?;
 
-        render_to_outputs(&safety_report, outputs, args.explain, None, progress)?;
+        render_to_outputs(
+            &safety_report,
+            outputs,
+            args.explain,
+            args.ascii,
+            None,
+            progress,
+        )?;
 
         let is_safe = safety_report.is_safe();
         if !is_safe {
@@ -1238,11 +1327,12 @@ fn render_to_outputs(
     report: &report::SafetyReport,
     outputs: &[OutputSpec],
     explain: bool,
+    ascii: bool,
     contract_name: Option<&str>,
     progress: &dyn Fn(String),
 ) -> Result<()> {
     for output in outputs {
-        let content = render_single(report, output.format, explain)?;
+        let content = render_single(report, output.format, explain, ascii)?;
         emit_output(output, &content)?;
 
         if let Some(ref path) = output.path {
@@ -1259,12 +1349,60 @@ fn render_single(
     report: &report::SafetyReport,
     format: OutputFormat,
     explain: bool,
+    ascii: bool,
 ) -> Result<String> {
+    // JSON carries the severity as a field rather than as a marker glyph, and
+    // the GitHub Actions workflow-command syntax is already plain ASCII, so
+    // `--ascii` only affects the human-readable formats.
     match format {
         OutputFormat::Json => Ok(serde_json::to_string_pretty(&report.to_json())?),
-        OutputFormat::Markdown => Ok(report.generate_summary_markdown()),
-        OutputFormat::Text => Ok(report.generate_summary_text(explain)),
+        OutputFormat::Markdown => {
+            let markdown = report.generate_summary_markdown();
+            Ok(if ascii {
+                report::asciify_markers(&markdown)
+            } else {
+                markdown
+            })
+        }
+        OutputFormat::Text => {
+            let text = report.generate_summary_text(explain);
+            Ok(if ascii {
+                report::asciify_markers(&text)
+            } else {
+                text
+            })
+        }
+        OutputFormat::GithubActions => Ok(render_github_actions(report)),
     }
+}
+
+fn render_github_actions(report: &report::SafetyReport) -> String {
+    let mut output = String::new();
+    let mut categories: Vec<_> = report.findings_by_category().keys().collect();
+    categories.sort();
+    for category in categories {
+        if let Some(findings) = report.findings_by_category().get(category) {
+            for reported in findings {
+                let finding = reported.finding();
+                let level = if reported.suppressed() {
+                    "notice"
+                } else {
+                    match finding.severity() {
+                        diff::Severity::Critical => "error",
+                        diff::Severity::Warning => "warning",
+                        diff::Severity::Info => "notice",
+                    }
+                };
+                let message = finding.message().replace(['\r', '\n'], " ");
+                output.push_str(&format!("::{level}::[{category}] {message}\n"));
+            }
+        }
+    }
+    output.push_str(&format!(
+        "Soroban Upgrade Safeguard: {}\n",
+        if report.is_safe() { "PASSED" } else { "FAILED" }
+    ));
+    output
 }
 
 fn emit_output(spec: &OutputSpec, content: &str) -> Result<()> {
@@ -1296,9 +1434,11 @@ fn run_watch_mode(
     _args: &Args,
     _outputs: &[OutputSpec],
     _suppressions: &SuppressionConfig,
-    run_comparison: impl Fn(&impl Fn(String)) -> Result<bool>,
+    run_comparison: impl Fn(&dyn Fn(String)) -> Result<bool>,
 ) -> Result<()> {
+    use notify::Watcher;
     use std::sync::mpsc;
+    use std::time::Duration;
 
     let (tx, rx) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |res| {
@@ -1318,19 +1458,15 @@ fn run_watch_mode(
 
     eprintln!("\n👀 Watch mode active. Waiting for file changes... (Ctrl+C to stop)\n");
 
-    let mut last_event = std::time::Instant::now();
     let debounce_ms = 300;
 
     loop {
         match rx.recv_timeout(Duration::from_millis(debounce_ms)) {
             Ok(_event) => {
-                last_event = std::time::Instant::now();
                 // Brief debounce window: wait for more events
                 loop {
                     match rx.recv_timeout(Duration::from_millis(50)) {
-                        Ok(_) => {
-                            last_event = std::time::Instant::now();
-                        }
+                        Ok(_) => {}
                         Err(mpsc::RecvTimeoutError::Timeout) => break,
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
                             return Err(anyhow::anyhow!("File watcher channel disconnected"));
@@ -1500,8 +1636,15 @@ fn compare_contracts(
         &mut diff_report,
     );
 
-    let mut report = report::SafetyReport::with_suppressions(&diff_report, suppressions, *explain, *strict, &old_spec, &new_spec)
-        .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash());
+    let mut report = report::SafetyReport::with_suppressions_with_specs(
+        &diff_report,
+        suppressions,
+        *explain,
+        *strict,
+        &old_spec,
+        &new_spec,
+    )
+    .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash());
 
     report.no_timestamp = *no_timestamp;
 
@@ -1513,10 +1656,16 @@ fn compare_contracts(
         let mut entries = Vec::new();
 
         if let Some(file_path) = empirical_file {
-            progress(format!("📖 Loading empirical storage entries from: {}", file_path.display()));
+            progress(format!(
+                "📖 Loading empirical storage entries from: {}",
+                file_path.display()
+            ));
             match soroban_upgrade_safeguard::empirical::load_empirical_entries(file_path) {
                 Ok(loaded) => {
-                    progress(format!("✅ Loaded {} storage entries from file", loaded.len()));
+                    progress(format!(
+                        "✅ Loaded {} storage entries from file",
+                        loaded.len()
+                    ));
                     entries = loaded;
                 }
                 Err(e) => {
@@ -1525,19 +1674,25 @@ fn compare_contracts(
                 }
             }
         } else if let (Some(cid), Some(rpc)) = (contract_id, rpc_url) {
-            progress(format!("🌐 Fetching contract instance storage from RPC..."));
+            progress("🌐 Fetching contract instance storage from RPC...".to_string());
             match loader::fetch_instance_storage_from_rpc(cid, rpc) {
                 Ok(loaded) => {
-                    progress(format!("✅ Fetched {} instance storage entries from RPC", loaded.len()));
+                    progress(format!(
+                        "✅ Fetched {} instance storage entries from RPC",
+                        loaded.len()
+                    ));
                     entries = loaded;
                 }
                 Err(e) => {
-                    progress(format!("⚠️  Failed to fetch instance storage from RPC: {}", e));
-                    progress(format!("Limits: Stellar RPC does not support wildcard ledger enumeration. Degrading gracefully."));
+                    progress(format!(
+                        "⚠️  Failed to fetch instance storage from RPC: {}",
+                        e
+                    ));
+                    progress("Limits: Stellar RPC does not support wildcard ledger enumeration. Degrading gracefully.".to_string());
                 }
             }
         } else {
-            progress(format!("⚠️  Empirical mode requested, but no local file (--empirical-file) or RPC source (--contract-id and --rpc-url) was provided."));
+            progress("⚠️  Empirical mode requested, but no local file (--empirical-file) or RPC source (--contract-id and --rpc-url) was provided.".to_string());
         }
 
         // Run empirical checks
@@ -1592,6 +1747,9 @@ fn validate_suppression_config(path: &Path) -> Result<()> {
             )
             .red()
         );
+    }
+    for error in &validation.errors {
+        eprintln!("{}", format!("❌ {error}").red());
     }
     eprintln!(
         "{}",
@@ -1681,6 +1839,7 @@ fn render_report(
         OutputFormat::Json => Ok(serde_json::to_string_pretty(&report.to_json())?),
         OutputFormat::Markdown => Ok(report.generate_summary_markdown()),
         OutputFormat::Text => Ok(report.generate_summary_text(explain)),
+        OutputFormat::GithubActions => Ok(render_github_actions(report)),
     }
 }
 
@@ -1724,6 +1883,7 @@ fn sanitize_report_filename(contract_name: &str, format: OutputFormat) -> PathBu
         OutputFormat::Json => "json",
         OutputFormat::Markdown => "md",
         OutputFormat::Text => "txt",
+        OutputFormat::GithubActions => "txt",
     };
 
     let mut path = PathBuf::from(sanitized);

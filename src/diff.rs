@@ -234,21 +234,8 @@ pub fn compare(old: &ContractSpec, new: &ContractSpec) -> DiffReport {
 
     // Post-process to assign axes and legacy severity
     for finding in &mut report.findings {
-        finding.axes = classify_finding_axes(
-            &finding.category,
-            finding.type_name.as_deref(),
-            old,
-            new,
-        );
-        finding.severity = finding.axes
-            .iter()
-            .map(|a| a.default_severity())
-            .max_by_key(|s| match s {
-                Severity::Critical => 3,
-                Severity::Warning => 2,
-                Severity::Info => 1,
-            })
-            .unwrap_or(Severity::Info);
+        finding.axes =
+            classify_finding_axes(&finding.category, finding.type_name.as_deref(), old, new);
     }
 
     report
@@ -276,20 +263,17 @@ fn references_type(type_def: &ScSpecTypeDef, target_name: &str, spec: &ContractS
             }
             if let Some(un) = spec.unions.get(&udt_name) {
                 for case in un.cases.iter() {
-                    match case {
-                        stellar_xdr::curr::ScSpecUdtUnionCaseV0::TupleV0(t) => {
-                            for ty in t.type_.iter() {
-                                if let ScSpecTypeDef::Udt(ref f_udt) = ty {
-                                    if f_udt.name.to_string() == udt_name {
-                                        continue;
-                                    }
-                                }
-                                if references_type(ty, target_name, spec) {
-                                    return true;
+                    if let stellar_xdr::curr::ScSpecUdtUnionCaseV0::TupleV0(t) = case {
+                        for ty in t.type_.iter() {
+                            if let ScSpecTypeDef::Udt(ref f_udt) = ty {
+                                if f_udt.name.to_string() == udt_name {
+                                    continue;
                                 }
                             }
+                            if references_type(ty, target_name, spec) {
+                                return true;
+                            }
                         }
-                        _ => {}
                     }
                 }
             }
@@ -305,14 +289,17 @@ fn references_type(type_def: &ScSpecTypeDef, target_name: &str, spec: &ContractS
             references_type(&m.key_type, target_name, spec)
                 || references_type(&m.value_type, target_name, spec)
         }
-        ScSpecTypeDef::Tuple(t) => t.value_types.iter().any(|ty| references_type(ty, target_name, spec)),
+        ScSpecTypeDef::Tuple(t) => t
+            .value_types
+            .iter()
+            .any(|ty| references_type(ty, target_name, spec)),
         _ => false,
     }
 }
 
 /// Helper to check if type_name is used in any function signatures.
 fn is_type_used_in_functions(type_name: &str, spec: &ContractSpec) -> bool {
-    for (_, func) in &spec.functions {
+    for func in spec.functions.values() {
         for input in func.inputs.iter() {
             if references_type(&input.type_, type_name, spec) {
                 return true;
@@ -332,7 +319,7 @@ fn is_type_used_in_events(type_name: &str, spec: &ContractSpec) -> bool {
     if type_name.to_lowercase().contains("event") {
         return true;
     }
-    for (name, _) in &spec.structs {
+    for name in spec.structs.keys() {
         if name.to_lowercase().contains("event")
             && references_type(
                 &ScSpecTypeDef::Udt(stellar_xdr::curr::ScSpecTypeUdt {
@@ -345,7 +332,7 @@ fn is_type_used_in_events(type_name: &str, spec: &ContractSpec) -> bool {
             return true;
         }
     }
-    for (name, _) in &spec.unions {
+    for name in spec.unions.keys() {
         if name.to_lowercase().contains("event")
             && references_type(
                 &ScSpecTypeDef::Udt(stellar_xdr::curr::ScSpecTypeUdt {
@@ -579,7 +566,9 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                     report.findings.push(Finding {
                         axes: Vec::new(),
                         severity: Severity::Info,
-                        category: FindingCategory::FunctionDocumentationChanged.as_str().to_string(),
+                        category: FindingCategory::FunctionDocumentationChanged
+                            .as_str()
+                            .to_string(),
                         message,
                         type_name: None,
                         target: Some(name.clone()),
@@ -621,7 +610,9 @@ fn check_function_signature(
         report.findings.push(Finding {
             axes: Vec::new(),
             severity: Severity::Critical,
-            category: FindingCategory::FunctionSignatureChanged.as_str().to_string(),
+            category: FindingCategory::FunctionSignatureChanged
+                .as_str()
+                .to_string(),
             message: format!(
                 "Function '{}': parameter count changed from {} to {}.",
                 name,
@@ -677,7 +668,10 @@ fn check_function_signature(
                     let (category, detail) = if let Some(bytesn_msg) =
                         describe_bytesn_size_change(&old_input.type_, new_type)
                     {
-                        (FindingCategory::BytesNSizeChanged.as_str().to_string(), bytesn_msg)
+                        (
+                            FindingCategory::BytesNSizeChanged.as_str().to_string(),
+                            bytesn_msg,
+                        )
                     } else {
                         (
                             FindingCategory::ParameterTypeChanged.as_str().to_string(),
@@ -732,7 +726,10 @@ fn check_function_signature(
                 let (category, detail) = if let Some(bytesn_msg) =
                     describe_bytesn_size_change(&old_input.type_, &new_input.type_)
                 {
-                    (FindingCategory::BytesNSizeChanged.as_str().to_string(), bytesn_msg)
+                    (
+                        FindingCategory::BytesNSizeChanged.as_str().to_string(),
+                        bytesn_msg,
+                    )
                 } else {
                     (
                         FindingCategory::ParameterTypeChanged.as_str().to_string(),
@@ -786,11 +783,14 @@ fn check_function_signature(
             if !types_equal(old_out, new_out) {
                 let (category, detail) =
                     if let Some(bytesn_msg) = describe_bytesn_size_change(old_out, new_out) {
-                        (FindingCategory::BytesNSizeChanged.as_str().to_string(), bytesn_msg)
+                        (
+                            FindingCategory::BytesNSizeChanged.as_str().to_string(),
+                            bytesn_msg,
+                        )
                     } else {
                         (
-                        FindingCategory::ReturnTypeChanged.as_str().to_string(),
-                        describe_nested_type_change(old_out, new_out).unwrap_or_else(|| {
+                            FindingCategory::ReturnTypeChanged.as_str().to_string(),
+                            describe_nested_type_change(old_out, new_out).unwrap_or_else(|| {
                                 format!(
                                     "changed from `{}` to `{}`",
                                     crate::mapper::type_to_string(old_out),
@@ -860,7 +860,9 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                     report.findings.push(Finding {
                         axes: Vec::new(),
                         severity: Severity::Info,
-                        category: FindingCategory::StructDocumentationChanged.as_str().to_string(),
+                        category: FindingCategory::StructDocumentationChanged
+                            .as_str()
+                            .to_string(),
                         message,
                         type_name: Some(name.clone()),
                         target: Some(name.clone()),
@@ -906,15 +908,15 @@ fn check_struct_fields(
     for old_field in old_fields {
         let old_name = old_field.name.to_string();
         let still_exists = new_fields.iter().any(|f| f.name.to_string() == old_name);
-            if !still_exists {
-                report.findings.push(Finding {
-                    axes: Vec::new(),
-                    severity: Severity::Critical,
-                    category: if is_evt {
-                        FindingCategory::EventSchemaRemoved.as_str().to_string()
-                    } else {
-                        FindingCategory::StructFieldRemoved.as_str().to_string()
-                    },
+        if !still_exists {
+            report.findings.push(Finding {
+                axes: Vec::new(),
+                severity: Severity::Critical,
+                category: if is_evt {
+                    FindingCategory::EventSchemaRemoved.as_str().to_string()
+                } else {
+                    FindingCategory::StructFieldRemoved.as_str().to_string()
+                },
                 message: format!(
                     "{} '{}': field '{}' was removed. Backwards compatibility is broken.",
                     msg_prefix, name, old_name
@@ -932,15 +934,15 @@ fn check_struct_fields(
         let new_name = new_field.name.to_string();
 
         // Field at the same position has a different name — reordering detected
-            if old_name != new_name {
-                report.findings.push(Finding {
-                    axes: Vec::new(),
-                    severity: Severity::Critical,
-                    category: if is_evt {
-                        FindingCategory::EventSchemaReordered.as_str().to_string()
-                    } else {
-                        FindingCategory::StructFieldReordered.as_str().to_string()
-                    },
+        if old_name != new_name {
+            report.findings.push(Finding {
+                axes: Vec::new(),
+                severity: Severity::Critical,
+                category: if is_evt {
+                    FindingCategory::EventSchemaReordered.as_str().to_string()
+                } else {
+                    FindingCategory::StructFieldReordered.as_str().to_string()
+                },
                 message: format!(
                     "{} '{}': field at position {} changed from '{}' to '{}'. \
                      Positional serialization breaks layout compatibility.",
@@ -954,10 +956,13 @@ fn check_struct_fields(
 
         // Field type changed
         if !types_equal(&old_field.type_, &new_field.type_) {
-            let (category, detail) =
-                if let Some(bytesn_msg) = describe_bytesn_size_change(&old_field.type_, &new_field.type_)
-                {
-                    (FindingCategory::BytesNSizeChanged.as_str().to_string(), bytesn_msg)
+            let (category, detail) = if let Some(bytesn_msg) =
+                describe_bytesn_size_change(&old_field.type_, &new_field.type_)
+            {
+                (
+                    FindingCategory::BytesNSizeChanged.as_str().to_string(),
+                    bytesn_msg,
+                )
             } else {
                 (
                     if is_evt {
@@ -1053,7 +1058,9 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                     report.findings.push(Finding {
                         axes: Vec::new(),
                         severity: Severity::Info,
-                        category: FindingCategory::EnumDocumentationChanged.as_str().to_string(),
+                        category: FindingCategory::EnumDocumentationChanged
+                            .as_str()
+                            .to_string(),
                         message,
                         type_name: Some(name.clone()),
                         target: Some(name.clone()),
@@ -1123,7 +1130,9 @@ fn check_enum_cases(
                         axes: Vec::new(),
                         severity: Severity::Critical,
                         category: if is_evt {
-                            FindingCategory::EventEnumCaseValueChanged.as_str().to_string()
+                            FindingCategory::EventEnumCaseValueChanged
+                                .as_str()
+                                .to_string()
                         } else {
                             FindingCategory::EnumCaseValueChanged.as_str().to_string()
                         },
@@ -1261,7 +1270,10 @@ fn check_union_cases(
         if !union_cases_equal(old_case, new_case) {
             let (category, detail) =
                 if let Some(bytesn_msg) = union_case_bytesn_size_change(old_case, new_case) {
-                    (FindingCategory::BytesNSizeChanged.as_str().to_string(), bytesn_msg)
+                    (
+                        FindingCategory::BytesNSizeChanged.as_str().to_string(),
+                        bytesn_msg,
+                    )
                 } else {
                     (
                         FindingCategory::UnionCaseTypeChanged.as_str().to_string(),
@@ -1413,7 +1425,9 @@ fn check_error_enum_cases(
                 report.findings.push(Finding {
                     axes: Vec::new(),
                     severity: Severity::Critical,
-                    category: FindingCategory::ErrorEnumCaseValueChanged.as_str().to_string(),
+                    category: FindingCategory::ErrorEnumCaseValueChanged
+                        .as_str()
+                        .to_string(),
                     message: format!(
                         "Error enum '{}': case '{}' value changed from {} to {}. \
                          This breaks error-code compatibility.",
@@ -1575,7 +1589,7 @@ pub fn detect_type_kind_changes(old: &ContractSpec, new: &ContractSpec, report: 
         report.findings.push(Finding {
             axes: Vec::new(),
             severity: Severity::Critical,
-                category: FindingCategory::TypeKindChanged.as_str().to_string(),
+            category: FindingCategory::TypeKindChanged.as_str().to_string(),
             message: format!(
                 "Type '{}' changed from {} to {}. Stored data and client \
                  decoders written against the {} layout cannot read the {} \
@@ -2079,7 +2093,7 @@ mod tests {
         assert!(found, "Expected an info finding for struct doc change");
 
         // Ensure info findings do not influence safety
-        let safety = crate::report::SafetyReport::new(&report, &old, &new);
+        let safety = crate::report::SafetyReport::new_with_specs(&report, &old, &new);
         assert!(safety.is_safe);
         assert_eq!(safety.critical_count, 0);
     }
@@ -2146,7 +2160,7 @@ mod tests {
         compare_env_metadata(Some(&old), Some(&new), &mut report);
 
         let empty_spec = ContractSpec::default();
-        let safety = crate::report::SafetyReport::new(&report, &empty_spec, &empty_spec);
+        let safety = crate::report::SafetyReport::new_with_specs(&report, &empty_spec, &empty_spec);
         assert!(safety.is_safe);
         assert_eq!(safety.critical_count, 0);
     }
@@ -2370,7 +2384,8 @@ mod tests {
             .findings
             .iter()
             .filter(|f| {
-                f.category == FindingCategory::TypeKindChanged.as_str() && f.target.as_deref() == Some(name)
+                f.category == FindingCategory::TypeKindChanged.as_str()
+                    && f.target.as_deref() == Some(name)
             })
             .collect()
     }
@@ -2513,14 +2528,18 @@ mod tests {
             }))
         };
         let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-            element_type: Box::new(ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
-                value_type: Box::new(inner_map(ScSpecTypeDef::U32)),
-            }))),
+            element_type: Box::new(ScSpecTypeDef::Option(Box::new(
+                stellar_xdr::curr::ScSpecTypeOption {
+                    value_type: Box::new(inner_map(ScSpecTypeDef::U32)),
+                },
+            ))),
         }));
         let new = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-            element_type: Box::new(ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
-                value_type: Box::new(inner_map(ScSpecTypeDef::U64)),
-            }))),
+            element_type: Box::new(ScSpecTypeDef::Option(Box::new(
+                stellar_xdr::curr::ScSpecTypeOption {
+                    value_type: Box::new(inner_map(ScSpecTypeDef::U64)),
+                },
+            ))),
         }));
         let desc = describe_nested_type_change(&old, &new);
         assert_eq!(
@@ -2557,7 +2576,10 @@ mod tests {
             .filter(|f| f.target.as_deref() == Some("Status"))
             .map(|f| f.category.as_str())
             .collect();
-        assert_eq!(about_status, vec![FindingCategory::TypeKindChanged.as_str()]);
+        assert_eq!(
+            about_status,
+            vec![FindingCategory::TypeKindChanged.as_str()]
+        );
     }
 
     #[test]

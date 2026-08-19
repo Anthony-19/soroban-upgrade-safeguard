@@ -1,16 +1,14 @@
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::Write;
-use stellar_xdr::curr::{
-    ContractDataDurability, ContractDataEntry, Limits, ScAddress, ScMap, ScMapEntry,
-    ScSpecTypeDef, ScSpecUdtStructV0, ScVal, WriteXdr, ScSymbol, ScVec, ScSpecUdtStructFieldV0,
-    StringM, VecM,
-};
+use soroban_upgrade_safeguard::diff::{Finding, Severity};
 use soroban_upgrade_safeguard::empirical::{
     load_empirical_entries, run_empirical_check, validate_scval_type, validate_scval_udt,
 };
 use soroban_upgrade_safeguard::spec::ContractSpec;
-use soroban_upgrade_safeguard::diff::{Finding, Severity};
+use std::fs::File;
+use std::io::Write;
+use stellar_xdr::curr::{
+    ContractDataDurability, ContractDataEntry, Limits, ScAddress, ScMap, ScMapEntry, ScSpecTypeDef,
+    ScSpecUdtStructFieldV0, ScSpecUdtStructV0, ScVal, StringM, VecM, WriteXdr,
+};
 
 fn make_contract_data_entry(key: ScVal, val: ScVal) -> ContractDataEntry {
     ContractDataEntry {
@@ -25,7 +23,7 @@ fn make_contract_data_entry(key: ScVal, val: ScVal) -> ContractDataEntry {
 #[test]
 fn test_primitive_validation() {
     let spec = ContractSpec::default();
-    
+
     // Test basic types
     let val_u32 = ScVal::U32(42);
     assert!(validate_scval_type(&val_u32, &ScSpecTypeDef::U32, &spec, "test").is_ok());
@@ -71,10 +69,7 @@ fn test_struct_validation() {
             },
             ScMapEntry {
                 key: ScVal::Symbol("field_b".try_into().unwrap()),
-                val: ScVal::U128(stellar_xdr::curr::UInt128Parts {
-                    hi: 0,
-                    lo: 100,
-                }),
+                val: ScVal::U128(stellar_xdr::curr::UInt128Parts { hi: 0, lo: 100 }),
             },
         ]
         .try_into()
@@ -116,13 +111,11 @@ fn test_struct_validation() {
 #[test]
 fn test_json_loading_and_empirical_check() {
     let mut old_spec = ContractSpec::default();
-    let fields = vec![
-        ScSpecUdtStructFieldV0 {
-            doc: StringM::default(),
-            name: "amount".try_into().unwrap(),
-            type_: ScSpecTypeDef::U64,
-        },
-    ];
+    let fields = vec![ScSpecUdtStructFieldV0 {
+        doc: StringM::default(),
+        name: "amount".try_into().unwrap(),
+        type_: ScSpecTypeDef::U64,
+    }];
     old_spec.structs.insert(
         "Balance".to_string(),
         ScSpecUdtStructV0 {
@@ -134,13 +127,11 @@ fn test_json_loading_and_empirical_check() {
     );
 
     let mut new_spec = ContractSpec::default();
-    let new_fields = vec![
-        ScSpecUdtStructFieldV0 {
-            doc: StringM::default(),
-            name: "amount".try_into().unwrap(),
-            type_: ScSpecTypeDef::U128, // Type changed
-        },
-    ];
+    let new_fields = vec![ScSpecUdtStructFieldV0 {
+        doc: StringM::default(),
+        name: "amount".try_into().unwrap(),
+        type_: ScSpecTypeDef::U128, // Type changed
+    }];
     new_spec.structs.insert(
         "Balance".to_string(),
         ScSpecUdtStructV0 {
@@ -189,7 +180,10 @@ fn test_json_loading_and_empirical_check() {
 
     let results = run_empirical_check(&old_spec, &new_spec, &loaded, &structural_findings);
     assert_eq!(results.len(), 1);
-    assert!(!results[0].is_success, "empirical check must catch type mismatch");
+    assert!(
+        !results[0].is_success,
+        "empirical check must catch type mismatch"
+    );
     assert!(results[0].error.as_ref().unwrap().contains("expected u128"));
 
     // Clean up
