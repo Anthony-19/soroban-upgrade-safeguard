@@ -8,7 +8,8 @@ use soroban_upgrade_safeguard::{
     attestation::{
         canonical_json_bytes, sign_statement, verify_artifacts, verify_signatures, ArtifactDigest,
         AttestedArtifact, AttestedVerdict, DsseEnvelope, Ed25519Signer, InTotoStatementV1,
-        InTotoSubject, SafeguardPredicateV1, VerificationPolicy,
+        InTotoSubject, SafeguardPredicateV1, VerificationFailure, VerificationFailureKind,
+        VerificationPolicy,
     },
     color::{should_disable_color, ColorMode},
     diff, loader, parser,
@@ -308,6 +309,9 @@ struct AttestArgs {
     key_id: String,
     #[arg(long, value_name = "DSSE_JSON")]
     output: PathBuf,
+    /// JSON file containing the fully resolved policy/configuration.
+    #[arg(long, value_name = "POLICY_JSON")]
+    policy: Option<PathBuf>,
     #[arg(long, value_name = "SCHEMA", requires = "new_storage_schema")]
     old_storage_schema: Option<PathBuf>,
     #[arg(long, value_name = "SCHEMA", requires = "old_storage_schema")]
@@ -502,6 +506,19 @@ fn run_attest(args: &AttestArgs) -> Result<()> {
     {
         storage_schemas.push(file_artifact(path)?);
     }
+    let resolved_policy = if let Some(path) = &args.policy {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("Failed to read policy '{}'.", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("Policy '{}' is not valid JSON.", path.display()))?
+    } else {
+        serde_json::json!({
+            "strict": report.strict,
+            "gated_axes": report.gated_axes,
+            "axis_verdicts": report.axis_verdicts,
+            "report_schema_version": report.report_schema_version,
+        })
+    };
     let predicate = SafeguardPredicateV1::new(
         vec![
             AttestedArtifact {
@@ -515,7 +532,7 @@ fn run_attest(args: &AttestArgs) -> Result<()> {
         ],
         vec![old_spec, new_spec],
         storage_schemas,
-        serde_json::json!({ "strict": report.strict, "gated_axes": report.gated_axes }),
+        resolved_policy,
         AttestedArtifact {
             name: args.report.to_string_lossy().to_string(),
             digest: ArtifactDigest::from_bytes(&report_bytes),
@@ -554,7 +571,22 @@ fn run_attest(args: &AttestArgs) -> Result<()> {
 
 fn run_verify_attestation(args: &VerifyAttestationArgs) -> Result<()> {
     let envelope: DsseEnvelope = serde_json::from_slice(&std::fs::read(&args.attestation)?)?;
-    let statement = envelope.statement().map_err(|e| anyhow::anyhow!(e))?;
+    let statement = match envelope.statement() {
+        Ok(statement) => statement,
+        Err(error) => {
+            let result = serde_json::json!({
+                "verified": false,
+                "signer_identities": [],
+                "failures": [VerificationFailure {
+                    kind: VerificationFailureKind::InvalidStatement,
+                    subject: None,
+                    message: error.to_string(),
+                }],
+            });
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            std::process::exit(1);
+        }
+    };
     let mut trusted = std::collections::BTreeMap::new();
     for item in &args.trusted_keys {
         let (id, path) = item

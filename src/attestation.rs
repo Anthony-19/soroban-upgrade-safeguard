@@ -152,7 +152,32 @@ impl DsseEnvelope {
         if statement.canonical_bytes()? != bytes {
             return Err(AttestationError::NonCanonicalPayload);
         }
+        statement.validate()?;
         Ok(statement)
+    }
+}
+
+impl InTotoStatementV1 {
+    fn validate(&self) -> Result<(), AttestationError> {
+        if self.statement_type != STATEMENT_TYPE {
+            return Err(AttestationError::InvalidStatementShape(format!(
+                "unsupported in-toto statement type '{}'",
+                self.statement_type
+            )));
+        }
+        if self.predicate_type != PREDICATE_TYPE {
+            return Err(AttestationError::InvalidStatementShape(format!(
+                "unsupported safeguard predicate type '{}'",
+                self.predicate_type
+            )));
+        }
+        if self.predicate.version != 1 {
+            return Err(AttestationError::InvalidStatementShape(format!(
+                "unsupported safeguard predicate version {}",
+                self.predicate.version
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -258,7 +283,7 @@ pub fn verify_artifacts(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if now > expires_at {
+        if now >= expires_at {
             failures.push(VerificationFailure {
                 kind: VerificationFailureKind::ExpiredPolicy,
                 subject: None,
@@ -323,6 +348,20 @@ pub fn verify_signatures(
             VerificationFailureKind::NonCanonicalPayload,
             None,
             "DSSE payload is not in canonical JSON form",
+        );
+    }
+    if let Err(error) = statement.validate() {
+        return verification_failure(
+            VerificationFailureKind::InvalidStatement,
+            None,
+            &error.to_string(),
+        );
+    }
+    if envelope.signatures.is_empty() {
+        return verification_failure(
+            VerificationFailureKind::InvalidSignature,
+            None,
+            "DSSE envelope contains no signatures",
         );
     }
 
@@ -451,6 +490,7 @@ fn verification_failure(
 pub enum AttestationError {
     Serialize(serde_json::Error),
     InvalidStatement(serde_json::Error),
+    InvalidStatementShape(String),
     InvalidPayloadType(String),
     InvalidBase64(&'static str),
     NonCanonicalPayload,
@@ -464,6 +504,9 @@ impl std::fmt::Display for AttestationError {
         match self {
             Self::Serialize(error) => write!(f, "failed to serialize attestation: {error}"),
             Self::InvalidStatement(error) => write!(f, "invalid in-toto statement: {error}"),
+            Self::InvalidStatementShape(message) => {
+                write!(f, "invalid in-toto statement: {message}")
+            }
             Self::InvalidPayloadType(value) => write!(f, "unsupported DSSE payload type: {value}"),
             Self::InvalidBase64(field) => write!(f, "DSSE {field} is not valid base64"),
             Self::NonCanonicalPayload => write!(f, "DSSE payload is not canonical JSON"),
@@ -478,3 +521,129 @@ impl std::fmt::Display for AttestationError {
 }
 
 impl std::error::Error for AttestationError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ring::rand::SystemRandom;
+    use std::collections::BTreeMap;
+
+    fn statement() -> InTotoStatementV1 {
+        let predicate = SafeguardPredicateV1::new(
+            vec![AttestedArtifact {
+                name: "old.wasm".into(),
+                digest: ArtifactDigest::from_bytes(b"old"),
+            }],
+            vec![],
+            vec![],
+            serde_json::json!({"strict": true, "gated_axes": ["call_abi"]}),
+            AttestedArtifact {
+                name: "report.json".into(),
+                digest: ArtifactDigest::from_bytes(b"report"),
+            },
+            AttestedVerdict {
+                is_safe: true,
+                recommended_bump: "patch".into(),
+                old_client_to_new_contract: true,
+                new_client_to_old_contract: true,
+            },
+        );
+        InTotoStatementV1::new(
+            vec![InTotoSubject {
+                name: "old.wasm".into(),
+                digest: ArtifactDigest::from_bytes(b"old"),
+            }],
+            predicate,
+        )
+    }
+
+    #[test]
+    fn canonical_statement_and_dsse_vector_are_deterministic() {
+        let statement = statement();
+        let first = statement.canonical_bytes().unwrap();
+        let second = statement.canonical_bytes().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            dsse_pae("text/plain", b"hello"),
+            b"DSSEv1 10 text/plain 5 hello"
+        );
+        assert_eq!(hex::encode(Sha256::digest(&first)).len(), 64);
+    }
+
+    #[test]
+    fn ed25519_signatures_verify_offline_and_report_identity() {
+        let key = signature::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let signer = Ed25519Signer::from_pkcs8("build-key", key.as_ref()).unwrap();
+        let envelope = sign_statement(&statement(), &signer).unwrap();
+        let mut trusted = BTreeMap::new();
+        trusted.insert("build-key".into(), signer.public_key());
+        let result = verify_signatures(&envelope, &trusted);
+        assert!(result.verified);
+        assert_eq!(result.signer_identities, vec!["build-key"]);
+    }
+
+    #[test]
+    fn tampering_and_trust_failures_are_distinct() {
+        let key = signature::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let signer = Ed25519Signer::from_pkcs8("trusted", key.as_ref()).unwrap();
+        let mut envelope = sign_statement(&statement(), &signer).unwrap();
+        envelope.payload.push('A');
+        let mut trusted = BTreeMap::new();
+        trusted.insert("trusted".into(), signer.public_key());
+        assert_eq!(
+            verify_signatures(&envelope, &trusted).failures[0].kind,
+            VerificationFailureKind::InvalidStatement
+        );
+
+        let envelope = sign_statement(&statement(), &signer).unwrap();
+        let result = verify_signatures(&envelope, &BTreeMap::new());
+        assert_eq!(
+            result.failures[0].kind,
+            VerificationFailureKind::UntrustedSigner
+        );
+
+        let mut envelope = sign_statement(&statement(), &signer).unwrap();
+        envelope.signatures.clear();
+        assert_eq!(
+            verify_signatures(&envelope, &trusted).failures[0].kind,
+            VerificationFailureKind::InvalidSignature
+        );
+    }
+
+    #[test]
+    fn unsupported_predicate_versions_are_rejected() {
+        let mut statement = statement();
+        statement.predicate.version = 2;
+        let key = signature::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let signer = Ed25519Signer::from_pkcs8("trusted", key.as_ref()).unwrap();
+        let envelope = sign_statement(&statement, &signer).unwrap();
+        let mut trusted = BTreeMap::new();
+        trusted.insert("trusted".into(), signer.public_key());
+        assert_eq!(
+            verify_signatures(&envelope, &trusted).failures[0].kind,
+            VerificationFailureKind::InvalidStatement
+        );
+    }
+
+    #[test]
+    fn artifact_failures_cover_missing_mismatch_and_expiry() {
+        let mut artifacts = BTreeMap::new();
+        artifacts.insert("old.wasm".into(), b"wrong".to_vec());
+        let failures = verify_artifacts(
+            &statement(),
+            &artifacts,
+            &VerificationPolicy {
+                expires_at: Some(0),
+            },
+        );
+        assert!(failures
+            .iter()
+            .any(|f| f.kind == VerificationFailureKind::ArtifactDigestMismatch));
+        assert!(failures
+            .iter()
+            .any(|f| f.kind == VerificationFailureKind::MissingArtifact));
+        assert!(failures
+            .iter()
+            .any(|f| f.kind == VerificationFailureKind::ExpiredPolicy));
+    }
+}
