@@ -110,9 +110,9 @@ mod suppression;
 
 // Stable public API exports at the root
 pub use crate::attestation::{
-    sign_statement, verify_signatures, ArtifactDigest, AttestationSigner, DsseEnvelope,
-    Ed25519Signer, InTotoStatementV1, SafeguardPredicateV1, SignatureVerification,
-    VerificationFailure, VerificationFailureKind,
+    sign_statement, verify_artifacts, verify_signatures, ArtifactDigest, AttestationSigner,
+    DsseEnvelope, Ed25519Signer, InTotoStatementV1, SafeguardPredicateV1, SignatureVerification,
+    VerificationFailure, VerificationFailureKind, VerificationPolicy,
 };
 pub use crate::call_abi::{
     CallAbiBreak, CallAbiCompatibility, CallDirection, DirectionalCallVerdict,

@@ -169,13 +169,13 @@ pub struct Ed25519Signer {
 }
 
 impl Ed25519Signer {
-    /// Load an Ed25519 key from PKCS#8 v2 bytes. Diagnostics never include the
-    /// supplied bytes.
+    /// Load an Ed25519 key from unencrypted PKCS#8 v1 or v2 bytes. Diagnostics
+    /// never include the supplied bytes.
     pub fn from_pkcs8(
         key_id: impl Into<String>,
         private_key: &[u8],
     ) -> Result<Self, AttestationError> {
-        let key_pair = signature::Ed25519KeyPair::from_pkcs8(private_key)
+        let key_pair = signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(private_key)
             .map_err(|_| AttestationError::InvalidPrivateKey)?;
         Ok(Self {
             key_id: key_id.into(),
@@ -239,6 +239,57 @@ pub struct SignatureVerification {
     pub verified: bool,
     pub signer_identities: Vec<String>,
     pub failures: Vec<VerificationFailure>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VerificationPolicy {
+    /// Unix timestamp after which this verification policy is invalid.
+    pub expires_at: Option<u64>,
+}
+
+pub fn verify_artifacts(
+    statement: &InTotoStatementV1,
+    artifacts: &BTreeMap<String, Vec<u8>>,
+    policy: &VerificationPolicy,
+) -> Vec<VerificationFailure> {
+    let mut failures = Vec::new();
+    if let Some(expires_at) = policy.expires_at {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now > expires_at {
+            failures.push(VerificationFailure {
+                kind: VerificationFailureKind::ExpiredPolicy,
+                subject: None,
+                message: format!("verification policy expired at Unix timestamp {expires_at}"),
+            });
+        }
+    }
+
+    let referenced = statement
+        .predicate
+        .inputs
+        .iter()
+        .chain(statement.predicate.extracted_specs.iter())
+        .chain(statement.predicate.storage_schemas.iter())
+        .chain(std::iter::once(&statement.predicate.report));
+    for artifact in referenced {
+        match artifacts.get(&artifact.name) {
+            None => failures.push(VerificationFailure {
+                kind: VerificationFailureKind::MissingArtifact,
+                subject: Some(artifact.name.clone()),
+                message: "referenced artifact was not supplied for verification".to_string(),
+            }),
+            Some(bytes) if !artifact.digest.matches(bytes) => failures.push(VerificationFailure {
+                kind: VerificationFailureKind::ArtifactDigestMismatch,
+                subject: Some(artifact.name.clone()),
+                message: "supplied artifact does not match the attested SHA-256 digest".to_string(),
+            }),
+            Some(_) => {}
+        }
+    }
+    failures
 }
 
 /// Verify at least one signature against the supplied offline trust store.
@@ -420,7 +471,7 @@ impl std::fmt::Display for AttestationError {
                 f,
                 "canonical statements do not permit floating-point numbers"
             ),
-            Self::InvalidPrivateKey => write!(f, "invalid Ed25519 PKCS#8 private key"),
+            Self::InvalidPrivateKey => write!(f, "invalid unencrypted Ed25519 PKCS#8 private key"),
             Self::Signing(message) => write!(f, "attestation signing failed: {message}"),
         }
     }
