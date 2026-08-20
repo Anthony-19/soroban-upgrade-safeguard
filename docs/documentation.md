@@ -160,6 +160,28 @@ soroban-upgrade-safeguard \
   new.wasm
 ```
 
+#### Authenticated RPC endpoints
+
+Keep credentials outside command lines, configuration files, reports, and CI
+logs. Configure each header as `HEADER_NAME=ENVIRONMENT_VARIABLE`; the tool
+reads the secret only when it sends an RPC request:
+
+```bash
+export SOROBAN_RPC_TOKEN="..."
+soroban-upgrade-safeguard \
+  --contract-id C... \
+  --rpc-url https://provider.example/rpc \
+  --rpc-header Authorization=SOROBAN_RPC_TOKEN \
+  new.wasm
+```
+
+Multiple provider headers are supported by repeating `--rpc-header`. Header
+names are validated, missing or empty environment variables are rejected, and
+secret values are never serialized into reports or debug output. RPC redirects
+are refused for authenticated requests so provider credentials cannot reach a
+different origin. In CI, store the secret in the runner's secret store and
+export it for the step rather than putting it in a workflow argument or file.
+
 ### Suppression config
 
 Mount the directory that contains `.safeguard.toml` and point to it with `--config`:
