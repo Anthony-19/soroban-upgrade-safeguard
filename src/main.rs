@@ -8,7 +8,9 @@ use soroban_upgrade_safeguard::{
     color::{should_disable_color, ColorMode},
     diff, loader, parser,
     render::RenderableReport,
-    report, spec,
+    report,
+    rpc::RpcClientConfig,
+    spec,
     spec_json::ExtractedSpec,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
@@ -180,6 +182,10 @@ struct Args {
     #[arg(long, value_name = "RPC_URL", requires = "contract_id")]
     rpc_url: Option<String>,
 
+    /// RPC headers as NAME=ENV_VAR. The secret is read only from the environment.
+    #[arg(long = "rpc-header", value_name = "NAME=ENV_VAR")]
+    rpc_headers: Vec<String>,
+
     /// Path to a suppression config acknowledging known, intentional breaking
     /// changes. When omitted, `.safeguard.toml` in the current directory is
     /// used if present; otherwise no suppressions are applied.
@@ -294,6 +300,9 @@ struct ExtractArgs {
     #[arg(long, value_name = "RPC_URL", requires = "contract_id")]
     rpc_url: Option<String>,
 
+    #[arg(long = "rpc-header", value_name = "NAME=ENV_VAR")]
+    rpc_headers: Vec<String>,
+
     /// Print only the interface hash, with no other output.
     #[arg(long)]
     hash_only: bool,
@@ -342,6 +351,22 @@ struct InitArgs {
     /// Stellar RPC URL (e.g. https://soroban-testnet.stellar.org)
     #[arg(long, value_name = "RPC_URL", requires = "contract_id")]
     rpc_url: Option<String>,
+
+    #[arg(long = "rpc-header", value_name = "NAME=ENV_VAR")]
+    rpc_headers: Vec<String>,
+}
+
+fn rpc_config(url: &str, headers: &[String]) -> Result<RpcClientConfig> {
+    let mut config = RpcClientConfig::new(url.to_string()).map_err(|e| anyhow::anyhow!(e))?;
+    for spec in headers {
+        let (name, env_var) = spec.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("Invalid --rpc-header '{}'; expected NAME=ENV_VAR", spec)
+        })?;
+        config = config
+            .with_env_header(name.to_string(), env_var.to_string())
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+    Ok(config)
 }
 
 /// Decode one build and emit its interface as JSON, or just its hash.
@@ -353,7 +378,10 @@ fn run_extract(args: &ExtractArgs) -> Result<()> {
                 .rpc_url
                 .as_ref()
                 .expect("clap requires --rpc-url alongside --contract-id");
-            loader::fetch_wasm_from_rpc(contract_id, rpc_url)?
+            loader::fetch_wasm_from_rpc_with_config(
+                contract_id,
+                &rpc_config(rpc_url, &args.rpc_headers)?,
+            )?
         }
         (Some(_), Some(_)) => anyhow::bail!(
             "Provide either a WASM path or --contract-id, not both.\n\n\
@@ -441,7 +469,10 @@ fn run_init(args: &InitArgs) -> Result<()> {
                 .as_ref()
                 .expect("clap requires --rpc-url alongside --contract-id");
             (
-                loader::fetch_wasm_from_rpc(contract_id, rpc_url),
+                loader::fetch_wasm_from_rpc_with_config(
+                    contract_id,
+                    &rpc_config(rpc_url, &args.rpc_headers)?,
+                ),
                 loader::load_wasm(new),
             )
         }
@@ -854,6 +885,7 @@ fn run_batch(
                         empirical_file: args.empirical_file.as_deref(),
                         contract_id: None,
                         rpc_url: None,
+                        rpc_headers: &args.rpc_headers,
                     },
                     progress,
                 ) {
@@ -1254,7 +1286,10 @@ fn run_single(
 
         let old = if let Some(contract_id) = old_source {
             let rpc_url = args.rpc_url.as_ref().unwrap();
-            loader::fetch_wasm_from_rpc(contract_id, rpc_url)?
+            loader::fetch_wasm_from_rpc_with_config(
+                contract_id,
+                &rpc_config(rpc_url, &args.rpc_headers)?,
+            )?
         } else {
             load_positional_wasm(&args.wasm_paths[0])?
         };
@@ -1282,6 +1317,7 @@ fn run_single(
                 empirical_file: args.empirical_file.as_deref(),
                 contract_id: old_source,
                 rpc_url: args.rpc_url.as_deref(),
+                rpc_headers: &args.rpc_headers,
             },
             progress,
         )?;
@@ -1577,6 +1613,7 @@ struct ContractComparison<'a> {
     empirical_file: Option<&'a Path>,
     contract_id: Option<&'a str>,
     rpc_url: Option<&'a str>,
+    rpc_headers: &'a [String],
 }
 
 fn compare_contracts(
@@ -1596,6 +1633,7 @@ fn compare_contracts(
         empirical_file,
         contract_id,
         rpc_url,
+        rpc_headers,
     } = comparison;
     let old_meta = parser::extract_metadata(old_bytes)?;
     let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
@@ -1675,7 +1713,10 @@ fn compare_contracts(
             }
         } else if let (Some(cid), Some(rpc)) = (contract_id, rpc_url) {
             progress("🌐 Fetching contract instance storage from RPC...".to_string());
-            match loader::fetch_instance_storage_from_rpc(cid, rpc) {
+            match rpc_config(rpc, rpc_headers).and_then(|config| {
+                loader::fetch_instance_storage_from_rpc_with_config(cid, &config)
+                    .map_err(|e| anyhow::anyhow!(e))
+            }) {
                 Ok(loaded) => {
                     progress(format!(
                         "✅ Fetched {} instance storage entries from RPC",

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::error::Error;
+use ureq::{Agent, AgentBuilder};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct RpcHeader {
@@ -102,10 +103,30 @@ impl RpcClientConfig {
     pub fn redacted_url(&self) -> String {
         redact_url(&self.url)
     }
+
+    pub(crate) fn request_parts(&self) -> Result<(Agent, ResolvedRpcHeaders), Error> {
+        let headers = self.resolve_headers()?;
+        let agent = AgentBuilder::new()
+            // Reject redirects entirely. `ureq` only strips the standard
+            // Authorization header; provider-specific API-key headers would
+            // otherwise be forwarded to the redirected origin.
+            .redirects(0)
+            .redirect_auth_headers(ureq::RedirectAuthHeaders::Never)
+            .build();
+        Ok((agent, headers))
+    }
 }
 
 pub struct ResolvedRpcHeaders {
     pub(crate) values: HashMap<String, String>,
+}
+
+impl ResolvedRpcHeaders {
+    pub(crate) fn empty() -> Self {
+        Self {
+            values: HashMap::new(),
+        }
+    }
 }
 
 impl fmt::Debug for ResolvedRpcHeaders {
