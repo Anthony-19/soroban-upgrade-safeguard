@@ -241,6 +241,15 @@ pub fn compare(old: &ContractSpec, new: &ContractSpec) -> DiffReport {
     report
 }
 
+/// Compute directional call-ABI verdicts without changing the legacy finding
+/// stream consumed by existing callers.
+pub fn compare_call_abi(
+    old: &ContractSpec,
+    new: &ContractSpec,
+) -> crate::call_abi::CallAbiCompatibility {
+    crate::call_abi::compare(old, new)
+}
+
 /// Recursively check if type_def references target_name directly or transitively in spec.
 fn references_type(type_def: &ScSpecTypeDef, target_name: &str, spec: &ContractSpec) -> bool {
     match type_def {
