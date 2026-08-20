@@ -498,7 +498,10 @@ impl FindingCategory {
 
     /// Look up a variant by its exact category string.
     pub fn find_by_name(s: &str) -> Option<FindingCategory> {
-        FindingCategory::all().iter().find(|c| c.as_str() == s).copied()
+        FindingCategory::all()
+            .iter()
+            .find(|c| c.as_str() == s)
+            .copied()
     }
 
     /// Generate the full finding-category reference as Markdown.
@@ -547,11 +550,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for cat in FindingCategory::all() {
             let s = cat.as_str();
-            assert!(
-                seen.insert(s),
-                "Duplicate category string: '{}'",
-                s
-            );
+            assert!(seen.insert(s), "Duplicate category string: '{}'", s);
         }
     }
 
@@ -597,7 +596,9 @@ mod tests {
         let committed = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("Failed to read {}: {}", path.display(), e));
 
-        if generated != committed {
+        // Git may materialize this text file with CRLF on Windows. Compare the
+        // logical Markdown content rather than platform-specific line endings.
+        if generated != committed.replace("\r\n", "\n") {
             // Write the generated content to a temp file for comparison.
             let tmp = std::env::temp_dir().join("finding-categories.generated.md");
             std::fs::write(&tmp, &generated).expect("Failed to write generated content");

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use soroban_upgrade_safeguard::error::ErrorKind;
 use soroban_upgrade_safeguard::loader::fetch_wasm_from_rpc;
@@ -76,6 +77,28 @@ fn build_code_entry_xdr(wasm_hash: &[u8; 32], code: &[u8]) -> String {
         .expect("failed to encode code entry")
 }
 
+fn read_http_request(stream: &mut std::net::TcpStream) {
+    let mut request = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => request.extend_from_slice(&buf[..n]),
+        }
+        if request.len() > 64 * 1024 {
+            break;
+        }
+    }
+}
+
+fn finish_http_response(stream: &mut std::net::TcpStream, response: &[u8]) {
+    stream
+        .write_all(response)
+        .expect("failed to write response");
+    stream.flush().expect("failed to flush");
+    thread::sleep(Duration::from_millis(25));
+}
+
 /// A tiny HTTP server that handles exactly two sequential `getLedgerEntries`
 /// requests and returns pre-canned JSON-RPC responses.
 ///
@@ -92,9 +115,7 @@ fn start_mock_rpc(instance_xdr: String, code_xdr: String) -> (String, Arc<TcpLis
             let (mut stream, _) = listener_clone.accept().expect("failed to accept");
 
             // Read the full HTTP request (we don't need to parse it carefully)
-            let mut buf = [0u8; 8192];
-            let n = stream.read(&mut buf).expect("failed to read request");
-            let _request = String::from_utf8_lossy(&buf[..n]);
+            read_http_request(&mut stream);
 
             let body = serde_json::json!({
                 "jsonrpc": "2.0",
@@ -111,14 +132,11 @@ fn start_mock_rpc(instance_xdr: String, code_xdr: String) -> (String, Arc<TcpLis
             let body_str = serde_json::to_string(&body).unwrap();
 
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body_str.len(),
                 body_str
             );
-            stream
-                .write_all(response.as_bytes())
-                .expect("failed to write response");
-            stream.flush().expect("failed to flush");
+            finish_http_response(&mut stream, response.as_bytes());
         }
     });
 
@@ -134,8 +152,7 @@ fn start_mock_rpc_not_found() -> (String, Arc<TcpListener>) {
 
     thread::spawn(move || {
         let (mut stream, _) = listener_clone.accept().expect("failed to accept");
-        let mut buf = [0u8; 8192];
-        let _ = stream.read(&mut buf).expect("failed to read request");
+        read_http_request(&mut stream);
 
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -147,14 +164,11 @@ fn start_mock_rpc_not_found() -> (String, Arc<TcpListener>) {
         });
         let body_str = serde_json::to_string(&body).unwrap();
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body_str.len(),
             body_str
         );
-        stream
-            .write_all(response.as_bytes())
-            .expect("failed to write response");
-        stream.flush().expect("failed to flush");
+        finish_http_response(&mut stream, response.as_bytes());
     });
 
     (addr, listener)
@@ -211,16 +225,14 @@ fn start_mock_rpc_with(responses: Vec<serde_json::Value>) -> (String, Arc<TcpLis
     thread::spawn(move || {
         for resp in responses {
             if let Ok((mut stream, _)) = l.accept() {
-                let mut buf = [0u8; 8192];
-                let _ = stream.read(&mut buf);
+                read_http_request(&mut stream);
                 let body = serde_json::to_string(&resp).unwrap();
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
+                finish_http_response(&mut stream, response.as_bytes());
             }
         }
     });

@@ -57,15 +57,15 @@ fn batch_manifest_toml_mode_fails_and_exits_one() {
         "Missing batch report header"
     );
     assert!(
-        stdout.contains("Overall Status: ??? FAILED"),
+        stdout.contains("Overall Status: ❌ FAILED"),
         "Missing failed status"
     );
     assert!(
-        stdout.contains("clean_contract: ??? PASSED"),
+        stdout.contains("clean_contract: ✅ PASSED"),
         "Missing passed contract summary"
     );
     assert!(
-        stdout.contains("breaking_contract: ??? FAILED"),
+        stdout.contains("breaking_contract: ❌ FAILED"),
         "Missing failed contract summary"
     );
 
@@ -118,7 +118,7 @@ fn batch_manifest_all_clean_exits_zero() {
 
     assert_eq!(code, 0, "batch run with all clean contracts must exit 0");
     assert!(
-        stdout.contains("Overall Status: ??? PASSED"),
+        stdout.contains("Overall Status: ✅ PASSED"),
         "Missing passed status"
     );
 }
@@ -206,9 +206,9 @@ fn batch_directory_scanning_fails_on_breaking_contract() {
     let code = output.status.code().expect("process terminated by signal");
 
     assert_eq!(code, 1);
-    assert!(stdout.contains("Overall Status: ??? FAILED"));
-    assert!(stdout.contains("a: ??? PASSED"));
-    assert!(stdout.contains("b: ??? FAILED"));
+    assert!(stdout.contains("Overall Status: ❌ FAILED"));
+    assert!(stdout.contains("a: ✅ PASSED"));
+    assert!(stdout.contains("b: ❌ FAILED"));
 }
 
 #[test]

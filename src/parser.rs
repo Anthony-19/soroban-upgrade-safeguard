@@ -3,6 +3,7 @@ use stellar_xdr::curr::{Limited, Limits, ReadXdr, ScEnvMetaEntry, ScSpecEntry};
 use wasmparser::{Parser, Payload};
 
 use crate::error::Error;
+use crate::storage_inference::{infer_storage, StorageInference};
 
 /// Decoded contents of a contract's `contractenvmetav0` custom section.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +49,8 @@ impl ContractEnvMeta {
 pub struct SorobanMetadata {
     pub spec: Vec<ScSpecEntry>,
     pub env_meta: Option<ContractEnvMeta>,
+    /// Conservative observations from SDK-generated storage host calls.
+    pub storage: StorageInference,
 }
 
 /// Decodes concatenated ScSpecEntry XDR objects from raw bytes.
@@ -139,6 +142,13 @@ pub fn extract_metadata(bytes: &[u8]) -> Result<SorobanMetadata, Error> {
             _ => {}
         }
     }
+
+    metadata.storage = infer_storage(bytes).map_err(|details| Error::WasmValidation {
+        path: None,
+        details: format!("Storage analysis failed: {details}"),
+        byte_offset: None,
+        source: None,
+    })?;
 
     Ok(metadata)
 }

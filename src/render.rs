@@ -17,7 +17,7 @@
 //!                       saved report.json ───┘  (RenderableReport::from_json_str)
 //! ```
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
@@ -128,10 +128,10 @@ pub struct RenderableReport {
     pub findings_by_category: BTreeMap<String, Vec<ReportedFinding>>,
     /// Per-axis pass/warning/fail verdict.
     #[serde(default)]
-    pub axis_verdicts: HashMap<CompatibilityAxis, AxisStatus>,
+    pub axis_verdicts: BTreeMap<CompatibilityAxis, AxisStatus>,
     /// Axes whose findings gate `is_safe` (per policy and `--strict`).
     #[serde(default)]
-    pub gated_axes: HashSet<CompatibilityAxis>,
+    pub gated_axes: BTreeSet<CompatibilityAxis>,
     /// Findings grouped by the compatibility axis they were classified under.
     #[serde(default)]
     pub findings_by_axis: BTreeMap<CompatibilityAxis, Vec<ReportedFinding>>,
@@ -166,16 +166,6 @@ impl RenderableReport {
             (Some(old), Some(new)) => Some(old == new),
             _ => None,
         }
-    }
-
-    /// Categories in display order: `Environment` first, then alphabetical.
-    fn ordered_categories(&self) -> Vec<&String> {
-        let mut categories: Vec<&String> = self.findings_by_category.keys().collect();
-        categories.sort_by(|a, b| {
-            let rank = |name: &str| if name == "Environment" { 0 } else { 1 };
-            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
-        });
-        categories
     }
 
     /// The interface-hash block shared by the text and Markdown headers.
@@ -286,7 +276,11 @@ impl RenderableReport {
             crate::diff::CompatibilityAxis::SourceLevel,
         ];
         for axis in axes_in_order {
-            let axis_status = self.axis_verdicts.get(&axis).cloned().unwrap_or(crate::report::AxisStatus::Passed);
+            let axis_status = self
+                .axis_verdicts
+                .get(&axis)
+                .cloned()
+                .unwrap_or(crate::report::AxisStatus::Passed);
             let status_str = match axis_status {
                 crate::report::AxisStatus::Passed => "✅ PASSED".green().bold(),
                 crate::report::AxisStatus::Warning => "⚠️ WARNING (Non-gated)".yellow().bold(),
@@ -394,7 +388,8 @@ impl RenderableReport {
                 output.push_str(&format!("{}\n", formatted));
                 if self.empirical {
                     if let Some(ref udt_name) = finding.type_name {
-                        let matching_emp: Vec<&crate::empirical::EmpiricalFinding> = self.empirical_findings
+                        let matching_emp: Vec<&crate::empirical::EmpiricalFinding> = self
+                            .empirical_findings
                             .iter()
                             .filter(|ef| &ef.type_name == udt_name)
                             .collect();
@@ -407,10 +402,10 @@ impl RenderableReport {
                                     }
                                 }
                             } else {
-                                output.push_str(&format!("    ↳ 🟢 [CONTRADICTED] Sampled stored values all decoded successfully under the new spec.\n").green().to_string());
+                                output.push_str(&"    ↳ 🟢 [CONTRADICTED] Sampled stored values all decoded successfully under the new spec.\n".green().to_string());
                             }
                         } else {
-                            output.push_str(&format!("    ↳ ⚪ [UNCONFIRMED] No matching stored data found in the sample.\n").dimmed().to_string());
+                            output.push_str(&"    ↳ ⚪ [UNCONFIRMED] No matching stored data found in the sample.\n".dimmed().to_string());
                         }
                     }
                 }
@@ -463,12 +458,30 @@ impl RenderableReport {
                     .bold()
                     .to_string(),
             );
-            let successes = self.empirical_findings.iter().filter(|ef| ef.is_success).count();
-            let failures = self.empirical_findings.iter().filter(|ef| !ef.is_success).count();
+            let successes = self
+                .empirical_findings
+                .iter()
+                .filter(|ef| ef.is_success)
+                .count();
+            let failures = self
+                .empirical_findings
+                .iter()
+                .filter(|ef| !ef.is_success)
+                .count();
             let total_sampled = self.empirical_findings.len();
             output.push_str(&format!("Total Sampled UDT Values: {}\n", total_sampled));
-            output.push_str(&format!("  - Decoded Successfully: {}\n", successes.to_string().green()));
-            output.push_str(&format!("  - Failed to Decode:     {}\n", if failures > 0 { failures.to_string().red().bold().to_string() } else { failures.to_string() }));
+            output.push_str(&format!(
+                "  - Decoded Successfully: {}\n",
+                successes.to_string().green()
+            ));
+            output.push_str(&format!(
+                "  - Failed to Decode:     {}\n",
+                if failures > 0 {
+                    failures.to_string().red().bold().to_string()
+                } else {
+                    failures.to_string()
+                }
+            ));
             output.push_str("Limits: Stellar RPC does not support wildcard ledger enumeration. Coverage is bounded to instance storage or offline files.\n");
         }
 
@@ -498,7 +511,11 @@ impl RenderableReport {
         ];
 
         for axis in axes_in_order {
-            let status = self.axis_verdicts.get(&axis).cloned().unwrap_or(crate::report::AxisStatus::Passed);
+            let status = self
+                .axis_verdicts
+                .get(&axis)
+                .cloned()
+                .unwrap_or(crate::report::AxisStatus::Passed);
             let status_str = match status {
                 crate::report::AxisStatus::Passed => "✅ PASSED",
                 crate::report::AxisStatus::Warning => "⚠️ WARNING",
@@ -510,7 +527,11 @@ impl RenderableReport {
                 crate::diff::CompatibilityAxis::EventIndexer => "Event & Indexer",
                 crate::diff::CompatibilityAxis::SourceLevel => "Source Level",
             };
-            let gated = if self.gated_axes.contains(&axis) { "Yes" } else { "No" };
+            let gated = if self.gated_axes.contains(&axis) {
+                "Yes"
+            } else {
+                "No"
+            };
             output.push_str(&format!("| **{}** | {} | {} |\n", label, status_str, gated));
         }
         output.push('\n');
@@ -560,8 +581,13 @@ impl RenderableReport {
             };
 
             output.push_str(&format!("### {}\n\n", label));
+            let mut current_category: Option<&str> = None;
             for reported in group {
                 let finding = &reported.finding;
+                if current_category != Some(finding.category.as_str()) {
+                    current_category = Some(&finding.category);
+                    output.push_str(&format!("### {}\n\n", finding.category));
+                }
 
                 if reported.suppressed {
                     output.push_str(&format!("- 🔕 **[SUPPRESSED]** {}\n", finding.message));
@@ -579,7 +605,8 @@ impl RenderableReport {
                 output.push_str(&format!("- {} {}\n", emoji, finding.message));
                 if self.empirical {
                     if let Some(ref udt_name) = finding.type_name {
-                        let matching_emp: Vec<&crate::empirical::EmpiricalFinding> = self.empirical_findings
+                        let matching_emp: Vec<&crate::empirical::EmpiricalFinding> = self
+                            .empirical_findings
                             .iter()
                             .filter(|ef| &ef.type_name == udt_name)
                             .collect();
@@ -611,10 +638,21 @@ impl RenderableReport {
 
         if self.empirical {
             output.push_str("### 📊 Empirical Storage Validation Summary\n\n");
-            let successes = self.empirical_findings.iter().filter(|ef| ef.is_success).count();
-            let failures = self.empirical_findings.iter().filter(|ef| !ef.is_success).count();
+            let successes = self
+                .empirical_findings
+                .iter()
+                .filter(|ef| ef.is_success)
+                .count();
+            let failures = self
+                .empirical_findings
+                .iter()
+                .filter(|ef| !ef.is_success)
+                .count();
             let total_sampled = self.empirical_findings.len();
-            output.push_str(&format!("- **Total Sampled UDT Values**: {}\n", total_sampled));
+            output.push_str(&format!(
+                "- **Total Sampled UDT Values**: {}\n",
+                total_sampled
+            ));
             output.push_str(&format!("- **Decoded Successfully**: {}\n", successes));
             output.push_str(&format!("- **Failed to Decode**: {}\n", failures));
             output.push_str("- **Limits**: Stellar RPC does not support wildcard ledger enumeration. Coverage is bounded to instance storage or offline files.\n\n");
@@ -669,7 +707,7 @@ mod tests {
             ],
         };
         let empty_spec = ContractSpec::default();
-        SafetyReport::new(&diff, &empty_spec, &empty_spec)
+        SafetyReport::new_with_specs(&diff, &empty_spec, &empty_spec)
     }
 
     #[test]
@@ -704,7 +742,7 @@ mod tests {
             )],
         };
         let empty_spec = ContractSpec::default();
-        let live = SafetyReport::with_suppressions(
+        let live = SafetyReport::with_suppressions_with_specs(
             &diff,
             &crate::suppression::SuppressionConfig::default(),
             true,

@@ -9,11 +9,14 @@ pub mod color;
 mod color;
 
 #[cfg(feature = "unstable")]
+pub mod config;
+#[cfg(not(feature = "unstable"))]
+mod config;
+
+#[cfg(feature = "unstable")]
 pub mod dependency;
 #[cfg(not(feature = "unstable"))]
 mod dependency;
-#[cfg(not(feature = "unstable"))]
-mod color;
 
 #[cfg(feature = "unstable")]
 pub mod diff;
@@ -39,6 +42,11 @@ mod interface_hash;
 pub mod loader;
 #[cfg(not(feature = "unstable"))]
 mod loader;
+
+#[cfg(feature = "unstable")]
+pub mod limits;
+#[cfg(not(feature = "unstable"))]
+mod limits;
 
 #[cfg(feature = "unstable")]
 pub mod mapper;
@@ -71,6 +79,16 @@ pub mod spec_json;
 mod spec_json;
 
 #[cfg(feature = "unstable")]
+pub mod storage_inference;
+#[cfg(not(feature = "unstable"))]
+mod storage_inference;
+
+#[cfg(feature = "unstable")]
+pub mod storage_schema;
+#[cfg(not(feature = "unstable"))]
+mod storage_schema;
+
+#[cfg(feature = "unstable")]
 pub mod suppression;
 #[cfg(not(feature = "unstable"))]
 mod suppression;
@@ -78,6 +96,7 @@ mod suppression;
 // Stable public API exports at the root
 pub use crate::diff::{Finding, Severity};
 pub use crate::report::{ReportedFinding, SafetyReport};
+pub use crate::storage_schema::{StorageReconciliation, StorageSchema, StorageSchemaComparison};
 
 use std::path::Path;
 
@@ -85,6 +104,35 @@ use anyhow::{Context, Result};
 
 use crate::spec::ContractSpec;
 use crate::suppression::SuppressionConfig;
+
+/// Infer and reconcile storage use for a single compiled contract.
+pub fn analyze_wasm_storage_schema(
+    wasm: &[u8],
+    schema: &StorageSchema,
+) -> Result<StorageReconciliation> {
+    let metadata =
+        parser::extract_metadata(wasm).context("Failed to analyze storage use in WASM")?;
+    Ok(schema.reconcile(&metadata.storage))
+}
+
+/// Infer and reconcile storage use for both sides of an upgrade.
+pub fn compare_wasm_storage_schemas(
+    old_wasm: &[u8],
+    old_schema: &StorageSchema,
+    new_wasm: &[u8],
+    new_schema: &StorageSchema,
+) -> Result<StorageSchemaComparison> {
+    let old = parser::extract_metadata(old_wasm)
+        .context("Failed to analyze storage use in the old WASM")?;
+    let new = parser::extract_metadata(new_wasm)
+        .context("Failed to analyze storage use in the new WASM")?;
+    Ok(storage_schema::compare_storage_schemas(
+        old_schema,
+        &old.storage,
+        new_schema,
+        &new.storage,
+    ))
+}
 
 /// Compare two Soroban contract builds supplied as raw WASM byte slices.
 pub fn compare_wasm_bytes(old_wasm: &[u8], new_wasm: &[u8]) -> Result<SafetyReport> {
@@ -97,8 +145,10 @@ pub fn compare_wasm_bytes(old_wasm: &[u8], new_wasm: &[u8]) -> Result<SafetyRepo
     let new_spec = ContractSpec::from_entries(&new_meta.spec);
 
     let diff_report = diff::compare(&old_spec, &new_spec);
-    Ok(SafetyReport::new(&diff_report, &old_spec, &new_spec)
-        .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash()))
+    Ok(
+        SafetyReport::new_with_specs(&diff_report, &old_spec, &new_spec)
+            .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash()),
+    )
 }
 
 /// Compare two Soroban contract builds read from WASM files on disk.
@@ -121,7 +171,7 @@ pub fn compare_wasm_bytes_with_options(
     old_wasm: &[u8],
     new_wasm: &[u8],
     options: &CompareOptions<'_>,
- ) -> Result<SafetyReport> {
+) -> Result<SafetyReport> {
     let empty_suppressions = SuppressionConfig::default();
     let suppressions = options.suppressions.unwrap_or(&empty_suppressions);
 
@@ -141,7 +191,7 @@ pub fn compare_wasm_bytes_with_options(
         &mut diff_report,
     );
 
-    let mut safety_report = SafetyReport::with_suppressions(
+    let mut safety_report = SafetyReport::with_suppressions_with_specs(
         &diff_report,
         suppressions,
         options.explain,
