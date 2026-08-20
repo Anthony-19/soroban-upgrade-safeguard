@@ -1,4 +1,9 @@
 #[cfg(feature = "unstable")]
+pub mod attestation;
+#[cfg(not(feature = "unstable"))]
+mod attestation;
+
+#[cfg(feature = "unstable")]
 pub mod call_abi;
 #[cfg(not(feature = "unstable"))]
 mod call_abi;
@@ -104,6 +109,11 @@ pub mod suppression;
 mod suppression;
 
 // Stable public API exports at the root
+pub use crate::attestation::{
+    sign_statement, verify_signatures, ArtifactDigest, AttestationSigner, DsseEnvelope,
+    Ed25519Signer, InTotoStatementV1, SafeguardPredicateV1, SignatureVerification,
+    VerificationFailure, VerificationFailureKind,
+};
 pub use crate::call_abi::{
     CallAbiBreak, CallAbiCompatibility, CallDirection, DirectionalCallVerdict,
 };
