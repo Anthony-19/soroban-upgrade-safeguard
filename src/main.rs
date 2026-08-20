@@ -732,6 +732,7 @@ fn run_batch(
         ));
 
         let gap_report = report::SafetyReport {
+            call_abi: soroban_upgrade_safeguard::CallAbiCompatibility::default(),
             critical_count: 1,
             warning_count: 0,
             info_count: 0,
@@ -981,6 +982,7 @@ fn synthesize_error_report(
     no_timestamp: bool,
 ) -> report::SafetyReport {
     report::SafetyReport {
+        call_abi: soroban_upgrade_safeguard::CallAbiCompatibility::default(),
         critical_count: 1,
         warning_count: 0,
         info_count: 0,

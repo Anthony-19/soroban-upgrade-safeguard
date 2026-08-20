@@ -176,6 +176,13 @@ fn compare_direction(
         }
     }
 
+    let mut breaks = breaks;
+    breaks.sort_by(|a, b| {
+        a.function
+            .cmp(&b.function)
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.reason.cmp(&b.reason))
+    });
     DirectionalCallVerdict::new(direction, breaks)
 }
 
@@ -472,4 +479,3 @@ fn sorted<T: Ord>(values: HashSet<T>) -> Vec<T> {
     values.sort();
     values
 }
-

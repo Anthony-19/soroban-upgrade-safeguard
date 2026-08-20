@@ -136,6 +136,8 @@ pub struct RenderableReport {
     #[serde(default)]
     pub findings_by_axis: BTreeMap<CompatibilityAxis, Vec<ReportedFinding>>,
     #[serde(default)]
+    pub call_abi: crate::call_abi::CallAbiCompatibility,
+    #[serde(default)]
     pub empirical: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub empirical_findings: Vec<crate::empirical::EmpiricalFinding>,
@@ -294,6 +296,7 @@ impl RenderableReport {
             };
             output.push_str(&format!("  - {:<18} {}\n", label, status_str));
         }
+        output.push_str(&self.directional_call_abi_text());
         output.push('\n');
 
         let crit_str = if self.counts.critical > 0 {
@@ -549,6 +552,7 @@ impl RenderableReport {
             "\n**Recommended SemVer Bump**: `{}`\n\n",
             self.recommended_bump
         ));
+        output.push_str(&self.directional_call_abi_markdown());
         for (label, value) in self.interface_hash_lines() {
             output.push_str(&format!("**{}**: `{}`\n\n", label, value));
         }
@@ -659,6 +663,59 @@ impl RenderableReport {
         }
 
         output
+    }
+
+    fn directional_call_abi_text(&self) -> String {
+        let mut out = String::from("\nDirectional Call ABI:\n");
+        for verdict in [
+            &self.call_abi.old_client_to_new_contract,
+            &self.call_abi.new_client_to_old_contract,
+        ] {
+            let label = match verdict.direction {
+                crate::call_abi::CallDirection::OldClientToNewContract => {
+                    "old client -> new contract"
+                }
+                crate::call_abi::CallDirection::NewClientToOldContract => {
+                    "new client -> old contract"
+                }
+            };
+            out.push_str(&format!(
+                "  - {:<28} {}\n",
+                label,
+                if verdict.compatible { "PASSED" } else { "FAILED" }
+            ));
+            for br in verdict.breaks.iter().take(8) {
+                out.push_str(&format!("      {}: {}\n", br.path, br.reason));
+            }
+        }
+        out
+    }
+
+    fn directional_call_abi_markdown(&self) -> String {
+        let mut out = String::from("### Directional Call ABI\n\n");
+        for verdict in [
+            &self.call_abi.old_client_to_new_contract,
+            &self.call_abi.new_client_to_old_contract,
+        ] {
+            let label = match verdict.direction {
+                crate::call_abi::CallDirection::OldClientToNewContract => {
+                    "Old client → new contract"
+                }
+                crate::call_abi::CallDirection::NewClientToOldContract => {
+                    "New client → old contract"
+                }
+            };
+            out.push_str(&format!(
+                "- **{}**: `{}`\n",
+                label,
+                if verdict.compatible { "passed" } else { "failed" }
+            ));
+            for br in verdict.breaks.iter().take(8) {
+                out.push_str(&format!("  - `{}` — {}\n", br.path, br.reason));
+            }
+        }
+        out.push('\n');
+        out
     }
 }
 
