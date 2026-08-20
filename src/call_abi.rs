@@ -175,7 +175,6 @@ fn compare_direction(
         }
     }
 
-    let mut breaks = breaks;
     breaks.sort_by(|a, b| {
         a.function
             .cmp(&b.function)

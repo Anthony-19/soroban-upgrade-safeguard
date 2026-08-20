@@ -612,6 +612,7 @@ impl SafetyReport {
         let mut critical_root_count = 0;
         let mut cascade_critical_count = 0;
         let call_abi = crate::call_abi::compare(old_spec, new_spec);
+        let mut unsuppressed_call_abi_finding = false;
 
         let mut axis_verdicts = HashMap::new();
         axis_verdicts.insert(
@@ -741,6 +742,9 @@ impl SafetyReport {
                 && finding.severity != Severity::Info
                 && finding.category != "Environment"
             {
+                if axes.contains(&crate::diff::CompatibilityAxis::CallAbi) {
+                    unsuppressed_call_abi_finding = true;
+                }
                 for axis in &axes {
                     let is_gated = strict
                         || match axis {
@@ -796,7 +800,7 @@ impl SafetyReport {
         // Directional ABI breaks are part of the aggregate CallAbi verdict.
         // They are derived from the wire value flow and therefore remain
         // visible even when no legacy source-level finding was emitted.
-        if !call_abi.compatible() {
+        if !call_abi.compatible() && (diff.findings.is_empty() || unsuppressed_call_abi_finding) {
             axis_verdicts.insert(
                 crate::diff::CompatibilityAxis::CallAbi,
                 if suppressions.policy.gate_call_abi || strict {
