@@ -69,6 +69,11 @@ pub mod report;
 mod report;
 
 #[cfg(feature = "unstable")]
+pub mod rpc;
+#[cfg(not(feature = "unstable"))]
+mod rpc;
+
+#[cfg(feature = "unstable")]
 pub mod spec;
 #[cfg(not(feature = "unstable"))]
 mod spec;
