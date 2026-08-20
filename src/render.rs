@@ -682,7 +682,11 @@ impl RenderableReport {
             out.push_str(&format!(
                 "  - {:<28} {}\n",
                 label,
-                if verdict.compatible { "PASSED" } else { "FAILED" }
+                if verdict.compatible {
+                    "PASSED"
+                } else {
+                    "FAILED"
+                }
             ));
             for br in verdict.breaks.iter().take(8) {
                 out.push_str(&format!("      {}: {}\n", br.path, br.reason));
@@ -708,7 +712,11 @@ impl RenderableReport {
             out.push_str(&format!(
                 "- **{}**: `{}`\n",
                 label,
-                if verdict.compatible { "passed" } else { "failed" }
+                if verdict.compatible {
+                    "passed"
+                } else {
+                    "failed"
+                }
             ));
             for br in verdict.breaks.iter().take(8) {
                 out.push_str(&format!("  - `{}` — {}\n", br.path, br.reason));

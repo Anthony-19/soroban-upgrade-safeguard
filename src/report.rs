@@ -318,6 +318,10 @@ impl SafetyReport {
         &self.axis_verdicts
     }
 
+    pub fn call_abi(&self) -> &crate::call_abi::CallAbiCompatibility {
+        &self.call_abi
+    }
+
     pub fn gated_axes(&self) -> &HashSet<crate::diff::CompatibilityAxis> {
         &self.gated_axes
     }

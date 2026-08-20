@@ -29,6 +29,27 @@ These findings affect the layout of serialized persistent and instance storage. 
 
 These findings affect the public interface of the contract. If deployed, calling contracts and client applications using existing SDKs will fail to compile or execute transactions.
 
+### 2.0 Directional verdicts and Soroban value flow
+
+Every comparison now reports two independent call conclusions:
+
+- `old_client_to_new_contract`: an existing client encodes old values and the
+  upgraded contract decodes them.
+- `new_client_to_old_contract`: a newly generated client encodes new values and
+  the old contract decodes them.
+
+Arguments flow from client to provider; return values flow from provider to
+client. The analyzer follows Soroban's encoded representation recursively:
+positional function arguments and tuple elements retain arity and order;
+`Option`, `Vec`, `Map`, and `Result` descend into their contained values;
+struct fields are matched by encoded symbol keys; enum and union cases must
+remain decodable for every value the producer may emit. A break includes the
+exact value path, such as `function.transfer.argument[0].some.value` or
+`function.quote.return[0].err`.
+
+The existing aggregate `call_abi` axis remains available for policies and older
+consumers. It fails when either directional verdict is incompatible.
+
 ### 2.1 Function Removed
 - **Description**: An exported public function was deleted.
 - **Why it breaks**: Deployed contracts or client SDKs that invoke this function will receive an unrecognized function identifier error.

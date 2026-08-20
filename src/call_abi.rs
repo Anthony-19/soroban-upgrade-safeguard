@@ -71,8 +71,7 @@ impl Default for CallAbiCompatibility {
 impl CallAbiCompatibility {
     /// Legacy aggregate view: call ABI is compatible only when both flows are.
     pub fn compatible(&self) -> bool {
-        self.old_client_to_new_contract.compatible
-            && self.new_client_to_old_contract.compatible
+        self.old_client_to_new_contract.compatible && self.new_client_to_old_contract.compatible
     }
 }
 
@@ -478,4 +477,206 @@ fn sorted<T: Ord>(values: HashSet<T>) -> Vec<T> {
     let mut values: Vec<_> = values.into_iter().collect();
     values.sort();
     values
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::{
+        ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeOption, ScSpecTypeResult, ScSpecTypeUdt,
+        ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0, ScSpecUdtStructFieldV0, ScSpecUdtStructV0, StringM,
+        VecM,
+    };
+
+    fn function(
+        name: &str,
+        inputs: Vec<ScSpecTypeDef>,
+        outputs: Vec<ScSpecTypeDef>,
+    ) -> ScSpecFunctionV0 {
+        ScSpecFunctionV0 {
+            doc: StringM::default(),
+            name: name.try_into().unwrap(),
+            inputs: VecM::try_from(
+                inputs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, type_)| ScSpecFunctionInputV0 {
+                        doc: StringM::default(),
+                        name: format!("p{i}").try_into().unwrap(),
+                        type_,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            outputs: VecM::try_from(outputs).unwrap(),
+        }
+    }
+
+    fn one_function(input: ScSpecTypeDef, output: ScSpecTypeDef) -> ContractSpec {
+        let mut spec = ContractSpec::default();
+        spec.functions
+            .insert("call".into(), function("call", vec![input], vec![output]));
+        spec
+    }
+
+    fn udt(name: &str) -> ScSpecTypeDef {
+        ScSpecTypeDef::Udt(ScSpecTypeUdt {
+            name: name.try_into().unwrap(),
+        })
+    }
+
+    fn add_struct(spec: &mut ContractSpec, fields: Vec<(&str, ScSpecTypeDef)>) {
+        spec.structs.insert(
+            "Data".into(),
+            ScSpecUdtStructV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: "Data".try_into().unwrap(),
+                fields: VecM::try_from(
+                    fields
+                        .into_iter()
+                        .map(|(name, type_)| ScSpecUdtStructFieldV0 {
+                            doc: StringM::default(),
+                            name: name.try_into().unwrap(),
+                            type_,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            },
+        );
+    }
+
+    fn add_enum(spec: &mut ContractSpec, values: &[u32]) {
+        spec.enums.insert(
+            "Choice".into(),
+            ScSpecUdtEnumV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: "Choice".try_into().unwrap(),
+                cases: VecM::try_from(
+                    values
+                        .iter()
+                        .map(|value| ScSpecUdtEnumCaseV0 {
+                            doc: StringM::default(),
+                            name: format!("C{value}").try_into().unwrap(),
+                            value: *value,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            },
+        );
+    }
+
+    #[test]
+    fn function_addition_only_breaks_new_clients_calling_old_contract() {
+        let old = ContractSpec::default();
+        let mut new = ContractSpec::default();
+        new.functions
+            .insert("added".into(), function("added", vec![], vec![]));
+        let result = compare(&old, &new);
+        assert!(result.old_client_to_new_contract.compatible);
+        assert!(!result.new_client_to_old_contract.compatible);
+        assert_eq!(
+            result.new_client_to_old_contract.breaks[0].path,
+            "function.added"
+        );
+    }
+
+    #[test]
+    fn parameter_arity_breaks_both_directions() {
+        let mut old = ContractSpec::default();
+        let mut new = ContractSpec::default();
+        old.functions.insert(
+            "call".into(),
+            function("call", vec![ScSpecTypeDef::U32], vec![]),
+        );
+        new.functions.insert(
+            "call".into(),
+            function("call", vec![ScSpecTypeDef::U32, ScSpecTypeDef::U32], vec![]),
+        );
+        let result = compare(&old, &new);
+        assert!(!result.old_client_to_new_contract.compatible);
+        assert!(!result.new_client_to_old_contract.compatible);
+    }
+
+    #[test]
+    fn enum_addition_is_directional_for_arguments_and_returns() {
+        let mut old = one_function(udt("Choice"), udt("Choice"));
+        let mut new = one_function(udt("Choice"), udt("Choice"));
+        add_enum(&mut old, &[1]);
+        add_enum(&mut new, &[1, 2]);
+        let result = compare(&old, &new);
+        let old_to_new = &result.old_client_to_new_contract.breaks;
+        let new_to_old = &result.new_client_to_old_contract.breaks;
+        assert!(old_to_new
+            .iter()
+            .any(|b| b.path.ends_with("return[0].case[2]")));
+        assert!(new_to_old
+            .iter()
+            .any(|b| b.path.ends_with("argument[0].case[2]")));
+    }
+
+    #[test]
+    fn nested_result_path_identifies_the_breaking_arm_and_field() {
+        let nested_old = ScSpecTypeDef::Result(Box::new(ScSpecTypeResult {
+            ok_type: Box::new(udt("Data")),
+            error_type: Box::new(ScSpecTypeDef::U32),
+        }));
+        let nested_new = ScSpecTypeDef::Result(Box::new(ScSpecTypeResult {
+            ok_type: Box::new(udt("Data")),
+            error_type: Box::new(ScSpecTypeDef::U32),
+        }));
+        let mut old = one_function(ScSpecTypeDef::U32, nested_old);
+        let mut new = one_function(ScSpecTypeDef::U32, nested_new);
+        add_struct(&mut old, vec![("value", ScSpecTypeDef::U32)]);
+        add_struct(&mut new, vec![("value", ScSpecTypeDef::U64)]);
+        let result = compare(&old, &new);
+        assert_eq!(
+            result.old_client_to_new_contract.breaks[0].path,
+            "function.call.return[0].ok.value"
+        );
+    }
+
+    #[test]
+    fn val_consumer_accepts_specific_values_but_specific_consumer_rejects_val() {
+        let old = one_function(ScSpecTypeDef::U32, ScSpecTypeDef::U32);
+        let new = one_function(ScSpecTypeDef::Val, ScSpecTypeDef::Val);
+        let result = compare(&old, &new);
+        assert!(result
+            .old_client_to_new_contract
+            .breaks
+            .iter()
+            .all(|b| !b.path.contains("argument")));
+        assert!(result
+            .new_client_to_old_contract
+            .breaks
+            .iter()
+            .any(|b| b.path.contains("argument")));
+        assert!(result
+            .old_client_to_new_contract
+            .breaks
+            .iter()
+            .any(|b| b.path.contains("return")));
+    }
+
+    #[test]
+    fn option_recursion_reports_some_path() {
+        let old = one_function(
+            ScSpecTypeDef::Option(Box::new(ScSpecTypeOption {
+                value_type: Box::new(ScSpecTypeDef::U32),
+            })),
+            ScSpecTypeDef::U32,
+        );
+        let new = one_function(
+            ScSpecTypeDef::Option(Box::new(ScSpecTypeOption {
+                value_type: Box::new(ScSpecTypeDef::U64),
+            })),
+            ScSpecTypeDef::U32,
+        );
+        assert!(compare(&old, &new).old_client_to_new_contract.breaks[0]
+            .path
+            .ends_with("argument[0].some"));
+    }
 }

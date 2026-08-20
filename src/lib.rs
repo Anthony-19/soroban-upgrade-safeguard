@@ -104,7 +104,9 @@ pub mod suppression;
 mod suppression;
 
 // Stable public API exports at the root
-pub use crate::call_abi::{CallAbiBreak, CallAbiCompatibility, CallDirection, DirectionalCallVerdict};
+pub use crate::call_abi::{
+    CallAbiBreak, CallAbiCompatibility, CallDirection, DirectionalCallVerdict,
+};
 pub use crate::diff::{Finding, Severity};
 pub use crate::report::{ReportedFinding, SafetyReport};
 pub use crate::storage_schema::{StorageReconciliation, StorageSchema, StorageSchemaComparison};

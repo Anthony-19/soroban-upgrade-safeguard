@@ -22,6 +22,8 @@ fn library_detects_breaking_upgrade_from_files() {
         .expect("comparison should succeed on valid fixtures");
 
     assert!(!report.is_safe(), "v1 -> v2 must be flagged as unsafe");
+    assert!(!report.call_abi().old_client_to_new_contract.compatible);
+    assert!(!report.call_abi().new_client_to_old_contract.compatible);
     assert!(
         report.critical_count() >= 1,
         "v1 -> v2 must report at least one critical finding"
