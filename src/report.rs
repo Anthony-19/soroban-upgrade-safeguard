@@ -83,6 +83,7 @@ impl ReportedFinding {
 /// A structured container for aggregated comparison findings.
 #[derive(Debug, Default)]
 pub struct SafetyReport {
+    pub call_abi: crate::call_abi::CallAbiCompatibility,
     #[cfg(feature = "unstable")]
     pub critical_count: usize,
     #[cfg(not(feature = "unstable"))]
@@ -317,6 +318,10 @@ impl SafetyReport {
         &self.axis_verdicts
     }
 
+    pub fn call_abi(&self) -> &crate::call_abi::CallAbiCompatibility {
+        &self.call_abi
+    }
+
     pub fn gated_axes(&self) -> &HashSet<crate::diff::CompatibilityAxis> {
         &self.gated_axes
     }
@@ -522,6 +527,7 @@ impl SafetyReport {
         gated_axes.insert(crate::diff::CompatibilityAxis::CallAbi);
 
         Self {
+            call_abi: crate::call_abi::CallAbiCompatibility::default(),
             critical_count: 0,
             warning_count: 0,
             info_count: 0,
@@ -605,6 +611,8 @@ impl SafetyReport {
         let mut findings_by_category: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
         let mut critical_root_count = 0;
         let mut cascade_critical_count = 0;
+        let call_abi = crate::call_abi::compare(old_spec, new_spec);
+        let mut unsuppressed_call_abi_finding = false;
 
         let mut axis_verdicts = HashMap::new();
         axis_verdicts.insert(
@@ -734,6 +742,9 @@ impl SafetyReport {
                 && finding.severity != Severity::Info
                 && finding.category != "Environment"
             {
+                if axes.contains(&crate::diff::CompatibilityAxis::CallAbi) {
+                    unsuppressed_call_abi_finding = true;
+                }
                 for axis in &axes {
                     let is_gated = strict
                         || match axis {
@@ -786,11 +797,25 @@ impl SafetyReport {
                 });
         }
 
+        // Directional ABI breaks are part of the aggregate CallAbi verdict.
+        // They are derived from the wire value flow and therefore remain
+        // visible even when no legacy source-level finding was emitted.
+        if !call_abi.compatible() && (diff.findings.is_empty() || unsuppressed_call_abi_finding) {
+            axis_verdicts.insert(
+                crate::diff::CompatibilityAxis::CallAbi,
+                if suppressions.policy.gate_call_abi || strict {
+                    AxisStatus::Failed
+                } else {
+                    AxisStatus::Warning
+                },
+            );
+        }
         let is_safe = !axis_verdicts
             .values()
             .any(|&status| status == AxisStatus::Failed);
 
         Self {
+            call_abi,
             critical_count,
             warning_count,
             info_count,
@@ -837,7 +862,7 @@ impl SafetyReport {
     }
 
     pub fn recommended_bump(&self) -> &'static str {
-        if self.critical_count > 0 {
+        if self.critical_count > 0 || !self.call_abi.compatible() {
             "major"
         } else if self.warning_count > 0 {
             "minor"
@@ -934,6 +959,7 @@ impl SafetyReport {
             axis_verdicts: self.axis_verdicts.iter().map(|(k, v)| (*k, *v)).collect(),
             gated_axes: self.gated_axes.iter().copied().collect(),
             findings_by_axis,
+            call_abi: self.call_abi.clone(),
             empirical: self.empirical,
             empirical_findings: self.empirical_findings.clone(),
         }
@@ -1071,6 +1097,7 @@ mod tests {
         }
 
         let mut report = SafetyReport {
+            call_abi: crate::call_abi::CallAbiCompatibility::default(),
             critical_count: 0,
             warning_count: 0,
             info_count: 0,
