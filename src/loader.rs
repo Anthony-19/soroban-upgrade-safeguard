@@ -10,6 +10,7 @@ use stellar_xdr::curr::{
 use wasmparser::Parser;
 
 use crate::error::Error;
+use crate::rpc::RpcClientConfig;
 
 /// Holds raw WASM bytes alongside the validated file path.
 #[derive(Debug)]
@@ -121,6 +122,21 @@ fn validate_wasm_structure(bytes: &[u8]) -> Result<(), Error> {
 
 /// Fetches a deployed Soroban contract's WASM bytes from Stellar RPC by contract ID.
 pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModule, Error> {
+    fetch_wasm_from_rpc_inner(contract_id, rpc_url, None)
+}
+
+pub fn fetch_wasm_from_rpc_with_config(
+    contract_id: &str,
+    config: &RpcClientConfig,
+) -> Result<WasmModule, Error> {
+    fetch_wasm_from_rpc_inner(contract_id, &config.url, Some(config))
+}
+
+fn fetch_wasm_from_rpc_inner(
+    contract_id: &str,
+    rpc_url: &str,
+    auth: Option<&RpcClientConfig>,
+) -> Result<WasmModule, Error> {
     // 1. Parse contract_id using stellar_strkey
     let strkey =
         stellar_strkey::Strkey::from_string(contract_id).map_err(|e| Error::InvalidInput {
@@ -156,6 +172,7 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
     // 4. Query getLedgerEntries RPC
     let response = query_rpc(
         rpc_url,
+        auth,
         "getLedgerEntries",
         serde_json::json!({
             "keys": [key_b64]
@@ -251,6 +268,7 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
 
     let code_response = query_rpc(
         rpc_url,
+        auth,
         "getLedgerEntries",
         serde_json::json!({
             "keys": [code_key_b64]
@@ -336,6 +354,7 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
 /// Helper to execute JSON-RPC request to Stellar RPC.
 fn query_rpc(
     rpc_url: &str,
+    auth: Option<&RpcClientConfig>,
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
@@ -346,25 +365,38 @@ fn query_rpc(
         "params": params
     });
 
-    let response: serde_json::Value = ureq::post(rpc_url)
+    let (agent, headers) = match auth {
+        Some(config) => config.request_parts()?,
+        None => (
+            ureq::AgentBuilder::new()
+                .redirect_auth_headers(ureq::RedirectAuthHeaders::Never)
+                .build(),
+            crate::rpc::ResolvedRpcHeaders::empty(),
+        ),
+    };
+    let mut request = agent.post(rpc_url);
+    for (name, value) in &headers.values {
+        request = request.set(name, value);
+    }
+    let response: serde_json::Value = request
         .send_json(payload)
         .map_err(|e| Error::RpcTransport {
-            rpc_url: rpc_url.to_string(),
-            details: format!("RPC request failed: {}", e),
-            source: Some(Box::new(e)),
+            rpc_url: crate::rpc::redact_url(rpc_url),
+            details: format!("RPC request failed ({:?})", e.kind()),
+            source: None,
         })?
         .into_json()
-        .map_err(|e| Error::RpcTransport {
-            rpc_url: rpc_url.to_string(),
-            details: format!("Failed to parse RPC response: {}", e),
-            source: Some(Box::new(e)),
+        .map_err(|_e| Error::RpcTransport {
+            rpc_url: crate::rpc::redact_url(rpc_url),
+            details: "Failed to parse RPC response body".to_string(),
+            source: None,
         })?;
 
     if let Some(err) = response.get("error") {
         let msg = err["message"].as_str().unwrap_or("Unknown RPC error");
         let code = err["code"].as_i64().unwrap_or(0);
         return Err(Error::RpcProtocol {
-            rpc_url: rpc_url.to_string(),
+            rpc_url: crate::rpc::redact_url(rpc_url),
             code,
             message: msg.to_string(),
         });
@@ -377,6 +409,21 @@ fn query_rpc(
 pub fn fetch_instance_storage_from_rpc(
     contract_id: &str,
     rpc_url: &str,
+) -> Result<Vec<ContractDataEntry>, Error> {
+    fetch_instance_storage_from_rpc_inner(contract_id, rpc_url, None)
+}
+
+pub fn fetch_instance_storage_from_rpc_with_config(
+    contract_id: &str,
+    config: &RpcClientConfig,
+) -> Result<Vec<ContractDataEntry>, Error> {
+    fetch_instance_storage_from_rpc_inner(contract_id, &config.url, Some(config))
+}
+
+fn fetch_instance_storage_from_rpc_inner(
+    contract_id: &str,
+    rpc_url: &str,
+    auth: Option<&RpcClientConfig>,
 ) -> Result<Vec<ContractDataEntry>, Error> {
     let strkey =
         stellar_strkey::Strkey::from_string(contract_id).map_err(|e| Error::InvalidInput {
@@ -409,6 +456,7 @@ pub fn fetch_instance_storage_from_rpc(
 
     let response = query_rpc(
         rpc_url,
+        auth,
         "getLedgerEntries",
         serde_json::json!({
             "keys": [key_b64]

@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use soroban_upgrade_safeguard::error::ErrorKind;
 use soroban_upgrade_safeguard::loader::fetch_wasm_from_rpc;
+use soroban_upgrade_safeguard::loader::fetch_wasm_from_rpc_with_config;
+use soroban_upgrade_safeguard::rpc::RpcClientConfig;
 
 use stellar_xdr::curr::{
     ContractCodeEntry, ContractDataDurability, ContractDataEntry, ContractExecutable,
@@ -77,7 +79,7 @@ fn build_code_entry_xdr(wasm_hash: &[u8; 32], code: &[u8]) -> String {
         .expect("failed to encode code entry")
 }
 
-fn read_http_request(stream: &mut std::net::TcpStream) {
+fn read_http_request(stream: &mut std::net::TcpStream) -> String {
     let mut request = Vec::new();
     let mut buf = [0u8; 1024];
     while !request.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -89,6 +91,7 @@ fn read_http_request(stream: &mut std::net::TcpStream) {
             break;
         }
     }
+    String::from_utf8_lossy(&request).into_owned()
 }
 
 fn finish_http_response(stream: &mut std::net::TcpStream, response: &[u8]) {
@@ -115,7 +118,7 @@ fn start_mock_rpc(instance_xdr: String, code_xdr: String) -> (String, Arc<TcpLis
             let (mut stream, _) = listener_clone.accept().expect("failed to accept");
 
             // Read the full HTTP request (we don't need to parse it carefully)
-            read_http_request(&mut stream);
+            let _ = read_http_request(&mut stream);
 
             let body = serde_json::json!({
                 "jsonrpc": "2.0",
@@ -152,7 +155,7 @@ fn start_mock_rpc_not_found() -> (String, Arc<TcpListener>) {
 
     thread::spawn(move || {
         let (mut stream, _) = listener_clone.accept().expect("failed to accept");
-        read_http_request(&mut stream);
+        let _ = read_http_request(&mut stream);
 
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -225,7 +228,7 @@ fn start_mock_rpc_with(responses: Vec<serde_json::Value>) -> (String, Arc<TcpLis
     thread::spawn(move || {
         for resp in responses {
             if let Ok((mut stream, _)) = l.accept() {
-                read_http_request(&mut stream);
+                let _ = read_http_request(&mut stream);
                 let body = serde_json::to_string(&resp).unwrap();
                 let response = format!(
                     "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -527,4 +530,80 @@ fn fetch_wasm_from_rpc_json_rpc_error() {
         msg.contains("ledger not found"),
         "expected error to contain the RPC error message, got: {msg}"
     );
+}
+
+#[test]
+fn authenticated_header_is_applied_to_every_rpc_request() {
+    let code = wasm_bytes("v1.wasm");
+    let wasm_hash = [42u8; 32];
+    let responses = vec![
+        build_rpc_success(&build_instance_entry_xdr(&wasm_hash)),
+        build_rpc_success(&build_code_entry_xdr(&wasm_hash, &code)),
+    ];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+
+    let server = thread::spawn(move || {
+        for body in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            captured
+                .lock()
+                .unwrap()
+                .push(read_http_request(&mut stream));
+            let body = serde_json::to_string(&body).unwrap();
+            let response = format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            finish_http_response(&mut stream, response.as_bytes());
+        }
+    });
+
+    std::env::set_var("SAFEGUARD_RPC_AUTH_TEST", "Bearer test-secret");
+    let config = RpcClientConfig::new(format!("http://{addr}"))
+        .unwrap()
+        .with_env_header("Authorization", "SAFEGUARD_RPC_AUTH_TEST")
+        .unwrap();
+    fetch_wasm_from_rpc_with_config(TEST_CONTRACT_ID, &config).unwrap();
+    server.join().unwrap();
+    std::env::remove_var("SAFEGUARD_RPC_AUTH_TEST");
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests
+        .iter()
+        .all(|request| request.contains("Authorization: Bearer test-secret")));
+}
+
+#[test]
+fn authenticated_request_does_not_follow_cross_origin_redirect() {
+    let sink = TcpListener::bind("127.0.0.1:0").unwrap();
+    sink.set_nonblocking(true).unwrap();
+    let sink_addr = sink.local_addr().unwrap();
+    let redirect = TcpListener::bind("127.0.0.1:0").unwrap();
+    let redirect_addr = redirect.local_addr().unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = redirect.accept().unwrap();
+        let _ = read_http_request(&mut stream);
+        let response = format!(
+            "HTTP/1.0 302 Found\r\nLocation: http://{sink_addr}/leak\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        finish_http_response(&mut stream, response.as_bytes());
+    });
+
+    std::env::set_var("SAFEGUARD_RPC_REDIRECT_TEST", "redirect-secret");
+    let config = RpcClientConfig::new(format!("http://{redirect_addr}"))
+        .unwrap()
+        .with_env_header("X-Api-Key", "SAFEGUARD_RPC_REDIRECT_TEST")
+        .unwrap();
+    let error = fetch_wasm_from_rpc_with_config(TEST_CONTRACT_ID, &config).unwrap_err();
+    server.join().unwrap();
+    std::env::remove_var("SAFEGUARD_RPC_REDIRECT_TEST");
+
+    assert_eq!(error.kind(), ErrorKind::RpcTransport);
+    thread::sleep(Duration::from_millis(50));
+    assert!(sink.accept().is_err(), "redirect target received a request");
 }

@@ -19,6 +19,8 @@ pub enum ErrorKind {
     Integrity,
     InvalidInput,
     LimitExceeded,
+    RpcAuthConfig,
+    InvalidHeaderName,
 }
 
 /// The canonical error type for the soroban-upgrade-safeguard library.
@@ -104,6 +106,12 @@ pub enum Error {
         details: String,
         source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
     },
+    RpcAuthConfig {
+        details: String,
+    },
+    InvalidHeaderName {
+        name: String,
+    },
 }
 
 impl Error {
@@ -125,6 +133,8 @@ impl Error {
             Error::Integrity { .. } => ErrorKind::Integrity,
             Error::InvalidInput { .. } => ErrorKind::InvalidInput,
             Error::LimitExceeded { .. } => ErrorKind::LimitExceeded,
+            Error::RpcAuthConfig { .. } => ErrorKind::RpcAuthConfig,
+            Error::InvalidHeaderName { .. } => ErrorKind::InvalidHeaderName,
         }
     }
 
@@ -255,6 +265,10 @@ impl fmt::Display for Error {
             Error::LimitExceeded { details, .. } => {
                 write!(f, "Resource limit exceeded: {details}")
             }
+            Error::RpcAuthConfig { details } => {
+                write!(f, "RPC authentication configuration error: {details}")
+            }
+            Error::InvalidHeaderName { name } => write!(f, "Invalid RPC header name '{name}'"),
         }
     }
 }
@@ -292,6 +306,7 @@ impl std::error::Error for Error {
             Error::LimitExceeded { source, .. } => source
                 .as_ref()
                 .map(|s| s.as_ref() as &dyn std::error::Error),
+            Error::RpcAuthConfig { .. } | Error::InvalidHeaderName { .. } => None,
         }
     }
 }
