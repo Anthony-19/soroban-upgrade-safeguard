@@ -69,6 +69,11 @@ pub mod mapper;
 mod mapper;
 
 #[cfg(feature = "unstable")]
+pub mod oci;
+#[cfg(not(feature = "unstable"))]
+mod oci;
+
+#[cfg(feature = "unstable")]
 pub mod parser;
 #[cfg(not(feature = "unstable"))]
 mod parser;
@@ -138,6 +143,10 @@ pub use crate::call_abi::{
     CallAbiBreak, CallAbiCompatibility, CallDirection, DirectionalCallVerdict,
 };
 pub use crate::diff::{Finding, Severity};
+pub use crate::oci::{
+    OciArtifact, OciArtifactKind, OciFetchConfig, OciReference, OciSelector,
+    MEDIA_TYPE_EXTRACTED_SPEC, MEDIA_TYPE_WASM,
+};
 pub use crate::remote::{
     default_cache_dir, fetch_verified, CacheStatus, FetchedArtifact, RemoteFetchConfig, RemoteRef,
 };

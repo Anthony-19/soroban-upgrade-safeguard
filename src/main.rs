@@ -13,7 +13,9 @@ use soroban_upgrade_safeguard::{
         VerificationPolicy,
     },
     color::{should_disable_color, ColorMode},
-    diff, loader, parser,
+    diff, loader,
+    oci::{self, OciArtifactKind, OciFetchConfig, OciReference},
+    parser,
     remote::{self, RemoteFetchConfig, RemoteRef},
     render::RenderableReport,
     report,
@@ -307,6 +309,34 @@ struct Args {
     /// Delete every cached `https://` input artifact and exit.
     #[arg(long)]
     clear_remote_cache: bool,
+
+    /// Maximum bytes accepted for any `oci://` manifest or layer download.
+    #[arg(long, value_name = "BYTES", default_value_t = oci::DEFAULT_MAX_BYTES)]
+    oci_max_bytes: usize,
+
+    /// Timeout, in seconds, for any single `oci://` registry request.
+    #[arg(long, value_name = "SECONDS", default_value_t = oci::DEFAULT_TIMEOUT_SECS)]
+    oci_timeout_secs: u64,
+
+    /// Directory used to cache verified `oci://` input layers by digest.
+    /// Defaults to a directory under the OS temp dir; see
+    /// `SOROBAN_SAFEGUARD_OCI_CACHE`.
+    #[arg(long, value_name = "DIR")]
+    oci_cache_dir: Option<PathBuf>,
+
+    /// Do not read from or write to the OCI-artifact cache for this run.
+    #[arg(long)]
+    no_oci_cache: bool,
+
+    /// Delete every cached `oci://` input artifact and exit.
+    #[arg(long)]
+    clear_oci_cache: bool,
+
+    /// Allow an `oci://` input to reference a mutable tag instead of a
+    /// pinned `@sha256:<hex>` digest. The resolved digest is printed so the
+    /// reference can be pinned afterward. Off by default.
+    #[arg(long)]
+    allow_oci_tags: bool,
 }
 
 /// Build the remote-fetch policy for `https://` inputs from the top-level CLI flags.
@@ -318,6 +348,18 @@ fn remote_fetch_config(args: &Args) -> RemoteFetchConfig {
         cache_dir: args.remote_cache_dir.clone(),
         no_cache: args.no_remote_cache,
         https_only: true,
+    }
+}
+
+/// Build the OCI-fetch policy for `oci://` inputs from the top-level CLI flags.
+fn oci_fetch_config(args: &Args) -> OciFetchConfig {
+    OciFetchConfig {
+        max_bytes: args.oci_max_bytes,
+        timeout: Duration::from_secs(args.oci_timeout_secs),
+        cache_dir: args.oci_cache_dir.clone(),
+        no_cache: args.no_oci_cache,
+        https_only: true,
+        allow_tags: args.allow_oci_tags,
     }
 }
 
@@ -467,9 +509,14 @@ fn rpc_config(url: &str, headers: &[String]) -> Result<RpcClientConfig> {
 /// Decode one build and emit its interface as JSON, or just its hash.
 fn run_extract(args: &ExtractArgs) -> Result<()> {
     let build = match (&args.wasm, &args.contract_id) {
-        (Some(path), None) => load_wasm_input(path, &RemoteFetchConfig::default(), &|line| {
-            eprintln!("{line}");
-        })?,
+        (Some(path), None) => load_wasm_input(
+            path,
+            &RemoteFetchConfig::default(),
+            &OciFetchConfig::default(),
+            &|line| {
+                eprintln!("{line}");
+            },
+        )?,
         (None, Some(contract_id)) => {
             let rpc_url = args
                 .rpc_url
@@ -505,9 +552,10 @@ fn run_extract(args: &ExtractArgs) -> Result<()> {
     Ok(())
 }
 
-/// Reads bytes for an artifact reference that may be a local path or an
-/// `https://…#sha256=<hex>` remote reference (used for storage-schema
-/// references in `attest`/`verify-attestation`).
+/// Reads bytes for an artifact reference that may be a local path, an
+/// `https://…#sha256=<hex>` remote reference, or an
+/// `oci://registry/repository@sha256:<hex>` reference (used for
+/// storage-schema references in `attest`/`verify-attestation`).
 fn read_artifact_bytes(path: &Path) -> Result<Vec<u8>> {
     if let Some(remote) =
         RemoteRef::parse(&path.to_string_lossy()).map_err(|e| anyhow::anyhow!(e))?
@@ -525,10 +573,39 @@ fn read_artifact_bytes(path: &Path) -> Result<Vec<u8>> {
                 .unwrap_or_default()
         );
         Ok(artifact.bytes)
+    } else if let Some(reference) =
+        OciReference::parse(&path.to_string_lossy()).map_err(|e| anyhow::anyhow!(e))?
+    {
+        let artifact = oci::resolve_oci_artifact(
+            &reference,
+            OciArtifactKind::ExtractedSpec,
+            &OciFetchConfig::default(),
+        )?;
+        print_oci_provenance(&artifact);
+        Ok(artifact.bytes)
     } else {
         std::fs::read(path)
             .with_context(|| format!("Failed to read artifact '{}'.", path.display()))
     }
+}
+
+/// Prints a provenance line for a resolved OCI artifact naming exactly which
+/// registry, repository, manifest, and layer were analyzed.
+fn print_oci_provenance(artifact: &oci::OciArtifact) {
+    eprintln!(
+        "📦 OCI input: {}/{}@{} (manifest {}{}, cache {}, {})",
+        artifact.registry,
+        artifact.repository,
+        artifact.layer_digest,
+        artifact.manifest_digest,
+        artifact
+            .resolved_tag
+            .as_deref()
+            .map(|t| format!(", resolved from tag '{t}'"))
+            .unwrap_or_default(),
+        artifact.cache_status,
+        artifact.media_type
+    );
 }
 
 fn file_artifact(path: &Path) -> Result<AttestedArtifact> {
@@ -899,6 +976,19 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if args.clear_oci_cache {
+        let dir = args
+            .oci_cache_dir
+            .clone()
+            .unwrap_or_else(oci::default_cache_dir);
+        oci::clear_cache(&dir)
+            .with_context(|| format!("Failed to clear OCI cache at '{}'", dir.display()))?;
+        if !args.quiet {
+            println!("Cleared OCI artifact cache at '{}'", dir.display());
+        }
+        return Ok(());
+    }
+
     match &args.command {
         Some(Command::Extract(extract_args)) => return run_extract(extract_args),
         Some(Command::Render(render_args)) => return run_render(render_args),
@@ -1027,6 +1117,7 @@ fn run_batch(
         )?
     };
     let remote_config = remote_fetch_config(args);
+    let oci_config = oci_fetch_config(args);
 
     progress("🔍 Soroban Upgrade Safeguard (Batch Mode)".to_string());
     progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
@@ -1197,8 +1288,8 @@ fn run_batch(
         ));
 
         let report = match (
-            load_wasm_input(&pair.old, &remote_config, progress),
-            load_wasm_input(&pair.new, &remote_config, progress),
+            load_wasm_input(&pair.old, &remote_config, &oci_config, progress),
+            load_wasm_input(&pair.new, &remote_config, &oci_config, progress),
         ) {
             (Ok(old_wasm), Ok(new_wasm)) => {
                 match compare_contracts(
@@ -1616,6 +1707,7 @@ fn run_single(
         ));
 
         let remote_config = remote_fetch_config(args);
+        let oci_config = oci_fetch_config(args);
 
         let old = if let Some(contract_id) = old_source {
             let rpc_url = args.rpc_url.as_ref().unwrap();
@@ -1624,10 +1716,10 @@ fn run_single(
                 &rpc_config(rpc_url, &args.rpc_headers)?,
             )?
         } else {
-            load_wasm_input(&args.wasm_paths[0], &remote_config, progress)?
+            load_wasm_input(&args.wasm_paths[0], &remote_config, &oci_config, progress)?
         };
 
-        let new = load_wasm_input(new_wasm_path, &remote_config, progress)?;
+        let new = load_wasm_input(new_wasm_path, &remote_config, &oci_config, progress)?;
 
         if !suppressions.rules.is_empty() {
             progress(format!(
@@ -1912,15 +2004,17 @@ fn is_stdin_wasm_path(path: &Path) -> bool {
     path == Path::new("-")
 }
 
-/// Loads a WASM input that may be `-` for stdin, a local file path, or an
-/// `https://…#sha256=<hex>` remote reference.
+/// Loads a WASM input that may be `-` for stdin, a local file path, an
+/// `https://…#sha256=<hex>` remote reference, or an
+/// `oci://registry/repository@sha256:<hex>` reference.
 ///
 /// This is the single dispatch point shared by the comparison positional
 /// arguments, `extract`, and batch manifest entries, so every WASM input
-/// position gets HTTPS support uniformly.
+/// position gets HTTPS and OCI support uniformly.
 fn load_wasm_input(
     path: &Path,
     remote_config: &RemoteFetchConfig,
+    oci_config: &OciFetchConfig,
     progress: &dyn Fn(String),
 ) -> Result<loader::WasmModule> {
     if is_stdin_wasm_path(path) {
@@ -1941,6 +2035,26 @@ fn load_wasm_input(
                 .as_deref()
                 .map(|m| format!(", {m}"))
                 .unwrap_or_default()
+        ));
+        return Ok(module);
+    }
+    if let Some(reference) =
+        OciReference::parse(&path.to_string_lossy()).map_err(|e| anyhow::anyhow!(e))?
+    {
+        let (module, artifact) = loader::load_wasm_from_oci(&reference, oci_config)?;
+        progress(format!(
+            "📦 OCI input: {}/{}@{} (manifest {}{}, cache {}, {})",
+            artifact.registry,
+            artifact.repository,
+            artifact.layer_digest,
+            artifact.manifest_digest,
+            artifact
+                .resolved_tag
+                .as_deref()
+                .map(|t| format!(", resolved from tag '{t}'"))
+                .unwrap_or_default(),
+            artifact.cache_status,
+            artifact.media_type
         ));
         return Ok(module);
     }

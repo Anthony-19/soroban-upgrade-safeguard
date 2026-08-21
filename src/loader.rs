@@ -10,6 +10,7 @@ use stellar_xdr::curr::{
 use wasmparser::Parser;
 
 use crate::error::Error;
+use crate::oci::{self, OciArtifact, OciArtifactKind, OciFetchConfig, OciReference};
 use crate::remote::{self, FetchedArtifact, RemoteFetchConfig, RemoteRef};
 use crate::rpc::RpcClientConfig;
 
@@ -91,6 +92,28 @@ pub fn load_wasm_from_url(
         PathBuf::from(&artifact.final_url),
         artifact.final_url.clone(),
     )?;
+    Ok((module, artifact))
+}
+
+/// Resolves a WASM binary from an `oci://<registry>/<repository>@sha256:<hex>`
+/// reference, verifies it against the resolved layer digest, and validates
+/// it like a local file.
+///
+/// Returns both the resulting [`WasmModule`] (whose `path` is a
+/// `oci://registry/repository@sha256:...` label built from the resolved
+/// digest, mirroring how [`fetch_wasm_from_rpc`] labels RPC-sourced modules)
+/// and the [`OciArtifact`] provenance record for callers that want to
+/// surface registry/repository/manifest/layer details.
+pub fn load_wasm_from_oci(
+    reference: &OciReference,
+    config: &OciFetchConfig,
+) -> Result<(WasmModule, OciArtifact), Error> {
+    let artifact = oci::resolve_oci_artifact(reference, OciArtifactKind::Wasm, config)?;
+    let label = format!(
+        "oci://{}/{}@{}",
+        artifact.registry, artifact.repository, artifact.layer_digest
+    );
+    let module = wasm_module_from_bytes(artifact.bytes.clone(), PathBuf::from(&label), label)?;
     Ok((module, artifact))
 }
 
