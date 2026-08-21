@@ -239,15 +239,14 @@ fn fetch_wasm_recording(
             code: 0,
             message: "Code entry missing 'xdr' field".to_string(),
         })?;
-    let code_entry =
-        LedgerEntry::from_xdr_base64(code_xdr_b64, Limits::none()).map_err(|e| {
-            Error::XdrDecoding {
-                entry_index: Some(0),
-                byte_offset: None,
-                details: format!("Failed to decode code LedgerEntry: {}", e),
-                source: Some(Box::new(e)),
-            }
-        })?;
+    let code_entry = LedgerEntry::from_xdr_base64(code_xdr_b64, Limits::none()).map_err(|e| {
+        Error::XdrDecoding {
+            entry_index: Some(0),
+            byte_offset: None,
+            details: format!("Failed to decode code LedgerEntry: {}", e),
+            source: Some(Box::new(e)),
+        }
+    })?;
     let wasm_bytes = match code_entry.data {
         LedgerEntryData::ContractCode(code) => code.code.to_vec(),
         _ => {
@@ -262,10 +261,7 @@ fn fetch_wasm_recording(
     // ── Step 5: validate and return ──────────────────────────────────────────
     if wasm_bytes.len() < 4 || &wasm_bytes[0..4] != b"\0asm" {
         return Err(Error::Integrity {
-            details: format!(
-                "Fetched WASM for '{}' has invalid magic bytes",
-                contract_id
-            ),
+            details: format!("Fetched WASM for '{}' has invalid magic bytes", contract_id),
             source: None,
         });
     }
