@@ -69,6 +69,11 @@ pub mod parser;
 mod parser;
 
 #[cfg(feature = "unstable")]
+pub mod remote;
+#[cfg(not(feature = "unstable"))]
+mod remote;
+
+#[cfg(feature = "unstable")]
 pub mod render;
 #[cfg(not(feature = "unstable"))]
 mod render;
@@ -118,6 +123,9 @@ pub use crate::call_abi::{
     CallAbiBreak, CallAbiCompatibility, CallDirection, DirectionalCallVerdict,
 };
 pub use crate::diff::{Finding, Severity};
+pub use crate::remote::{
+    default_cache_dir, fetch_verified, CacheStatus, FetchedArtifact, RemoteFetchConfig, RemoteRef,
+};
 pub use crate::report::{ReportedFinding, SafetyReport};
 pub use crate::storage_schema::{StorageReconciliation, StorageSchema, StorageSchemaComparison};
 
