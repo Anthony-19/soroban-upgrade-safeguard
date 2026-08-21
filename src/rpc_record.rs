@@ -84,12 +84,7 @@ impl Recorder {
         }
     }
 
-    fn record(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-        response: serde_json::Value,
-    ) {
+    fn record(&self, method: &str, params: serde_json::Value, response: serde_json::Value) {
         self.entries
             .borrow_mut()
             .push((method.to_string(), params, response));
@@ -371,19 +366,18 @@ pub fn replay_wasm_from_bundle_struct(bundle: &ReplayBundle) -> Result<WasmModul
             details: "Empty 'entries' array in instance response".to_string(),
         });
     }
-    let xdr_b64 = entries[0]["xdr"].as_str().ok_or_else(|| {
-        ReplayError::MalformedEntry {
+    let xdr_b64 = entries[0]["xdr"]
+        .as_str()
+        .ok_or_else(|| ReplayError::MalformedEntry {
             sequence: 0,
             details: "Missing 'xdr' in instance entry".to_string(),
+        })?;
+    let entry = LedgerEntry::from_xdr_base64(xdr_b64, Limits::none()).map_err(|e| {
+        ReplayError::MalformedEntry {
+            sequence: 0,
+            details: format!("XDR decode failed: {}", e),
         }
     })?;
-    let entry =
-        LedgerEntry::from_xdr_base64(xdr_b64, Limits::none()).map_err(|e| {
-            ReplayError::MalformedEntry {
-                sequence: 0,
-                details: format!("XDR decode failed: {}", e),
-            }
-        })?;
     let contract_data = match entry.data {
         LedgerEntryData::ContractData(cd) => cd,
         _ => {
