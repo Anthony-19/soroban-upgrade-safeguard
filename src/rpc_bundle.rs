@@ -145,11 +145,7 @@ impl ReplayBundle {
     ///
     /// `header_names` should list the names (not values) of any authentication
     /// or custom headers that were included in requests.
-    pub fn new(
-        url: &str,
-        contract_id: impl Into<String>,
-        header_names: Vec<String>,
-    ) -> Self {
+    pub fn new(url: &str, contract_id: impl Into<String>, header_names: Vec<String>) -> Self {
         Self {
             version: BUNDLE_VERSION,
             sanitized_url: redact_url(url),
@@ -240,7 +236,10 @@ pub enum ReplayBundleError {
     /// The bundle's `version` field is not recognized by this release.
     UnsupportedVersion { found: u32, expected: u32 },
     /// An entry's `sequence` field does not match its position in the array.
-    EntryOutOfOrder { index: usize, stored_sequence: usize },
+    EntryOutOfOrder {
+        index: usize,
+        stored_sequence: usize,
+    },
     /// An entry's `response_hash` does not match the entry's `response`.
     TamperedEntry(String),
     /// An artifact's `sha256` does not match the decoded bytes.

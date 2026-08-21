@@ -226,10 +226,7 @@ fn fetch_wasm_recording(
         return Err(Error::RpcProtocol {
             rpc_url: redact_url(rpc_url),
             code: 0,
-            message: format!(
-                "WASM code not found for hash {}",
-                hex::encode(wasm_hash.0)
-            ),
+            message: format!("WASM code not found for hash {}", hex::encode(wasm_hash.0)),
         });
     }
     let code_xdr_b64 = code_entries[0]["xdr"]
