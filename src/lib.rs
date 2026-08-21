@@ -84,6 +84,16 @@ pub mod rpc;
 mod rpc;
 
 #[cfg(feature = "unstable")]
+pub mod rpc_bundle;
+#[cfg(not(feature = "unstable"))]
+mod rpc_bundle;
+
+#[cfg(feature = "unstable")]
+pub mod rpc_record;
+#[cfg(not(feature = "unstable"))]
+mod rpc_record;
+
+#[cfg(feature = "unstable")]
 pub mod spec;
 #[cfg(not(feature = "unstable"))]
 mod spec;
