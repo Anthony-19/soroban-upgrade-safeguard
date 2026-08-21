@@ -5,6 +5,12 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use soroban_upgrade_safeguard::{
+    attestation::{
+        canonical_json_bytes, sign_statement, verify_artifacts, verify_signatures, ArtifactDigest,
+        AttestedArtifact, AttestedVerdict, DsseEnvelope, Ed25519Signer, InTotoStatementV1,
+        InTotoSubject, SafeguardPredicateV1, VerificationFailure, VerificationFailureKind,
+        VerificationPolicy,
+    },
     color::{should_disable_color, ColorMode},
     diff, loader, parser,
     render::RenderableReport,
@@ -283,6 +289,55 @@ enum Command {
     Render(RenderArgs),
     /// Generate a suppression config from current findings
     Init(InitArgs),
+    /// Create a signed DSSE in-toto attestation for a saved analysis report
+    Attest(AttestArgs),
+    /// Verify a safeguard DSSE attestation and all referenced artifacts offline
+    VerifyAttestation(VerifyAttestationArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+struct AttestArgs {
+    #[arg(value_name = "REPORT_JSON")]
+    report: PathBuf,
+    #[arg(long, value_name = "WASM")]
+    old_wasm: PathBuf,
+    #[arg(long, value_name = "WASM")]
+    new_wasm: PathBuf,
+    #[arg(long, value_name = "PKCS8_KEY")]
+    private_key: PathBuf,
+    #[arg(long, value_name = "IDENTITY")]
+    key_id: String,
+    #[arg(long, value_name = "DSSE_JSON")]
+    output: PathBuf,
+    /// JSON file containing the fully resolved policy/configuration.
+    #[arg(long, value_name = "POLICY_JSON")]
+    policy: Option<PathBuf>,
+    #[arg(long, value_name = "SCHEMA", requires = "new_storage_schema")]
+    old_storage_schema: Option<PathBuf>,
+    #[arg(long, value_name = "SCHEMA", requires = "old_storage_schema")]
+    new_storage_schema: Option<PathBuf>,
+}
+
+#[derive(ClapArgs, Debug)]
+struct VerifyAttestationArgs {
+    #[arg(value_name = "DSSE_JSON")]
+    attestation: PathBuf,
+    #[arg(long, value_name = "REPORT_JSON")]
+    report: Option<PathBuf>,
+    #[arg(long, value_name = "WASM")]
+    old_wasm: Option<PathBuf>,
+    #[arg(long, value_name = "WASM")]
+    new_wasm: Option<PathBuf>,
+    /// Trusted Ed25519 key in ID=PATH form. PATH contains a raw 32-byte public key.
+    #[arg(long = "trusted-key", value_name = "ID=PATH", required = true)]
+    trusted_keys: Vec<String>,
+    #[arg(long, value_name = "SCHEMA")]
+    old_storage_schema: Option<PathBuf>,
+    #[arg(long, value_name = "SCHEMA")]
+    new_storage_schema: Option<PathBuf>,
+    /// Unix timestamp after which the verification policy is expired.
+    #[arg(long, value_name = "UNIX_SECONDS")]
+    policy_expires_at: Option<u64>,
 }
 
 /// `extract`: decode one build and emit its interface.
@@ -405,6 +460,192 @@ fn run_extract(args: &ExtractArgs) -> Result<()> {
 
     let extracted = ExtractedSpec::new(&build.path, &metadata, &contract_spec);
     println!("{}", serde_json::to_string_pretty(&extracted)?);
+    Ok(())
+}
+
+fn file_artifact(path: &Path) -> Result<AttestedArtifact> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("Failed to read artifact '{}'.", path.display()))?;
+    Ok(AttestedArtifact {
+        name: path.to_string_lossy().to_string(),
+        digest: ArtifactDigest::from_bytes(&bytes),
+    })
+}
+
+fn extracted_spec_bytes(path: &Path) -> Result<Vec<u8>> {
+    let build = loader::load_wasm(path)?;
+    let metadata = parser::extract_metadata(&build.bytes)?;
+    let contract_spec = spec::ContractSpec::from_entries(&metadata.spec);
+    let extracted = ExtractedSpec::new(&build.path, &metadata, &contract_spec);
+    canonical_json_bytes(&extracted).map_err(|e| anyhow::anyhow!(e))
+}
+
+fn extracted_spec_artifact(path: &Path) -> Result<AttestedArtifact> {
+    let bytes = extracted_spec_bytes(path)?;
+    Ok(AttestedArtifact {
+        name: format!("{}.spec.json", path.display()),
+        digest: ArtifactDigest::from_bytes(&bytes),
+    })
+}
+
+fn run_attest(args: &AttestArgs) -> Result<()> {
+    let report_bytes = std::fs::read(&args.report)
+        .with_context(|| format!("Failed to read report '{}'.", args.report.display()))?;
+    let old_bytes = std::fs::read(&args.old_wasm)?;
+    let new_bytes = std::fs::read(&args.new_wasm)?;
+    let report: RenderableReport = RenderableReport::from_json_str(
+        std::str::from_utf8(&report_bytes).context("Report is not UTF-8")?,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let old_spec = extracted_spec_artifact(&args.old_wasm)?;
+    let new_spec = extracted_spec_artifact(&args.new_wasm)?;
+    let mut storage_schemas = Vec::new();
+    for path in [&args.old_storage_schema, &args.new_storage_schema]
+        .into_iter()
+        .flatten()
+    {
+        storage_schemas.push(file_artifact(path)?);
+    }
+    let resolved_policy = if let Some(path) = &args.policy {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("Failed to read policy '{}'.", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("Policy '{}' is not valid JSON.", path.display()))?
+    } else {
+        serde_json::json!({
+            "strict": report.strict,
+            "gated_axes": report.gated_axes,
+            "axis_verdicts": report.axis_verdicts,
+            "report_schema_version": report.report_schema_version,
+        })
+    };
+    let predicate = SafeguardPredicateV1::new(
+        vec![
+            AttestedArtifact {
+                name: args.old_wasm.to_string_lossy().to_string(),
+                digest: ArtifactDigest::from_bytes(&old_bytes),
+            },
+            AttestedArtifact {
+                name: args.new_wasm.to_string_lossy().to_string(),
+                digest: ArtifactDigest::from_bytes(&new_bytes),
+            },
+        ],
+        vec![old_spec, new_spec],
+        storage_schemas,
+        resolved_policy,
+        AttestedArtifact {
+            name: args.report.to_string_lossy().to_string(),
+            digest: ArtifactDigest::from_bytes(&report_bytes),
+        },
+        AttestedVerdict {
+            is_safe: report.is_safe,
+            recommended_bump: report.recommended_bump.clone(),
+            old_client_to_new_contract: report.call_abi.old_client_to_new_contract.compatible,
+            new_client_to_old_contract: report.call_abi.new_client_to_old_contract.compatible,
+        },
+    );
+    let statement = InTotoStatementV1::new(
+        vec![
+            InTotoSubject {
+                name: args.old_wasm.to_string_lossy().to_string(),
+                digest: ArtifactDigest::from_bytes(&old_bytes),
+            },
+            InTotoSubject {
+                name: args.new_wasm.to_string_lossy().to_string(),
+                digest: ArtifactDigest::from_bytes(&new_bytes),
+            },
+        ],
+        predicate,
+    );
+    let key = std::fs::read(&args.private_key).with_context(|| {
+        format!(
+            "Failed to read private key '{}'.",
+            args.private_key.display()
+        )
+    })?;
+    let signer = Ed25519Signer::from_pkcs8(&args.key_id, &key).map_err(|e| anyhow::anyhow!(e))?;
+    let envelope = sign_statement(&statement, &signer).map_err(|e| anyhow::anyhow!(e))?;
+    std::fs::write(&args.output, serde_json::to_vec_pretty(&envelope)?)?;
+    Ok(())
+}
+
+fn run_verify_attestation(args: &VerifyAttestationArgs) -> Result<()> {
+    let envelope: DsseEnvelope = serde_json::from_slice(&std::fs::read(&args.attestation)?)?;
+    let statement = match envelope.statement() {
+        Ok(statement) => statement,
+        Err(error) => {
+            let result = serde_json::json!({
+                "verified": false,
+                "signer_identities": [],
+                "failures": [VerificationFailure {
+                    kind: VerificationFailureKind::InvalidStatement,
+                    subject: None,
+                    message: error.to_string(),
+                }],
+            });
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            std::process::exit(1);
+        }
+    };
+    let mut trusted = std::collections::BTreeMap::new();
+    for item in &args.trusted_keys {
+        let (id, path) = item
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--trusted-key must use ID=PATH"))?;
+        trusted.insert(
+            id.to_string(),
+            std::fs::read(path).with_context(|| format!("Failed to read trusted key '{id}'."))?,
+        );
+    }
+    let signatures = verify_signatures(&envelope, &trusted);
+    let mut artifacts = std::collections::BTreeMap::new();
+    if let Some(path) = &args.report {
+        artifacts.insert(
+            statement.predicate.report.name.clone(),
+            std::fs::read(path)?,
+        );
+    }
+    for (path, artifact) in [&args.old_wasm, &args.new_wasm]
+        .into_iter()
+        .zip(&statement.predicate.inputs)
+    {
+        if let Some(path) = path {
+            artifacts.insert(artifact.name.clone(), std::fs::read(path)?);
+        }
+    }
+    for (path, artifact) in [&args.old_wasm, &args.new_wasm]
+        .into_iter()
+        .zip(&statement.predicate.extracted_specs)
+    {
+        if let Some(path) = path {
+            artifacts.insert(artifact.name.clone(), extracted_spec_bytes(path)?);
+        }
+    }
+    for (path, artifact) in [&args.old_storage_schema, &args.new_storage_schema]
+        .into_iter()
+        .zip(&statement.predicate.storage_schemas)
+    {
+        if let Some(path) = path {
+            artifacts.insert(artifact.name.clone(), std::fs::read(path)?);
+        }
+    }
+    let mut failures = signatures.failures;
+    failures.extend(verify_artifacts(
+        &statement,
+        &artifacts,
+        &VerificationPolicy {
+            expires_at: args.policy_expires_at,
+        },
+    ));
+    let result = serde_json::json!({
+        "verified": signatures.verified && failures.is_empty(),
+        "signer_identities": signatures.signer_identities,
+        "failures": failures,
+    });
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    if result["verified"] != true {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -582,6 +823,10 @@ fn main() -> Result<()> {
         Some(Command::Extract(extract_args)) => return run_extract(extract_args),
         Some(Command::Render(render_args)) => return run_render(render_args),
         Some(Command::Init(init_args)) => return run_init(init_args),
+        Some(Command::Attest(attest_args)) => return run_attest(attest_args),
+        Some(Command::VerifyAttestation(verify_args)) => {
+            return run_verify_attestation(verify_args)
+        }
         None => {}
     }
 

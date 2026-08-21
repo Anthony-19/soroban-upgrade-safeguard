@@ -19,6 +19,7 @@ A powerful CLI tool to analyze and validate Soroban smart contract upgrades on t
 - **Multi-Format Output**: Emit the same report as JSON, Markdown, and text simultaneously — each to its own file or stdout — in a single run.
 - **Watch Mode**: Continuously monitor input WASM files for changes and automatically re-run the comparison on every build.
 - **Provenance Metadata**: Every report includes the tool version, a timestamp, and input identifiers for full auditability (`--no-timestamp` for deterministic snapshot testing).
+- **Signed Attestations**: Bind reports, artifacts, extracted specs, policy, and verdicts in canonical in-toto statements with offline DSSE verification.
 - **GitHub Action**: Reusable action that posts the Markdown report as a PR comment and updates it in-place on subsequent pushes.
 
 ## Installation
@@ -57,6 +58,23 @@ soroban-upgrade-safeguard extract ./wasm/v1.wasm --hash-only
 soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --format json > report.json
 soroban-upgrade-safeguard render report.json --format markdown
 ```
+
+### Signing and verifying reports
+
+```bash
+soroban-upgrade-safeguard attest report.json \
+  --old-wasm old.wasm --new-wasm new.wasm \
+  --private-key signing-key.pk8 --key-id release-key \
+  --output report.dsse.json
+
+soroban-upgrade-safeguard verify-attestation report.dsse.json \
+  --trusted-key release-key=public-key.raw \
+  --report report.json --old-wasm old.wasm --new-wasm new.wasm
+```
+
+See the [attestation guide](docs/attestations.md) for predicate details,
+resolved policy binding, offline verification, and key-handling guidance.
+
 Use `-` for one positional WASM to read it from stdin, for example when a build
 artifact is piped from another command:
 
@@ -196,6 +214,7 @@ More detailed guides live in the [docs](docs/) folder:
 - [Documentation](docs/documentation.md): full explanation of how the analysis pipeline works, severity levels, cascading layout breaks, and CI integration.
 - [Finding Category Reference](docs/finding-categories.md): every category emitted by the tool, with severity, trigger, and remediation guidance — the exact strings to use in suppression rules.
 - [Contributing](docs/contributing.md): development setup, project structure, testing, and how to add new detection rules.
+- [Signed Attestations](docs/attestations.md): DSSE signing, the in-toto predicate, offline verification, and security guidance.
 
 ## License
 
