@@ -388,6 +388,52 @@ Because every reference names its own digest, a verified download is cached cont
 
 A remote fetch prints a line naming the final (post-redirect) URL, the verified digest, the cache status (`hit`, `miss`, or `bypassed`), and the response's `Content-Type`, so a CI log always identifies exactly which bytes were analyzed — not just the URL that was requested.
 
+### OCI registry inputs
+
+Anywhere the CLI accepts a local WASM path — the positional comparison arguments, `extract`, and each entry in a `--manifest` batch file — it also accepts an `oci://` reference, so a release pipeline that publishes contract artifacts to an OCI-compatible registry (alongside container images and supply-chain metadata) does not need a separate pull-and-verify step before running the tool. The same resolver backs `--old-storage-schema` / `--new-storage-schema` on `attest` and `verify-attestation`, selecting the extracted-spec media type instead of the WASM one.
+
+```bash
+# Compare a local build against an artifact published to a registry.
+soroban-upgrade-safeguard old.wasm \
+  "oci://ghcr.io/example/contracts@sha256:3b1a2c9e4d5f60718293847566172839405162738495061728394051627384"
+
+# Both sides published, in a batch manifest (pairs.old / pairs.new accept the
+# same oci://<registry>/<repository>@sha256:<hex> syntax as any other path field).
+soroban-upgrade-safeguard --manifest pairs.toml
+```
+
+#### Reference syntax
+
+An OCI reference names a registry host, a repository path, and either a pinned digest or a tag:
+
+```text
+oci://ghcr.io/example/contracts@sha256:<64 lowercase or uppercase hex characters>   (pinned, no opt-in needed)
+oci://ghcr.io/example/contracts:v1.2.3                                              (tag, requires --allow-oci-tags)
+```
+
+A digest reference is immutable by construction — the manifest bytes are verified against that digest before anything downstream is trusted, exactly like the `https://` fragment above. A tag names something that can be repointed at any time, so it is rejected before any network request unless `--allow-oci-tags` is passed; when it is, the resolved manifest digest is still computed locally (never trusted from a response header) and printed, so the reference can be pinned afterward.
+
+#### Manifest and layer selection
+
+The tool requests an OCI (or Docker v2) image manifest and selects the one layer whose `mediaType` matches the artifact being resolved: `application/vnd.soroban.contract.wasm.v1` or the generic `application/wasm` for a WASM comparison input, `application/vnd.soroban.extracted-spec.v1+json` for a storage-schema input. A multi-manifest image index is rejected with a clear error rather than guessing a platform — a Soroban contract artifact is not a multi-platform image.
+
+#### Authentication
+
+Every request is first attempted anonymously. A `401` response carrying a `WWW-Authenticate` challenge is handled automatically:
+
+- **Bearer** — the tool exchanges the challenge for a token at the advertised realm, optionally authenticating that token request with credentials resolved from the standard Docker credential store.
+- **Basic** — the same resolved credentials are sent directly.
+
+Credential resolution follows `docker login`/`docker pull` exactly: a plaintext `auths` entry in `~/.docker/config.json` (or `$DOCKER_CONFIG/config.json`) is tried first, then a per-registry `credHelpers` entry, then the global `credsStore` — each credential helper is invoked as `docker-credential-<helper> get`. There are no separate credential flags; logging in with `docker login <registry>` before running the tool is sufficient.
+
+#### Caching
+
+Every fetch is keyed by the resolved *layer* digest (not the manifest digest), so a verified blob is cached content-addressed and can be served again without re-fetching. The cache lives under `--oci-cache-dir` (default: a `soroban-upgrade-safeguard/oci-cache` directory under the OS temp dir, or the path in `SOROBAN_SAFEGUARD_OCI_CACHE` if set). `--no-oci-cache` bypasses both reading and writing the cache for a single run; `--clear-oci-cache` deletes the whole cache directory and exits. The manifest itself is still fetched on every run (its digest is what determines the layer to check the cache for), but the potentially much larger blob download is skipped on a cache hit.
+
+#### Provenance
+
+An OCI fetch prints a line naming the registry, repository, resolved layer digest, manifest digest, resolved tag (if any), cache status, and media type, so a CI log always identifies exactly which bytes — and which registry state — were analyzed.
+
 ## How the Analysis Works
 
 The analysis runs as a short pipeline. Each stage lives in its own module under `src/`.
