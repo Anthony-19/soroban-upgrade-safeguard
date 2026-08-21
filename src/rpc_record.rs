@@ -96,8 +96,7 @@ impl Recorder {
     }
 
     fn into_bundle(self) -> ReplayBundle {
-        let mut bundle =
-            ReplayBundle::new(&self.url, self.contract_id.clone(), Vec::new());
+        let mut bundle = ReplayBundle::new(&self.url, self.contract_id.clone(), Vec::new());
         for (method, params, response) in self.entries.into_inner() {
             bundle.push_entry(method, params, response);
         }
@@ -160,19 +159,20 @@ fn fetch_wasm_recording(
             message: format!("Contract '{}' not found on-chain", contract_id),
         });
     }
-    let xdr_b64 = entries[0]["xdr"].as_str().ok_or_else(|| Error::RpcProtocol {
-        rpc_url: redact_url(rpc_url),
-        code: 0,
-        message: "Instance entry missing 'xdr' field".to_string(),
-    })?;
-    let entry = LedgerEntry::from_xdr_base64(xdr_b64, Limits::none()).map_err(|e| {
-        Error::XdrDecoding {
+    let xdr_b64 = entries[0]["xdr"]
+        .as_str()
+        .ok_or_else(|| Error::RpcProtocol {
+            rpc_url: redact_url(rpc_url),
+            code: 0,
+            message: "Instance entry missing 'xdr' field".to_string(),
+        })?;
+    let entry =
+        LedgerEntry::from_xdr_base64(xdr_b64, Limits::none()).map_err(|e| Error::XdrDecoding {
             entry_index: Some(0),
             byte_offset: None,
             details: format!("Failed to decode instance LedgerEntry: {}", e),
             source: Some(Box::new(e)),
-        }
-    })?;
+        })?;
     let contract_data = match entry.data {
         LedgerEntryData::ContractData(cd) => cd,
         _ => {
@@ -207,15 +207,14 @@ fn fetch_wasm_recording(
     let code_key = LedgerKey::ContractCode(LedgerKeyContractCode {
         hash: wasm_hash.clone(),
     });
-    let code_key_b64 =
-        code_key
-            .to_xdr_base64(Limits::none())
-            .map_err(|e| Error::XdrDecoding {
-                entry_index: None,
-                byte_offset: None,
-                details: format!("Failed to serialize code LedgerKey: {}", e),
-                source: Some(Box::new(e)),
-            })?;
+    let code_key_b64 = code_key
+        .to_xdr_base64(Limits::none())
+        .map_err(|e| Error::XdrDecoding {
+            entry_index: None,
+            byte_offset: None,
+            details: format!("Failed to serialize code LedgerKey: {}", e),
+            source: Some(Box::new(e)),
+        })?;
 
     let code_params = serde_json::json!({ "keys": [code_key_b64] });
     let code_response =
@@ -238,14 +237,13 @@ fn fetch_wasm_recording(
             ),
         });
     }
-    let code_xdr_b64 =
-        code_entries[0]["xdr"]
-            .as_str()
-            .ok_or_else(|| Error::RpcProtocol {
-                rpc_url: redact_url(rpc_url),
-                code: 0,
-                message: "Code entry missing 'xdr' field".to_string(),
-            })?;
+    let code_xdr_b64 = code_entries[0]["xdr"]
+        .as_str()
+        .ok_or_else(|| Error::RpcProtocol {
+            rpc_url: redact_url(rpc_url),
+            code: 0,
+            message: "Code entry missing 'xdr' field".to_string(),
+        })?;
     let code_entry =
         LedgerEntry::from_xdr_base64(code_xdr_b64, Limits::none()).map_err(|e| {
             Error::XdrDecoding {
