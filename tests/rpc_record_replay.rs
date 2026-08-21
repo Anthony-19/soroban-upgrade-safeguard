@@ -35,9 +35,9 @@ fn ledger_entries_response(xdr_b64: &str) -> serde_json::Value {
 /// as an artifact.
 fn minimal_replay_bundle() -> ReplayBundle {
     use stellar_xdr::curr::{
-        ContractExecutable, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt,
-        ScContractInstance, ScAddress, ScVal, ContractDataDurability,
-        ContractDataEntry, ExtensionPoint, Limits, WriteXdr,
+        ContractDataDurability, ContractDataEntry, ContractExecutable, ExtensionPoint, Hash,
+        LedgerEntry, LedgerEntryData, LedgerEntryExt, Limits, ScAddress, ScContractInstance, ScVal,
+        WriteXdr,
     };
 
     // Build a synthetic wasm hash (32 zero bytes)
@@ -71,7 +71,7 @@ fn minimal_replay_bundle() -> ReplayBundle {
         .expect("encode instance");
 
     // Build a minimal code entry (WASM bytes wrapped in ContractCodeEntry)
-    use stellar_xdr::curr::{ContractCodeEntry, BytesM};
+    use stellar_xdr::curr::{BytesM, ContractCodeEntry};
     let code_entry = LedgerEntry {
         last_modified_ledger_seq: 0,
         data: LedgerEntryData::ContractCode(ContractCodeEntry {
@@ -119,11 +119,10 @@ fn bundle_entry_hash_roundtrip() {
 #[test]
 fn bundle_entry_detects_tampered_response() {
     let response = serde_json::json!({"result": {"entries": [{"xdr": "abc"}]}, "id": 1});
-    let mut entry =
-        BundleEntry::new(0, "getLedgerEntries", serde_json::Value::Null, response);
+    let mut entry = BundleEntry::new(0, "getLedgerEntries", serde_json::Value::Null, response);
     // Tamper: replace the stored hash with a wrong value
-    entry.response_hash = "0000000000000000000000000000000000000000000000000000000000000000"
-        .to_string();
+    entry.response_hash =
+        "0000000000000000000000000000000000000000000000000000000000000000".to_string();
     assert!(
         entry.verify_hash().is_err(),
         "tampered hash must be detected"
