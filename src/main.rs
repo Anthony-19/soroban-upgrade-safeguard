@@ -1920,6 +1920,13 @@ fn compare_contracts(
         new_meta.env_meta.as_ref(),
         &mut diff_report,
     );
+    diff::compare_host_imports(
+        &old_meta.host_imports,
+        &new_meta.host_imports,
+        old_meta.env_meta.as_ref(),
+        new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
 
     let mut report = report::SafetyReport::with_suppressions_with_specs(
         &diff_report,
