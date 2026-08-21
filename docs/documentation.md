@@ -246,7 +246,7 @@ RPC mode fetches the baseline from chain and verifies it cryptographically; mani
 directory, and glob modes run batch comparisons. The full usage strings and options
 match the CLI help output (`--help`) and the `override_usage` in `src/main.rs`.
 
-Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, and the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)).
+Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)), and the `https://` input overrides `--remote-max-bytes`, `--remote-timeout-secs`, `--remote-max-redirects`, `--remote-cache-dir`, `--no-remote-cache`, and `--clear-remote-cache` (see [Remote HTTPS inputs](#remote-https-inputs)).
 
 ### Spec JSON input mode
 
@@ -344,6 +344,49 @@ Both requirements are checked before the build starts. A missing target produces
 - `--locked` is set automatically, so the build respects the crate's `Cargo.lock` and is reproducible.
 - The build always targets `--release` so the Soroban SDK emits the `contractspecv0` custom section that this tool reads.
 - `--old-crate` cannot be combined with `--contract-id` or `--old-spec`. `--new-crate` cannot be combined with `--new-spec`.
+
+### Remote HTTPS inputs
+
+Anywhere the CLI accepts a local WASM path — the positional comparison arguments, `extract`, and each entry in a `--manifest` batch file — it also accepts an `https://` URL, so a release pipeline that publishes immutable build artifacts to object storage does not need a separate download-and-verify step before running the tool. The same resolver backs `--old-storage-schema` / `--new-storage-schema` on `attest` and `verify-attestation`, since a storage-schema manifest is itself just a JSON/TOML spec file read from a path.
+
+```bash
+# Compare a local build against a published release artifact.
+soroban-upgrade-safeguard old.wasm \
+  "https://releases.example.com/v2/contract.wasm#sha256=3b1a2c9e4d5f60718293847566172839405162738495061728394051627384"
+
+# Both sides published, in a batch manifest (pairs.old / pairs.new accept the
+# same https://…#sha256=<hex> syntax as any other path field).
+soroban-upgrade-safeguard --manifest pairs.toml
+```
+
+#### Reference syntax
+
+A remote reference is an `https://` URL followed by a `#sha256=<hex>` fragment naming the digest the downloaded bytes must match:
+
+```text
+https://cdn.example.com/releases/v2/contract.wasm#sha256=<64 lowercase or uppercase hex characters>
+```
+
+The fragment is never sent to the server (URL fragments are client-side only), which is what makes it a safe place to pin an expected digest onto a bare URL without a second flag per input position. The digest is **mandatory** — a `https://` URL with no `#sha256=` fragment, or a fragment that isn't exactly 64 hex characters, is rejected before any network request is made.
+
+#### Transport policy
+
+Every remote fetch is HTTPS-only, on every hop:
+
+- The initial request must be `https://`; the fetch is refused before connecting otherwise.
+- A redirect that would downgrade to plain `http://` is rejected — capped, in either case, by `--remote-max-redirects` (default 5).
+- No `Authorization` or `Cookie` header is ever forwarded to a redirected request, including a same-origin one.
+- The response body is capped at `--remote-max-bytes` (default 64 MiB), enforced by bounding how many bytes are read from the stream rather than trusting a `Content-Length` header a server could omit or misstate.
+- The whole request is bounded by `--remote-timeout-secs` (default 30).
+- After download, the SHA-256 of the bytes is compared against the reference's expected digest; a mismatch is reported as an integrity failure and the bytes are discarded rather than analyzed.
+
+#### Caching
+
+Because every reference names its own digest, a verified download is cached content-addressed and can be served again without re-fetching, with no risk of staleness — the reference itself changes if the artifact does. The cache lives under `--remote-cache-dir` (default: a `soroban-upgrade-safeguard/remote-cache` directory under the OS temp dir, or the path in `SOROBAN_SAFEGUARD_REMOTE_CACHE` if set). `--no-remote-cache` bypasses both reading and writing the cache for a single run without deleting anything already cached; `--clear-remote-cache` deletes the whole cache directory and exits.
+
+#### Provenance
+
+A remote fetch prints a line naming the final (post-redirect) URL, the verified digest, the cache status (`hit`, `miss`, or `bypassed`), and the response's `Content-Type`, so a CI log always identifies exactly which bytes were analyzed — not just the URL that was requested.
 
 ## How the Analysis Works
 
