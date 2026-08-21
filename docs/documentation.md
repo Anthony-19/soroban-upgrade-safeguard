@@ -353,11 +353,11 @@ The analysis runs as a short pipeline. Each stage lives in its own module under 
 
    When the baseline is fetched from an RPC endpoint (`--contract-id` / `--rpc-url`), the loader applies a **zero-trust pipeline**: the URL is validated for transport security (HTTPS required unless `--allow-http-local` is set), the RPC response entries are checked for matching ledger keys, and the SHA-256 hash of the fetched bytecode is verified against the on-chain contract instance hash. An optional `--expected-wasm-hash` flag provides additional hash pinning.
 
-2. **Extract metadata (`parser.rs`).** The Soroban SDK stores the contract interface in custom WASM sections. The parser scans for the `contractspecv0` section and decodes the concatenated XDR `ScSpecEntry` objects it contains. The `contractenvmetav0` section is decoded too, and environment metadata differences are compared as part of the analysis. Protocol interface version changes are reported as `Warning`; other environment metadata changes are reported as `Info`.
+2. **Extract metadata (`parser.rs`).** The Soroban SDK stores the contract interface in custom WASM sections. The parser scans for the `contractspecv0` section and decodes the concatenated XDR `ScSpecEntry` objects it contains. The `contractenvmetav0` section is decoded too, and environment metadata differences are compared as part of the analysis. Protocol interface version changes are reported as `Warning`; other environment metadata changes are reported as `Info`. The parser also walks the WASM type and import sections to record every function import as an `ImportedFunction` — a `(module, name)` pair plus its resolved parameter/result types, when resolvable. See [Host Imports and Protocol Capabilities](#host-imports-and-protocol-capabilities).
 
 3. **Build the spec model (`spec.rs`).** Decoded entries are sorted into a `ContractSpec`, which groups functions, structs, enums, unions, and error enums into separate maps keyed by name. This gives the comparison stage fast lookups by type name.
 
-4. **Compare (`diff.rs`).** The old and new specs are compared item by item. Functions, structs, and enums are matched by name and then examined for the specific breaking changes described below. Every difference becomes a `Finding` with a severity and a category.
+4. **Compare (`diff.rs`).** The old and new specs are compared item by item. Functions, structs, and enums are matched by name and then examined for the specific breaking changes described below. Every difference becomes a `Finding` with a severity and a category. `compare_host_imports` separately classifies host-import changes against the [capability registry](capability-registry.md).
 
 5. **Map dependencies (`mapper.rs`).** A `LayoutMapper` builds a reverse dependency graph over user-defined types. This is what lets the tool understand that a change to a small shared type can break every larger type that embeds it.
 
@@ -561,6 +561,17 @@ Soroban's `contractspecv0` carries no marker that says "this type is an event", 
 
 Classification affects only the **wording** of a finding and the remediation advice attached to it — a type classified as an event gets guidance about off-chain indexers and subscribers, because a change that is merely awkward for storage can be fully breaking for an indexer. It never affects the finding's `category`.
 
+### Host Imports and Protocol Capabilities
+
+A WASM import that a contract did not need before can raise the minimum Stellar protocol version the target network must support, independently of anything visible in the exported spec. `diff::compare_host_imports` classifies these changes using the versioned registry in `src/capability.rs`, which maps recognized `(module, name)` host-import wire codes (e.g. `("l", "_")` is `put_contract_data`) to a capability id, a capability group, and the protocol version at which the capability became available. See [Updating the Capability Registry](capability-registry.md) for what the registry is generated from and how to refresh it, and [`capability-reference.md`](capability-reference.md) for the full generated list.
+
+- **Host Import Added.** The new build imports a recognized capability the old build did not. Warning — verify the target network has activated the required protocol.
+- **Host Import Removed.** A recognized capability the old build imported is no longer imported. Informational.
+- **Host Import Signature Changed.** The same `(module, name)` import appears on both sides but its resolved parameter/result types differ. Critical for a recognized capability (this should never legitimately happen and likely indicates a toolchain problem), Warning for an unrecognized one. Never reported when either side's type index could not be resolved — a missing signature is not evidence of a change.
+- **Unknown Host Import.** The import's `(module, name)` pair is not in the registry. Its protocol requirement is deliberately left unset rather than guessed; the finding exists purely so the import stays visible. Warning.
+- **Protocol Requirement Raised.** The highest `min_protocol` among the new build's recognized imports exceeds the old build's. Warning, and only computed when both sides have at least one recognized import to compare.
+- **Protocol Environment Mismatch.** A single build's own `contractenvmetav0` protocol version is lower than the minimum protocol implied by its own recognized imports — an internal inconsistency in how the binary was produced. Critical.
+
 ## Type Identity
 
 A contract spec identifies every user-defined type by name, but a name is not an identity. Two questions have to be kept apart:
@@ -714,6 +725,12 @@ severity, and the guidance used when `--explain` is enabled.
 | `error_enum_case_value_changed` | Error Enum Case Value Changed | Critical | Revert the value change to preserve error-code compatibility. |
 | `error_enum_case_added` | Error Enum Case Added | Info | Ensure clients can handle the new error case. |
 | `cascading_layout_break` | Cascading Layout Break | Critical | Resolve the underlying layout break in the referenced type. |
+| `host_import_added` | Host Import Added | Warning | Verify the target network has activated the required protocol before deploying. |
+| `host_import_removed` | Host Import Removed | Info | No action typically required. |
+| `host_import_signature_changed` | Host Import Signature Changed | Warning | Investigate why the same import now resolves to a different function type. |
+| `unknown_host_import` | Unknown Host Import | Warning | Verify the import's requirement manually; consider proposing it for the capability registry. |
+| `protocol_requirement_raised` | Protocol Requirement Raised | Warning | Confirm the target network has activated the reported protocol before deploying. |
+| `protocol_environment_mismatch` | Protocol Environment Mismatch | Critical | Rebuild with a matching SDK/toolchain version. |
 
 ## Severity Levels
 
