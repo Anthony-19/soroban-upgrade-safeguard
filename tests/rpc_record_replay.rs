@@ -44,10 +44,10 @@ fn minimal_replay_bundle() -> ReplayBundle {
     let wasm_hash = Hash([0u8; 32]);
 
     // Build a ContractInstance ScVal
-    let instance_val = ScVal::ContractInstance(Box::new(ScContractInstance {
+    let instance_val = ScVal::ContractInstance(ScContractInstance {
         executable: ContractExecutable::Wasm(wasm_hash.clone()),
         storage: None,
-    }));
+    });
 
     // Wrap it in a ContractDataEntry
     let contract_bytes = [0u8; 32];
