@@ -5,10 +5,21 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use soroban_upgrade_safeguard::{
+    attestation::{
+        canonical_json_bytes, sign_statement, verify_artifacts, verify_signatures, ArtifactDigest,
+        AttestedArtifact, AttestedVerdict, DsseEnvelope, Ed25519Signer, InTotoStatementV1,
+        InTotoSubject, SafeguardPredicateV1, VerificationFailure, VerificationFailureKind,
+        VerificationPolicy,
+    },
     color::{should_disable_color, ColorMode},
-    diff, loader, parser,
+    diff, loader,
+    oci::{self, OciArtifactKind, OciFetchConfig, OciReference},
+    parser,
+    remote::{self, RemoteFetchConfig, RemoteRef},
     render::RenderableReport,
-    report, spec,
+    report,
+    rpc::RpcClientConfig,
+    spec,
     spec_json::ExtractedSpec,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
@@ -23,6 +34,8 @@ enum OutputFormat {
     Json,
     /// Markdown document suitable for PR descriptions and comments.
     Markdown,
+    /// GitHub Actions workflow annotations.
+    GithubActions,
 }
 
 impl std::fmt::Display for OutputFormat {
@@ -31,6 +44,7 @@ impl std::fmt::Display for OutputFormat {
             OutputFormat::Text => write!(f, "text"),
             OutputFormat::Json => write!(f, "json"),
             OutputFormat::Markdown => write!(f, "markdown"),
+            OutputFormat::GithubActions => write!(f, "github-actions"),
         }
     }
 }
@@ -43,8 +57,9 @@ impl std::str::FromStr for OutputFormat {
             "text" => Ok(OutputFormat::Text),
             "json" => Ok(OutputFormat::Json),
             "markdown" | "md" => Ok(OutputFormat::Markdown),
+            "github-actions" | "gha" => Ok(OutputFormat::GithubActions),
             _ => Err(format!(
-                "Unknown format '{s}'. Supported: text, json, markdown"
+                "Unknown format '{s}'. Supported: text, json, markdown, github-actions"
             )),
         }
     }
@@ -56,6 +71,7 @@ impl OutputFormat {
             OutputFormat::Json => "json",
             OutputFormat::Markdown => "md",
             OutputFormat::Text => "txt",
+            OutputFormat::GithubActions => "txt",
         }
     }
 }
@@ -66,12 +82,20 @@ impl OutputFormat {
 struct OutputSpec {
     format: OutputFormat,
     path: Option<PathBuf>,
+    inherit_format: bool,
 }
 
 impl std::str::FromStr for OutputSpec {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if is_windows_absolute_path(s) {
+            return Ok(OutputSpec {
+                format: OutputFormat::Text,
+                path: Some(PathBuf::from(s)),
+                inherit_format: true,
+            });
+        }
         if let Some((fmt, path)) = s.split_once(':') {
             let format: OutputFormat = fmt
                 .parse()
@@ -79,14 +103,38 @@ impl std::str::FromStr for OutputSpec {
             Ok(OutputSpec {
                 format,
                 path: Some(PathBuf::from(path)),
+                inherit_format: false,
+            })
+        } else if let Ok(format) = s.parse() {
+            Ok(OutputSpec {
+                format,
+                path: None,
+                inherit_format: false,
+            })
+        } else if looks_like_output_path(s) {
+            Ok(OutputSpec {
+                format: OutputFormat::Text,
+                path: Some(PathBuf::from(s)),
+                inherit_format: true,
             })
         } else {
-            let format: OutputFormat = s.parse().map_err(|_| {
-                format!("Invalid format '{s}'. Use 'format:path' or one of: text, json, markdown")
-            })?;
-            Ok(OutputSpec { format, path: None })
+            Err(format!(
+                "Invalid format '{s}'. Use a known format, FORMAT:PATH, or a file path"
+            ))
         }
     }
+}
+
+fn is_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
+fn looks_like_output_path(value: &str) -> bool {
+    value.contains(['/', '\\']) || Path::new(value).extension().is_some()
 }
 
 /// Output format for a re-rendered report. JSON is excluded: re-rendering a
@@ -111,7 +159,9 @@ enum RenderFormat {
                       soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]\n       \
                       soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]\n       \
                       soroban-upgrade-safeguard extract <WASM> [OPTIONS]\n       \
-                      soroban-upgrade-safeguard render <REPORT_JSON> [OPTIONS]",
+                      soroban-upgrade-safeguard render <REPORT_JSON> [OPTIONS]\n       \
+                      soroban-upgrade-safeguard init [OPTIONS]\n       \
+                      soroban-upgrade-safeguard stream [OPTIONS]",
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
 )]
@@ -129,9 +179,9 @@ struct Args {
     #[arg(long, value_enum)]
     format: Option<OutputFormat>,
 
-    /// Output specification(s) in FORMAT:PATH format (e.g. json:report.json).
-    /// Can be specified multiple times. FORMAT is one of: text, json, markdown.
-    #[arg(long, value_name = "FORMAT:PATH", num_args = 1)]
+    /// Output specification(s) in FORMAT:PATH format (e.g. json:report.json),
+    /// or a bare path whose format comes from --format. Can be repeated.
+    #[arg(long, value_name = "FORMAT:PATH|PATH", num_args = 1)]
     output: Vec<OutputSpec>,
 
     /// Stellar/Soroban Contract ID to fetch from on-chain (e.g. C...)
@@ -142,6 +192,10 @@ struct Args {
     #[arg(long, value_name = "RPC_URL", requires = "contract_id")]
     rpc_url: Option<String>,
 
+    /// RPC headers as NAME=ENV_VAR. The secret is read only from the environment.
+    #[arg(long = "rpc-header", value_name = "NAME=ENV_VAR")]
+    rpc_headers: Vec<String>,
+
     /// Path to a suppression config acknowledging known, intentional breaking
     /// changes. When omitted, `.safeguard.toml` in the current directory is
     /// used if present; otherwise no suppressions are applied.
@@ -151,6 +205,10 @@ struct Args {
     /// Do not load any suppression config, including the default .safeguard.toml.
     #[arg(long, conflicts_with = "config")]
     no_config: bool,
+
+    /// Validate a suppression config without analyzing WASM inputs.
+    #[arg(long, value_name = "CONFIG")]
+    validate_config: Option<PathBuf>,
 
     /// Print a concise remediation explanation for each finding.
     #[arg(long)]
@@ -164,6 +222,11 @@ struct Args {
     #[arg(long)]
     no_color: bool,
 
+    /// Use ASCII-only markers instead of emoji ([CRITICAL], [WARN], [INFO],
+    /// [PASS], [FAIL], [SUPPRESSED]) for terminals and log viewers that cannot
+    /// render emoji. Applies to text and Markdown output, single and batch.
+    #[arg(long)]
+    ascii: bool,
     /// Suppress decorative and progress output; the report and exit code are unchanged.
     #[arg(long)]
     quiet: bool,
@@ -212,6 +275,92 @@ struct Args {
     /// Suppress timestamps in report output for deterministic/snapshot testing
     #[arg(long)]
     no_timestamp: bool,
+
+    /// Sample storage entries and perform empirical validation.
+    #[arg(long)]
+    empirical: bool,
+
+    /// Path to a JSON file containing captured ledger/storage entries for offline validation.
+    #[arg(long, value_name = "EMPIRICAL_FILE")]
+    empirical_file: Option<PathBuf>,
+
+    /// Maximum bytes accepted for any `https://` input download.
+    #[arg(long, value_name = "BYTES", default_value_t = remote::DEFAULT_MAX_BYTES)]
+    remote_max_bytes: usize,
+
+    /// Timeout, in seconds, for any single `https://` input request.
+    #[arg(long, value_name = "SECONDS", default_value_t = remote::DEFAULT_TIMEOUT_SECS)]
+    remote_timeout_secs: u64,
+
+    /// Maximum redirect hops followed when fetching an `https://` input.
+    #[arg(long, value_name = "COUNT", default_value_t = remote::DEFAULT_MAX_REDIRECTS)]
+    remote_max_redirects: u32,
+
+    /// Directory used to cache verified `https://` input downloads by digest.
+    /// Defaults to a directory under the OS temp dir; see
+    /// `SOROBAN_SAFEGUARD_REMOTE_CACHE`.
+    #[arg(long, value_name = "DIR")]
+    remote_cache_dir: Option<PathBuf>,
+
+    /// Do not read from or write to the remote-artifact cache for this run.
+    #[arg(long)]
+    no_remote_cache: bool,
+
+    /// Delete every cached `https://` input artifact and exit.
+    #[arg(long)]
+    clear_remote_cache: bool,
+
+    /// Maximum bytes accepted for any `oci://` manifest or layer download.
+    #[arg(long, value_name = "BYTES", default_value_t = oci::DEFAULT_MAX_BYTES)]
+    oci_max_bytes: usize,
+
+    /// Timeout, in seconds, for any single `oci://` registry request.
+    #[arg(long, value_name = "SECONDS", default_value_t = oci::DEFAULT_TIMEOUT_SECS)]
+    oci_timeout_secs: u64,
+
+    /// Directory used to cache verified `oci://` input layers by digest.
+    /// Defaults to a directory under the OS temp dir; see
+    /// `SOROBAN_SAFEGUARD_OCI_CACHE`.
+    #[arg(long, value_name = "DIR")]
+    oci_cache_dir: Option<PathBuf>,
+
+    /// Do not read from or write to the OCI-artifact cache for this run.
+    #[arg(long)]
+    no_oci_cache: bool,
+
+    /// Delete every cached `oci://` input artifact and exit.
+    #[arg(long)]
+    clear_oci_cache: bool,
+
+    /// Allow an `oci://` input to reference a mutable tag instead of a
+    /// pinned `@sha256:<hex>` digest. The resolved digest is printed so the
+    /// reference can be pinned afterward. Off by default.
+    #[arg(long)]
+    allow_oci_tags: bool,
+}
+
+/// Build the remote-fetch policy for `https://` inputs from the top-level CLI flags.
+fn remote_fetch_config(args: &Args) -> RemoteFetchConfig {
+    RemoteFetchConfig {
+        max_bytes: args.remote_max_bytes,
+        timeout: Duration::from_secs(args.remote_timeout_secs),
+        max_redirects: args.remote_max_redirects,
+        cache_dir: args.remote_cache_dir.clone(),
+        no_cache: args.no_remote_cache,
+        https_only: true,
+    }
+}
+
+/// Build the OCI-fetch policy for `oci://` inputs from the top-level CLI flags.
+fn oci_fetch_config(args: &Args) -> OciFetchConfig {
+    OciFetchConfig {
+        max_bytes: args.oci_max_bytes,
+        timeout: Duration::from_secs(args.oci_timeout_secs),
+        cache_dir: args.oci_cache_dir.clone(),
+        no_cache: args.no_oci_cache,
+        https_only: true,
+        allow_tags: args.allow_oci_tags,
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -220,6 +369,79 @@ enum Command {
     Extract(ExtractArgs),
     /// Re-render a previously saved JSON report in another format
     Render(RenderArgs),
+    /// Generate a suppression config from current findings
+    Init(InitArgs),
+    /// Create a signed DSSE in-toto attestation for a saved analysis report
+    Attest(AttestArgs),
+    /// Verify a safeguard DSSE attestation and all referenced artifacts offline
+    VerifyAttestation(VerifyAttestationArgs),
+    /// Streaming JSON Lines batch mode: one job per line on stdin, one result per line on stdout
+    Stream(StreamArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+struct AttestArgs {
+    #[arg(value_name = "REPORT_JSON")]
+    report: PathBuf,
+    #[arg(long, value_name = "WASM")]
+    old_wasm: PathBuf,
+    #[arg(long, value_name = "WASM")]
+    new_wasm: PathBuf,
+    #[arg(long, value_name = "PKCS8_KEY")]
+    private_key: PathBuf,
+    #[arg(long, value_name = "IDENTITY")]
+    key_id: String,
+    #[arg(long, value_name = "DSSE_JSON")]
+    output: PathBuf,
+    /// JSON file containing the fully resolved policy/configuration.
+    #[arg(long, value_name = "POLICY_JSON")]
+    policy: Option<PathBuf>,
+    #[arg(long, value_name = "SCHEMA", requires = "new_storage_schema")]
+    old_storage_schema: Option<PathBuf>,
+    #[arg(long, value_name = "SCHEMA", requires = "old_storage_schema")]
+    new_storage_schema: Option<PathBuf>,
+}
+
+#[derive(ClapArgs, Debug)]
+struct VerifyAttestationArgs {
+    #[arg(value_name = "DSSE_JSON")]
+    attestation: PathBuf,
+    #[arg(long, value_name = "REPORT_JSON")]
+    report: Option<PathBuf>,
+    #[arg(long, value_name = "WASM")]
+    old_wasm: Option<PathBuf>,
+    #[arg(long, value_name = "WASM")]
+    new_wasm: Option<PathBuf>,
+    /// Trusted Ed25519 key in ID=PATH form. PATH contains a raw 32-byte public key.
+    #[arg(long = "trusted-key", value_name = "ID=PATH", required = true)]
+    trusted_keys: Vec<String>,
+    #[arg(long, value_name = "SCHEMA")]
+    old_storage_schema: Option<PathBuf>,
+    #[arg(long, value_name = "SCHEMA")]
+    new_storage_schema: Option<PathBuf>,
+    /// Unix timestamp after which the verification policy is expired.
+    #[arg(long, value_name = "UNIX_SECONDS")]
+    policy_expires_at: Option<u64>,
+}
+
+/// `stream`: JSON Lines streaming batch mode.
+#[derive(ClapArgs, Debug)]
+struct StreamArgs {
+    /// Maximum number of concurrent worker threads.
+    #[arg(long, default_value_t = 4)]
+    concurrency: usize,
+    /// Preserve input order in output (slower; buffers results).
+    #[arg(long)]
+    input_order: bool,
+    /// Treat warnings as errors globally (jobs may override).
+    #[arg(long)]
+    strict: bool,
+    /// Do not load .safeguard.toml automatically.
+    #[arg(long)]
+    no_config: bool,
+    /// Path to a suppression config.
+    #[arg(long, value_name = "CONFIG")]
+    config: Option<PathBuf>,
 }
 
 /// `extract`: decode one build and emit its interface.
@@ -236,6 +458,9 @@ struct ExtractArgs {
     /// Stellar RPC URL (e.g. https://soroban-testnet.stellar.org)
     #[arg(long, value_name = "RPC_URL", requires = "contract_id")]
     rpc_url: Option<String>,
+
+    #[arg(long = "rpc-header", value_name = "NAME=ENV_VAR")]
+    rpc_headers: Vec<String>,
 
     /// Print only the interface hash, with no other output.
     #[arg(long)]
@@ -263,16 +488,66 @@ struct RenderArgs {
     no_color: bool,
 }
 
+/// `init`: generate a suppression config from current findings.
+#[derive(ClapArgs, Debug)]
+struct InitArgs {
+    /// Overwrite existing .safeguard.toml if it exists
+    #[arg(long)]
+    force: bool,
+
+    /// Path to the old WASM file (or contract ID with --rpc-url)
+    #[arg(value_name = "OLD")]
+    old: Option<PathBuf>,
+
+    /// Path to the new WASM file
+    #[arg(value_name = "NEW")]
+    new: Option<PathBuf>,
+
+    /// Stellar/Soroban Contract ID to fetch from on-chain (e.g. C...)
+    #[arg(long, value_name = "CONTRACT_ID", requires = "rpc_url")]
+    contract_id: Option<String>,
+
+    /// Stellar RPC URL (e.g. https://soroban-testnet.stellar.org)
+    #[arg(long, value_name = "RPC_URL", requires = "contract_id")]
+    rpc_url: Option<String>,
+
+    #[arg(long = "rpc-header", value_name = "NAME=ENV_VAR")]
+    rpc_headers: Vec<String>,
+}
+
+fn rpc_config(url: &str, headers: &[String]) -> Result<RpcClientConfig> {
+    let mut config = RpcClientConfig::new(url.to_string()).map_err(|e| anyhow::anyhow!(e))?;
+    for spec in headers {
+        let (name, env_var) = spec.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("Invalid --rpc-header '{}'; expected NAME=ENV_VAR", spec)
+        })?;
+        config = config
+            .with_env_header(name.to_string(), env_var.to_string())
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+    Ok(config)
+}
+
 /// Decode one build and emit its interface as JSON, or just its hash.
 fn run_extract(args: &ExtractArgs) -> Result<()> {
     let build = match (&args.wasm, &args.contract_id) {
-        (Some(path), None) => loader::load_wasm(path)?,
+        (Some(path), None) => load_wasm_input(
+            path,
+            &RemoteFetchConfig::default(),
+            &OciFetchConfig::default(),
+            &|line| {
+                eprintln!("{line}");
+            },
+        )?,
         (None, Some(contract_id)) => {
             let rpc_url = args
                 .rpc_url
                 .as_ref()
                 .expect("clap requires --rpc-url alongside --contract-id");
-            loader::fetch_wasm_from_rpc(contract_id, rpc_url)?
+            loader::fetch_wasm_from_rpc_with_config(
+                contract_id,
+                &rpc_config(rpc_url, &args.rpc_headers)?,
+            )?
         }
         (Some(_), Some(_)) => anyhow::bail!(
             "Provide either a WASM path or --contract-id, not both.\n\n\
@@ -297,6 +572,284 @@ fn run_extract(args: &ExtractArgs) -> Result<()> {
     let extracted = ExtractedSpec::new(&build.path, &metadata, &contract_spec);
     println!("{}", serde_json::to_string_pretty(&extracted)?);
     Ok(())
+}
+
+/// Reads bytes for an artifact reference that may be a local path, an
+/// `https://…#sha256=<hex>` remote reference, or an
+/// `oci://registry/repository@sha256:<hex>` reference (used for
+/// storage-schema references in `attest`/`verify-attestation`).
+fn read_artifact_bytes(path: &Path) -> Result<Vec<u8>> {
+    if let Some(remote) =
+        RemoteRef::parse(&path.to_string_lossy()).map_err(|e| anyhow::anyhow!(e))?
+    {
+        let artifact = remote::fetch_verified(&remote, &RemoteFetchConfig::default())?;
+        eprintln!(
+            "🌐 Remote input: {} (sha256:{}, cache {}{})",
+            artifact.final_url,
+            artifact.sha256,
+            artifact.cache_status,
+            artifact
+                .media_type
+                .as_deref()
+                .map(|m| format!(", {m}"))
+                .unwrap_or_default()
+        );
+        Ok(artifact.bytes)
+    } else if let Some(reference) =
+        OciReference::parse(&path.to_string_lossy()).map_err(|e| anyhow::anyhow!(e))?
+    {
+        let artifact = oci::resolve_oci_artifact(
+            &reference,
+            OciArtifactKind::ExtractedSpec,
+            &OciFetchConfig::default(),
+        )?;
+        print_oci_provenance(&artifact);
+        Ok(artifact.bytes)
+    } else {
+        std::fs::read(path)
+            .with_context(|| format!("Failed to read artifact '{}'.", path.display()))
+    }
+}
+
+/// Prints a provenance line for a resolved OCI artifact naming exactly which
+/// registry, repository, manifest, and layer were analyzed.
+fn print_oci_provenance(artifact: &oci::OciArtifact) {
+    eprintln!(
+        "📦 OCI input: {}/{}@{} (manifest {}{}, cache {}, {})",
+        artifact.registry,
+        artifact.repository,
+        artifact.layer_digest,
+        artifact.manifest_digest,
+        artifact
+            .resolved_tag
+            .as_deref()
+            .map(|t| format!(", resolved from tag '{t}'"))
+            .unwrap_or_default(),
+        artifact.cache_status,
+        artifact.media_type
+    );
+}
+
+fn file_artifact(path: &Path) -> Result<AttestedArtifact> {
+    let bytes = read_artifact_bytes(path)?;
+    Ok(AttestedArtifact {
+        name: path.to_string_lossy().to_string(),
+        digest: ArtifactDigest::from_bytes(&bytes),
+    })
+}
+
+fn extracted_spec_bytes(path: &Path) -> Result<Vec<u8>> {
+    let build = loader::load_wasm(path)?;
+    let metadata = parser::extract_metadata(&build.bytes)?;
+    let contract_spec = spec::ContractSpec::from_entries(&metadata.spec);
+    let extracted = ExtractedSpec::new(&build.path, &metadata, &contract_spec);
+    canonical_json_bytes(&extracted).map_err(|e| anyhow::anyhow!(e))
+}
+
+fn extracted_spec_artifact(path: &Path) -> Result<AttestedArtifact> {
+    let bytes = extracted_spec_bytes(path)?;
+    Ok(AttestedArtifact {
+        name: format!("{}.spec.json", path.display()),
+        digest: ArtifactDigest::from_bytes(&bytes),
+    })
+}
+
+fn run_attest(args: &AttestArgs) -> Result<()> {
+    let report_bytes = std::fs::read(&args.report)
+        .with_context(|| format!("Failed to read report '{}'.", args.report.display()))?;
+    let old_bytes = std::fs::read(&args.old_wasm)?;
+    let new_bytes = std::fs::read(&args.new_wasm)?;
+    let report: RenderableReport = RenderableReport::from_json_str(
+        std::str::from_utf8(&report_bytes).context("Report is not UTF-8")?,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let old_spec = extracted_spec_artifact(&args.old_wasm)?;
+    let new_spec = extracted_spec_artifact(&args.new_wasm)?;
+    let mut storage_schemas = Vec::new();
+    for path in [&args.old_storage_schema, &args.new_storage_schema]
+        .into_iter()
+        .flatten()
+    {
+        storage_schemas.push(file_artifact(path)?);
+    }
+    let resolved_policy = if let Some(path) = &args.policy {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("Failed to read policy '{}'.", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("Policy '{}' is not valid JSON.", path.display()))?
+    } else {
+        serde_json::json!({
+            "strict": report.strict,
+            "gated_axes": report.gated_axes,
+            "axis_verdicts": report.axis_verdicts,
+            "report_schema_version": report.report_schema_version,
+        })
+    };
+    let predicate = SafeguardPredicateV1::new(
+        vec![
+            AttestedArtifact {
+                name: args.old_wasm.to_string_lossy().to_string(),
+                digest: ArtifactDigest::from_bytes(&old_bytes),
+            },
+            AttestedArtifact {
+                name: args.new_wasm.to_string_lossy().to_string(),
+                digest: ArtifactDigest::from_bytes(&new_bytes),
+            },
+        ],
+        vec![old_spec, new_spec],
+        storage_schemas,
+        resolved_policy,
+        AttestedArtifact {
+            name: args.report.to_string_lossy().to_string(),
+            digest: ArtifactDigest::from_bytes(&report_bytes),
+        },
+        AttestedVerdict {
+            is_safe: report.is_safe,
+            recommended_bump: report.recommended_bump.clone(),
+            old_client_to_new_contract: report.call_abi.old_client_to_new_contract.compatible,
+            new_client_to_old_contract: report.call_abi.new_client_to_old_contract.compatible,
+        },
+    );
+    let statement = InTotoStatementV1::new(
+        vec![
+            InTotoSubject {
+                name: args.old_wasm.to_string_lossy().to_string(),
+                digest: ArtifactDigest::from_bytes(&old_bytes),
+            },
+            InTotoSubject {
+                name: args.new_wasm.to_string_lossy().to_string(),
+                digest: ArtifactDigest::from_bytes(&new_bytes),
+            },
+        ],
+        predicate,
+    );
+    let key = std::fs::read(&args.private_key).with_context(|| {
+        format!(
+            "Failed to read private key '{}'.",
+            args.private_key.display()
+        )
+    })?;
+    let signer = Ed25519Signer::from_pkcs8(&args.key_id, &key).map_err(|e| anyhow::anyhow!(e))?;
+    let envelope = sign_statement(&statement, &signer).map_err(|e| anyhow::anyhow!(e))?;
+    std::fs::write(&args.output, serde_json::to_vec_pretty(&envelope)?)?;
+    Ok(())
+}
+
+fn run_verify_attestation(args: &VerifyAttestationArgs) -> Result<()> {
+    let envelope: DsseEnvelope = serde_json::from_slice(&std::fs::read(&args.attestation)?)?;
+    let statement = match envelope.statement() {
+        Ok(statement) => statement,
+        Err(error) => {
+            let result = serde_json::json!({
+                "verified": false,
+                "signer_identities": [],
+                "failures": [VerificationFailure {
+                    kind: VerificationFailureKind::InvalidStatement,
+                    subject: None,
+                    message: error.to_string(),
+                }],
+            });
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            std::process::exit(1);
+        }
+    };
+    let mut trusted = std::collections::BTreeMap::new();
+    for item in &args.trusted_keys {
+        let (id, path) = item
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--trusted-key must use ID=PATH"))?;
+        trusted.insert(
+            id.to_string(),
+            std::fs::read(path).with_context(|| format!("Failed to read trusted key '{id}'."))?,
+        );
+    }
+    let signatures = verify_signatures(&envelope, &trusted);
+    let mut artifacts = std::collections::BTreeMap::new();
+    if let Some(path) = &args.report {
+        artifacts.insert(
+            statement.predicate.report.name.clone(),
+            std::fs::read(path)?,
+        );
+    }
+    for (path, artifact) in [&args.old_wasm, &args.new_wasm]
+        .into_iter()
+        .zip(&statement.predicate.inputs)
+    {
+        if let Some(path) = path {
+            artifacts.insert(artifact.name.clone(), std::fs::read(path)?);
+        }
+    }
+    for (path, artifact) in [&args.old_wasm, &args.new_wasm]
+        .into_iter()
+        .zip(&statement.predicate.extracted_specs)
+    {
+        if let Some(path) = path {
+            artifacts.insert(artifact.name.clone(), extracted_spec_bytes(path)?);
+        }
+    }
+    for (path, artifact) in [&args.old_storage_schema, &args.new_storage_schema]
+        .into_iter()
+        .zip(&statement.predicate.storage_schemas)
+    {
+        if let Some(path) = path {
+            artifacts.insert(artifact.name.clone(), read_artifact_bytes(path)?);
+        }
+    }
+    let mut failures = signatures.failures;
+    failures.extend(verify_artifacts(
+        &statement,
+        &artifacts,
+        &VerificationPolicy {
+            expires_at: args.policy_expires_at,
+        },
+    ));
+    let result = serde_json::json!({
+        "verified": signatures.verified && failures.is_empty(),
+        "signer_identities": signatures.signer_identities,
+        "failures": failures,
+    });
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    if result["verified"] != true {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Run the streaming JSONL batch protocol.
+///
+/// Reads versioned JSON jobs from stdin, processes them concurrently,
+/// and writes versioned JSON results to stdout. All diagnostics go to stderr.
+fn run_stream(args: &StreamArgs) -> Result<()> {
+    use soroban_upgrade_safeguard::jsonl::{self, OutputOrder, StreamConfig};
+
+    let suppressions = if args.no_config {
+        SuppressionConfig::default()
+    } else {
+        match &args.config {
+            Some(path) => SuppressionConfig::load_from_path(path)?,
+            None => SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?
+                .unwrap_or_default(),
+        }
+    };
+
+    let output_order = if args.input_order {
+        OutputOrder::InputOrder
+    } else {
+        OutputOrder::CompletionOrder
+    };
+
+    let config = StreamConfig {
+        concurrency: args.concurrency.max(1),
+        output_order,
+        strict: args.strict,
+        suppressions,
+        no_config: args.no_config,
+        ..StreamConfig::default()
+    };
+
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    jsonl::run_streaming(stdin.lock(), stdout.lock(), &config)
 }
 
 /// Re-render a stored JSON report as text or Markdown.
@@ -336,12 +889,174 @@ fn run_render(args: &RenderArgs) -> Result<()> {
     Ok(())
 }
 
+/// Generate a suppression config from current findings.
+fn run_init(args: &InitArgs) -> Result<()> {
+    use std::fs;
+    use std::io::Write;
+
+    let config_path = Path::new(DEFAULT_CONFIG_FILE);
+
+    // Check if config already exists
+    if config_path.exists() && !args.force {
+        anyhow::bail!(
+            "{} already exists. Use --force to overwrite.",
+            config_path.display()
+        );
+    }
+
+    // Determine old and new sources
+    let (old_source, new_source) = match (&args.old, &args.new, &args.contract_id) {
+        (Some(old), Some(new), None) => (Ok(loader::load_wasm(old)?), Ok(loader::load_wasm(new)?)),
+        (None, Some(new), Some(contract_id)) => {
+            let rpc_url = args
+                .rpc_url
+                .as_ref()
+                .expect("clap requires --rpc-url alongside --contract-id");
+            (
+                loader::fetch_wasm_from_rpc_with_config(
+                    contract_id,
+                    &rpc_config(rpc_url, &args.rpc_headers)?,
+                ),
+                loader::load_wasm(new),
+            )
+        }
+        (Some(_), Some(_), Some(_)) => anyhow::bail!(
+            "Provide either WASM paths or --contract-id, not both.\n\n\
+             Usage: soroban-upgrade-safeguard init <OLD_WASM> <NEW_WASM>\n       \
+             soroban-upgrade-safeguard init --contract-id <ID> --rpc-url <URL> <NEW_WASM>"
+        ),
+        _ => anyhow::bail!(
+            "Missing WASM paths.\n\n\
+             Usage: soroban-upgrade-safeguard init <OLD_WASM> <NEW_WASM>\n       \
+             soroban-upgrade-safeguard init --contract-id <ID> --rpc-url <URL> <NEW_WASM>"
+        ),
+    };
+
+    let old = old_source?;
+    let new = new_source?;
+
+    // Extract metadata and compare
+    let old_meta = parser::extract_metadata(&old.bytes)?;
+    let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
+
+    let new_meta = parser::extract_metadata(&new.bytes)?;
+    let new_spec = spec::ContractSpec::from_entries(&new_meta.spec);
+
+    // Generate diff
+    let diff_report = diff::compare(&old_spec, &new_spec);
+
+    // Collect unsuppressed findings (with empty suppression config)
+    let empty_suppressions = SuppressionConfig::default();
+    let safety_report = report::SafetyReport::with_suppressions_with_specs(
+        &diff_report,
+        &empty_suppressions,
+        false,
+        false,
+        &old_spec,
+        &new_spec,
+    );
+
+    // Extract findings from the report
+    let mut findings: Vec<(String, String)> = Vec::new();
+
+    // Extract from findings_by_category
+    for (category, reported_findings) in safety_report.findings_by_category.iter() {
+        for finding in reported_findings {
+            // Skip suppressed findings (none will be suppressed with empty config)
+            if !finding.suppressed {
+                let target = finding
+                    .finding
+                    .target
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                findings.push((category.clone(), target));
+            }
+        }
+    }
+
+    // Generate config content
+    let mut content = String::new();
+    content.push_str("# Auto-generated suppression config\n");
+    content.push_str("# This file was generated by `soroban-upgrade-safeguard init`.\n");
+    content.push_str("# Each suppression entry requires a reason to be filled in.\n");
+    content.push_str("# Remove the '#' to uncomment and activate each suppression.\n\n");
+
+    if findings.is_empty() {
+        content.push_str("# No findings found. Your contracts are compatible!\n");
+        content.push_str("# No suppression entries needed.\n");
+    } else {
+        content.push_str("# Suppressions are commented out by default. Edit this file and\n");
+        content.push_str("# remove the '#' before each [[suppress]] block you want to apply.\n\n");
+
+        for (category, target) in &findings {
+            content.push_str(&format!(
+                "# [[suppress]]\n\
+                 # category = \"{}\"\n\
+                 # target = \"{}\"\n\
+                 # reason = \"TODO: Add justification for suppressing this rule.\"\n\n",
+                category, target
+            ));
+        }
+    }
+
+    // Write the file
+    let mut file = fs::File::create(config_path)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+
+    println!("✅ Generated {}", config_path.display());
+    println!("📝 Found {} finding(s) requiring attention", findings.len());
+    if findings.is_empty() {
+        println!("🎉 No compatibility issues detected. No suppressions needed.");
+    } else {
+        println!(
+            "📝 Please edit {} and add a valid reason for each suppression entry you want to apply.",
+            config_path.display()
+        );
+        println!("   Remove the '#' before each [[suppress]] block to activate it.");
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.clear_remote_cache {
+        let dir = args
+            .remote_cache_dir
+            .clone()
+            .unwrap_or_else(remote::default_cache_dir);
+        remote::clear_cache(&dir)
+            .with_context(|| format!("Failed to clear remote cache at '{}'", dir.display()))?;
+        if !args.quiet {
+            println!("Cleared remote artifact cache at '{}'", dir.display());
+        }
+        return Ok(());
+    }
+
+    if args.clear_oci_cache {
+        let dir = args
+            .oci_cache_dir
+            .clone()
+            .unwrap_or_else(oci::default_cache_dir);
+        oci::clear_cache(&dir)
+            .with_context(|| format!("Failed to clear OCI cache at '{}'", dir.display()))?;
+        if !args.quiet {
+            println!("Cleared OCI artifact cache at '{}'", dir.display());
+        }
+        return Ok(());
+    }
 
     match &args.command {
         Some(Command::Extract(extract_args)) => return run_extract(extract_args),
         Some(Command::Render(render_args)) => return run_render(render_args),
+        Some(Command::Init(init_args)) => return run_init(init_args),
+        Some(Command::Attest(attest_args)) => return run_attest(attest_args),
+        Some(Command::VerifyAttestation(verify_args)) => {
+            return run_verify_attestation(verify_args)
+        }
+        Some(Command::Stream(stream_args)) => return run_stream(stream_args),
         None => {}
     }
 
@@ -354,6 +1069,12 @@ fn main() -> Result<()> {
         colored::control::set_override(false);
     } else if args.color == ColorMode::Always {
         colored::control::set_override(true);
+    }
+
+    // Config-validation mode: check a suppression config on its own and exit,
+    // before any WASM inputs are required.
+    if let Some(path) = &args.validate_config {
+        return validate_suppression_config(path);
     }
 
     let is_batch = args.manifest.is_some() || (args.old_dir.is_some() && args.new_dir.is_some());
@@ -377,12 +1098,19 @@ fn main() -> Result<()> {
         // User specified explicit outputs; --format still controls stdout if not
         // already covered by an --output spec.
         let has_stdout = args.output.iter().any(|o| o.path.is_none());
+        let has_inherited_file = args.output.iter().any(|o| o.inherit_format);
         let mut outputs = args.output.clone();
-        if !has_stdout {
+        for output in &mut outputs {
+            if output.inherit_format {
+                output.format = stdout_format;
+            }
+        }
+        if args.format.is_some() && !has_stdout && !has_inherited_file {
             // Add --format (or text) as stdout output
             outputs.push(OutputSpec {
                 format: stdout_format,
                 path: None,
+                inherit_format: false,
             });
         }
         outputs
@@ -390,6 +1118,7 @@ fn main() -> Result<()> {
         vec![OutputSpec {
             format: stdout_format,
             path: None,
+            inherit_format: false,
         }]
     };
 
@@ -397,8 +1126,13 @@ fn main() -> Result<()> {
     // Decorative progress goes to stderr when stdout is clean (JSON/Markdown to file
     // or when stdout format would produce a clean document), or when any file output
     // is requested alongside stdout in a clean format.
-    let stdout_is_clean = outputs.iter().any(|o| o.path.is_none())
-        && (stdout_format == OutputFormat::Json || stdout_format == OutputFormat::Markdown);
+    let stdout_is_clean = outputs.iter().any(|o| {
+        o.path.is_none()
+            && matches!(
+                o.format,
+                OutputFormat::Json | OutputFormat::Markdown | OutputFormat::GithubActions
+            )
+    });
     let clean_stdout = stdout_is_clean || has_non_stdout;
     let progress = |line: String| {
         if args.quiet {
@@ -442,6 +1176,8 @@ fn run_batch(
             args.new_dir.as_ref().unwrap(),
         )?
     };
+    let remote_config = remote_fetch_config(args);
+    let oci_config = oci_fetch_config(args);
 
     progress("🔍 Soroban Upgrade Safeguard (Batch Mode)".to_string());
     progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
@@ -473,6 +1209,7 @@ fn run_batch(
         ));
 
         let gap_report = report::SafetyReport {
+            call_abi: soroban_upgrade_safeguard::CallAbiCompatibility::default(),
             critical_count: 1,
             warning_count: 0,
             info_count: 0,
@@ -492,13 +1229,38 @@ fn run_batch(
             new_spec_summary: Some("(contract missing from new deployment)".to_string()),
             scope: report::AnalysisScope::default(),
             metrics: None,
+            axis_verdicts: {
+                let mut verdicts = std::collections::HashMap::new();
+                verdicts.insert(diff::CompatibilityAxis::CallAbi, report::AxisStatus::Failed);
+                verdicts.insert(
+                    diff::CompatibilityAxis::StorageLayout,
+                    report::AxisStatus::Passed,
+                );
+                verdicts.insert(
+                    diff::CompatibilityAxis::EventIndexer,
+                    report::AxisStatus::Passed,
+                );
+                verdicts.insert(
+                    diff::CompatibilityAxis::SourceLevel,
+                    report::AxisStatus::Passed,
+                );
+                verdicts
+            },
+            gated_axes: {
+                let mut gated = std::collections::HashSet::new();
+                gated.insert(diff::CompatibilityAxis::CallAbi);
+                gated.insert(diff::CompatibilityAxis::StorageLayout);
+                gated
+            },
             findings_by_category: {
                 let mut map = std::collections::HashMap::new();
                 map.insert(
                     "contract-missing-from-new".to_string(),
                     vec![report::ReportedFinding {
+                        rule_id: "contract_missing_from_new".to_string(),
                         finding: diff::Finding {
                             severity: diff::Severity::Critical,
+                            axes: vec![diff::CompatibilityAxis::CallAbi],
                             category: "contract-missing-from-new".to_string(),
                             message: format!(
                                 "'{}' exists in the old directory but was not found in the new directory. \
@@ -510,6 +1272,7 @@ fn run_batch(
                             target: Some(gap.name.clone()),
                             root_target: None,
                         },
+                        axes: vec![diff::CompatibilityAxis::CallAbi],
                         suppressed: false,
                         suppression_reason: None,
                         remediation: Some(format!(
@@ -521,12 +1284,21 @@ fn run_batch(
                 );
                 map
             },
+            empirical: false,
+            empirical_findings: Vec::new(),
+            settings: report::ReportSettings::default(),
         };
 
+        let file_outputs: Vec<OutputSpec> = outputs
+            .iter()
+            .filter(|output| output.path.is_some())
+            .cloned()
+            .collect();
         render_to_outputs(
             &gap_report,
-            outputs,
+            &file_outputs,
             args.explain,
+            args.ascii,
             Some(&gap.name),
             progress,
         )?;
@@ -536,6 +1308,7 @@ fn run_batch(
                 &gap_report,
                 args.format.unwrap_or(OutputFormat::Text),
                 args.explain,
+                args.ascii,
             )?;
             write_report_file(
                 output_dir,
@@ -574,7 +1347,10 @@ fn run_batch(
             contract_name.bold()
         ));
 
-        let report = match (loader::load_wasm(&pair.old), loader::load_wasm(&pair.new)) {
+        let report = match (
+            load_wasm_input(&pair.old, &remote_config, &oci_config, progress),
+            load_wasm_input(&pair.new, &remote_config, &oci_config, progress),
+        ) {
             (Ok(old_wasm), Ok(new_wasm)) => {
                 match compare_contracts(
                     &ContractComparison {
@@ -586,6 +1362,11 @@ fn run_batch(
                         explain: args.explain,
                         strict: args.strict,
                         no_timestamp: args.no_timestamp,
+                        empirical: args.empirical || args.empirical_file.is_some(),
+                        empirical_file: args.empirical_file.as_deref(),
+                        contract_id: None,
+                        rpc_url: None,
+                        rpc_headers: &args.rpc_headers,
                     },
                     progress,
                 ) {
@@ -620,14 +1401,20 @@ fn run_batch(
             }
         };
 
-        if !report.is_safe {
+        if !report.is_safe() {
             overall_safe = false;
         }
 
+        let file_outputs: Vec<OutputSpec> = outputs
+            .iter()
+            .filter(|output| output.path.is_some())
+            .cloned()
+            .collect();
         render_to_outputs(
             &report,
-            outputs,
+            &file_outputs,
             args.explain,
+            args.ascii,
             Some(&contract_name),
             progress,
         )?;
@@ -637,6 +1424,7 @@ fn run_batch(
                 &report,
                 args.format.unwrap_or(OutputFormat::Text),
                 args.explain,
+                args.ascii,
             )?;
             write_report_file(
                 output_dir,
@@ -656,6 +1444,7 @@ fn run_batch(
         total,
         args.strict,
         outputs,
+        args.ascii,
         progress,
     )?;
 
@@ -673,6 +1462,7 @@ fn synthesize_error_report(
     no_timestamp: bool,
 ) -> report::SafetyReport {
     report::SafetyReport {
+        call_abi: soroban_upgrade_safeguard::CallAbiCompatibility::default(),
         critical_count: 1,
         warning_count: 0,
         info_count: 0,
@@ -692,13 +1482,38 @@ fn synthesize_error_report(
         new_spec_summary: Some("(analysis failed)".to_string()),
         scope: report::AnalysisScope::default(),
         metrics: None,
+        axis_verdicts: {
+            let mut verdicts = std::collections::HashMap::new();
+            verdicts.insert(diff::CompatibilityAxis::CallAbi, report::AxisStatus::Failed);
+            verdicts.insert(
+                diff::CompatibilityAxis::StorageLayout,
+                report::AxisStatus::Passed,
+            );
+            verdicts.insert(
+                diff::CompatibilityAxis::EventIndexer,
+                report::AxisStatus::Passed,
+            );
+            verdicts.insert(
+                diff::CompatibilityAxis::SourceLevel,
+                report::AxisStatus::Passed,
+            );
+            verdicts
+        },
+        gated_axes: {
+            let mut gated = std::collections::HashSet::new();
+            gated.insert(diff::CompatibilityAxis::CallAbi);
+            gated.insert(diff::CompatibilityAxis::StorageLayout);
+            gated
+        },
         findings_by_category: {
             let mut map = std::collections::HashMap::new();
             map.insert(
                 "analysis-error".to_string(),
                 vec![report::ReportedFinding {
+                    rule_id: "analysis_error".to_string(),
                     finding: diff::Finding {
                         severity: diff::Severity::Critical,
+                        axes: vec![diff::CompatibilityAxis::CallAbi],
                         category: "analysis-error".to_string(),
                         message: format!(
                             "Analysis of '{}' failed: {}", name, error_message
@@ -707,6 +1522,7 @@ fn synthesize_error_report(
                         target: Some(name.to_string()),
                         root_target: None,
                     },
+                    axes: vec![diff::CompatibilityAxis::CallAbi],
                     suppressed: false,
                     suppression_reason: None,
                     remediation: Some(
@@ -716,6 +1532,9 @@ fn synthesize_error_report(
             );
             map
         },
+        empirical: false,
+        empirical_findings: Vec::new(),
+        settings: report::ReportSettings::default(),
     }
 }
 
@@ -725,6 +1544,7 @@ fn render_batch_summary(
     total_pairs: usize,
     strict: bool,
     outputs: &[OutputSpec],
+    ascii: bool,
     progress: &dyn Fn(String),
 ) -> Result<()> {
     for output in outputs {
@@ -758,7 +1578,7 @@ fn render_batch_summary(
                 markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
 
                 for (name, report) in results {
-                    let status_str = if report.is_safe {
+                    let status_str = if report.is_safe() {
                         "✅ PASSED"
                     } else {
                         "❌ FAILED"
@@ -767,10 +1587,10 @@ fn render_batch_summary(
                         "| {} | {} | {} | {} | {} | {} |\n",
                         name,
                         status_str,
-                        report.critical_count,
-                        report.warning_count,
-                        report.info_count,
-                        report.suppressed_count
+                        report.critical_count(),
+                        report.warning_count(),
+                        report.info_count(),
+                        report.suppressed_count()
                     ));
                 }
 
@@ -784,6 +1604,11 @@ fn render_batch_summary(
                     markdown.push_str("\n---\n\n");
                 }
 
+                // Convert the summary status markers this arm added directly
+                // (the inner detail sections were already rendered ASCII above).
+                if ascii {
+                    markdown = report::asciify_markers(&markdown);
+                }
                 markdown
             }
             OutputFormat::Text => {
@@ -791,7 +1616,6 @@ fn render_batch_summary(
                 text.push_str("========================================\n");
                 text.push_str("    SOROBAN BATCH SAFETY REPORT\n");
                 text.push_str("========================================\n");
-
                 let status = if overall_safe {
                     "✅ PASSED (All contracts safe)".green().bold().to_string()
                 } else {
@@ -801,10 +1625,9 @@ fn render_batch_summary(
                         .to_string()
                 };
                 text.push_str(&format!("Overall Status: {}\n\n", status));
-
                 text.push_str("Summary of Contracts:\n");
                 for (name, report) in results {
-                    let status_str = if report.is_safe {
+                    let status_str = if report.is_safe() {
                         "✅ PASSED".green().to_string()
                     } else {
                         "❌ FAILED".red().bold().to_string()
@@ -813,10 +1636,10 @@ fn render_batch_summary(
                         "  - {}: {} ({} critical, {} warnings, {} info, {} suppressed)\n",
                         name.bold(),
                         status_str,
-                        report.critical_count,
-                        report.warning_count,
-                        report.info_count,
-                        report.suppressed_count
+                        report.critical_count(),
+                        report.warning_count(),
+                        report.info_count(),
+                        report.suppressed_count()
                     ));
                 }
 
@@ -824,11 +1647,32 @@ fn render_batch_summary(
 
                 for (name, report) in results {
                     text.push_str(&format!("=== Contract: {} ===\n", name.bold().magenta()));
-                    text.push_str(&report.generate_summary_text(false));
+                    let detail = report.generate_summary_text(false);
+                    if ascii {
+                        text.push_str(&report::asciify_markers(&detail));
+                    } else {
+                        text.push_str(&detail);
+                    }
                     text.push_str("========================================\n\n");
                 }
-
-                text
+                if ascii {
+                    report::asciify_markers(&text)
+                } else {
+                    text
+                }
+            }
+            OutputFormat::GithubActions => {
+                let mut output = String::new();
+                for (name, report) in results {
+                    output.push_str(&format!("::group::{name}\n"));
+                    output.push_str(&render_github_actions(report));
+                    output.push_str("::endgroup::\n");
+                }
+                output.push_str(&format!(
+                    "Soroban Upgrade Safeguard: {}\n",
+                    if overall_safe { "PASSED" } else { "FAILED" }
+                ));
+                output
             }
         };
 
@@ -922,14 +1766,20 @@ fn run_single(
             "📦 Loading and Parsing contracts...".cyan().bold()
         ));
 
+        let remote_config = remote_fetch_config(args);
+        let oci_config = oci_fetch_config(args);
+
         let old = if let Some(contract_id) = old_source {
             let rpc_url = args.rpc_url.as_ref().unwrap();
-            loader::fetch_wasm_from_rpc(contract_id, rpc_url)?
+            loader::fetch_wasm_from_rpc_with_config(
+                contract_id,
+                &rpc_config(rpc_url, &args.rpc_headers)?,
+            )?
         } else {
-            load_positional_wasm(&args.wasm_paths[0])?
+            load_wasm_input(&args.wasm_paths[0], &remote_config, &oci_config, progress)?
         };
 
-        let new = load_positional_wasm(new_wasm_path)?;
+        let new = load_wasm_input(new_wasm_path, &remote_config, &oci_config, progress)?;
 
         if !suppressions.rules.is_empty() {
             progress(format!(
@@ -948,13 +1798,25 @@ fn run_single(
                 explain: args.explain,
                 strict: args.strict,
                 no_timestamp: args.no_timestamp,
+                empirical: args.empirical || args.empirical_file.is_some(),
+                empirical_file: args.empirical_file.as_deref(),
+                contract_id: old_source,
+                rpc_url: args.rpc_url.as_deref(),
+                rpc_headers: &args.rpc_headers,
             },
             progress,
         )?;
 
-        render_to_outputs(&safety_report, outputs, args.explain, None, progress)?;
+        render_to_outputs(
+            &safety_report,
+            outputs,
+            args.explain,
+            args.ascii,
+            None,
+            progress,
+        )?;
 
-        let is_safe = safety_report.is_safe;
+        let is_safe = safety_report.is_safe();
         if !is_safe {
             return Ok(false);
         }
@@ -986,11 +1848,12 @@ fn render_to_outputs(
     report: &report::SafetyReport,
     outputs: &[OutputSpec],
     explain: bool,
+    ascii: bool,
     contract_name: Option<&str>,
     progress: &dyn Fn(String),
 ) -> Result<()> {
     for output in outputs {
-        let content = render_single(report, output.format, explain)?;
+        let content = render_single(report, output.format, explain, ascii)?;
         emit_output(output, &content)?;
 
         if let Some(ref path) = output.path {
@@ -1007,12 +1870,60 @@ fn render_single(
     report: &report::SafetyReport,
     format: OutputFormat,
     explain: bool,
+    ascii: bool,
 ) -> Result<String> {
+    // JSON carries the severity as a field rather than as a marker glyph, and
+    // the GitHub Actions workflow-command syntax is already plain ASCII, so
+    // `--ascii` only affects the human-readable formats.
     match format {
         OutputFormat::Json => Ok(serde_json::to_string_pretty(&report.to_json())?),
-        OutputFormat::Markdown => Ok(report.generate_summary_markdown()),
-        OutputFormat::Text => Ok(report.generate_summary_text(explain)),
+        OutputFormat::Markdown => {
+            let markdown = report.generate_summary_markdown();
+            Ok(if ascii {
+                report::asciify_markers(&markdown)
+            } else {
+                markdown
+            })
+        }
+        OutputFormat::Text => {
+            let text = report.generate_summary_text(explain);
+            Ok(if ascii {
+                report::asciify_markers(&text)
+            } else {
+                text
+            })
+        }
+        OutputFormat::GithubActions => Ok(render_github_actions(report)),
     }
+}
+
+fn render_github_actions(report: &report::SafetyReport) -> String {
+    let mut output = String::new();
+    let mut categories: Vec<_> = report.findings_by_category().keys().collect();
+    categories.sort();
+    for category in categories {
+        if let Some(findings) = report.findings_by_category().get(category) {
+            for reported in findings {
+                let finding = reported.finding();
+                let level = if reported.suppressed() {
+                    "notice"
+                } else {
+                    match finding.severity() {
+                        diff::Severity::Critical => "error",
+                        diff::Severity::Warning => "warning",
+                        diff::Severity::Info => "notice",
+                    }
+                };
+                let message = finding.message().replace(['\r', '\n'], " ");
+                output.push_str(&format!("::{level}::[{category}] {message}\n"));
+            }
+        }
+    }
+    output.push_str(&format!(
+        "Soroban Upgrade Safeguard: {}\n",
+        if report.is_safe() { "PASSED" } else { "FAILED" }
+    ));
+    output
 }
 
 fn emit_output(spec: &OutputSpec, content: &str) -> Result<()> {
@@ -1044,9 +1955,11 @@ fn run_watch_mode(
     _args: &Args,
     _outputs: &[OutputSpec],
     _suppressions: &SuppressionConfig,
-    run_comparison: impl Fn(&impl Fn(String)) -> Result<bool>,
+    run_comparison: impl Fn(&dyn Fn(String)) -> Result<bool>,
 ) -> Result<()> {
+    use notify::Watcher;
     use std::sync::mpsc;
+    use std::time::Duration;
 
     let (tx, rx) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |res| {
@@ -1066,19 +1979,15 @@ fn run_watch_mode(
 
     eprintln!("\n👀 Watch mode active. Waiting for file changes... (Ctrl+C to stop)\n");
 
-    let mut last_event = std::time::Instant::now();
     let debounce_ms = 300;
 
     loop {
         match rx.recv_timeout(Duration::from_millis(debounce_ms)) {
             Ok(_event) => {
-                last_event = std::time::Instant::now();
                 // Brief debounce window: wait for more events
                 loop {
                     match rx.recv_timeout(Duration::from_millis(50)) {
-                        Ok(_) => {
-                            last_event = std::time::Instant::now();
-                        }
+                        Ok(_) => {}
                         Err(mpsc::RecvTimeoutError::Timeout) => break,
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
                             return Err(anyhow::anyhow!("File watcher channel disconnected"));
@@ -1155,13 +2064,61 @@ fn is_stdin_wasm_path(path: &Path) -> bool {
     path == Path::new("-")
 }
 
-fn load_positional_wasm(path: &Path) -> Result<loader::WasmModule> {
+/// Loads a WASM input that may be `-` for stdin, a local file path, an
+/// `https://…#sha256=<hex>` remote reference, or an
+/// `oci://registry/repository@sha256:<hex>` reference.
+///
+/// This is the single dispatch point shared by the comparison positional
+/// arguments, `extract`, and batch manifest entries, so every WASM input
+/// position gets HTTPS and OCI support uniformly.
+fn load_wasm_input(
+    path: &Path,
+    remote_config: &RemoteFetchConfig,
+    oci_config: &OciFetchConfig,
+    progress: &dyn Fn(String),
+) -> Result<loader::WasmModule> {
     if is_stdin_wasm_path(path) {
         let mut stdin = std::io::stdin().lock();
-        Ok(loader::load_wasm_from_stdin(&mut stdin)?)
-    } else {
-        Ok(loader::load_wasm(path)?)
+        return Ok(loader::load_wasm_from_stdin(&mut stdin)?);
     }
+    if let Some(remote) =
+        RemoteRef::parse(&path.to_string_lossy()).map_err(|e| anyhow::anyhow!(e))?
+    {
+        let (module, artifact) = loader::load_wasm_from_url(&remote, remote_config)?;
+        progress(format!(
+            "🌐 Remote input: {} (sha256:{}, cache {}{})",
+            artifact.final_url,
+            artifact.sha256,
+            artifact.cache_status,
+            artifact
+                .media_type
+                .as_deref()
+                .map(|m| format!(", {m}"))
+                .unwrap_or_default()
+        ));
+        return Ok(module);
+    }
+    if let Some(reference) =
+        OciReference::parse(&path.to_string_lossy()).map_err(|e| anyhow::anyhow!(e))?
+    {
+        let (module, artifact) = loader::load_wasm_from_oci(&reference, oci_config)?;
+        progress(format!(
+            "📦 OCI input: {}/{}@{} (manifest {}{}, cache {}, {})",
+            artifact.registry,
+            artifact.repository,
+            artifact.layer_digest,
+            artifact.manifest_digest,
+            artifact
+                .resolved_tag
+                .as_deref()
+                .map(|t| format!(", resolved from tag '{t}'"))
+                .unwrap_or_default(),
+            artifact.cache_status,
+            artifact.media_type
+        ));
+        return Ok(module);
+    }
+    Ok(loader::load_wasm(path)?)
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -1185,6 +2142,11 @@ struct ContractComparison<'a> {
     explain: bool,
     strict: bool,
     no_timestamp: bool,
+    empirical: bool,
+    empirical_file: Option<&'a Path>,
+    contract_id: Option<&'a str>,
+    rpc_url: Option<&'a str>,
+    rpc_headers: &'a [String],
 }
 
 fn compare_contracts(
@@ -1200,6 +2162,11 @@ fn compare_contracts(
         explain,
         strict,
         no_timestamp,
+        empirical,
+        empirical_file,
+        contract_id,
+        rpc_url,
+        rpc_headers,
     } = comparison;
     let old_meta = parser::extract_metadata(old_bytes)?;
     let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
@@ -1209,7 +2176,11 @@ fn compare_contracts(
         old_path,
         old_bytes.len()
     ));
-    progress(format!("     └─ {}", old_spec.summary().dimmed()));
+    progress(format!("     ├─ {}", old_spec.summary().dimmed()));
+    progress(format!(
+        "     └─ {}",
+        format!("sha256: {}", loader::sha256_hex(old_bytes)).dimmed()
+    ));
 
     let new_meta = parser::extract_metadata(new_bytes)?;
     let new_spec = spec::ContractSpec::from_entries(&new_meta.spec);
@@ -1219,7 +2190,11 @@ fn compare_contracts(
         new_path,
         new_bytes.len()
     ));
-    progress(format!("     └─ {}", new_spec.summary().dimmed()));
+    progress(format!("     ├─ {}", new_spec.summary().dimmed()));
+    progress(format!(
+        "     └─ {}",
+        format!("sha256: {}", loader::sha256_hex(new_bytes)).dimmed()
+    ));
 
     progress(format!(
         "\n{}",
@@ -1231,14 +2206,142 @@ fn compare_contracts(
         new_meta.env_meta.as_ref(),
         &mut diff_report,
     );
+    diff::compare_host_imports(
+        &old_meta.host_imports,
+        &new_meta.host_imports,
+        old_meta.env_meta.as_ref(),
+        new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
 
-    let mut report =
-        report::SafetyReport::with_suppressions(&diff_report, suppressions, *explain, *strict)
-            .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash());
+    let mut report = report::SafetyReport::with_suppressions_with_specs(
+        &diff_report,
+        suppressions,
+        *explain,
+        *strict,
+        &old_spec,
+        &new_spec,
+    )
+    .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash());
 
     report.no_timestamp = *no_timestamp;
 
+    let mut empirical_findings = Vec::new();
+    let mut is_empirical = false;
+
+    if *empirical {
+        is_empirical = true;
+        let mut entries = Vec::new();
+
+        if let Some(file_path) = empirical_file {
+            progress(format!(
+                "📖 Loading empirical storage entries from: {}",
+                file_path.display()
+            ));
+            match soroban_upgrade_safeguard::empirical::load_empirical_entries(file_path) {
+                Ok(loaded) => {
+                    progress(format!(
+                        "✅ Loaded {} storage entries from file",
+                        loaded.len()
+                    ));
+                    entries = loaded;
+                }
+                Err(e) => {
+                    progress(format!("❌ Failed to load empirical storage file: {}", e));
+                    return Err(anyhow::anyhow!("Empirical validation error: {}", e));
+                }
+            }
+        } else if let (Some(cid), Some(rpc)) = (contract_id, rpc_url) {
+            progress("🌐 Fetching contract instance storage from RPC...".to_string());
+            match rpc_config(rpc, rpc_headers).and_then(|config| {
+                loader::fetch_instance_storage_from_rpc_with_config(cid, &config)
+                    .map_err(|e| anyhow::anyhow!(e))
+            }) {
+                Ok(loaded) => {
+                    progress(format!(
+                        "✅ Fetched {} instance storage entries from RPC",
+                        loaded.len()
+                    ));
+                    entries = loaded;
+                }
+                Err(e) => {
+                    progress(format!(
+                        "⚠️  Failed to fetch instance storage from RPC: {}",
+                        e
+                    ));
+                    progress("Limits: Stellar RPC does not support wildcard ledger enumeration. Degrading gracefully.".to_string());
+                }
+            }
+        } else {
+            progress("⚠️  Empirical mode requested, but no local file (--empirical-file) or RPC source (--contract-id and --rpc-url) was provided.".to_string());
+        }
+
+        // Run empirical checks
+        let structural_findings: Vec<diff::Finding> = diff_report.findings.clone();
+        empirical_findings = soroban_upgrade_safeguard::empirical::run_empirical_check(
+            &old_spec,
+            &new_spec,
+            &entries,
+            &structural_findings,
+        );
+    }
+
+    report.empirical = is_empirical;
+    report.empirical_findings = empirical_findings;
+
+    if report.empirical_findings.iter().any(|ef| !ef.is_success) {
+        report.is_safe = false;
+    }
+
     Ok(report)
+}
+
+/// Validate a suppression config in isolation and exit with a status that
+/// reflects the outcome: `0` when the config is valid, `1` when it is malformed
+/// or names a category the tool never emits. Requires no WASM inputs.
+fn validate_suppression_config(path: &Path) -> Result<()> {
+    println!("Validating suppression config: {}", path.display());
+
+    // Parsing (and file-read) problems surface here as a clear, specific error.
+    let config = match SuppressionConfig::load_from_path(path) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("{}", format!("❌ {e}").red().bold());
+            std::process::exit(1);
+        }
+    };
+
+    println!("  Parsed {} rule(s).", config.rules.len());
+
+    let validation = config.validate();
+    if validation.is_valid() {
+        println!("{}", "✅ Config is valid.".green().bold());
+        return Ok(());
+    }
+
+    for (rule_number, category) in &validation.unknown_categories {
+        eprintln!(
+            "{}",
+            format!(
+                "❌ Rule #{rule_number}: unknown category '{category}' — the tool never emits \
+                 this category, so this rule can never match.",
+            )
+            .red()
+        );
+    }
+    for error in &validation.errors {
+        eprintln!("{}", format!("❌ {error}").red());
+    }
+    eprintln!(
+        "{}",
+        format!(
+            "\n{} rule(s) name an unknown category. Fix the category name(s) above.",
+            validation.unknown_categories.len()
+        )
+        .red()
+        .bold()
+    );
+    std::process::exit(1);
 }
 
 fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {
@@ -1317,6 +2420,7 @@ fn render_report(
         OutputFormat::Json => Ok(serde_json::to_string_pretty(&report.to_json())?),
         OutputFormat::Markdown => Ok(report.generate_summary_markdown()),
         OutputFormat::Text => Ok(report.generate_summary_text(explain)),
+        OutputFormat::GithubActions => Ok(render_github_actions(report)),
     }
 }
 
@@ -1360,6 +2464,7 @@ fn sanitize_report_filename(contract_name: &str, format: OutputFormat) -> PathBu
         OutputFormat::Json => "json",
         OutputFormat::Markdown => "md",
         OutputFormat::Text => "txt",
+        OutputFormat::GithubActions => "txt",
     };
 
     let mut path = PathBuf::from(sanitized);

@@ -3,46 +3,336 @@ use crate::interface_hash::InterfaceHash;
 use crate::render::{RenderableReport, REPORT_SCHEMA_VERSION};
 use crate::suppression::SuppressionConfig;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub use crate::render::SeverityCounts;
 
+/// The status of a compatibility axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AxisStatus {
+    Passed,
+    Warning,
+    Failed,
+}
 /// A finding as it appears in the report, augmented with suppression state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportedFinding {
+    #[serde(default)]
+    pub rule_id: String,
     #[serde(flatten)]
+    #[cfg(feature = "unstable")]
     pub finding: Finding,
+    #[serde(flatten)]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) finding: Finding,
+
+    /// The compatibility axes this finding was classified under.
+    #[serde(default, skip)]
+    #[cfg(feature = "unstable")]
+    pub axes: Vec<crate::diff::CompatibilityAxis>,
+    /// The compatibility axes this finding was classified under.
+    #[serde(default, skip)]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) axes: Vec<crate::diff::CompatibilityAxis>,
+
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg(feature = "unstable")]
     pub suppressed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) suppressed: bool,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(feature = "unstable")]
     pub suppression_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) suppression_reason: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(feature = "unstable")]
     pub remediation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) remediation: Option<String>,
+}
+
+impl ReportedFinding {
+    pub fn finding(&self) -> &Finding {
+        &self.finding
+    }
+
+    pub fn axes(&self) -> &[crate::diff::CompatibilityAxis] {
+        &self.axes
+    }
+
+    pub fn suppressed(&self) -> bool {
+        self.suppressed
+    }
+
+    pub fn suppression_reason(&self) -> Option<&str> {
+        self.suppression_reason.as_deref()
+    }
+
+    pub fn remediation(&self) -> Option<&str> {
+        self.remediation.as_deref()
+    }
 }
 
 /// A structured container for aggregated comparison findings.
 #[derive(Debug, Default)]
 pub struct SafetyReport {
+    pub call_abi: crate::call_abi::CallAbiCompatibility,
+    #[cfg(feature = "unstable")]
     pub critical_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) critical_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub warning_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) warning_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub info_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) info_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub suppressed_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) suppressed_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub suppressed_critical_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) suppressed_critical_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub suppressed_warning_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) suppressed_warning_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub suppressed_info_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) suppressed_info_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub total_findings: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) total_findings: usize,
+
+    #[cfg(feature = "unstable")]
     pub is_safe: bool,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) is_safe: bool,
+
+    #[cfg(feature = "unstable")]
     pub findings_by_category: HashMap<String, Vec<ReportedFinding>>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) findings_by_category: HashMap<String, Vec<ReportedFinding>>,
+
+    #[cfg(feature = "unstable")]
     pub strict: bool,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) strict: bool,
+
+    #[cfg(feature = "unstable")]
     pub critical_root_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) critical_root_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub cascade_critical_count: usize,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) cascade_critical_count: usize,
+
+    #[cfg(feature = "unstable")]
     pub old_interface_hash: Option<InterfaceHash>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) old_interface_hash: Option<InterfaceHash>,
+
+    #[cfg(feature = "unstable")]
     pub new_interface_hash: Option<InterfaceHash>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) new_interface_hash: Option<InterfaceHash>,
+
+    #[cfg(feature = "unstable")]
     pub no_timestamp: bool,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) no_timestamp: bool,
+
+    #[cfg(feature = "unstable")]
     pub old_spec_summary: Option<String>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) old_spec_summary: Option<String>,
+
+    #[cfg(feature = "unstable")]
     pub new_spec_summary: Option<String>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) new_spec_summary: Option<String>,
+
+    #[cfg(feature = "unstable")]
     pub scope: AnalysisScope,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) scope: AnalysisScope,
+
+    #[cfg(feature = "unstable")]
     pub metrics: Option<BuildMetrics>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) metrics: Option<BuildMetrics>,
+
+    /// Per-axis pass/warning/fail verdict.
+    #[cfg(feature = "unstable")]
+    pub axis_verdicts: HashMap<crate::diff::CompatibilityAxis, AxisStatus>,
+    /// Per-axis pass/warning/fail verdict.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) axis_verdicts: HashMap<crate::diff::CompatibilityAxis, AxisStatus>,
+
+    /// Axes whose findings gate `is_safe` (per policy and `--strict`).
+    #[cfg(feature = "unstable")]
+    pub gated_axes: HashSet<crate::diff::CompatibilityAxis>,
+    /// Axes whose findings gate `is_safe` (per policy and `--strict`).
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) gated_axes: HashSet<crate::diff::CompatibilityAxis>,
+
+    /// Whether empirical (storage-sample) validation was performed.
+    #[cfg(feature = "unstable")]
+    pub empirical: bool,
+    /// Whether empirical (storage-sample) validation was performed.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) empirical: bool,
+
+    /// Findings from empirical validation, if performed.
+    #[cfg(feature = "unstable")]
+    pub empirical_findings: Vec<crate::empirical::EmpiricalFinding>,
+    /// Findings from empirical validation, if performed.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) empirical_findings: Vec<crate::empirical::EmpiricalFinding>,
+    #[cfg(feature = "unstable")]
+    pub settings: ReportSettings,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) settings: ReportSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ReportSettings {
+    pub strict: bool,
+    pub explain: bool,
+    pub max_suppressions: Option<usize>,
+    pub allow_targetless: Option<bool>,
+    pub max_xdr_depth: u32,
+    pub max_xdr_len: usize,
+    pub max_entries: usize,
+    pub max_walk_depth: usize,
+}
+
+impl SafetyReport {
+    pub fn critical_count(&self) -> usize {
+        self.critical_count
+    }
+
+    pub fn warning_count(&self) -> usize {
+        self.warning_count
+    }
+
+    pub fn info_count(&self) -> usize {
+        self.info_count
+    }
+
+    pub fn suppressed_count(&self) -> usize {
+        self.suppressed_count
+    }
+
+    pub fn suppressed_critical_count(&self) -> usize {
+        self.suppressed_critical_count
+    }
+
+    pub fn suppressed_warning_count(&self) -> usize {
+        self.suppressed_warning_count
+    }
+
+    pub fn suppressed_info_count(&self) -> usize {
+        self.suppressed_info_count
+    }
+
+    pub fn total_findings(&self) -> usize {
+        self.total_findings
+    }
+
+    pub fn is_safe(&self) -> bool {
+        self.is_safe
+    }
+
+    pub fn findings_by_category(&self) -> &HashMap<String, Vec<ReportedFinding>> {
+        &self.findings_by_category
+    }
+
+    pub fn strict(&self) -> bool {
+        self.strict
+    }
+
+    pub fn critical_root_count(&self) -> usize {
+        self.critical_root_count
+    }
+
+    pub fn cascade_critical_count(&self) -> usize {
+        self.cascade_critical_count
+    }
+
+    pub fn old_interface_hash(&self) -> Option<&InterfaceHash> {
+        self.old_interface_hash.as_ref()
+    }
+
+    pub fn new_interface_hash(&self) -> Option<&InterfaceHash> {
+        self.new_interface_hash.as_ref()
+    }
+
+    pub fn no_timestamp(&self) -> bool {
+        self.no_timestamp
+    }
+
+    pub fn set_no_timestamp(&mut self, val: bool) {
+        self.no_timestamp = val;
+    }
+
+    pub fn old_spec_summary(&self) -> Option<&str> {
+        self.old_spec_summary.as_deref()
+    }
+
+    pub fn new_spec_summary(&self) -> Option<&str> {
+        self.new_spec_summary.as_deref()
+    }
+
+    pub fn scope(&self) -> &AnalysisScope {
+        &self.scope
+    }
+
+    pub fn metrics(&self) -> Option<&BuildMetrics> {
+        self.metrics.as_ref()
+    }
+
+    pub fn axis_verdicts(&self) -> &HashMap<crate::diff::CompatibilityAxis, AxisStatus> {
+        &self.axis_verdicts
+    }
+
+    pub fn call_abi(&self) -> &crate::call_abi::CallAbiCompatibility {
+        &self.call_abi
+    }
+
+    pub fn gated_axes(&self) -> &HashSet<crate::diff::CompatibilityAxis> {
+        &self.gated_axes
+    }
+
+    pub fn empirical(&self) -> bool {
+        self.empirical
+    }
+
+    pub fn empirical_findings(&self) -> &[crate::empirical::EmpiricalFinding] {
+        &self.empirical_findings
+    }
 }
 
 /// Track what was analyzed in the report.
@@ -178,13 +468,66 @@ fn contract_identity_label(name: Option<&str>, version: Option<&str>) -> String 
     }
 }
 
+pub fn asciify_markers(text: &str) -> String {
+    text.replace("🔕 ", "")
+        .replace('🔕', "[SUPPRESSED]")
+        .replace('🔴', "[CRITICAL]")
+        .replace('🟡', "[WARN]")
+        .replace('🔵', "[INFO]")
+        .replace('✅', "[PASS]")
+        .replace('❌', "[FAIL]")
+        .replace("⚠️", "[WARNING]")
+        .replace('⚠', "[WARNING]")
+}
+
 impl SafetyReport {
     pub fn new(diff: &DiffReport) -> Self {
-        Self::with_suppressions(diff, &SuppressionConfig::default(), false, false)
+        Self::with_suppressions(
+            diff,
+            &SuppressionConfig::default(),
+            false,
+            false,
+            &crate::limits::ResourcePolicy::default(),
+        )
+    }
+
+    pub fn new_with_specs(
+        diff: &DiffReport,
+        old_spec: &crate::spec::ContractSpec,
+        new_spec: &crate::spec::ContractSpec,
+    ) -> Self {
+        Self::with_suppressions_with_specs(
+            diff,
+            &SuppressionConfig::default(),
+            false,
+            false,
+            old_spec,
+            new_spec,
+        )
     }
 
     pub fn noop(old_wasm_size: usize, new_wasm_size: usize) -> Self {
+        let mut axis_verdicts = HashMap::new();
+        axis_verdicts.insert(
+            crate::diff::CompatibilityAxis::StorageLayout,
+            AxisStatus::Passed,
+        );
+        axis_verdicts.insert(crate::diff::CompatibilityAxis::CallAbi, AxisStatus::Passed);
+        axis_verdicts.insert(
+            crate::diff::CompatibilityAxis::EventIndexer,
+            AxisStatus::Passed,
+        );
+        axis_verdicts.insert(
+            crate::diff::CompatibilityAxis::SourceLevel,
+            AxisStatus::Passed,
+        );
+
+        let mut gated_axes = HashSet::new();
+        gated_axes.insert(crate::diff::CompatibilityAxis::StorageLayout);
+        gated_axes.insert(crate::diff::CompatibilityAxis::CallAbi);
+
         Self {
+            call_abi: crate::call_abi::CallAbiCompatibility::default(),
             critical_count: 0,
             warning_count: 0,
             info_count: 0,
@@ -218,6 +561,11 @@ impl SafetyReport {
                 0,
                 0,
             )),
+            axis_verdicts,
+            gated_axes,
+            empirical: false,
+            empirical_findings: Vec::new(),
+            settings: ReportSettings::default(),
         }
     }
 
@@ -227,6 +575,31 @@ impl SafetyReport {
         suppressions: &SuppressionConfig,
         explain: bool,
         strict: bool,
+        policy: &crate::limits::ResourcePolicy,
+    ) -> Self {
+        let empty = crate::spec::ContractSpec::default();
+        let mut report =
+            Self::with_suppressions_with_specs(diff, suppressions, explain, strict, &empty, &empty);
+        report.settings = ReportSettings {
+            strict,
+            explain,
+            max_suppressions: suppressions.max_suppressions,
+            allow_targetless: suppressions.allow_targetless,
+            max_xdr_depth: policy.max_xdr_depth,
+            max_xdr_len: policy.max_xdr_len,
+            max_entries: policy.max_entries,
+            max_walk_depth: policy.max_walk_depth,
+        };
+        report
+    }
+
+    pub fn with_suppressions_with_specs(
+        diff: &DiffReport,
+        suppressions: &SuppressionConfig,
+        explain: bool,
+        strict: bool,
+        old_spec: &crate::spec::ContractSpec,
+        new_spec: &crate::spec::ContractSpec,
     ) -> Self {
         let mut critical_count = 0;
         let mut warning_count = 0;
@@ -235,11 +608,52 @@ impl SafetyReport {
         let mut suppressed_critical_count = 0;
         let mut suppressed_warning_count = 0;
         let mut suppressed_info_count = 0;
-        let mut failing_critical_count = 0;
-        let mut failing_warning_count = 0;
         let mut findings_by_category: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
         let mut critical_root_count = 0;
         let mut cascade_critical_count = 0;
+        let call_abi = crate::call_abi::compare(old_spec, new_spec);
+        let mut unsuppressed_call_abi_finding = false;
+
+        let mut axis_verdicts = HashMap::new();
+        axis_verdicts.insert(
+            crate::diff::CompatibilityAxis::StorageLayout,
+            AxisStatus::Passed,
+        );
+        axis_verdicts.insert(crate::diff::CompatibilityAxis::CallAbi, AxisStatus::Passed);
+        axis_verdicts.insert(
+            crate::diff::CompatibilityAxis::EventIndexer,
+            AxisStatus::Passed,
+        );
+        axis_verdicts.insert(
+            crate::diff::CompatibilityAxis::SourceLevel,
+            AxisStatus::Passed,
+        );
+
+        let mut gated_axes = HashSet::new();
+        let axes_list = vec![
+            crate::diff::CompatibilityAxis::StorageLayout,
+            crate::diff::CompatibilityAxis::CallAbi,
+            crate::diff::CompatibilityAxis::EventIndexer,
+            crate::diff::CompatibilityAxis::SourceLevel,
+        ];
+        for axis in axes_list {
+            let is_gated = strict
+                || match axis {
+                    crate::diff::CompatibilityAxis::StorageLayout => {
+                        suppressions.policy.gate_storage_layout
+                    }
+                    crate::diff::CompatibilityAxis::CallAbi => suppressions.policy.gate_call_abi,
+                    crate::diff::CompatibilityAxis::EventIndexer => {
+                        suppressions.policy.gate_event_indexer
+                    }
+                    crate::diff::CompatibilityAxis::SourceLevel => {
+                        suppressions.policy.gate_source_level
+                    }
+                };
+            if is_gated {
+                gated_axes.insert(axis);
+            }
+        }
 
         let mut suppressed_root_types: HashSet<String> = HashSet::new();
         for finding in &diff.findings {
@@ -279,12 +693,6 @@ impl SafetyReport {
                     Severity::Warning => suppressed_warning_count += 1,
                     Severity::Info => suppressed_info_count += 1,
                 }
-            } else {
-                match finding.severity {
-                    Severity::Critical => failing_critical_count += 1,
-                    Severity::Warning => failing_warning_count += 1,
-                    _ => {}
-                }
             }
 
             let remediation = if explain {
@@ -293,24 +701,121 @@ impl SafetyReport {
                 None
             };
 
+            // Retrieve or inherit axes
+            let axes = if let Some(ref rt) = finding.root_target {
+                diff.findings
+                    .iter()
+                    .find(|f| f.target.as_deref() == Some(rt))
+                    .map(|f| {
+                        crate::diff::classify_finding_axes(
+                            &f.category,
+                            f.type_name.as_deref(),
+                            old_spec,
+                            new_spec,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        crate::diff::classify_finding_axes(
+                            &finding.category,
+                            finding.type_name.as_deref(),
+                            old_spec,
+                            new_spec,
+                        )
+                    })
+            } else {
+                crate::diff::classify_finding_axes(
+                    &finding.category,
+                    finding.type_name.as_deref(),
+                    old_spec,
+                    new_spec,
+                )
+            };
+
+            // Environment metadata is reported for visibility, but it is not a
+            // contract compatibility finding and therefore cannot gate safety.
+            //
+            // `Info` findings describe backwards-compatible additions (a new
+            // function, a new union case), so they are never allowed to move an
+            // axis off `Passed`. `Warning` findings only fail under `--strict`;
+            // a `Critical` fails whenever its axis is gated.
+            if !suppressed
+                && finding.severity != Severity::Info
+                && finding.category != "Environment"
+            {
+                if axes.contains(&crate::diff::CompatibilityAxis::CallAbi) {
+                    unsuppressed_call_abi_finding = true;
+                }
+                for axis in &axes {
+                    let is_gated = strict
+                        || match axis {
+                            crate::diff::CompatibilityAxis::StorageLayout => {
+                                suppressions.policy.gate_storage_layout
+                            }
+                            crate::diff::CompatibilityAxis::CallAbi => {
+                                suppressions.policy.gate_call_abi
+                            }
+                            crate::diff::CompatibilityAxis::EventIndexer => {
+                                suppressions.policy.gate_event_indexer
+                            }
+                            crate::diff::CompatibilityAxis::SourceLevel => {
+                                suppressions.policy.gate_source_level
+                            }
+                        };
+
+                    // A Warning only fails the run under `--strict`; a Critical
+                    // fails wherever the policy gates its axis.
+                    let fails = match finding.severity {
+                        Severity::Critical => is_gated,
+                        _ => strict,
+                    };
+
+                    let new_status = if fails {
+                        AxisStatus::Failed
+                    } else {
+                        AxisStatus::Warning
+                    };
+
+                    let current = axis_verdicts.entry(*axis).or_insert(AxisStatus::Passed);
+                    if *current == AxisStatus::Passed
+                        || (*current == AxisStatus::Warning && new_status == AxisStatus::Failed)
+                    {
+                        *current = new_status;
+                    }
+                }
+            }
+
             findings_by_category
                 .entry(finding.category.clone())
                 .or_default()
                 .push(ReportedFinding {
+                    rule_id: canonical_rule_id(&finding.category),
                     finding: finding.clone(),
+                    axes,
                     suppressed,
                     suppression_reason: rule.and_then(|r| r.reason.clone()),
                     remediation,
                 });
         }
 
-        let is_safe = if strict {
-            failing_critical_count == 0 && failing_warning_count == 0
-        } else {
-            failing_critical_count == 0
-        };
+        // Directional ABI breaks are part of the aggregate CallAbi verdict.
+        // They are derived from the wire value flow and therefore remain
+        // visible even when no legacy source-level finding was emitted.
+        if !call_abi.compatible() && (diff.findings.is_empty() || unsuppressed_call_abi_finding) {
+            axis_verdicts.insert(
+                crate::diff::CompatibilityAxis::CallAbi,
+                if suppressions.policy.gate_call_abi || strict {
+                    AxisStatus::Failed
+                } else {
+                    AxisStatus::Warning
+                },
+            );
+        }
+        let is_safe = !axis_verdicts
+            .values()
+            .any(|&status| status == AxisStatus::Failed);
 
         Self {
+            call_abi,
             critical_count,
             warning_count,
             info_count,
@@ -331,6 +836,15 @@ impl SafetyReport {
             new_spec_summary: None,
             scope: AnalysisScope::default(),
             metrics: None,
+            axis_verdicts,
+            gated_axes,
+            empirical: false,
+            empirical_findings: Vec::new(),
+            settings: ReportSettings {
+                strict,
+                explain,
+                ..ReportSettings::default()
+            },
         }
     }
 
@@ -348,7 +862,7 @@ impl SafetyReport {
     }
 
     pub fn recommended_bump(&self) -> &'static str {
-        if self.critical_count > 0 {
+        if self.critical_count > 0 || !self.call_abi.compatible() {
             "major"
         } else if self.warning_count > 0 {
             "minor"
@@ -389,23 +903,48 @@ impl SafetyReport {
             chrono_now_rfc3339()
         };
 
+        let mut findings_by_axis = BTreeMap::new();
+        findings_by_axis.insert(crate::diff::CompatibilityAxis::StorageLayout, Vec::new());
+        findings_by_axis.insert(crate::diff::CompatibilityAxis::CallAbi, Vec::new());
+        findings_by_axis.insert(crate::diff::CompatibilityAxis::EventIndexer, Vec::new());
+        findings_by_axis.insert(crate::diff::CompatibilityAxis::SourceLevel, Vec::new());
+
+        for category_findings in self.findings_by_category.values() {
+            for reported in category_findings {
+                for axis in &reported.axes {
+                    if let Some(list) = findings_by_axis.get_mut(axis) {
+                        list.push(reported.clone());
+                    }
+                }
+            }
+        }
+
+        for list in findings_by_axis.values_mut() {
+            list.sort_by(|a, b| {
+                a.finding
+                    .category
+                    .cmp(&b.finding.category)
+                    .then_with(|| a.finding.target.cmp(&b.finding.target))
+            });
+        }
+
         RenderableReport {
             report_schema_version: REPORT_SCHEMA_VERSION,
             provenance: crate::render::Provenance {
                 tool_version: env!("CARGO_PKG_VERSION").to_string(),
                 timestamp,
-                inputs: vec![],
+                inputs: [self.old_interface_hash, self.new_interface_hash]
+                    .into_iter()
+                    .flatten()
+                    .map(|hash| hash.to_hex())
+                    .collect(),
             },
             is_safe: self.is_safe,
             strict: self.strict,
             counts: SeverityCounts {
-                critical: self
-                    .critical_count
-                    .saturating_sub(self.suppressed_critical_count),
-                warning: self
-                    .warning_count
-                    .saturating_sub(self.suppressed_warning_count),
-                info: self.info_count.saturating_sub(self.suppressed_info_count),
+                critical: self.critical_count,
+                warning: self.warning_count,
+                info: self.info_count,
             },
             suppressed_count: self.suppressed_count,
             total_findings: self.total_findings,
@@ -417,6 +956,12 @@ impl SafetyReport {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            axis_verdicts: self.axis_verdicts.iter().map(|(k, v)| (*k, *v)).collect(),
+            gated_axes: self.gated_axes.iter().copied().collect(),
+            findings_by_axis,
+            call_abi: self.call_abi.clone(),
+            empirical: self.empirical,
+            empirical_findings: self.empirical_findings.clone(),
         }
     }
 
@@ -434,54 +979,28 @@ impl SafetyReport {
 }
 
 /// Returns remediation/explanation guidance for a given finding category.
+///
+/// Delegates to [`crate::category::FindingCategory`] which is the single source
+/// of truth.
 pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
-    match category {
-        "Environment" => Some("Verify that the target network supports the new protocol version and adjust any SDK/tooling dependencies accordingly."),
-        "Function Removed" => Some("This is a breaking change. If the function is no longer needed, deprecate it in client integrations. Otherwise, restore the function signature."),
-        "Function Documentation Changed" => Some("No code changes required. Ensure client/consumer integrations are aware of the updated documentation/behavior."),
-        "Function Added" => Some("No action required. Inform client integrations about the availability of the new function."),
-        "Function Signature Changed" => Some("This is a breaking change. Update call sites, SDKs, and tests to match the new parameter structure."),
-        "Parameter Renamed" => Some("This is a breaking change for named-argument RPC systems. Update all client integrations to use the new parameter name."),
-        "Parameter Reordered" => Some("This is a breaking change. Reordering parameters breaks positional RPC invocation. Restore the original parameter order."),
-        "Parameter Type Changed" => Some("This is a breaking change. Update caller arguments and client SDKs to match the new parameter type."),
-        "Return Type Changed" => Some("This is a breaking change. Update caller expectations and client SDKs to match the new return type."),
-        "Event Definition Removed" => Some("This is a breaking change. Update or remove downstream event indexing or monitoring systems that consume this event."),
-        "Struct Removed" => Some("This is a breaking change. Ensure no stored data or active interfaces reference this struct. If they do, restore the struct."),
-        "Struct Documentation Changed" => Some("No code changes required. Ensure documentation changes are aligned with the struct's intended usage."),
-        "Struct Added" => Some("No action required. New structs can be safely integrated into storage layouts or interface parameters."),
-        "Struct Field Removed" => Some("This is a breaking change. Removing fields breaks serialized storage layouts. Restore the field or perform a state migration."),
-        "Event Field Removed" => Some("This is a breaking change. Update event indexers and consumers that expect this field to be present."),
-        "Struct Field Reordered" => Some("This is a breaking change. Reordering fields breaks positional serialization layouts. Restore the original field order."),
-        "Event Field Reordered" => Some("This is a breaking change. Update event indexers and consumers to handle the new positional field order."),
-        "Struct Field Type Changed" => Some("This is a breaking change. Changing field types breaks layout serialization. Revert the type change or migrate existing data."),
-        "Event Field Type Changed" => Some("This is a breaking change. Update event indexers and consumers to handle the new field type."),
-        "Struct Field Added" => Some("Warning: Ensure existing storage entries are migrated or initialized with correct default values for the new field."),
-        "Event Enum Removed" => Some("This is a breaking change. Downstream event consumers or indexers relying on this enum will fail. Restore the enum."),
-        "Enum Removed" => Some("This is a breaking change. Stored data or parameters using this enum will be invalid. Restore the enum."),
-        "Enum Documentation Changed" => Some("No code changes required. Ensure the updated docs are clear for consumers."),
-        "Enum Added" => Some("No action required. Ensure consumers are aware of the new enum type if needed."),
-        "Enum Case Removed" => Some("This is a breaking change. On-chain data or parameters using this case will be invalid. Restore the case."),
-        "Event Enum Case Removed" => Some("This is a breaking change. Downstream event indexers or consumers relying on this case will fail. Restore the case."),
-        "Enum Case Value Changed" => Some("This is a breaking change. Modifying case values breaks serialization/deserialization. Revert the value change."),
-        "Event Enum Case Value Changed" => Some("This is a breaking change. Downstream event indexers or consumers relying on these values will fail. Revert the value change."),
-        "Enum Case Added" => Some("No action required. Ensure consumers can handle the new case gracefully."),
-        "Event Enum Case Added" => Some("No action required. Update event indexers and consumers to handle the new event enum case if necessary."),
-        "Union Removed" => Some("This is a breaking change. Stored data or parameters using this union will be invalid. Restore the union."),
-        "Union Added" => Some("No action required. Ensure consumers are aware of the new union type if needed."),
-        "Union Case Removed" => Some("This is a breaking change. On-chain data using this union case will be invalid. Restore the case."),
-        "Union Case Reordered" => Some("This is a breaking change. Reordering union cases breaks positional discriminant serialization. Restore the original case order."),
-        "Union Case Type Changed" => Some("This is a breaking change. Changing union case payload types breaks layout serialization. Revert the type change or migrate existing data."),
-        "Union Case Added" => Some("No action required. Ensure consumers can handle the new union case gracefully."),
-        "Error Enum Removed" => Some("This is a breaking change. Clients matching on these error codes will break. Restore the error enum."),
-        "Error Enum Added" => Some("No action required. Inform client integrations about the new error enum if needed."),
-        "Error Enum Case Removed" => Some("This is a breaking change. Clients matching on this error code will break. Restore the case."),
-        "Error Enum Case Value Changed" => Some("This is a breaking change. Modifying error case values breaks error-code compatibility. Revert the value change."),
-        "Error Enum Case Added" => Some("No action required. Ensure clients can handle the new error case gracefully."),
-        "Cascading Layout Break" => Some("This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type."),
-        "Type Kind Changed" => Some("This is a breaking change. The type kept its name but is now a different kind of type (struct, enum, union, or error enum), so its serialized layout changed entirely. Stored data written as the old kind cannot be decoded as the new one. Restore the original kind, or migrate the stored data and give the replacement a new name."),
-        "BytesN Size Changed" => Some("This is a breaking change. Changing the size of a fixed-size byte array alters its binary encoding. Revert the size or migrate data that depends on the original byte length."),
-        _ => None,
-    }
+    crate::category::FindingCategory::find_by_name(category).map(|c| c.remediation())
+}
+
+fn canonical_rule_id(category: &str) -> String {
+    category
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
 }
 
 /// Return the current UTC time as an RFC 3339 / ISO 8601 string.
@@ -490,8 +1009,6 @@ fn chrono_now_rfc3339() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = now.as_secs();
-    let nanos = now.subsec_nanos();
-
     let mut days = secs / 86400;
     let time_secs = secs % 86400;
 
@@ -527,14 +1044,8 @@ fn chrono_now_rfc3339() -> String {
     let second = time_secs % 60;
 
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        year,
-        month,
-        day,
-        hour,
-        minute,
-        second,
-        nanos / 1_000_000
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hour, minute, second
     )
 }
 
@@ -546,92 +1057,18 @@ fn is_leap_year(y: u64) -> bool {
 mod tests {
     use super::*;
 
+    /// Verify that every documented category in the reference page can be
+    /// resolved by `get_remediation_guidance`.  The true single-source-of-truth
+    /// test lives in `category.rs` (`generated_markdown_matches_committed_file`);
+    /// this just guards the delegation wrapper.
     #[test]
-    fn test_every_emitted_category_has_guidance() {
-        let diff_rs_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("diff.rs");
-        let content = std::fs::read_to_string(diff_rs_path).expect("Failed to read src/diff.rs");
-
-        let mut checked_categories = std::collections::HashSet::new();
-
-        for line in content.lines() {
-            if line.contains("category:") {
-                if line.contains("ENVIRONMENT_CATEGORY") {
-                    checked_categories.insert("Environment".to_string());
-                    continue;
-                }
-
-                if line.contains("TYPE_KIND_CHANGED_CATEGORY") {
-                    checked_categories.insert(crate::diff::TYPE_KIND_CHANGED_CATEGORY.to_string());
-                    continue;
-                }
-
-                let mut chars = line.chars().peekable();
-                while let Some(c) = chars.next() {
-                    if c == '"' {
-                        let mut literal = String::new();
-                        while let Some(&nc) = chars.peek() {
-                            if nc == '"' {
-                                chars.next();
-                                break;
-                            }
-                            literal.push(chars.next().unwrap());
-                        }
-                        if !literal.is_empty() {
-                            if literal.contains("{}") {
-                                let suffixes = vec![
-                                    "Removed",
-                                    "Reordered",
-                                    "Type Changed",
-                                    "Value Changed",
-                                    "Added",
-                                ];
-                                for suffix in suffixes {
-                                    if literal == format!("{{}} {}", suffix) {
-                                        let prefixes = match suffix {
-                                            "Reordered" | "Type Changed" => {
-                                                vec!["Struct Field", "Event Field"]
-                                            }
-                                            "Value Changed" | "Added" => {
-                                                vec!["Enum Case", "Event Enum Case"]
-                                            }
-                                            "Removed" => vec![
-                                                "Struct Field",
-                                                "Event Field",
-                                                "Enum Case",
-                                                "Event Enum Case",
-                                            ],
-                                            _ => unreachable!(),
-                                        };
-                                        for prefix in prefixes {
-                                            checked_categories
-                                                .insert(format!("{} {}", prefix, suffix));
-                                        }
-                                    }
-                                }
-                            } else {
-                                checked_categories.insert(literal);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        checked_categories.remove("TOTALLY CUSTOM CATEGORY");
-
-        assert!(
-            !checked_categories.is_empty(),
-            "Sanity check: should have found categories"
-        );
-
-        for cat in &checked_categories {
-            let guidance = get_remediation_guidance(cat);
+    fn test_remediation_guidance_resolves_known_categories() {
+        for cat in crate::category::FindingCategory::all() {
+            let guidance = get_remediation_guidance(cat.as_str());
             assert!(
                 guidance.is_some(),
-                "Category '{}' does not have remediation guidance!",
-                cat
+                "get_remediation_guidance('{}') returned None",
+                cat.as_str()
             );
         }
     }
@@ -642,14 +1079,17 @@ mod tests {
 
         fn make_finding(severity: Severity, category: &str) -> ReportedFinding {
             ReportedFinding {
+                rule_id: canonical_rule_id(category),
                 finding: Finding {
                     severity,
+                    axes: Vec::new(),
                     category: category.to_string(),
                     message: String::new(),
                     type_name: None,
                     target: None,
                     root_target: None,
                 },
+                axes: Vec::new(),
                 suppressed: false,
                 suppression_reason: None,
                 remediation: None,
@@ -657,6 +1097,7 @@ mod tests {
         }
 
         let mut report = SafetyReport {
+            call_abi: crate::call_abi::CallAbiCompatibility::default(),
             critical_count: 0,
             warning_count: 0,
             info_count: 0,
@@ -677,6 +1118,11 @@ mod tests {
             new_spec_summary: None,
             scope: AnalysisScope::default(),
             metrics: None,
+            axis_verdicts: HashMap::new(),
+            gated_axes: HashSet::new(),
+            empirical: false,
+            empirical_findings: Vec::new(),
+            settings: ReportSettings::default(),
         };
 
         assert_eq!(report.recommended_bump(), "patch");
@@ -715,6 +1161,7 @@ mod tests {
         let mut diff = DiffReport::default();
         diff.findings.push(Finding {
             severity: Severity::Critical,
+            axes: Vec::new(),
             category: "Struct Field Type Changed".to_string(),
             message: "Type 'Data' field 'amount' changed from i64 to i128".to_string(),
             type_name: Some("Data".to_string()),
@@ -723,6 +1170,7 @@ mod tests {
         });
         diff.findings.push(Finding {
             severity: Severity::Critical,
+            axes: Vec::new(),
             category: "Cascading Layout Break".to_string(),
             message: "Type 'Outer' layout is broken because it embeds modified type 'Data'"
                 .to_string(),
@@ -731,8 +1179,14 @@ mod tests {
             root_target: Some("Data".to_string()),
         });
 
-        let report =
-            SafetyReport::with_suppressions(&diff, &SuppressionConfig::default(), false, false);
+        let report = SafetyReport::with_suppressions_with_specs(
+            &diff,
+            &SuppressionConfig::default(),
+            false,
+            false,
+            &crate::spec::ContractSpec::default(),
+            &crate::spec::ContractSpec::default(),
+        );
 
         assert_eq!(report.critical_root_count, 1);
         assert_eq!(report.cascade_critical_count, 1);
@@ -745,6 +1199,7 @@ mod tests {
         let mut diff = DiffReport::default();
         diff.findings.push(Finding {
             severity: Severity::Critical,
+            axes: Vec::new(),
             category: "Struct Field Type Changed".to_string(),
             message: "Type 'Data' field 'amount' changed".to_string(),
             type_name: Some("Data".to_string()),
@@ -753,6 +1208,7 @@ mod tests {
         });
         diff.findings.push(Finding {
             severity: Severity::Critical,
+            axes: Vec::new(),
             category: "Cascading Layout Break".to_string(),
             message: "Type 'Outer' layout is broken".to_string(),
             type_name: Some("Outer".to_string()),
@@ -770,7 +1226,14 @@ mod tests {
         )
         .unwrap();
 
-        let report = SafetyReport::with_suppressions(&diff, &suppressions, false, false);
+        let report = SafetyReport::with_suppressions_with_specs(
+            &diff,
+            &suppressions,
+            false,
+            false,
+            &crate::spec::ContractSpec::default(),
+            &crate::spec::ContractSpec::default(),
+        );
 
         let root_finding = report
             .findings_by_category
@@ -795,6 +1258,7 @@ mod tests {
         let mut diff = DiffReport::default();
         diff.findings.push(Finding {
             severity: Severity::Critical,
+            axes: Vec::new(),
             category: "Struct Field Type Changed".to_string(),
             message: "Type 'Data' field 'amount' changed".to_string(),
             type_name: Some("Data".to_string()),
@@ -803,6 +1267,7 @@ mod tests {
         });
         diff.findings.push(Finding {
             severity: Severity::Critical,
+            axes: Vec::new(),
             category: "Cascading Layout Break".to_string(),
             message: "Type 'Outer' layout is broken".to_string(),
             type_name: Some("Outer".to_string()),
@@ -819,7 +1284,14 @@ mod tests {
         )
         .unwrap();
 
-        let report = SafetyReport::with_suppressions(&diff, &suppressions, false, false);
+        let report = SafetyReport::with_suppressions_with_specs(
+            &diff,
+            &suppressions,
+            false,
+            false,
+            &crate::spec::ContractSpec::default(),
+            &crate::spec::ContractSpec::default(),
+        );
 
         let root_finding = &report
             .findings_by_category

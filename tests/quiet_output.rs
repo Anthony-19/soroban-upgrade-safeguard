@@ -23,6 +23,8 @@ fn run_text(extra_args: &[&str]) -> (i32, String, String) {
     (code, stdout, stderr)
 }
 
+/// The report body, starting at the `Status:` line. Everything before it is the
+/// report's own decorative banner and, without `--quiet`, the progress chatter.
 fn report_slice(output: &str) -> &str {
     output
         .find("Status:")
@@ -51,7 +53,13 @@ fn quiet_text_suppresses_progress_but_keeps_report_and_exit_code() {
         "--quiet must suppress progress lines"
     );
     assert!(
-        quiet_stdout.starts_with("Status:"),
+        quiet_stdout
+            .trim_start()
+            .starts_with("========================================"),
+        "--quiet output must open with the report itself, not progress"
+    );
+    assert!(
+        quiet_stdout.contains("SOROBAN UPGRADE SAFETY REPORT"),
         "--quiet must still print the report"
     );
     assert!(
@@ -59,7 +67,7 @@ fn quiet_text_suppresses_progress_but_keeps_report_and_exit_code() {
         "--quiet must keep report details"
     );
     assert_eq!(
-        quiet_stdout,
+        report_slice(&quiet_stdout),
         report_slice(&normal_stdout),
         "--quiet must leave the report body unchanged"
     );

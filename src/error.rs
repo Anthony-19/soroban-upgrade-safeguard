@@ -19,6 +19,10 @@ pub enum ErrorKind {
     Integrity,
     InvalidInput,
     LimitExceeded,
+    RpcAuthConfig,
+    InvalidHeaderName,
+    RemoteFetch,
+    OciFetch,
 }
 
 /// The canonical error type for the soroban-upgrade-safeguard library.
@@ -43,6 +47,8 @@ pub enum ErrorKind {
 /// | [`Integrity`](Error::Integrity) | An integrity check (hash comparison, magic bytes) failed |
 /// | [`InvalidInput`](Error::InvalidInput) | An argument or input value is semantically invalid |
 /// | [`LimitExceeded`](Error::LimitExceeded) | A resource limit (XDR depth, entry count, WASM size) was exceeded |
+/// | [`RemoteFetch`](Error::RemoteFetch) | Downloading a `https://` input artifact failed (transport, size, redirect, or transport-policy violation) |
+/// | [`OciFetch`](Error::OciFetch) | Resolving an `oci://` input artifact failed (manifest/blob transport, auth, or media-type selection) |
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -104,6 +110,22 @@ pub enum Error {
         details: String,
         source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
     },
+    RpcAuthConfig {
+        details: String,
+    },
+    InvalidHeaderName {
+        name: String,
+    },
+    RemoteFetch {
+        url: String,
+        details: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    },
+    OciFetch {
+        reference: String,
+        details: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    },
 }
 
 impl Error {
@@ -125,16 +147,24 @@ impl Error {
             Error::Integrity { .. } => ErrorKind::Integrity,
             Error::InvalidInput { .. } => ErrorKind::InvalidInput,
             Error::LimitExceeded { .. } => ErrorKind::LimitExceeded,
+            Error::RpcAuthConfig { .. } => ErrorKind::RpcAuthConfig,
+            Error::InvalidHeaderName { .. } => ErrorKind::InvalidHeaderName,
+            Error::RemoteFetch { .. } => ErrorKind::RemoteFetch,
+            Error::OciFetch { .. } => ErrorKind::OciFetch,
         }
     }
 
     /// Returns `true` if the error is likely transient and the operation may
     /// succeed if retried.
     ///
-    /// Currently returns `true` for [`RpcTransport`](Error::RpcTransport) errors
-    /// (network hiccups) and `false` for all other variants.
+    /// Currently returns `true` for [`RpcTransport`](Error::RpcTransport) and
+    /// [`RemoteFetch`](Error::RemoteFetch) errors (network hiccups) and `false`
+    /// for all other variants.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Error::RpcTransport { .. })
+        matches!(
+            self,
+            Error::RpcTransport { .. } | Error::RemoteFetch { .. } | Error::OciFetch { .. }
+        )
     }
 
     /// Returns `true` if the error is a transient infrastructure issue
@@ -255,6 +285,22 @@ impl fmt::Display for Error {
             Error::LimitExceeded { details, .. } => {
                 write!(f, "Resource limit exceeded: {details}")
             }
+            Error::RpcAuthConfig { details } => {
+                write!(f, "RPC authentication configuration error: {details}")
+            }
+            Error::InvalidHeaderName { name } => write!(f, "Invalid RPC header name '{name}'"),
+            Error::RemoteFetch { url, details, .. } => {
+                write!(f, "Failed to fetch remote input '{url}': {details}")
+            }
+            Error::OciFetch {
+                reference, details, ..
+            } => {
+                if reference.is_empty() {
+                    write!(f, "Failed to fetch OCI input: {details}")
+                } else {
+                    write!(f, "Failed to fetch OCI input '{reference}': {details}")
+                }
+            }
         }
     }
 }
@@ -290,6 +336,13 @@ impl std::error::Error for Error {
                 .map(|s| s.as_ref() as &dyn std::error::Error),
             Error::InvalidInput { .. } => None,
             Error::LimitExceeded { source, .. } => source
+                .as_ref()
+                .map(|s| s.as_ref() as &dyn std::error::Error),
+            Error::RpcAuthConfig { .. } | Error::InvalidHeaderName { .. } => None,
+            Error::RemoteFetch { source, .. } => source
+                .as_ref()
+                .map(|s| s.as_ref() as &dyn std::error::Error),
+            Error::OciFetch { source, .. } => source
                 .as_ref()
                 .map(|s| s.as_ref() as &dyn std::error::Error),
         }

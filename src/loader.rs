@@ -1,19 +1,37 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use ring::digest::{digest, SHA256};
 use stellar_xdr::curr::{
-    ContractExecutable, Hash, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyContractCode,
-    LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
+    ContractDataEntry, ContractExecutable, ExtensionPoint, Hash, LedgerEntry, LedgerEntryData,
+    LedgerKey, LedgerKeyContractCode, LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal,
+    WriteXdr,
 };
 use wasmparser::Parser;
 
 use crate::error::Error;
+use crate::oci::{self, OciArtifact, OciArtifactKind, OciFetchConfig, OciReference};
+use crate::remote::{self, FetchedArtifact, RemoteFetchConfig, RemoteRef};
+use crate::rpc::RpcClientConfig;
 
 /// Holds raw WASM bytes alongside the validated file path.
 #[derive(Debug)]
 pub struct WasmModule {
     pub path: String,
     pub bytes: Vec<u8>,
+    /// Lowercase hex SHA-256 of `bytes`, computed at load time. Fingerprints the
+    /// exact bytecode analyzed so a report can be tied back to the build that
+    /// produced it. In RPC mode this equals the on-chain contract code hash.
+    pub sha256: String,
+}
+
+/// Compute the lowercase hex SHA-256 of a byte slice.
+///
+/// Used to fingerprint each analyzed WASM for provenance. Kept public so
+/// library callers and tests can reproduce the same identifier the report
+/// displays.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(digest(&SHA256, bytes).as_ref())
 }
 
 /// Reads a WASM file from disk, validates it is a valid WASM binary,
@@ -57,6 +75,48 @@ pub fn load_wasm_from_stdin(stdin: &mut impl Read) -> Result<WasmModule, Error> 
     wasm_module_from_bytes(bytes, PathBuf::from("-"), "-".to_string())
 }
 
+/// Downloads a WASM binary from an `https://…#sha256=<hex>` reference,
+/// verifies it against the pinned digest, and validates it like a local file.
+///
+/// Returns both the resulting [`WasmModule`] (whose `path` is the sanitized
+/// final URL, mirroring how [`fetch_wasm_from_rpc`] labels RPC-sourced
+/// modules) and the [`FetchedArtifact`] provenance record — original URL,
+/// cache status, and media type — for callers that want to surface it.
+pub fn load_wasm_from_url(
+    remote: &RemoteRef,
+    config: &RemoteFetchConfig,
+) -> Result<(WasmModule, FetchedArtifact), Error> {
+    let artifact = remote::fetch_verified(remote, config)?;
+    let module = wasm_module_from_bytes(
+        artifact.bytes.clone(),
+        PathBuf::from(&artifact.final_url),
+        artifact.final_url.clone(),
+    )?;
+    Ok((module, artifact))
+}
+
+/// Resolves a WASM binary from an `oci://<registry>/<repository>@sha256:<hex>`
+/// reference, verifies it against the resolved layer digest, and validates
+/// it like a local file.
+///
+/// Returns both the resulting [`WasmModule`] (whose `path` is a
+/// `oci://registry/repository@sha256:...` label built from the resolved
+/// digest, mirroring how [`fetch_wasm_from_rpc`] labels RPC-sourced modules)
+/// and the [`OciArtifact`] provenance record for callers that want to
+/// surface registry/repository/manifest/layer details.
+pub fn load_wasm_from_oci(
+    reference: &OciReference,
+    config: &OciFetchConfig,
+) -> Result<(WasmModule, OciArtifact), Error> {
+    let artifact = oci::resolve_oci_artifact(reference, OciArtifactKind::Wasm, config)?;
+    let label = format!(
+        "oci://{}/{}@{}",
+        artifact.registry, artifact.repository, artifact.layer_digest
+    );
+    let module = wasm_module_from_bytes(artifact.bytes.clone(), PathBuf::from(&label), label)?;
+    Ok((module, artifact))
+}
+
 fn wasm_module_from_bytes(
     bytes: Vec<u8>,
     validation_path: PathBuf,
@@ -85,6 +145,7 @@ fn wasm_module_from_bytes(
 
     Ok(WasmModule {
         path: display_path,
+        sha256: sha256_hex(&bytes),
         bytes,
     })
 }
@@ -105,6 +166,21 @@ fn validate_wasm_structure(bytes: &[u8]) -> Result<(), Error> {
 
 /// Fetches a deployed Soroban contract's WASM bytes from Stellar RPC by contract ID.
 pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModule, Error> {
+    fetch_wasm_from_rpc_inner(contract_id, rpc_url, None)
+}
+
+pub fn fetch_wasm_from_rpc_with_config(
+    contract_id: &str,
+    config: &RpcClientConfig,
+) -> Result<WasmModule, Error> {
+    fetch_wasm_from_rpc_inner(contract_id, &config.url, Some(config))
+}
+
+fn fetch_wasm_from_rpc_inner(
+    contract_id: &str,
+    rpc_url: &str,
+    auth: Option<&RpcClientConfig>,
+) -> Result<WasmModule, Error> {
     // 1. Parse contract_id using stellar_strkey
     let strkey =
         stellar_strkey::Strkey::from_string(contract_id).map_err(|e| Error::InvalidInput {
@@ -140,6 +216,7 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
     // 4. Query getLedgerEntries RPC
     let response = query_rpc(
         rpc_url,
+        auth,
         "getLedgerEntries",
         serde_json::json!({
             "keys": [key_b64]
@@ -235,6 +312,7 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
 
     let code_response = query_rpc(
         rpc_url,
+        auth,
         "getLedgerEntries",
         serde_json::json!({
             "keys": [code_key_b64]
@@ -312,6 +390,7 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
 
     Ok(WasmModule {
         path: format!("stellar://{}", contract_id),
+        sha256: sha256_hex(&wasm_bytes),
         bytes: wasm_bytes,
     })
 }
@@ -319,6 +398,7 @@ pub fn fetch_wasm_from_rpc(contract_id: &str, rpc_url: &str) -> Result<WasmModul
 /// Helper to execute JSON-RPC request to Stellar RPC.
 fn query_rpc(
     rpc_url: &str,
+    auth: Option<&RpcClientConfig>,
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
@@ -329,29 +409,171 @@ fn query_rpc(
         "params": params
     });
 
-    let response: serde_json::Value = ureq::post(rpc_url)
+    let (agent, headers) = match auth {
+        Some(config) => config.request_parts()?,
+        None => (
+            ureq::AgentBuilder::new()
+                .redirect_auth_headers(ureq::RedirectAuthHeaders::Never)
+                .build(),
+            crate::rpc::ResolvedRpcHeaders::empty(),
+        ),
+    };
+    let mut request = agent.post(rpc_url);
+    for (name, value) in &headers.values {
+        request = request.set(name, value);
+    }
+    let response: serde_json::Value = request
         .send_json(payload)
         .map_err(|e| Error::RpcTransport {
-            rpc_url: rpc_url.to_string(),
-            details: format!("RPC request failed: {}", e),
-            source: Some(Box::new(e)),
+            rpc_url: crate::rpc::redact_url(rpc_url),
+            details: format!("RPC request failed ({:?})", e.kind()),
+            source: None,
         })?
         .into_json()
-        .map_err(|e| Error::RpcTransport {
-            rpc_url: rpc_url.to_string(),
-            details: format!("Failed to parse RPC response: {}", e),
-            source: Some(Box::new(e)),
+        .map_err(|_e| Error::RpcTransport {
+            rpc_url: crate::rpc::redact_url(rpc_url),
+            details: "Failed to parse RPC response body".to_string(),
+            source: None,
         })?;
 
     if let Some(err) = response.get("error") {
         let msg = err["message"].as_str().unwrap_or("Unknown RPC error");
         let code = err["code"].as_i64().unwrap_or(0);
         return Err(Error::RpcProtocol {
-            rpc_url: rpc_url.to_string(),
+            rpc_url: crate::rpc::redact_url(rpc_url),
             code,
             message: msg.to_string(),
         });
     }
 
     Ok(response)
+}
+
+/// Fetches instance storage entries of a deployed contract from Stellar RPC.
+pub fn fetch_instance_storage_from_rpc(
+    contract_id: &str,
+    rpc_url: &str,
+) -> Result<Vec<ContractDataEntry>, Error> {
+    fetch_instance_storage_from_rpc_inner(contract_id, rpc_url, None)
+}
+
+pub fn fetch_instance_storage_from_rpc_with_config(
+    contract_id: &str,
+    config: &RpcClientConfig,
+) -> Result<Vec<ContractDataEntry>, Error> {
+    fetch_instance_storage_from_rpc_inner(contract_id, &config.url, Some(config))
+}
+
+fn fetch_instance_storage_from_rpc_inner(
+    contract_id: &str,
+    rpc_url: &str,
+    auth: Option<&RpcClientConfig>,
+) -> Result<Vec<ContractDataEntry>, Error> {
+    let strkey =
+        stellar_strkey::Strkey::from_string(contract_id).map_err(|e| Error::InvalidInput {
+            details: format!("Invalid contract ID '{}': {}", contract_id, e),
+        })?;
+
+    let contract_bytes = match strkey {
+        stellar_strkey::Strkey::Contract(c) => c.0,
+        _ => {
+            return Err(Error::InvalidInput {
+                details: format!("Provided ID '{}' is not a valid contract ID", contract_id),
+            })
+        }
+    };
+
+    let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
+        contract: ScAddress::Contract(Hash(contract_bytes)),
+        key: ScVal::LedgerKeyContractInstance,
+        durability: stellar_xdr::curr::ContractDataDurability::Persistent,
+    });
+
+    let key_b64 = ledger_key
+        .to_xdr_base64(Limits::none())
+        .map_err(|e| Error::XdrDecoding {
+            entry_index: None,
+            byte_offset: None,
+            details: format!("Failed to serialize LedgerKey to base64: {}", e),
+            source: Some(Box::new(e)),
+        })?;
+
+    let response = query_rpc(
+        rpc_url,
+        auth,
+        "getLedgerEntries",
+        serde_json::json!({
+            "keys": [key_b64]
+        }),
+    )?;
+
+    let entries = response["result"]["entries"]
+        .as_array()
+        .ok_or_else(|| Error::RpcProtocol {
+            rpc_url: rpc_url.to_string(),
+            code: 0,
+            message: "RPC response did not contain 'entries' array".to_string(),
+        })?;
+
+    if entries.is_empty() {
+        return Err(Error::RpcProtocol {
+            rpc_url: rpc_url.to_string(),
+            code: 0,
+            message: format!("Contract '{}' not found on-chain", contract_id),
+        });
+    }
+
+    let entry_xdr_b64 = entries[0]["xdr"]
+        .as_str()
+        .ok_or_else(|| Error::RpcProtocol {
+            rpc_url: rpc_url.to_string(),
+            code: 0,
+            message: "RPC response entry missing 'xdr' field".to_string(),
+        })?;
+
+    let entry = LedgerEntry::from_xdr_base64(entry_xdr_b64, Limits::none()).map_err(|e| {
+        Error::XdrDecoding {
+            entry_index: Some(0),
+            byte_offset: None,
+            details: format!("Failed to deserialize LedgerEntry XDR: {}", e),
+            source: Some(Box::new(e)),
+        }
+    })?;
+
+    let contract_data = match entry.data {
+        LedgerEntryData::ContractData(cd) => cd,
+        _ => {
+            return Err(Error::RpcProtocol {
+                rpc_url: rpc_url.to_string(),
+                code: 0,
+                message: "Unexpected ledger entry type returned for contract instance".to_string(),
+            })
+        }
+    };
+
+    let instance = match contract_data.val {
+        ScVal::ContractInstance(inst) => inst,
+        _ => {
+            return Err(Error::RpcProtocol {
+                rpc_url: rpc_url.to_string(),
+                code: 0,
+                message: "Expected ScVal::ContractInstance in contract data".to_string(),
+            })
+        }
+    };
+
+    Ok(instance
+        .storage
+        .map(|s| {
+            s.0.iter()
+                .map(|entry| ContractDataEntry {
+                    ext: ExtensionPoint::V0,
+                    contract: ScAddress::Contract(Hash(contract_bytes)),
+                    key: entry.key.clone(),
+                    durability: stellar_xdr::curr::ContractDataDurability::Persistent,
+                    val: entry.val.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default())
 }

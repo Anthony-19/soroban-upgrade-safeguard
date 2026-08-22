@@ -46,6 +46,9 @@ fn markdown_breaking_upgrade_reports_critical_and_exits_one() {
         stdout.contains("### Summary Table"),
         "Missing summary table heading"
     );
+    assert!(stdout.contains("### Directional Call ABI"));
+    assert!(stdout.contains("Old client → new contract"));
+    assert!(stdout.contains("New client → old contract"));
     assert!(
         stdout.contains("| Finding Severity | Count |"),
         "Missing table columns"

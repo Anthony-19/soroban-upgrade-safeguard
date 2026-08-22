@@ -48,6 +48,13 @@ fn json_breaking_upgrade_reports_critical_and_exits_one() {
     // Stable top-level structure.
     assert_eq!(json["is_safe"], Value::Bool(false));
     assert_eq!(json["recommended_bump"], "major");
+    assert!(json["call_abi"]["old_client_to_new_contract"].is_object());
+    assert!(json["call_abi"]["new_client_to_old_contract"].is_object());
+    assert!(json["call_abi"]["old_client_to_new_contract"]["breaks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["path"].is_string()));
     assert!(json["counts"]["critical"].as_u64().unwrap() >= 1);
     assert_eq!(
         json["total_findings"].as_u64().unwrap(),

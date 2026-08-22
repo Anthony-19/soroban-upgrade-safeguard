@@ -17,13 +17,13 @@
 //!                       saved report.json ───┘  (RenderableReport::from_json_str)
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
-use crate::diff::Severity;
-use crate::report::ReportedFinding;
+use crate::diff::{CompatibilityAxis, Severity};
+use crate::report::{AxisStatus, ReportedFinding};
 
 /// Version of the JSON report shape.
 pub const REPORT_SCHEMA_VERSION: u32 = 1;
@@ -126,6 +126,21 @@ pub struct RenderableReport {
     /// Categories in a [`BTreeMap`] so the JSON key order is stable and
     /// diffable across runs.
     pub findings_by_category: BTreeMap<String, Vec<ReportedFinding>>,
+    /// Per-axis pass/warning/fail verdict.
+    #[serde(default)]
+    pub axis_verdicts: BTreeMap<CompatibilityAxis, AxisStatus>,
+    /// Axes whose findings gate `is_safe` (per policy and `--strict`).
+    #[serde(default)]
+    pub gated_axes: BTreeSet<CompatibilityAxis>,
+    /// Findings grouped by the compatibility axis they were classified under.
+    #[serde(default)]
+    pub findings_by_axis: BTreeMap<CompatibilityAxis, Vec<ReportedFinding>>,
+    #[serde(default)]
+    pub call_abi: crate::call_abi::CallAbiCompatibility,
+    #[serde(default)]
+    pub empirical: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub empirical_findings: Vec<crate::empirical::EmpiricalFinding>,
 }
 
 fn default_schema_version() -> u32 {
@@ -153,16 +168,6 @@ impl RenderableReport {
             (Some(old), Some(new)) => Some(old == new),
             _ => None,
         }
-    }
-
-    /// Categories in display order: `Environment` first, then alphabetical.
-    fn ordered_categories(&self) -> Vec<&String> {
-        let mut categories: Vec<&String> = self.findings_by_category.keys().collect();
-        categories.sort_by(|a, b| {
-            let rank = |name: &str| if name == "Environment" { 0 } else { 1 };
-            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
-        });
-        categories
     }
 
     /// The interface-hash block shared by the text and Markdown headers.
@@ -265,6 +270,35 @@ impl RenderableReport {
         };
         output.push_str(&format!("Status: {}\n", status));
 
+        output.push_str("\nCompatibility Verdicts:\n");
+        let axes_in_order = vec![
+            crate::diff::CompatibilityAxis::StorageLayout,
+            crate::diff::CompatibilityAxis::CallAbi,
+            crate::diff::CompatibilityAxis::EventIndexer,
+            crate::diff::CompatibilityAxis::SourceLevel,
+        ];
+        for axis in axes_in_order {
+            let axis_status = self
+                .axis_verdicts
+                .get(&axis)
+                .cloned()
+                .unwrap_or(crate::report::AxisStatus::Passed);
+            let status_str = match axis_status {
+                crate::report::AxisStatus::Passed => "✅ PASSED".green().bold(),
+                crate::report::AxisStatus::Warning => "⚠️ WARNING (Non-gated)".yellow().bold(),
+                crate::report::AxisStatus::Failed => "❌ FAILED".red().bold(),
+            };
+            let label = match axis {
+                crate::diff::CompatibilityAxis::StorageLayout => "Storage Layout",
+                crate::diff::CompatibilityAxis::CallAbi => "Call ABI",
+                crate::diff::CompatibilityAxis::EventIndexer => "Event & Indexer",
+                crate::diff::CompatibilityAxis::SourceLevel => "Source Level",
+            };
+            output.push_str(&format!("  - {:<18} {}\n", label, status_str));
+        }
+        output.push_str(&self.directional_call_abi_text());
+        output.push('\n');
+
         let crit_str = if self.counts.critical > 0 {
             self.counts.critical.to_string().red().bold()
         } else {
@@ -309,14 +343,31 @@ impl RenderableReport {
             return output;
         }
 
-        for category in self.ordered_categories() {
+        for axis in &[
+            crate::diff::CompatibilityAxis::StorageLayout,
+            crate::diff::CompatibilityAxis::CallAbi,
+            crate::diff::CompatibilityAxis::EventIndexer,
+            crate::diff::CompatibilityAxis::SourceLevel,
+        ] {
+            let group = match self.findings_by_axis.get(axis) {
+                Some(g) if !g.is_empty() => g,
+                _ => continue,
+            };
+
+            let label = match axis {
+                crate::diff::CompatibilityAxis::StorageLayout => "STORAGE LAYOUT COMPATIBILITY",
+                crate::diff::CompatibilityAxis::CallAbi => "CALL ABI COMPATIBILITY",
+                crate::diff::CompatibilityAxis::EventIndexer => "EVENT & INDEXER COMPATIBILITY",
+                crate::diff::CompatibilityAxis::SourceLevel => "SOURCE LEVEL COMPATIBILITY",
+            };
+
             output.push_str(
-                &format!("--- [{}] ---\n", category.to_ascii_uppercase())
+                &format!("--- [{}] ---\n", label)
                     .magenta()
                     .bold()
                     .to_string(),
             );
-            let group = &self.findings_by_category[category];
+
             for reported in group {
                 let finding = &reported.finding;
 
@@ -329,15 +380,6 @@ impl RenderableReport {
                         output
                             .push_str(&format!("    ↳ reason: {}\n", reason).dimmed().to_string());
                     }
-                    if explain {
-                        if let Some(remediation) = &reported.remediation {
-                            output.push_str(
-                                &format!("    ↳ guidance: {}\n", remediation)
-                                    .dimmed()
-                                    .to_string(),
-                            );
-                        }
-                    }
                     continue;
                 }
 
@@ -347,6 +389,29 @@ impl RenderableReport {
                     Severity::Info => format!("🔵 {}", finding.message).cyan(),
                 };
                 output.push_str(&format!("{}\n", formatted));
+                if self.empirical {
+                    if let Some(ref udt_name) = finding.type_name {
+                        let matching_emp: Vec<&crate::empirical::EmpiricalFinding> = self
+                            .empirical_findings
+                            .iter()
+                            .filter(|ef| &ef.type_name == udt_name)
+                            .collect();
+                        if !matching_emp.is_empty() {
+                            let has_failures = matching_emp.iter().any(|ef| !ef.is_success);
+                            if has_failures {
+                                for ef in matching_emp.iter().filter(|ef| !ef.is_success) {
+                                    if let Some(ref err) = ef.error {
+                                        output.push_str(&format!("    ↳ 🔴 [CONFIRMED] Stored data failed to decode: {}\n", err).red().bold().to_string());
+                                    }
+                                }
+                            } else {
+                                output.push_str(&"    ↳ 🟢 [CONTRADICTED] Sampled stored values all decoded successfully under the new spec.\n".green().to_string());
+                            }
+                        } else {
+                            output.push_str(&"    ↳ ⚪ [UNCONFIRMED] No matching stored data found in the sample.\n".dimmed().to_string());
+                        }
+                    }
+                }
                 if explain {
                     if let Some(remediation) = &reported.remediation {
                         output.push_str(
@@ -379,10 +444,53 @@ impl RenderableReport {
             }
         }
 
+        if self.empirical {
+            output.push_str(
+                &"\n========================================\n"
+                    .bold()
+                    .to_string(),
+            );
+            output.push_str(
+                &"    EMPIRICAL STORAGE VALIDATION SUMMARY\n"
+                    .bold()
+                    .magenta()
+                    .to_string(),
+            );
+            output.push_str(
+                &"========================================\n"
+                    .bold()
+                    .to_string(),
+            );
+            let successes = self
+                .empirical_findings
+                .iter()
+                .filter(|ef| ef.is_success)
+                .count();
+            let failures = self
+                .empirical_findings
+                .iter()
+                .filter(|ef| !ef.is_success)
+                .count();
+            let total_sampled = self.empirical_findings.len();
+            output.push_str(&format!("Total Sampled UDT Values: {}\n", total_sampled));
+            output.push_str(&format!(
+                "  - Decoded Successfully: {}\n",
+                successes.to_string().green()
+            ));
+            output.push_str(&format!(
+                "  - Failed to Decode:     {}\n",
+                if failures > 0 {
+                    failures.to_string().red().bold().to_string()
+                } else {
+                    failures.to_string()
+                }
+            ));
+            output.push_str("Limits: Stellar RPC does not support wildcard ledger enumeration. Coverage is bounded to instance storage or offline files.\n");
+        }
+
         output
     }
 
-    /// Render the structured Markdown output.
     pub fn to_markdown(&self) -> String {
         let mut output = String::new();
         output.push_str("# Soroban Upgrade Safety Report\n\n");
@@ -393,6 +501,43 @@ impl RenderableReport {
             "❌ FAILED (Critical breaking changes detected)"
         };
         output.push_str(&format!("## Status: {}\n\n", status));
+
+        output.push_str("### Compatibility Verdicts\n\n");
+        output.push_str("| Compatibility Axis | Status | Gated |\n");
+        output.push_str("| :--- | :--- | :--- |\n");
+
+        let axes_in_order = vec![
+            crate::diff::CompatibilityAxis::StorageLayout,
+            crate::diff::CompatibilityAxis::CallAbi,
+            crate::diff::CompatibilityAxis::EventIndexer,
+            crate::diff::CompatibilityAxis::SourceLevel,
+        ];
+
+        for axis in axes_in_order {
+            let status = self
+                .axis_verdicts
+                .get(&axis)
+                .cloned()
+                .unwrap_or(crate::report::AxisStatus::Passed);
+            let status_str = match status {
+                crate::report::AxisStatus::Passed => "✅ PASSED",
+                crate::report::AxisStatus::Warning => "⚠️ WARNING",
+                crate::report::AxisStatus::Failed => "❌ FAILED",
+            };
+            let label = match axis {
+                crate::diff::CompatibilityAxis::StorageLayout => "Storage Layout",
+                crate::diff::CompatibilityAxis::CallAbi => "Call ABI",
+                crate::diff::CompatibilityAxis::EventIndexer => "Event & Indexer",
+                crate::diff::CompatibilityAxis::SourceLevel => "Source Level",
+            };
+            let gated = if self.gated_axes.contains(&axis) {
+                "Yes"
+            } else {
+                "No"
+            };
+            output.push_str(&format!("| **{}** | {} | {} |\n", label, status_str, gated));
+        }
+        output.push('\n');
 
         output.push_str("### Summary Table\n\n");
         output.push_str("| Finding Severity | Count |\n");
@@ -407,6 +552,7 @@ impl RenderableReport {
             "\n**Recommended SemVer Bump**: `{}`\n\n",
             self.recommended_bump
         ));
+        output.push_str(&self.directional_call_abi_markdown());
         for (label, value) in self.interface_hash_lines() {
             output.push_str(&format!("**{}**: `{}`\n\n", label, value));
         }
@@ -420,11 +566,32 @@ impl RenderableReport {
             return output;
         }
 
-        for category in self.ordered_categories() {
-            output.push_str(&format!("### {}\n\n", category));
-            let group = &self.findings_by_category[category];
+        for axis in &[
+            crate::diff::CompatibilityAxis::StorageLayout,
+            crate::diff::CompatibilityAxis::CallAbi,
+            crate::diff::CompatibilityAxis::EventIndexer,
+            crate::diff::CompatibilityAxis::SourceLevel,
+        ] {
+            let group = match self.findings_by_axis.get(axis) {
+                Some(g) if !g.is_empty() => g,
+                _ => continue,
+            };
+
+            let label = match axis {
+                crate::diff::CompatibilityAxis::StorageLayout => "Storage Layout Compatibility",
+                crate::diff::CompatibilityAxis::CallAbi => "Call ABI Compatibility",
+                crate::diff::CompatibilityAxis::EventIndexer => "Event & Indexer Compatibility",
+                crate::diff::CompatibilityAxis::SourceLevel => "Source Level Compatibility",
+            };
+
+            output.push_str(&format!("### {}\n\n", label));
+            let mut current_category: Option<&str> = None;
             for reported in group {
                 let finding = &reported.finding;
+                if current_category != Some(finding.category.as_str()) {
+                    current_category = Some(&finding.category);
+                    output.push_str(&format!("### {}\n\n", finding.category));
+                }
 
                 if reported.suppressed {
                     output.push_str(&format!("- 🔕 **[SUPPRESSED]** {}\n", finding.message));
@@ -440,6 +607,29 @@ impl RenderableReport {
                     Severity::Info => "🔵",
                 };
                 output.push_str(&format!("- {} {}\n", emoji, finding.message));
+                if self.empirical {
+                    if let Some(ref udt_name) = finding.type_name {
+                        let matching_emp: Vec<&crate::empirical::EmpiricalFinding> = self
+                            .empirical_findings
+                            .iter()
+                            .filter(|ef| &ef.type_name == udt_name)
+                            .collect();
+                        if !matching_emp.is_empty() {
+                            let has_failures = matching_emp.iter().any(|ef| !ef.is_success);
+                            if has_failures {
+                                for ef in matching_emp.iter().filter(|ef| !ef.is_success) {
+                                    if let Some(ref err) = ef.error {
+                                        output.push_str(&format!("  - ↳ 🔴 **[CONFIRMED]** Stored data failed to decode: `{}`\n", err));
+                                    }
+                                }
+                            } else {
+                                output.push_str("  - ↳ 🟢 **[CONTRADICTED]** Sampled stored values all decoded successfully under the new spec.\n");
+                            }
+                        } else {
+                            output.push_str("  - ↳ ⚪ **[UNCONFIRMED]** No matching stored data found in the sample.\n");
+                        }
+                    }
+                }
             }
             output.push('\n');
         }
@@ -447,10 +637,93 @@ impl RenderableReport {
         if !self.is_safe {
             output.push_str("### ⚠️ Action Required\n\n");
             output.push_str("- The new contract version modifies existing storage layouts or function interfaces.\n");
-            output.push_str("- Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n");
+            output.push_str("- Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n\n");
+        }
+
+        if self.empirical {
+            output.push_str("### 📊 Empirical Storage Validation Summary\n\n");
+            let successes = self
+                .empirical_findings
+                .iter()
+                .filter(|ef| ef.is_success)
+                .count();
+            let failures = self
+                .empirical_findings
+                .iter()
+                .filter(|ef| !ef.is_success)
+                .count();
+            let total_sampled = self.empirical_findings.len();
+            output.push_str(&format!(
+                "- **Total Sampled UDT Values**: {}\n",
+                total_sampled
+            ));
+            output.push_str(&format!("- **Decoded Successfully**: {}\n", successes));
+            output.push_str(&format!("- **Failed to Decode**: {}\n", failures));
+            output.push_str("- **Limits**: Stellar RPC does not support wildcard ledger enumeration. Coverage is bounded to instance storage or offline files.\n\n");
         }
 
         output
+    }
+
+    fn directional_call_abi_text(&self) -> String {
+        let mut out = String::from("\nDirectional Call ABI:\n");
+        for verdict in [
+            &self.call_abi.old_client_to_new_contract,
+            &self.call_abi.new_client_to_old_contract,
+        ] {
+            let label = match verdict.direction {
+                crate::call_abi::CallDirection::OldClientToNewContract => {
+                    "old client -> new contract"
+                }
+                crate::call_abi::CallDirection::NewClientToOldContract => {
+                    "new client -> old contract"
+                }
+            };
+            out.push_str(&format!(
+                "  - {:<28} {}\n",
+                label,
+                if verdict.compatible {
+                    "PASSED"
+                } else {
+                    "FAILED"
+                }
+            ));
+            for br in verdict.breaks.iter().take(8) {
+                out.push_str(&format!("      {}: {}\n", br.path, br.reason));
+            }
+        }
+        out
+    }
+
+    fn directional_call_abi_markdown(&self) -> String {
+        let mut out = String::from("### Directional Call ABI\n\n");
+        for verdict in [
+            &self.call_abi.old_client_to_new_contract,
+            &self.call_abi.new_client_to_old_contract,
+        ] {
+            let label = match verdict.direction {
+                crate::call_abi::CallDirection::OldClientToNewContract => {
+                    "Old client → new contract"
+                }
+                crate::call_abi::CallDirection::NewClientToOldContract => {
+                    "New client → old contract"
+                }
+            };
+            out.push_str(&format!(
+                "- **{}**: `{}`\n",
+                label,
+                if verdict.compatible {
+                    "passed"
+                } else {
+                    "failed"
+                }
+            ));
+            for br in verdict.breaks.iter().take(8) {
+                out.push_str(&format!("  - `{}` — {}\n", br.path, br.reason));
+            }
+        }
+        out.push('\n');
+        out
     }
 }
 
@@ -472,14 +745,17 @@ mod tests {
     use super::*;
     use crate::diff::{DiffReport, Finding};
     use crate::report::SafetyReport;
+    use crate::spec::ContractSpec;
 
     fn finding(severity: Severity, category: &str, message: &str) -> Finding {
         Finding {
             severity,
+            axes: Vec::new(),
             category: category.to_string(),
             message: message.to_string(),
             type_name: None,
             target: Some("thing".to_string()),
+            root_target: None,
         }
     }
 
@@ -495,7 +771,8 @@ mod tests {
                 finding(Severity::Info, "Function Added", "New function 'b' added."),
             ],
         };
-        SafetyReport::new(&diff)
+        let empty_spec = ContractSpec::default();
+        SafetyReport::new_with_specs(&diff, &empty_spec, &empty_spec)
     }
 
     #[test]
@@ -529,11 +806,14 @@ mod tests {
                 "Function 'a' was removed.",
             )],
         };
-        let live = SafetyReport::with_suppressions(
+        let empty_spec = ContractSpec::default();
+        let live = SafetyReport::with_suppressions_with_specs(
             &diff,
             &crate::suppression::SuppressionConfig::default(),
             true,
             false,
+            &empty_spec,
+            &empty_spec,
         );
 
         let json = serde_json::to_string(&live.to_renderable()).unwrap();
