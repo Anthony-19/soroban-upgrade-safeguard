@@ -54,6 +54,11 @@ pub mod interface_hash;
 mod interface_hash;
 
 #[cfg(feature = "unstable")]
+pub mod jsonl;
+#[cfg(not(feature = "unstable"))]
+mod jsonl;
+
+#[cfg(feature = "unstable")]
 pub mod loader;
 #[cfg(not(feature = "unstable"))]
 mod loader;

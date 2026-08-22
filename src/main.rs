@@ -161,7 +161,8 @@ enum RenderFormat {
                       soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]\n       \
                       soroban-upgrade-safeguard extract <WASM> [OPTIONS]\n       \
                       soroban-upgrade-safeguard render <REPORT_JSON> [OPTIONS]\n       \
-                      soroban-upgrade-safeguard init [OPTIONS]",
+                      soroban-upgrade-safeguard init [OPTIONS]\n       \
+                      soroban-upgrade-safeguard stream [OPTIONS]",
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
 )]
@@ -375,6 +376,8 @@ enum Command {
     Attest(AttestArgs),
     /// Verify a safeguard DSSE attestation and all referenced artifacts offline
     VerifyAttestation(VerifyAttestationArgs),
+    /// Streaming JSON Lines batch mode: one job per line on stdin, one result per line on stdout
+    Stream(StreamArgs),
 }
 
 #[derive(ClapArgs, Debug)]
@@ -420,6 +423,26 @@ struct VerifyAttestationArgs {
     /// Unix timestamp after which the verification policy is expired.
     #[arg(long, value_name = "UNIX_SECONDS")]
     policy_expires_at: Option<u64>,
+}
+
+/// `stream`: JSON Lines streaming batch mode.
+#[derive(ClapArgs, Debug)]
+struct StreamArgs {
+    /// Maximum number of concurrent worker threads.
+    #[arg(long, default_value_t = 4)]
+    concurrency: usize,
+    /// Preserve input order in output (slower; buffers results).
+    #[arg(long)]
+    input_order: bool,
+    /// Treat warnings as errors globally (jobs may override).
+    #[arg(long)]
+    strict: bool,
+    /// Do not load .safeguard.toml automatically.
+    #[arg(long)]
+    no_config: bool,
+    /// Path to a suppression config.
+    #[arg(long, value_name = "CONFIG")]
+    config: Option<PathBuf>,
 }
 
 /// `extract`: decode one build and emit its interface.
@@ -793,6 +816,43 @@ fn run_verify_attestation(args: &VerifyAttestationArgs) -> Result<()> {
     Ok(())
 }
 
+/// Run the streaming JSONL batch protocol.
+///
+/// Reads versioned JSON jobs from stdin, processes them concurrently,
+/// and writes versioned JSON results to stdout. All diagnostics go to stderr.
+fn run_stream(args: &StreamArgs) -> Result<()> {
+    use soroban_upgrade_safeguard::jsonl::{self, OutputOrder, StreamConfig};
+
+    let suppressions = if args.no_config {
+        SuppressionConfig::default()
+    } else {
+        match &args.config {
+            Some(path) => SuppressionConfig::load_from_path(path)?,
+            None => SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?
+                .unwrap_or_default(),
+        }
+    };
+
+    let output_order = if args.input_order {
+        OutputOrder::InputOrder
+    } else {
+        OutputOrder::CompletionOrder
+    };
+
+    let config = StreamConfig {
+        concurrency: args.concurrency.max(1),
+        output_order,
+        strict: args.strict,
+        suppressions,
+        no_config: args.no_config,
+        ..StreamConfig::default()
+    };
+
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    jsonl::run_streaming(stdin.lock(), stdout.lock(), &config)
+}
+
 /// Re-render a stored JSON report as text or Markdown.
 fn run_render(args: &RenderArgs) -> Result<()> {
     let raw = if args.report == Path::new("-") {
@@ -997,6 +1057,7 @@ fn main() -> Result<()> {
         Some(Command::VerifyAttestation(verify_args)) => {
             return run_verify_attestation(verify_args)
         }
+        Some(Command::Stream(stream_args)) => return run_stream(stream_args),
         None => {}
     }
 
