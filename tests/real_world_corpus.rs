@@ -39,8 +39,8 @@ struct ExpectedVerdict {
 #[test]
 #[ignore = "real-world corpus validation - opt in via cargo test --test real_world_corpus -- --ignored or REAL_WORLD_CORPUS=1"]
 fn test_real_world_corpus_validation() {
-    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/real_world_corpus/manifest.json");
+    let manifest_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/real_world_corpus/manifest.json");
 
     assert!(
         manifest_path.exists(),
@@ -48,10 +48,10 @@ fn test_real_world_corpus_validation() {
         manifest_path
     );
 
-    let manifest_content = fs::read_to_string(&manifest_path)
-        .expect("Failed to read real-world corpus manifest.json");
-    let manifest: Manifest = serde_json::from_str(&manifest_content)
-        .expect("Failed to deserialize manifest.json");
+    let manifest_content =
+        fs::read_to_string(&manifest_path).expect("Failed to read real-world corpus manifest.json");
+    let manifest: Manifest =
+        serde_json::from_str(&manifest_content).expect("Failed to deserialize manifest.json");
 
     println!("\n========================================================");
     println!("  Soroban Real-World Contract Upgrade Validation Corpus");
@@ -102,7 +102,10 @@ fn test_real_world_corpus_validation() {
         );
         for (cat, list) in &report.findings_by_category {
             for f in list {
-                println!("  Finding [{:?}] {}: {}", f.finding.severity, cat, f.finding.message);
+                println!(
+                    "  Finding [{:?}] {}: {}",
+                    f.finding.severity, cat, f.finding.message
+                );
             }
         }
 
@@ -121,11 +124,25 @@ fn test_real_world_corpus_validation() {
             pair.id
         );
 
-        // Assertion 3: Critical count match if expected
+        // Assertion 3: Critical/Warning/Info count match if expected
         if let Some(expected_critical) = pair.expected_verdict.expected_critical_count {
             assert_eq!(
                 report.critical_count, expected_critical,
                 "Critical count mismatch for pair {}",
+                pair.id
+            );
+        }
+        if let Some(expected_warning) = pair.expected_verdict.expected_warning_count {
+            assert_eq!(
+                report.warning_count, expected_warning,
+                "Warning count mismatch for pair {}",
+                pair.id
+            );
+        }
+        if let Some(expected_info) = pair.expected_verdict.expected_info_count {
+            assert_eq!(
+                report.info_count, expected_info,
+                "Info count mismatch for pair {}",
                 pair.id
             );
         }

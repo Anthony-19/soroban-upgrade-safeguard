@@ -311,24 +311,24 @@ fn check_function_signature(
             let p_name = old_input.name.to_string();
             if let Some(new_type) = new_by_name.get(&p_name) {
                 if !types_equal(&old_input.type_, new_type) {
-                    let (category, detail) =
-                        if let Some(bytesn_msg) =
-                            describe_bytesn_size_change(&old_input.type_, new_type)
-                        {
-                            ("BytesN Size Changed".to_string(), bytesn_msg)
-                        } else {
-                            (
-                                "Parameter Type Changed".to_string(),
-                                describe_nested_type_change(&old_input.type_, new_type)
-                                    .unwrap_or_else(|| {
-                                        format!(
-                                            "type changed from `{}` to `{}`",
-                                            crate::mapper::type_to_string(&old_input.type_),
-                                            crate::mapper::type_to_string(new_type)
-                                        )
-                                    }),
-                            )
-                        };
+                    let (category, detail) = if let Some(bytesn_msg) =
+                        describe_bytesn_size_change(&old_input.type_, new_type)
+                    {
+                        ("BytesN Size Changed".to_string(), bytesn_msg)
+                    } else {
+                        (
+                            "Parameter Type Changed".to_string(),
+                            describe_nested_type_change(&old_input.type_, new_type).unwrap_or_else(
+                                || {
+                                    format!(
+                                        "type changed from `{}` to `{}`",
+                                        crate::mapper::type_to_string(&old_input.type_),
+                                        crate::mapper::type_to_string(new_type)
+                                    )
+                                },
+                            ),
+                        )
+                    };
                     report.findings.push(Finding {
                         severity: Severity::Critical,
                         category,
@@ -364,24 +364,23 @@ fn check_function_signature(
             }
 
             if !types_equal(&old_input.type_, &new_input.type_) {
-                let (category, detail) =
-                    if let Some(bytesn_msg) =
-                        describe_bytesn_size_change(&old_input.type_, &new_input.type_)
-                    {
-                        ("BytesN Size Changed".to_string(), bytesn_msg)
-                    } else {
-                        (
-                            "Parameter Type Changed".to_string(),
-                            describe_nested_type_change(&old_input.type_, &new_input.type_)
-                                .unwrap_or_else(|| {
-                                    format!(
-                                        "type changed from `{}` to `{}`",
-                                        crate::mapper::type_to_string(&old_input.type_),
-                                        crate::mapper::type_to_string(&new_input.type_)
-                                    )
-                                }),
-                        )
-                    };
+                let (category, detail) = if let Some(bytesn_msg) =
+                    describe_bytesn_size_change(&old_input.type_, &new_input.type_)
+                {
+                    ("BytesN Size Changed".to_string(), bytesn_msg)
+                } else {
+                    (
+                        "Parameter Type Changed".to_string(),
+                        describe_nested_type_change(&old_input.type_, &new_input.type_)
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "type changed from `{}` to `{}`",
+                                    crate::mapper::type_to_string(&old_input.type_),
+                                    crate::mapper::type_to_string(&new_input.type_)
+                                )
+                            }),
+                    )
+                };
                 report.findings.push(Finding {
                     severity: Severity::Critical,
                     category,
@@ -579,24 +578,24 @@ fn check_struct_fields(
 
         // Field type changed
         if !types_equal(&old_field.type_, &new_field.type_) {
-            let (category, detail) =
-                if let Some(bytesn_msg) =
-                    describe_bytesn_size_change(&old_field.type_, &new_field.type_)
-                {
-                    ("BytesN Size Changed".to_string(), bytesn_msg)
-                } else {
-                    (
-                        format!("{} Type Changed", category_prefix),
-                        describe_nested_type_change(&old_field.type_, &new_field.type_)
-                            .unwrap_or_else(|| {
-                                format!(
-                                    "type changed from `{}` to `{}`",
-                                    crate::mapper::type_to_string(&old_field.type_),
-                                    crate::mapper::type_to_string(&new_field.type_)
-                                )
-                            }),
-                    )
-                };
+            let (category, detail) = if let Some(bytesn_msg) =
+                describe_bytesn_size_change(&old_field.type_, &new_field.type_)
+            {
+                ("BytesN Size Changed".to_string(), bytesn_msg)
+            } else {
+                (
+                    format!("{} Type Changed", category_prefix),
+                    describe_nested_type_change(&old_field.type_, &new_field.type_).unwrap_or_else(
+                        || {
+                            format!(
+                                "type changed from `{}` to `{}`",
+                                crate::mapper::type_to_string(&old_field.type_),
+                                crate::mapper::type_to_string(&new_field.type_)
+                            )
+                        },
+                    ),
+                )
+            };
             report.findings.push(Finding {
                 severity: Severity::Critical,
                 category,
@@ -2036,10 +2035,7 @@ mod tests {
         let desc = describe_nested_type_change(&old, &new);
         assert_eq!(
             desc,
-            Some(
-                "the value type of Map changed from `u32` to `u64`"
-                    .to_string()
-            )
+            Some("the value type of Map changed from `u32` to `u64`".to_string())
         );
     }
 
@@ -2072,10 +2068,7 @@ mod tests {
         let desc = describe_nested_type_change(&old, &new);
         assert_eq!(
             desc,
-            Some(
-                "type at index 1 of tuple changed from `u64` to `i128`"
-                    .to_string()
-            )
+            Some("type at index 1 of tuple changed from `u64` to `i128`".to_string())
         );
     }
 
@@ -2108,26 +2101,19 @@ mod tests {
             }))
         };
         let old = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-            element_type: ScSpecTypeDef::Option(Box::new(
-                stellar_xdr::curr::ScSpecTypeOption {
-                    value_type: inner_map(ScSpecTypeDef::U32),
-                },
-            )),
+            element_type: ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+                value_type: inner_map(ScSpecTypeDef::U32),
+            })),
         }));
         let new = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-            element_type: ScSpecTypeDef::Option(Box::new(
-                stellar_xdr::curr::ScSpecTypeOption {
-                    value_type: inner_map(ScSpecTypeDef::U64),
-                },
-            )),
+            element_type: ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+                value_type: inner_map(ScSpecTypeDef::U64),
+            })),
         }));
         let desc = describe_nested_type_change(&old, &new);
         assert_eq!(
             desc,
-            Some(
-                "the value type of Map changed from `u32` to `u64`"
-                    .to_string()
-            )
+            Some("the value type of Map changed from `u32` to `u64`".to_string())
         );
     }
 
@@ -2217,18 +2203,24 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn field_type_change_vec_shows_concise_message() {
-        let old = spec_with_structs(vec![("Data", vec![(
-            "values",
-            ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-                element_type: ScSpecTypeDef::U32,
-            })),
-        )])]);
-        let new = spec_with_structs(vec![("Data", vec![(
-            "values",
-            ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-                element_type: ScSpecTypeDef::U64,
-            })),
-        )])]);
+        let old = spec_with_structs(vec![(
+            "Data",
+            vec![(
+                "values",
+                ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+                    element_type: ScSpecTypeDef::U32,
+                })),
+            )],
+        )]);
+        let new = spec_with_structs(vec![(
+            "Data",
+            vec![(
+                "values",
+                ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+                    element_type: ScSpecTypeDef::U64,
+                })),
+            )],
+        )]);
 
         let report = compare(&old, &new);
         let fc = report
@@ -2237,7 +2229,8 @@ mod tests {
             .find(|f| f.category == "Struct Field Type Changed")
             .expect("Expected field type change");
         assert!(
-            fc.message.contains("the element type of Vec changed from `u32` to `u64`"),
+            fc.message
+                .contains("the element type of Vec changed from `u32` to `u64`"),
             "Message was: {}",
             fc.message
         );
@@ -2338,8 +2331,14 @@ mod tests {
                 value_type: value,
             }))
         };
-        let old = spec_with_structs(vec![("Data", vec![("balances", make_map(ScSpecTypeDef::U32))])]);
-        let new = spec_with_structs(vec![("Data", vec![("balances", make_map(ScSpecTypeDef::U64))])]);
+        let old = spec_with_structs(vec![(
+            "Data",
+            vec![("balances", make_map(ScSpecTypeDef::U32))],
+        )]);
+        let new = spec_with_structs(vec![(
+            "Data",
+            vec![("balances", make_map(ScSpecTypeDef::U64))],
+        )]);
 
         let report = compare(&old, &new);
         let fc = report
@@ -2348,7 +2347,8 @@ mod tests {
             .find(|f| f.category == "Struct Field Type Changed")
             .expect("Expected field type change");
         assert!(
-            fc.message.contains("the value type of Map changed from `u32` to `u64`"),
+            fc.message
+                .contains("the value type of Map changed from `u32` to `u64`"),
             "Message was: {}",
             fc.message
         );
@@ -2433,7 +2433,8 @@ mod tests {
             .find(|f| f.category == "Struct Field Type Changed")
             .expect("Expected generic Struct Field Type Changed");
         assert!(
-            fc.message.contains("type changed from `BytesN<32>` to `String`"),
+            fc.message
+                .contains("type changed from `BytesN<32>` to `String`"),
             "Message was: {}",
             fc.message
         );

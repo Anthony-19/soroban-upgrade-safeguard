@@ -82,8 +82,14 @@ impl AnalysisScope {
 
     pub fn storage_status_line(&self) -> String {
         match &self.storage_schema {
-            StorageScopeState::Analyzed { key_types, value_types } => {
-                format!("Storage layout analyzed ({} key types, {} value types)", key_types, value_types)
+            StorageScopeState::Analyzed {
+                key_types,
+                value_types,
+            } => {
+                format!(
+                    "Storage layout analyzed ({} key types, {} value types)",
+                    key_types, value_types
+                )
             }
             StorageScopeState::NotAnalyzed => {
                 "Storage layout: NOT analyzed (use a storage schema manifest)".to_string()
@@ -93,16 +99,14 @@ impl AnalysisScope {
 }
 
 /// Whether storage schema analysis was performed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum StorageScopeState {
+    #[default]
     NotAnalyzed,
-    Analyzed { key_types: usize, value_types: usize },
-}
-
-impl Default for StorageScopeState {
-    fn default() -> Self {
-        StorageScopeState::NotAnalyzed
-    }
+    Analyzed {
+        key_types: usize,
+        value_types: usize,
+    },
 }
 
 /// Build metrics for the report.
@@ -123,6 +127,7 @@ pub struct BuildMetrics {
 }
 
 impl BuildMetrics {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         old_wasm_size: usize,
         new_wasm_size: usize,
@@ -154,6 +159,7 @@ impl BuildMetrics {
     }
 }
 
+#[allow(dead_code)]
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
@@ -162,6 +168,7 @@ fn is_zero(n: &usize) -> bool {
 pub type SafetyReportJson = RenderableReport;
 
 /// Format a contract identity label from optional name and version strings.
+#[allow(dead_code)]
 fn contract_identity_label(name: Option<&str>, version: Option<&str>) -> String {
     match (name, version) {
         (Some(n), Some(v)) => format!("{} v{}", n, v),
@@ -198,8 +205,18 @@ impl SafetyReport {
             new_spec_summary: None,
             scope: AnalysisScope::default(),
             metrics: Some(BuildMetrics::new(
-                old_wasm_size, new_wasm_size,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                old_wasm_size,
+                new_wasm_size,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
             )),
         }
     }
@@ -382,8 +399,12 @@ impl SafetyReport {
             is_safe: self.is_safe,
             strict: self.strict,
             counts: SeverityCounts {
-                critical: self.critical_count.saturating_sub(self.suppressed_critical_count),
-                warning: self.warning_count.saturating_sub(self.suppressed_warning_count),
+                critical: self
+                    .critical_count
+                    .saturating_sub(self.suppressed_critical_count),
+                warning: self
+                    .warning_count
+                    .saturating_sub(self.suppressed_warning_count),
                 info: self.info_count.saturating_sub(self.suppressed_info_count),
             },
             suppressed_count: self.suppressed_count,
@@ -507,12 +528,18 @@ fn chrono_now_rfc3339() -> String {
 
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        year, month, day, hour, minute, second, nanos / 1_000_000
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        nanos / 1_000_000
     )
 }
 
 fn is_leap_year(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 #[cfg(test)]
@@ -554,8 +581,11 @@ mod tests {
                         if !literal.is_empty() {
                             if literal.contains("{}") {
                                 let suffixes = vec![
-                                    "Removed", "Reordered", "Type Changed",
-                                    "Value Changed", "Added",
+                                    "Removed",
+                                    "Reordered",
+                                    "Type Changed",
+                                    "Value Changed",
+                                    "Added",
                                 ];
                                 for suffix in suffixes {
                                     if literal == format!("{{}} {}", suffix) {
@@ -567,8 +597,10 @@ mod tests {
                                                 vec!["Enum Case", "Event Enum Case"]
                                             }
                                             "Removed" => vec![
-                                                "Struct Field", "Event Field",
-                                                "Enum Case", "Event Enum Case",
+                                                "Struct Field",
+                                                "Event Field",
+                                                "Enum Case",
+                                                "Event Enum Case",
                                             ],
                                             _ => unreachable!(),
                                         };
@@ -662,7 +694,10 @@ mod tests {
         report.findings_by_category.clear();
         report.findings_by_category.insert(
             "Function Documentation Changed".to_string(),
-            vec![make_finding(Severity::Info, "Function Documentation Changed")],
+            vec![make_finding(
+                Severity::Info,
+                "Function Documentation Changed",
+            )],
         );
         assert_eq!(report.recommended_bump(), "patch");
 
@@ -689,7 +724,8 @@ mod tests {
         diff.findings.push(Finding {
             severity: Severity::Critical,
             category: "Cascading Layout Break".to_string(),
-            message: "Type 'Outer' layout is broken because it embeds modified type 'Data'".to_string(),
+            message: "Type 'Outer' layout is broken because it embeds modified type 'Data'"
+                .to_string(),
             type_name: Some("Outer".to_string()),
             target: Some("Outer".to_string()),
             root_target: Some("Data".to_string()),

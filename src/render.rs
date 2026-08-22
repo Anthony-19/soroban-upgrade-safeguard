@@ -190,7 +190,11 @@ impl RenderableReport {
     /// Render provenance as a compact text block for human-readable outputs.
     fn provenance_block_text(&self) -> String {
         let mut block = String::new();
-        block.push_str(&"────────────────────────────────────────\n".dimmed().to_string());
+        block.push_str(
+            &"────────────────────────────────────────\n"
+                .dimmed()
+                .to_string(),
+        );
         block.push_str(&format!("Tool:     v{}\n", self.provenance.tool_version).dimmed());
         if !self.provenance.timestamp.is_empty() {
             block.push_str(&format!("Time:     {}\n", self.provenance.timestamp).dimmed());
@@ -198,7 +202,11 @@ impl RenderableReport {
         for input in &self.provenance.inputs {
             block.push_str(&format!("Input:    {input}\n").dimmed());
         }
-        block.push_str(&"────────────────────────────────────────\n".dimmed().to_string());
+        block.push_str(
+            &"────────────────────────────────────────\n"
+                .dimmed()
+                .to_string(),
+        );
         block
     }
 
@@ -206,9 +214,15 @@ impl RenderableReport {
     fn provenance_block_markdown(&self) -> String {
         let mut block = String::new();
         block.push_str("###### Provenance\n\n");
-        block.push_str(&format!("- **Tool**: `soroban-upgrade-safeguard v{}`\n", self.provenance.tool_version));
+        block.push_str(&format!(
+            "- **Tool**: `soroban-upgrade-safeguard v{}`\n",
+            self.provenance.tool_version
+        ));
         if !self.provenance.timestamp.is_empty() {
-            block.push_str(&format!("- **Timestamp**: `{}`\n", self.provenance.timestamp));
+            block.push_str(&format!(
+                "- **Timestamp**: `{}`\n",
+                self.provenance.timestamp
+            ));
         }
         for input in &self.provenance.inputs {
             block.push_str(&format!("- **Input**: `{input}`\n"));
