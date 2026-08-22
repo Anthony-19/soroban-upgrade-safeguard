@@ -1069,6 +1069,27 @@ If your pipeline treats `is_safe: true` as "storage compatible", check `scope.st
 
 `--old-storage-schema` and `--new-storage-schema` are optional. Omitting them reproduces the previous behavior exactly, now with honest scope reporting. Adopting them is incremental: declare your storage-key types and the internal types you serialize into storage, starting with the ones holding value-bearing data. Partial coverage is genuinely useful, and the report always states how far it reached. See [Storage Schema Analysis](#storage-schema-analysis) for the format.
 
+## Real-World Contract Upgrade Validation Corpus
+
+To ensure the analyzer's safety claims hold against real-world smart contracts rather than just hand-crafted toy fixtures, a validation corpus of real-world contract upgrade pairs is included in `tests/real_world_corpus/`.
+
+This corpus includes upgrade pairs drawn from real mainnet Soroban protocols:
+- **Blend Protocol**: Lending pool contract evolution (v1 -> v2).
+- **Soroswap DEX**: AMM Router contract interface cleanup.
+- **Reflector Price Oracle**: Price data struct representation upgrade.
+- **Stellar Asset Contract**: Token router method extension (mint & burn).
+- **Governance Protocol**: Voting escrow parameter update.
+
+### Opt-In Corpus Testing
+
+Corpus validation runs as an opt-in integration test suite:
+
+```bash
+cargo test --test real_world_corpus -- --ignored
+```
+
+Each pair is checked against expected verdicts specified in `manifest.json`, asserting exact safety verdicts, recommended SemVer bumps, critical finding counts, and finding categories. See [`tests/real_world_corpus/README.md`](../tests/real_world_corpus/README.md) for full provenance and maintenance details.
+
 ## Frequently Asked Questions
 
 **Does the tool need access to the Stellar network?**
