@@ -140,6 +140,42 @@ Watch mode:
 - Keeps the process running regardless of comparison verdict (non-zero exit codes do NOT exit the watcher).
 - Exit with `Ctrl+C`.
 
+### Comparing many contracts at once
+
+A manifest lists the pairs one run compares:
+
+```bash
+soroban-upgrade-safeguard --manifest release.toml
+```
+
+```toml
+include = ["common/policy.toml"]   # share a policy across manifests
+
+[defaults]
+base_dir = "artifacts"             # relative paths resolve against the manifest
+strict   = false
+
+[[pairs]]
+old    = "token_v1.wasm"
+new    = "token_v2.wasm"
+name   = "token"
+strict = true                      # this one contract is held to a stricter bar
+
+[pairs.policy]
+gate_event_indexer = true
+```
+
+Settings resolve as `built-in < CLI < included defaults < root [defaults] < pair`,
+except `--strict`/`--explain`, which a manifest may enable but never disable.
+To see exactly where each value came from without running any comparison:
+
+```bash
+soroban-upgrade-safeguard --manifest release.toml --explain-manifest
+```
+
+See [Batch Manifests](docs/batch_manifests.md) for the full schema, includes,
+path rules, and the provenance emitted in JSON reports.
+
 ### Deterministic output for snapshot testing
 
 Use `--no-timestamp` to suppress the timestamp in report provenance,
@@ -213,6 +249,7 @@ More detailed guides live in the [docs](docs/) folder:
 
 - [Documentation](docs/documentation.md): full explanation of how the analysis pipeline works, severity levels, cascading layout breaks, and CI integration.
 - [Finding Category Reference](docs/finding-categories.md): every category emitted by the tool, with severity, trigger, and remediation guidance — the exact strings to use in suppression rules.
+- [Batch Manifests](docs/batch_manifests.md): the manifest schema, composing manifests with `include`, shared `[defaults]`, per-pair overrides, precedence, and resolution provenance.
 - [Contributing](docs/contributing.md): development setup, project structure, testing, and how to add new detection rules.
 - [Signed Attestations](docs/attestations.md): DSSE signing, the in-toto predicate, offline verification, and security guidance.
 
