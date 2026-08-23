@@ -12,7 +12,7 @@ use soroban_upgrade_safeguard::{
         VerificationPolicy,
     },
     color::{should_disable_color, ColorMode},
-    diff, loader, parser,
+    diff, loader, manifest, parser,
     render::RenderableReport,
     report,
     rpc::RpcClientConfig,
@@ -243,6 +243,11 @@ struct Args {
     /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
     #[arg(long, value_name = "MANIFEST_PATH")]
     manifest: Option<PathBuf>,
+
+    /// Resolve --manifest (including its `include` chain) and print how every
+    /// setting was decided, then exit without comparing anything.
+    #[arg(long, requires = "manifest")]
+    explain_manifest: bool,
 
     /// Directory containing the old versions of the contracts for directory comparison
     #[arg(long, value_name = "OLD_DIR", requires = "new_dir")]
@@ -857,6 +862,18 @@ fn main() -> Result<()> {
         anyhow::bail!("Cannot specify positional WASM paths when using batch mode (--manifest or --old-dir/--new-dir)");
     }
 
+    // Manifest-resolution mode: show how the composition resolved and exit,
+    // before any WASM is required. Makes a manifest reviewable on its own.
+    if args.explain_manifest {
+        let manifest_path = args
+            .manifest
+            .as_ref()
+            .expect("--explain-manifest requires --manifest (enforced by clap)");
+        let resolved = manifest::resolve(manifest_path, &cli_settings(&args))?;
+        print!("{}", resolved.explain_text());
+        return Ok(());
+    }
+
     // Determine stdout format: use --format if given, or "text" as default
     // (only used when no --output flags target stdout).
     let stdout_format = args.format.unwrap_or(OutputFormat::Text);
@@ -926,26 +943,42 @@ fn main() -> Result<()> {
     };
 
     if is_batch {
-        return run_batch(&args, &outputs, &suppressions, &progress);
+        // Batch mode resolves its suppression config per pair; the eager load
+        // above still runs so an unreadable --config fails before any analysis.
+        return run_batch(&args, &outputs, &progress);
     }
 
     run_single(&args, &outputs, &suppressions, &progress)
 }
 
-fn run_batch(
-    args: &Args,
-    outputs: &[OutputSpec],
-    suppressions: &SuppressionConfig,
-    progress: &dyn Fn(String),
-) -> Result<()> {
-    let (pairs, mut gaps) = if let Some(manifest_path) = &args.manifest {
-        (parse_manifest(manifest_path)?, Vec::new())
+fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> Result<()> {
+    let cli = cli_settings(args);
+
+    // Manifest mode resolves includes, defaults and per-pair overrides up front —
+    // including duplicate-identity detection, so a collision fails before any
+    // pair runs rather than mid-loop with earlier reports already on disk.
+    let (resolved_manifest, pairs, mut gaps) = if let Some(manifest_path) = &args.manifest {
+        let resolved = manifest::resolve(manifest_path, &cli)?;
+        let pairs: Vec<BatchPair> = resolved
+            .pairs
+            .iter()
+            .cloned()
+            .map(BatchPair::from)
+            .collect();
+        (Some(resolved), pairs, Vec::new())
     } else {
-        scan_directories(
+        let settings = manifest::cli_only_settings(&cli);
+        let (pairs, gaps) = scan_directories(
             args.old_dir.as_ref().unwrap(),
             args.new_dir.as_ref().unwrap(),
-        )?
+            &settings,
+        )?;
+        (None, pairs, gaps)
     };
+
+    // Suppression configs are shared across pairs far more often than not.
+    let mut config_cache: std::collections::HashMap<PathBuf, SuppressionConfig> =
+        std::collections::HashMap::new();
 
     progress("🔍 Soroban Upgrade Safeguard (Batch Mode)".to_string());
     progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
@@ -1092,14 +1125,11 @@ fn run_batch(
 
     // Process each regular pair with error-handling (per-pair failures do not abort the batch)
     for (i, pair) in pairs.iter().enumerate() {
-        let default_name = format!("pair_{}", i + 1);
-        let contract_name = pair.name.clone().unwrap_or_else(|| {
-            pair.new
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.to_string())
-                .unwrap_or(default_name)
-        });
+        let contract_name = pair.name.clone();
+        let settings = &pair.settings;
+        let pair_suppressions = suppressions_for_pair(settings, &mut config_cache)?;
+        let explain = settings.explain.value;
+        let ascii = settings.ascii.value || args.ascii;
 
         if !seen_names.insert(contract_name.clone()) {
             anyhow::bail!(
@@ -1123,10 +1153,10 @@ fn run_batch(
                         old_path: &old_wasm.path,
                         new_bytes: &new_wasm.bytes,
                         new_path: &new_wasm.path,
-                        suppressions,
-                        explain: args.explain,
-                        strict: args.strict,
-                        no_timestamp: args.no_timestamp,
+                        suppressions: &pair_suppressions,
+                        explain,
+                        strict: settings.strict.value,
+                        no_timestamp: settings.no_timestamp.value,
                         empirical: args.empirical || args.empirical_file.is_some(),
                         empirical_file: args.empirical_file.as_deref(),
                         contract_id: None,
@@ -1145,8 +1175,8 @@ fn run_batch(
                         synthesize_error_report(
                             &contract_name,
                             &e.to_string(),
-                            args.strict,
-                            args.no_timestamp,
+                            settings.strict.value,
+                            settings.no_timestamp.value,
                         )
                     }
                 }
@@ -1160,8 +1190,8 @@ fn run_batch(
                 synthesize_error_report(
                     &contract_name,
                     &e.to_string(),
-                    args.strict,
-                    args.no_timestamp,
+                    settings.strict.value,
+                    settings.no_timestamp.value,
                 )
             }
         };
@@ -1178,8 +1208,8 @@ fn run_batch(
         render_to_outputs(
             &report,
             &file_outputs,
-            args.explain,
-            args.ascii,
+            explain,
+            ascii,
             Some(&contract_name),
             progress,
         )?;
@@ -1188,8 +1218,8 @@ fn run_batch(
             let content = render_single(
                 &report,
                 args.format.unwrap_or(OutputFormat::Text),
-                args.explain,
-                args.ascii,
+                explain,
+                ascii,
             )?;
             write_report_file(
                 output_dir,
@@ -1204,12 +1234,15 @@ fn run_batch(
     }
 
     render_batch_summary(
-        &results,
-        overall_safe,
-        total,
-        args.strict,
+        &BatchSummary {
+            results: &results,
+            overall_safe,
+            total_pairs: total,
+            strict: args.strict,
+            ascii: args.ascii,
+            resolved_manifest: resolved_manifest.as_ref(),
+        },
         outputs,
-        args.ascii,
         progress,
     )?;
 
@@ -1303,15 +1336,38 @@ fn synthesize_error_report(
     }
 }
 
-fn render_batch_summary(
-    results: &std::collections::BTreeMap<String, report::SafetyReport>,
+/// Everything the batch summary renders from.
+///
+/// Grouped into a struct rather than passed positionally, following
+/// [`ContractComparison`] — the batch verdict, the per-contract reports, and the
+/// manifest provenance are three different things and reading them by name at
+/// the call site is worth more than the brevity.
+struct BatchSummary<'a> {
+    results: &'a std::collections::BTreeMap<String, report::SafetyReport>,
     overall_safe: bool,
     total_pairs: usize,
+    /// The run-level `--strict` flag. Per-pair strictness lives in the manifest
+    /// provenance; this is the CLI's own setting.
     strict: bool,
-    outputs: &[OutputSpec],
     ascii: bool,
+    /// `None` for directory-scan runs, which have no composition to describe.
+    resolved_manifest: Option<&'a manifest::ResolvedManifest>,
+}
+
+fn render_batch_summary(
+    summary: &BatchSummary<'_>,
+    outputs: &[OutputSpec],
     progress: &dyn Fn(String),
 ) -> Result<()> {
+    let BatchSummary {
+        results,
+        overall_safe,
+        total_pairs,
+        strict,
+        ascii,
+        resolved_manifest,
+    } = *summary;
+
     for output in outputs {
         let content = match output.format {
             OutputFormat::Json => {
@@ -1319,12 +1375,20 @@ fn render_batch_summary(
                 for (name, report) in results {
                     results_json.insert(name.clone(), serde_json::to_value(report.to_json())?);
                 }
-                let batch_json = serde_json::json!({
+                let mut batch_json = serde_json::json!({
                     "is_safe": overall_safe,
                     "strict": strict,
                     "total_pairs": total_pairs,
                     "results": results_json,
                 });
+                // Only manifest runs have a composition to describe; directory
+                // scans leave the key absent rather than emitting an empty one.
+                if let Some(resolved) = resolved_manifest {
+                    batch_json
+                        .as_object_mut()
+                        .expect("batch_json is constructed as an object")
+                        .insert("manifest".to_string(), resolved.to_json());
+                }
                 serde_json::to_string_pretty(&batch_json)?
             }
             OutputFormat::Markdown => {
@@ -1835,16 +1899,27 @@ fn load_positional_wasm(path: &Path) -> Result<loader::WasmModule> {
     }
 }
 
-#[derive(serde::Deserialize, Clone, Debug)]
-struct ContractPair {
+/// One pair the batch loop is about to run, with the settings it runs under.
+///
+/// Manifest mode resolves these through [`manifest::resolve`]; directory-scan
+/// mode builds them from the command line alone. Both feed the same loop, so
+/// per-pair settings need no special-casing there.
+struct BatchPair {
+    name: String,
     old: PathBuf,
     new: PathBuf,
-    name: Option<String>,
+    settings: manifest::ResolvedSettings,
 }
 
-#[derive(serde::Deserialize, Clone, Debug)]
-struct Manifest {
-    pairs: Vec<ContractPair>,
+impl From<manifest::ResolvedPair> for BatchPair {
+    fn from(pair: manifest::ResolvedPair) -> Self {
+        Self {
+            name: pair.name,
+            old: pair.old,
+            new: pair.new,
+            settings: pair.settings,
+        }
+    }
 }
 
 struct ContractComparison<'a> {
@@ -2051,21 +2126,53 @@ fn validate_suppression_config(path: &Path) -> Result<()> {
     std::process::exit(1);
 }
 
-fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read manifest file: {}", path.display()))?;
+/// The command-line layer of the manifest precedence chain.
+///
+/// The implicit `.safeguard.toml` lookup is passed as `default_config` rather
+/// than resolved here, so it lands at the built-in level of the chain and any
+/// manifest naming a config outranks it.
+fn cli_settings(args: &Args) -> manifest::CliSettings {
+    let default_config = (!args.no_config && args.config.is_none())
+        .then(|| PathBuf::from(DEFAULT_CONFIG_FILE))
+        .filter(|path| path.exists());
 
-    if let Ok(manifest) = toml::from_str::<Manifest>(&content) {
-        return Ok(manifest.pairs);
+    manifest::CliSettings {
+        config: args.config.clone(),
+        default_config,
+        no_config: args.no_config,
+        strict: args.strict,
+        explain: args.explain,
+        ascii: args.ascii,
+        no_timestamp: args.no_timestamp,
     }
-    if let Ok(manifest) = serde_json::from_str::<Manifest>(&content) {
-        return Ok(manifest.pairs);
-    }
+}
 
-    anyhow::bail!(
-        "Failed to parse manifest '{}' as either TOML or JSON.",
-        path.display()
-    )
+/// Load the suppression config a pair runs under, caching by resolved path so
+/// twenty pairs sharing one config parse it once, then fold the pair's `[policy]`
+/// overrides onto it.
+fn suppressions_for_pair(
+    settings: &manifest::ResolvedSettings,
+    cache: &mut std::collections::HashMap<PathBuf, SuppressionConfig>,
+) -> Result<SuppressionConfig> {
+    let base = match settings.config.value.as_ref() {
+        Some(path) => match cache.get(path) {
+            Some(cached) => cached.clone(),
+            None => {
+                let loaded = SuppressionConfig::load_from_path(path).with_context(|| {
+                    format!(
+                        "Failed to load the suppression config '{}' named by the manifest \
+                         (origin: {})",
+                        path.display(),
+                        settings.config.origin
+                    )
+                })?;
+                cache.insert(path.to_path_buf(), loaded.clone());
+                loaded
+            }
+        },
+        None => SuppressionConfig::default(),
+    };
+    Ok(settings.apply_policy(base))
 }
 
 #[allow(dead_code)]
@@ -2077,7 +2184,8 @@ struct GapContract {
 fn scan_directories(
     old_dir: &Path,
     new_dir: &Path,
-) -> Result<(Vec<ContractPair>, Vec<GapContract>)> {
+    settings: &manifest::ResolvedSettings,
+) -> Result<(Vec<BatchPair>, Vec<GapContract>)> {
     if !old_dir.is_dir() {
         anyhow::bail!("Old directory '{}' is not a directory", old_dir.display());
     }
@@ -2095,10 +2203,14 @@ fn scan_directories(
             let new_path = new_dir.join(filename);
             let name = path.file_stem().and_then(|s| s.to_str()).map(String::from);
             if new_path.exists() {
-                pairs.push(ContractPair {
+                let derived = name
+                    .clone()
+                    .unwrap_or_else(|| filename.to_string_lossy().to_string());
+                pairs.push(BatchPair {
+                    name: derived,
                     old: path,
                     new: new_path,
-                    name,
+                    settings: settings.clone(),
                 });
             } else {
                 let gap_name = name.unwrap_or_else(|| filename.to_string_lossy().to_string());
