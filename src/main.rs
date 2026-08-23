@@ -3,6 +3,8 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+#[allow(unused_imports)]
+use std::time::Duration;
 
 use soroban_upgrade_safeguard::{
     attestation::{
@@ -12,7 +14,10 @@ use soroban_upgrade_safeguard::{
         VerificationPolicy,
     },
     color::{should_disable_color, ColorMode},
-    diff, loader, manifest, parser,
+    diff, loader, manifest,
+    oci::{self, OciArtifactKind, OciFetchConfig, OciReference},
+    parser,
+    remote::{self, RemoteFetchConfig, RemoteRef},
     render::RenderableReport,
     report,
     rpc::RpcClientConfig,
@@ -157,7 +162,8 @@ enum RenderFormat {
                       soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]\n       \
                       soroban-upgrade-safeguard extract <WASM> [OPTIONS]\n       \
                       soroban-upgrade-safeguard render <REPORT_JSON> [OPTIONS]\n       \
-                      soroban-upgrade-safeguard init [OPTIONS]",
+                      soroban-upgrade-safeguard init [OPTIONS]\n       \
+                      soroban-upgrade-safeguard stream [OPTIONS]",
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
 )]
@@ -284,6 +290,84 @@ struct Args {
     /// Path to a JSON file containing captured ledger/storage entries for offline validation.
     #[arg(long, value_name = "EMPIRICAL_FILE")]
     empirical_file: Option<PathBuf>,
+
+    /// Maximum bytes accepted for any `https://` input download.
+    #[arg(long, value_name = "BYTES", default_value_t = remote::DEFAULT_MAX_BYTES)]
+    remote_max_bytes: usize,
+
+    /// Timeout, in seconds, for any single `https://` input request.
+    #[arg(long, value_name = "SECONDS", default_value_t = remote::DEFAULT_TIMEOUT_SECS)]
+    remote_timeout_secs: u64,
+
+    /// Maximum redirect hops followed when fetching an `https://` input.
+    #[arg(long, value_name = "COUNT", default_value_t = remote::DEFAULT_MAX_REDIRECTS)]
+    remote_max_redirects: u32,
+
+    /// Directory used to cache verified `https://` input downloads by digest.
+    /// Defaults to a directory under the OS temp dir; see
+    /// `SOROBAN_SAFEGUARD_REMOTE_CACHE`.
+    #[arg(long, value_name = "DIR")]
+    remote_cache_dir: Option<PathBuf>,
+
+    /// Do not read from or write to the remote-artifact cache for this run.
+    #[arg(long)]
+    no_remote_cache: bool,
+
+    /// Delete every cached `https://` input artifact and exit.
+    #[arg(long)]
+    clear_remote_cache: bool,
+
+    /// Maximum bytes accepted for any `oci://` manifest or layer download.
+    #[arg(long, value_name = "BYTES", default_value_t = oci::DEFAULT_MAX_BYTES)]
+    oci_max_bytes: usize,
+
+    /// Timeout, in seconds, for any single `oci://` registry request.
+    #[arg(long, value_name = "SECONDS", default_value_t = oci::DEFAULT_TIMEOUT_SECS)]
+    oci_timeout_secs: u64,
+
+    /// Directory used to cache verified `oci://` input layers by digest.
+    /// Defaults to a directory under the OS temp dir; see
+    /// `SOROBAN_SAFEGUARD_OCI_CACHE`.
+    #[arg(long, value_name = "DIR")]
+    oci_cache_dir: Option<PathBuf>,
+
+    /// Do not read from or write to the OCI-artifact cache for this run.
+    #[arg(long)]
+    no_oci_cache: bool,
+
+    /// Delete every cached `oci://` input artifact and exit.
+    #[arg(long)]
+    clear_oci_cache: bool,
+
+    /// Allow an `oci://` input to reference a mutable tag instead of a
+    /// pinned `@sha256:<hex>` digest. The resolved digest is printed so the
+    /// reference can be pinned afterward. Off by default.
+    #[arg(long)]
+    allow_oci_tags: bool,
+}
+
+/// Build the remote-fetch policy for `https://` inputs from the top-level CLI flags.
+fn remote_fetch_config(args: &Args) -> RemoteFetchConfig {
+    RemoteFetchConfig {
+        max_bytes: args.remote_max_bytes,
+        timeout: Duration::from_secs(args.remote_timeout_secs),
+        max_redirects: args.remote_max_redirects,
+        cache_dir: args.remote_cache_dir.clone(),
+        no_cache: args.no_remote_cache,
+        https_only: true,
+    }
+}
+
+/// Build the OCI-fetch policy for `oci://` inputs from the top-level CLI flags.
+fn oci_fetch_config(args: &Args) -> OciFetchConfig {
+    OciFetchConfig {
+        max_bytes: args.oci_max_bytes,
+        timeout: Duration::from_secs(args.oci_timeout_secs),
+        cache_dir: args.oci_cache_dir.clone(),
+        no_cache: args.no_oci_cache,
+        https_only: true,
+        allow_tags: args.allow_oci_tags,
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -298,6 +382,8 @@ enum Command {
     Attest(AttestArgs),
     /// Verify a safeguard DSSE attestation and all referenced artifacts offline
     VerifyAttestation(VerifyAttestationArgs),
+    /// Streaming JSON Lines batch mode: one job per line on stdin, one result per line on stdout
+    Stream(StreamArgs),
 }
 
 #[derive(ClapArgs, Debug)]
@@ -343,6 +429,26 @@ struct VerifyAttestationArgs {
     /// Unix timestamp after which the verification policy is expired.
     #[arg(long, value_name = "UNIX_SECONDS")]
     policy_expires_at: Option<u64>,
+}
+
+/// `stream`: JSON Lines streaming batch mode.
+#[derive(ClapArgs, Debug)]
+struct StreamArgs {
+    /// Maximum number of concurrent worker threads.
+    #[arg(long, default_value_t = 4)]
+    concurrency: usize,
+    /// Preserve input order in output (slower; buffers results).
+    #[arg(long)]
+    input_order: bool,
+    /// Treat warnings as errors globally (jobs may override).
+    #[arg(long)]
+    strict: bool,
+    /// Do not load .safeguard.toml automatically.
+    #[arg(long)]
+    no_config: bool,
+    /// Path to a suppression config.
+    #[arg(long, value_name = "CONFIG")]
+    config: Option<PathBuf>,
 }
 
 /// `extract`: decode one build and emit its interface.
@@ -432,7 +538,14 @@ fn rpc_config(url: &str, headers: &[String]) -> Result<RpcClientConfig> {
 /// Decode one build and emit its interface as JSON, or just its hash.
 fn run_extract(args: &ExtractArgs) -> Result<()> {
     let build = match (&args.wasm, &args.contract_id) {
-        (Some(path), None) => loader::load_wasm(path)?,
+        (Some(path), None) => load_wasm_input(
+            path,
+            &RemoteFetchConfig::default(),
+            &OciFetchConfig::default(),
+            &|line| {
+                eprintln!("{line}");
+            },
+        )?,
         (None, Some(contract_id)) => {
             let rpc_url = args
                 .rpc_url
@@ -468,9 +581,64 @@ fn run_extract(args: &ExtractArgs) -> Result<()> {
     Ok(())
 }
 
+/// Reads bytes for an artifact reference that may be a local path, an
+/// `https://…#sha256=<hex>` remote reference, or an
+/// `oci://registry/repository@sha256:<hex>` reference (used for
+/// storage-schema references in `attest`/`verify-attestation`).
+fn read_artifact_bytes(path: &Path) -> Result<Vec<u8>> {
+    if let Some(remote) =
+        RemoteRef::parse(&path.to_string_lossy()).map_err(|e| anyhow::anyhow!(e))?
+    {
+        let artifact = remote::fetch_verified(&remote, &RemoteFetchConfig::default())?;
+        eprintln!(
+            "🌐 Remote input: {} (sha256:{}, cache {}{})",
+            artifact.final_url,
+            artifact.sha256,
+            artifact.cache_status,
+            artifact
+                .media_type
+                .as_deref()
+                .map(|m| format!(", {m}"))
+                .unwrap_or_default()
+        );
+        Ok(artifact.bytes)
+    } else if let Some(reference) =
+        OciReference::parse(&path.to_string_lossy()).map_err(|e| anyhow::anyhow!(e))?
+    {
+        let artifact = oci::resolve_oci_artifact(
+            &reference,
+            OciArtifactKind::ExtractedSpec,
+            &OciFetchConfig::default(),
+        )?;
+        print_oci_provenance(&artifact);
+        Ok(artifact.bytes)
+    } else {
+        std::fs::read(path)
+            .with_context(|| format!("Failed to read artifact '{}'.", path.display()))
+    }
+}
+
+/// Prints a provenance line for a resolved OCI artifact naming exactly which
+/// registry, repository, manifest, and layer were analyzed.
+fn print_oci_provenance(artifact: &oci::OciArtifact) {
+    eprintln!(
+        "📦 OCI input: {}/{}@{} (manifest {}{}, cache {}, {})",
+        artifact.registry,
+        artifact.repository,
+        artifact.layer_digest,
+        artifact.manifest_digest,
+        artifact
+            .resolved_tag
+            .as_deref()
+            .map(|t| format!(", resolved from tag '{t}'"))
+            .unwrap_or_default(),
+        artifact.cache_status,
+        artifact.media_type
+    );
+}
+
 fn file_artifact(path: &Path) -> Result<AttestedArtifact> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("Failed to read artifact '{}'.", path.display()))?;
+    let bytes = read_artifact_bytes(path)?;
     Ok(AttestedArtifact {
         name: path.to_string_lossy().to_string(),
         digest: ArtifactDigest::from_bytes(&bytes),
@@ -631,7 +799,7 @@ fn run_verify_attestation(args: &VerifyAttestationArgs) -> Result<()> {
         .zip(&statement.predicate.storage_schemas)
     {
         if let Some(path) = path {
-            artifacts.insert(artifact.name.clone(), std::fs::read(path)?);
+            artifacts.insert(artifact.name.clone(), read_artifact_bytes(path)?);
         }
     }
     let mut failures = signatures.failures;
@@ -652,6 +820,43 @@ fn run_verify_attestation(args: &VerifyAttestationArgs) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Run the streaming JSONL batch protocol.
+///
+/// Reads versioned JSON jobs from stdin, processes them concurrently,
+/// and writes versioned JSON results to stdout. All diagnostics go to stderr.
+fn run_stream(args: &StreamArgs) -> Result<()> {
+    use soroban_upgrade_safeguard::jsonl::{self, OutputOrder, StreamConfig};
+
+    let suppressions = if args.no_config {
+        SuppressionConfig::default()
+    } else {
+        match &args.config {
+            Some(path) => SuppressionConfig::load_from_path(path)?,
+            None => SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?
+                .unwrap_or_default(),
+        }
+    };
+
+    let output_order = if args.input_order {
+        OutputOrder::InputOrder
+    } else {
+        OutputOrder::CompletionOrder
+    };
+
+    let config = StreamConfig {
+        concurrency: args.concurrency.max(1),
+        output_order,
+        strict: args.strict,
+        suppressions,
+        no_config: args.no_config,
+        ..StreamConfig::default()
+    };
+
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    jsonl::run_streaming(stdin.lock(), stdout.lock(), &config)
 }
 
 /// Re-render a stored JSON report as text or Markdown.
@@ -745,7 +950,24 @@ fn run_init(args: &InitArgs) -> Result<()> {
     let new_spec = spec::ContractSpec::from_entries(&new_meta.spec);
 
     // Generate diff
-    let diff_report = diff::compare(&old_spec, &new_spec);
+    let mut diff_report = diff::compare(&old_spec, &new_spec);
+    diff::compare_env_metadata(
+        old_meta.env_meta.as_ref(),
+        new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+    diff::compare_host_imports(
+        &old_meta.host_imports,
+        &new_meta.host_imports,
+        old_meta.env_meta.as_ref(),
+        new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+    diff::compare_runtime_surfaces(
+        &old_meta.runtime_surface,
+        &new_meta.runtime_surface,
+        &mut diff_report,
+    );
 
     // Collect unsuppressed findings (with empty suppression config)
     let empty_suppressions = SuppressionConfig::default();
@@ -824,6 +1046,32 @@ fn run_init(args: &InitArgs) -> Result<()> {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    if args.clear_remote_cache {
+        let dir = args
+            .remote_cache_dir
+            .clone()
+            .unwrap_or_else(remote::default_cache_dir);
+        remote::clear_cache(&dir)
+            .with_context(|| format!("Failed to clear remote cache at '{}'", dir.display()))?;
+        if !args.quiet {
+            println!("Cleared remote artifact cache at '{}'", dir.display());
+        }
+        return Ok(());
+    }
+
+    if args.clear_oci_cache {
+        let dir = args
+            .oci_cache_dir
+            .clone()
+            .unwrap_or_else(oci::default_cache_dir);
+        oci::clear_cache(&dir)
+            .with_context(|| format!("Failed to clear OCI cache at '{}'", dir.display()))?;
+        if !args.quiet {
+            println!("Cleared OCI artifact cache at '{}'", dir.display());
+        }
+        return Ok(());
+    }
+
     match &args.command {
         Some(Command::Extract(extract_args)) => return run_extract(extract_args),
         Some(Command::Render(render_args)) => return run_render(render_args),
@@ -832,6 +1080,7 @@ fn main() -> Result<()> {
         Some(Command::VerifyAttestation(verify_args)) => {
             return run_verify_attestation(verify_args)
         }
+        Some(Command::Stream(stream_args)) => return run_stream(stream_args),
         None => {}
     }
 
@@ -975,6 +1224,8 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
         )?;
         (None, pairs, gaps)
     };
+    let remote_config = remote_fetch_config(args);
+    let oci_config = oci_fetch_config(args);
 
     // Suppression configs are shared across pairs far more often than not.
     let mut config_cache: std::collections::HashMap<PathBuf, SuppressionConfig> =
@@ -1045,12 +1296,17 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                     diff::CompatibilityAxis::SourceLevel,
                     report::AxisStatus::Passed,
                 );
+                verdicts.insert(
+                    diff::CompatibilityAxis::RuntimeSurface,
+                    report::AxisStatus::Passed,
+                );
                 verdicts
             },
             gated_axes: {
                 let mut gated = std::collections::HashSet::new();
                 gated.insert(diff::CompatibilityAxis::CallAbi);
                 gated.insert(diff::CompatibilityAxis::StorageLayout);
+                gated.insert(diff::CompatibilityAxis::RuntimeSurface);
                 gated
             },
             findings_by_category: {
@@ -1145,7 +1401,10 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             contract_name.bold()
         ));
 
-        let report = match (loader::load_wasm(&pair.old), loader::load_wasm(&pair.new)) {
+        let report = match (
+            load_wasm_input(&pair.old, &remote_config, &oci_config, progress),
+            load_wasm_input(&pair.new, &remote_config, &oci_config, progress),
+        ) {
             (Ok(old_wasm), Ok(new_wasm)) => {
                 match compare_contracts(
                     &ContractComparison {
@@ -1295,12 +1554,17 @@ fn synthesize_error_report(
                 diff::CompatibilityAxis::SourceLevel,
                 report::AxisStatus::Passed,
             );
+            verdicts.insert(
+                diff::CompatibilityAxis::RuntimeSurface,
+                report::AxisStatus::Passed,
+            );
             verdicts
         },
         gated_axes: {
             let mut gated = std::collections::HashSet::new();
             gated.insert(diff::CompatibilityAxis::CallAbi);
             gated.insert(diff::CompatibilityAxis::StorageLayout);
+            gated.insert(diff::CompatibilityAxis::RuntimeSurface);
             gated
         },
         findings_by_category: {
@@ -1595,6 +1859,9 @@ fn run_single(
             "📦 Loading and Parsing contracts...".cyan().bold()
         ));
 
+        let remote_config = remote_fetch_config(args);
+        let oci_config = oci_fetch_config(args);
+
         let old = if let Some(contract_id) = old_source {
             let rpc_url = args.rpc_url.as_ref().unwrap();
             loader::fetch_wasm_from_rpc_with_config(
@@ -1602,10 +1869,10 @@ fn run_single(
                 &rpc_config(rpc_url, &args.rpc_headers)?,
             )?
         } else {
-            load_positional_wasm(&args.wasm_paths[0])?
+            load_wasm_input(&args.wasm_paths[0], &remote_config, &oci_config, progress)?
         };
 
-        let new = load_positional_wasm(new_wasm_path)?;
+        let new = load_wasm_input(new_wasm_path, &remote_config, &oci_config, progress)?;
 
         if !suppressions.rules.is_empty() {
             progress(format!(
@@ -1890,13 +2157,61 @@ fn is_stdin_wasm_path(path: &Path) -> bool {
     path == Path::new("-")
 }
 
-fn load_positional_wasm(path: &Path) -> Result<loader::WasmModule> {
+/// Loads a WASM input that may be `-` for stdin, a local file path, an
+/// `https://…#sha256=<hex>` remote reference, or an
+/// `oci://registry/repository@sha256:<hex>` reference.
+///
+/// This is the single dispatch point shared by the comparison positional
+/// arguments, `extract`, and batch manifest entries, so every WASM input
+/// position gets HTTPS and OCI support uniformly.
+fn load_wasm_input(
+    path: &Path,
+    remote_config: &RemoteFetchConfig,
+    oci_config: &OciFetchConfig,
+    progress: &dyn Fn(String),
+) -> Result<loader::WasmModule> {
     if is_stdin_wasm_path(path) {
         let mut stdin = std::io::stdin().lock();
-        Ok(loader::load_wasm_from_stdin(&mut stdin)?)
-    } else {
-        Ok(loader::load_wasm(path)?)
+        return Ok(loader::load_wasm_from_stdin(&mut stdin)?);
     }
+    if let Some(remote) =
+        RemoteRef::parse(&path.to_string_lossy()).map_err(|e| anyhow::anyhow!(e))?
+    {
+        let (module, artifact) = loader::load_wasm_from_url(&remote, remote_config)?;
+        progress(format!(
+            "🌐 Remote input: {} (sha256:{}, cache {}{})",
+            artifact.final_url,
+            artifact.sha256,
+            artifact.cache_status,
+            artifact
+                .media_type
+                .as_deref()
+                .map(|m| format!(", {m}"))
+                .unwrap_or_default()
+        ));
+        return Ok(module);
+    }
+    if let Some(reference) =
+        OciReference::parse(&path.to_string_lossy()).map_err(|e| anyhow::anyhow!(e))?
+    {
+        let (module, artifact) = loader::load_wasm_from_oci(&reference, oci_config)?;
+        progress(format!(
+            "📦 OCI input: {}/{}@{} (manifest {}{}, cache {}, {})",
+            artifact.registry,
+            artifact.repository,
+            artifact.layer_digest,
+            artifact.manifest_digest,
+            artifact
+                .resolved_tag
+                .as_deref()
+                .map(|t| format!(", resolved from tag '{t}'"))
+                .unwrap_or_default(),
+            artifact.cache_status,
+            artifact.media_type
+        ));
+        return Ok(module);
+    }
+    Ok(loader::load_wasm(path)?)
 }
 
 /// One pair the batch loop is about to run, with the settings it runs under.
@@ -1993,6 +2308,18 @@ fn compare_contracts(
     diff::compare_env_metadata(
         old_meta.env_meta.as_ref(),
         new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+    diff::compare_host_imports(
+        &old_meta.host_imports,
+        &new_meta.host_imports,
+        old_meta.env_meta.as_ref(),
+        new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+    diff::compare_runtime_surfaces(
+        &old_meta.runtime_surface,
+        &new_meta.runtime_surface,
         &mut diff_report,
     );
 

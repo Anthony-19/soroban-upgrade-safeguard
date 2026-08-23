@@ -251,7 +251,7 @@ RPC mode fetches the baseline from chain and verifies it cryptographically; mani
 directory, and glob modes run batch comparisons. The full usage strings and options
 match the CLI help output (`--help`) and the `override_usage` in `src/main.rs`.
 
-Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, and the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)).
+Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)), and the `https://` input overrides `--remote-max-bytes`, `--remote-timeout-secs`, `--remote-max-redirects`, `--remote-cache-dir`, `--no-remote-cache`, and `--clear-remote-cache` (see [Remote HTTPS inputs](#remote-https-inputs)).
 
 ### Spec JSON input mode
 
@@ -350,6 +350,95 @@ Both requirements are checked before the build starts. A missing target produces
 - The build always targets `--release` so the Soroban SDK emits the `contractspecv0` custom section that this tool reads.
 - `--old-crate` cannot be combined with `--contract-id` or `--old-spec`. `--new-crate` cannot be combined with `--new-spec`.
 
+### Remote HTTPS inputs
+
+Anywhere the CLI accepts a local WASM path — the positional comparison arguments, `extract`, and each entry in a `--manifest` batch file — it also accepts an `https://` URL, so a release pipeline that publishes immutable build artifacts to object storage does not need a separate download-and-verify step before running the tool. The same resolver backs `--old-storage-schema` / `--new-storage-schema` on `attest` and `verify-attestation`, since a storage-schema manifest is itself just a JSON/TOML spec file read from a path.
+
+```bash
+# Compare a local build against a published release artifact.
+soroban-upgrade-safeguard old.wasm \
+  "https://releases.example.com/v2/contract.wasm#sha256=3b1a2c9e4d5f60718293847566172839405162738495061728394051627384"
+
+# Both sides published, in a batch manifest (pairs.old / pairs.new accept the
+# same https://…#sha256=<hex> syntax as any other path field).
+soroban-upgrade-safeguard --manifest pairs.toml
+```
+
+#### Reference syntax
+
+A remote reference is an `https://` URL followed by a `#sha256=<hex>` fragment naming the digest the downloaded bytes must match:
+
+```text
+https://cdn.example.com/releases/v2/contract.wasm#sha256=<64 lowercase or uppercase hex characters>
+```
+
+The fragment is never sent to the server (URL fragments are client-side only), which is what makes it a safe place to pin an expected digest onto a bare URL without a second flag per input position. The digest is **mandatory** — a `https://` URL with no `#sha256=` fragment, or a fragment that isn't exactly 64 hex characters, is rejected before any network request is made.
+
+#### Transport policy
+
+Every remote fetch is HTTPS-only, on every hop:
+
+- The initial request must be `https://`; the fetch is refused before connecting otherwise.
+- A redirect that would downgrade to plain `http://` is rejected — capped, in either case, by `--remote-max-redirects` (default 5).
+- No `Authorization` or `Cookie` header is ever forwarded to a redirected request, including a same-origin one.
+- The response body is capped at `--remote-max-bytes` (default 64 MiB), enforced by bounding how many bytes are read from the stream rather than trusting a `Content-Length` header a server could omit or misstate.
+- The whole request is bounded by `--remote-timeout-secs` (default 30).
+- After download, the SHA-256 of the bytes is compared against the reference's expected digest; a mismatch is reported as an integrity failure and the bytes are discarded rather than analyzed.
+
+#### Caching
+
+Because every reference names its own digest, a verified download is cached content-addressed and can be served again without re-fetching, with no risk of staleness — the reference itself changes if the artifact does. The cache lives under `--remote-cache-dir` (default: a `soroban-upgrade-safeguard/remote-cache` directory under the OS temp dir, or the path in `SOROBAN_SAFEGUARD_REMOTE_CACHE` if set). `--no-remote-cache` bypasses both reading and writing the cache for a single run without deleting anything already cached; `--clear-remote-cache` deletes the whole cache directory and exits.
+
+#### Provenance
+
+A remote fetch prints a line naming the final (post-redirect) URL, the verified digest, the cache status (`hit`, `miss`, or `bypassed`), and the response's `Content-Type`, so a CI log always identifies exactly which bytes were analyzed — not just the URL that was requested.
+
+### OCI registry inputs
+
+Anywhere the CLI accepts a local WASM path — the positional comparison arguments, `extract`, and each entry in a `--manifest` batch file — it also accepts an `oci://` reference, so a release pipeline that publishes contract artifacts to an OCI-compatible registry (alongside container images and supply-chain metadata) does not need a separate pull-and-verify step before running the tool. The same resolver backs `--old-storage-schema` / `--new-storage-schema` on `attest` and `verify-attestation`, selecting the extracted-spec media type instead of the WASM one.
+
+```bash
+# Compare a local build against an artifact published to a registry.
+soroban-upgrade-safeguard old.wasm \
+  "oci://ghcr.io/example/contracts@sha256:3b1a2c9e4d5f60718293847566172839405162738495061728394051627384"
+
+# Both sides published, in a batch manifest (pairs.old / pairs.new accept the
+# same oci://<registry>/<repository>@sha256:<hex> syntax as any other path field).
+soroban-upgrade-safeguard --manifest pairs.toml
+```
+
+#### Reference syntax
+
+An OCI reference names a registry host, a repository path, and either a pinned digest or a tag:
+
+```text
+oci://ghcr.io/example/contracts@sha256:<64 lowercase or uppercase hex characters>   (pinned, no opt-in needed)
+oci://ghcr.io/example/contracts:v1.2.3                                              (tag, requires --allow-oci-tags)
+```
+
+A digest reference is immutable by construction — the manifest bytes are verified against that digest before anything downstream is trusted, exactly like the `https://` fragment above. A tag names something that can be repointed at any time, so it is rejected before any network request unless `--allow-oci-tags` is passed; when it is, the resolved manifest digest is still computed locally (never trusted from a response header) and printed, so the reference can be pinned afterward.
+
+#### Manifest and layer selection
+
+The tool requests an OCI (or Docker v2) image manifest and selects the one layer whose `mediaType` matches the artifact being resolved: `application/vnd.soroban.contract.wasm.v1` or the generic `application/wasm` for a WASM comparison input, `application/vnd.soroban.extracted-spec.v1+json` for a storage-schema input. A multi-manifest image index is rejected with a clear error rather than guessing a platform — a Soroban contract artifact is not a multi-platform image.
+
+#### Authentication
+
+Every request is first attempted anonymously. A `401` response carrying a `WWW-Authenticate` challenge is handled automatically:
+
+- **Bearer** — the tool exchanges the challenge for a token at the advertised realm, optionally authenticating that token request with credentials resolved from the standard Docker credential store.
+- **Basic** — the same resolved credentials are sent directly.
+
+Credential resolution follows `docker login`/`docker pull` exactly: a plaintext `auths` entry in `~/.docker/config.json` (or `$DOCKER_CONFIG/config.json`) is tried first, then a per-registry `credHelpers` entry, then the global `credsStore` — each credential helper is invoked as `docker-credential-<helper> get`. There are no separate credential flags; logging in with `docker login <registry>` before running the tool is sufficient.
+
+#### Caching
+
+Every fetch is keyed by the resolved *layer* digest (not the manifest digest), so a verified blob is cached content-addressed and can be served again without re-fetching. The cache lives under `--oci-cache-dir` (default: a `soroban-upgrade-safeguard/oci-cache` directory under the OS temp dir, or the path in `SOROBAN_SAFEGUARD_OCI_CACHE` if set). `--no-oci-cache` bypasses both reading and writing the cache for a single run; `--clear-oci-cache` deletes the whole cache directory and exits. The manifest itself is still fetched on every run (its digest is what determines the layer to check the cache for), but the potentially much larger blob download is skipped on a cache hit.
+
+#### Provenance
+
+An OCI fetch prints a line naming the registry, repository, resolved layer digest, manifest digest, resolved tag (if any), cache status, and media type, so a CI log always identifies exactly which bytes — and which registry state — were analyzed.
+
 ## How the Analysis Works
 
 The analysis runs as a short pipeline. Each stage lives in its own module under `src/`.
@@ -358,11 +447,11 @@ The analysis runs as a short pipeline. Each stage lives in its own module under 
 
    When the baseline is fetched from an RPC endpoint (`--contract-id` / `--rpc-url`), the loader applies a **zero-trust pipeline**: the URL is validated for transport security (HTTPS required unless `--allow-http-local` is set), the RPC response entries are checked for matching ledger keys, and the SHA-256 hash of the fetched bytecode is verified against the on-chain contract instance hash. An optional `--expected-wasm-hash` flag provides additional hash pinning.
 
-2. **Extract metadata (`parser.rs`).** The Soroban SDK stores the contract interface in custom WASM sections. The parser scans for the `contractspecv0` section and decodes the concatenated XDR `ScSpecEntry` objects it contains. The `contractenvmetav0` section is decoded too, and environment metadata differences are compared as part of the analysis. Protocol interface version changes are reported as `Warning`; other environment metadata changes are reported as `Info`.
+2. **Extract metadata (`parser.rs`).** The Soroban SDK stores the contract interface in custom WASM sections. The parser scans for the `contractspecv0` section and decodes the concatenated XDR `ScSpecEntry` objects it contains. The `contractenvmetav0` section is decoded too, and environment metadata differences are compared as part of the analysis. Protocol interface version changes are reported as `Warning`; other environment metadata changes are reported as `Info`. The parser also walks the WASM type and import sections to record every function import as an `ImportedFunction` — a `(module, name)` pair plus its resolved parameter/result types, when resolvable. See [Host Imports and Protocol Capabilities](#host-imports-and-protocol-capabilities).
 
 3. **Build the spec model (`spec.rs`).** Decoded entries are sorted into a `ContractSpec`, which groups functions, structs, enums, unions, and error enums into separate maps keyed by name. This gives the comparison stage fast lookups by type name.
 
-4. **Compare (`diff.rs`).** The old and new specs are compared item by item. Functions, structs, and enums are matched by name and then examined for the specific breaking changes described below. Every difference becomes a `Finding` with a severity and a category.
+4. **Compare (`diff.rs`).** The old and new specs are compared item by item. Functions, structs, and enums are matched by name and then examined for the specific breaking changes described below. Every difference becomes a `Finding` with a severity and a category. `compare_host_imports` separately classifies host-import changes against the [capability registry](capability-registry.md).
 
 5. **Map dependencies (`mapper.rs`).** A `LayoutMapper` builds a reverse dependency graph over user-defined types. This is what lets the tool understand that a change to a small shared type can break every larger type that embeds it.
 
@@ -566,6 +655,17 @@ Soroban's `contractspecv0` carries no marker that says "this type is an event", 
 
 Classification affects only the **wording** of a finding and the remediation advice attached to it — a type classified as an event gets guidance about off-chain indexers and subscribers, because a change that is merely awkward for storage can be fully breaking for an indexer. It never affects the finding's `category`.
 
+### Host Imports and Protocol Capabilities
+
+A WASM import that a contract did not need before can raise the minimum Stellar protocol version the target network must support, independently of anything visible in the exported spec. `diff::compare_host_imports` classifies these changes using the versioned registry in `src/capability.rs`, which maps recognized `(module, name)` host-import wire codes (e.g. `("l", "_")` is `put_contract_data`) to a capability id, a capability group, and the protocol version at which the capability became available. See [Updating the Capability Registry](capability-registry.md) for what the registry is generated from and how to refresh it, and [`capability-reference.md`](capability-reference.md) for the full generated list.
+
+- **Host Import Added.** The new build imports a recognized capability the old build did not. Warning — verify the target network has activated the required protocol.
+- **Host Import Removed.** A recognized capability the old build imported is no longer imported. Informational.
+- **Host Import Signature Changed.** The same `(module, name)` import appears on both sides but its resolved parameter/result types differ. Critical for a recognized capability (this should never legitimately happen and likely indicates a toolchain problem), Warning for an unrecognized one. Never reported when either side's type index could not be resolved — a missing signature is not evidence of a change.
+- **Unknown Host Import.** The import's `(module, name)` pair is not in the registry. Its protocol requirement is deliberately left unset rather than guessed; the finding exists purely so the import stays visible. Warning.
+- **Protocol Requirement Raised.** The highest `min_protocol` among the new build's recognized imports exceeds the old build's. Warning, and only computed when both sides have at least one recognized import to compare.
+- **Protocol Environment Mismatch.** A single build's own `contractenvmetav0` protocol version is lower than the minimum protocol implied by its own recognized imports — an internal inconsistency in how the binary was produced. Critical.
+
 ## Type Identity
 
 A contract spec identifies every user-defined type by name, but a name is not an identity. Two questions have to be kept apart:
@@ -719,6 +819,12 @@ severity, and the guidance used when `--explain` is enabled.
 | `error_enum_case_value_changed` | Error Enum Case Value Changed | Critical | Revert the value change to preserve error-code compatibility. |
 | `error_enum_case_added` | Error Enum Case Added | Info | Ensure clients can handle the new error case. |
 | `cascading_layout_break` | Cascading Layout Break | Critical | Resolve the underlying layout break in the referenced type. |
+| `host_import_added` | Host Import Added | Warning | Verify the target network has activated the required protocol before deploying. |
+| `host_import_removed` | Host Import Removed | Info | No action typically required. |
+| `host_import_signature_changed` | Host Import Signature Changed | Warning | Investigate why the same import now resolves to a different function type. |
+| `unknown_host_import` | Unknown Host Import | Warning | Verify the import's requirement manually; consider proposing it for the capability registry. |
+| `protocol_requirement_raised` | Protocol Requirement Raised | Warning | Confirm the target network has activated the reported protocol before deploying. |
+| `protocol_environment_mismatch` | Protocol Environment Mismatch | Critical | Rebuild with a matching SDK/toolchain version. |
 
 ## Severity Levels
 
@@ -1099,6 +1205,27 @@ If your pipeline treats `is_safe: true` as "storage compatible", check `scope.st
 ### The new storage-schema input
 
 `--old-storage-schema` and `--new-storage-schema` are optional. Omitting them reproduces the previous behavior exactly, now with honest scope reporting. Adopting them is incremental: declare your storage-key types and the internal types you serialize into storage, starting with the ones holding value-bearing data. Partial coverage is genuinely useful, and the report always states how far it reached. See [Storage Schema Analysis](#storage-schema-analysis) for the format.
+
+## Real-World Contract Upgrade Validation Corpus
+
+To ensure the analyzer's safety claims hold against real-world smart contracts rather than just hand-crafted toy fixtures, a validation corpus of real-world contract upgrade pairs is included in `tests/real_world_corpus/`.
+
+This corpus includes upgrade pairs drawn from real mainnet Soroban protocols:
+- **Blend Protocol**: Lending pool contract evolution (v1 -> v2).
+- **Soroswap DEX**: AMM Router contract interface cleanup.
+- **Reflector Price Oracle**: Price data struct representation upgrade.
+- **Stellar Asset Contract**: Token router method extension (mint & burn).
+- **Governance Protocol**: Voting escrow parameter update.
+
+### Opt-In Corpus Testing
+
+Corpus validation runs as an opt-in integration test suite:
+
+```bash
+cargo test --test real_world_corpus -- --ignored
+```
+
+Each pair is checked against expected verdicts specified in `manifest.json`, asserting exact safety verdicts, recommended SemVer bumps, critical finding counts, and finding categories. See [`tests/real_world_corpus/README.md`](../tests/real_world_corpus/README.md) for full provenance and maintenance details.
 
 ## Frequently Asked Questions
 

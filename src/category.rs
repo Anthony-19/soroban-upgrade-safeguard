@@ -53,6 +53,30 @@ pub enum FindingCategory {
     ErrorEnumCaseAdded,
     TypeKindChanged,
     CascadingLayoutBreak,
+    HostImportAdded,
+    HostImportRemoved,
+    HostImportSignatureChanged,
+    UnknownHostImport,
+    ProtocolRequirementRaised,
+    ProtocolEnvironmentMismatch,
+    MemoryAdded,
+    MemoryRemoved,
+    MemoryLimitsChanged,
+    TableAdded,
+    TableRemoved,
+    TableLimitsChanged,
+    TableElementTypeChanged,
+    GlobalAdded,
+    GlobalRemoved,
+    GlobalMutabilityChanged,
+    GlobalTypeChanged,
+    StartFunctionAdded,
+    StartFunctionRemoved,
+    StartFunctionChanged,
+    ElementSegmentChanged,
+    DataSegmentChanged,
+    WasmProposalAdded,
+    WasmProposalRemoved,
 }
 
 impl std::str::FromStr for FindingCategory {
@@ -113,6 +137,30 @@ impl FindingCategory {
             FindingCategory::ErrorEnumCaseAdded => "Error Enum Case Added",
             FindingCategory::TypeKindChanged => "Type Kind Changed",
             FindingCategory::CascadingLayoutBreak => "Cascading Layout Break",
+            FindingCategory::HostImportAdded => "Host Import Added",
+            FindingCategory::HostImportRemoved => "Host Import Removed",
+            FindingCategory::HostImportSignatureChanged => "Host Import Signature Changed",
+            FindingCategory::UnknownHostImport => "Unknown Host Import",
+            FindingCategory::ProtocolRequirementRaised => "Protocol Requirement Raised",
+            FindingCategory::ProtocolEnvironmentMismatch => "Protocol Environment Mismatch",
+            FindingCategory::MemoryAdded => "Memory Added",
+            FindingCategory::MemoryRemoved => "Memory Removed",
+            FindingCategory::MemoryLimitsChanged => "Memory Limits Changed",
+            FindingCategory::TableAdded => "Table Added",
+            FindingCategory::TableRemoved => "Table Removed",
+            FindingCategory::TableLimitsChanged => "Table Limits Changed",
+            FindingCategory::TableElementTypeChanged => "Table Element Type Changed",
+            FindingCategory::GlobalAdded => "Global Added",
+            FindingCategory::GlobalRemoved => "Global Removed",
+            FindingCategory::GlobalMutabilityChanged => "Global Mutability Changed",
+            FindingCategory::GlobalTypeChanged => "Global Type Changed",
+            FindingCategory::StartFunctionAdded => "Start Function Added",
+            FindingCategory::StartFunctionRemoved => "Start Function Removed",
+            FindingCategory::StartFunctionChanged => "Start Function Changed",
+            FindingCategory::ElementSegmentChanged => "Element Segment Changed",
+            FindingCategory::DataSegmentChanged => "Data Segment Changed",
+            FindingCategory::WasmProposalAdded => "WASM Proposal Added",
+            FindingCategory::WasmProposalRemoved => "WASM Proposal Removed",
         }
     }
 
@@ -167,6 +215,30 @@ impl FindingCategory {
             FindingCategory::ErrorEnumCaseAdded => Severity::Info,
             FindingCategory::TypeKindChanged => Severity::Critical,
             FindingCategory::CascadingLayoutBreak => Severity::Critical,
+            FindingCategory::HostImportAdded => Severity::Warning,
+            FindingCategory::HostImportRemoved => Severity::Info,
+            FindingCategory::HostImportSignatureChanged => Severity::Warning,
+            FindingCategory::UnknownHostImport => Severity::Warning,
+            FindingCategory::ProtocolRequirementRaised => Severity::Warning,
+            FindingCategory::ProtocolEnvironmentMismatch => Severity::Critical,
+            FindingCategory::MemoryAdded => Severity::Info,
+            FindingCategory::MemoryRemoved => Severity::Critical,
+            FindingCategory::MemoryLimitsChanged => Severity::Warning,
+            FindingCategory::TableAdded => Severity::Info,
+            FindingCategory::TableRemoved => Severity::Critical,
+            FindingCategory::TableLimitsChanged => Severity::Warning,
+            FindingCategory::TableElementTypeChanged => Severity::Critical,
+            FindingCategory::GlobalAdded => Severity::Info,
+            FindingCategory::GlobalRemoved => Severity::Warning,
+            FindingCategory::GlobalMutabilityChanged => Severity::Critical,
+            FindingCategory::GlobalTypeChanged => Severity::Critical,
+            FindingCategory::StartFunctionAdded => Severity::Critical,
+            FindingCategory::StartFunctionRemoved => Severity::Warning,
+            FindingCategory::StartFunctionChanged => Severity::Warning,
+            FindingCategory::ElementSegmentChanged => Severity::Info,
+            FindingCategory::DataSegmentChanged => Severity::Info,
+            FindingCategory::WasmProposalAdded => Severity::Warning,
+            FindingCategory::WasmProposalRemoved => Severity::Info,
         }
     }
 
@@ -304,6 +376,78 @@ impl FindingCategory {
             }
             FindingCategory::CascadingLayoutBreak => {
                 "A type embeds another type that has a critical layout break."
+            }
+            FindingCategory::HostImportAdded => {
+                "The new contract imports a recognized Soroban host function that the old contract did not import."
+            }
+            FindingCategory::HostImportRemoved => {
+                "A recognized Soroban host function that the old contract imported is no longer imported by the new contract."
+            }
+            FindingCategory::HostImportSignatureChanged => {
+                "The same module/name import appears in both builds, but its resolved parameter or result types differ."
+            }
+            FindingCategory::UnknownHostImport => {
+                "An import's module/name pair is not present in the host import capability registry, so its protocol requirement cannot be determined."
+            }
+            FindingCategory::ProtocolRequirementRaised => {
+                "The minimum Stellar protocol version implied by the new contract's recognized host imports is higher than the old contract's."
+            }
+            FindingCategory::ProtocolEnvironmentMismatch => {
+                "A contract's declared environment metadata protocol version is lower than the minimum protocol implied by its own recognized host imports."
+            }
+            FindingCategory::MemoryAdded => {
+                "A WebAssembly memory declaration was added in the new contract build."
+            }
+            FindingCategory::MemoryRemoved => {
+                "A WebAssembly memory declaration that existed in the old contract was removed."
+            }
+            FindingCategory::MemoryLimitsChanged => {
+                "The initial pages, maximum pages, origin, or 64-bit/shared properties of a memory declaration changed."
+            }
+            FindingCategory::TableAdded => {
+                "A WebAssembly table declaration was added in the new contract build."
+            }
+            FindingCategory::TableRemoved => {
+                "A WebAssembly table declaration that existed in the old contract was removed."
+            }
+            FindingCategory::TableLimitsChanged => {
+                "The initial or maximum element capacity of a table declaration changed."
+            }
+            FindingCategory::TableElementTypeChanged => {
+                "The element type of a WebAssembly table changed (e.g. funcref vs externref)."
+            }
+            FindingCategory::GlobalAdded => {
+                "A WebAssembly global variable declaration was added in the new contract build."
+            }
+            FindingCategory::GlobalRemoved => {
+                "A WebAssembly global variable declaration that existed in the old contract was removed."
+            }
+            FindingCategory::GlobalMutabilityChanged => {
+                "The mutability of a WebAssembly global variable changed between mutable and constant."
+            }
+            FindingCategory::GlobalTypeChanged => {
+                "The value type of a WebAssembly global variable changed."
+            }
+            FindingCategory::StartFunctionAdded => {
+                "A start function was added; the module will now execute initialization bytecode upon instantiation."
+            }
+            FindingCategory::StartFunctionRemoved => {
+                "The module start function was removed; initialization bytecode will no longer execute automatically."
+            }
+            FindingCategory::StartFunctionChanged => {
+                "The start function index changed to a different function."
+            }
+            FindingCategory::ElementSegmentChanged => {
+                "Indirect-call element segments or table population counts changed."
+            }
+            FindingCategory::DataSegmentChanged => {
+                "Data segment counts, active/passive modes, or byte payloads changed."
+            }
+            FindingCategory::WasmProposalAdded => {
+                "The upgraded module requires a new WebAssembly proposal/feature not required by the previous build."
+            }
+            FindingCategory::WasmProposalRemoved => {
+                "A WebAssembly proposal/feature required by the old contract is no longer required."
             }
         }
     }
@@ -443,6 +587,78 @@ impl FindingCategory {
             FindingCategory::CascadingLayoutBreak => {
                 "This is a breaking change. A nested user-defined type has a breaking layout change. Resolve the break in the referenced type."
             }
+            FindingCategory::HostImportAdded => {
+                "Verify the target network has activated the required protocol version before deploying, and that any client tooling accounts for the new capability."
+            }
+            FindingCategory::HostImportRemoved => {
+                "No action is typically required. If external tooling detects the old capability to gate behavior, update it to stop expecting the import."
+            }
+            FindingCategory::HostImportSignatureChanged => {
+                "Investigate why the same import now resolves to a different function type. For a recognized capability this should not happen and may indicate a toolchain or build issue; for an unrecognized import, confirm the provider did not change its calling convention."
+            }
+            FindingCategory::UnknownHostImport => {
+                "Manually verify the protocol or provider requirement for this import, then consider proposing it for addition to the capability registry so future comparisons classify it automatically."
+            }
+            FindingCategory::ProtocolRequirementRaised => {
+                "Confirm the target network has activated the reported protocol version before deploying the upgrade, and update deployment documentation accordingly."
+            }
+            FindingCategory::ProtocolEnvironmentMismatch => {
+                "This indicates the build's declared environment metadata undersells what it actually requires. Rebuild with a matching SDK/toolchain version, or investigate how the binary was produced."
+            }
+            FindingCategory::MemoryAdded => {
+                "If memory was newly added or imported, verify that the host runtime environment allocates sufficient memory pages for execution."
+            }
+            FindingCategory::MemoryRemoved => {
+                "This is a breaking change. Removing memory will cause traps in any contract functions or external callers expecting memory access. Restore the memory declaration."
+            }
+            FindingCategory::MemoryLimitsChanged => {
+                "Ensure memory page limits do not exceed the maximum allowed by the Soroban host environment, and that initial memory requirements remain compatible with callers."
+            }
+            FindingCategory::TableAdded => {
+                "No action required if table is defined locally. For imported tables, verify the host provides the required table resource."
+            }
+            FindingCategory::TableRemoved => {
+                "This is a breaking change. Removing a table breaks indirect function call dispatch (`call_indirect`). Restore the table."
+            }
+            FindingCategory::TableLimitsChanged => {
+                "Ensure table element limits do not prevent indirect function call dispatch."
+            }
+            FindingCategory::TableElementTypeChanged => {
+                "This is a breaking change. Changing table element types breaks indirect-call signatures and reference types. Revert the element type."
+            }
+            FindingCategory::GlobalAdded => {
+                "No action required for internal compiler globals. For imported globals, confirm the host environment supplies the variable."
+            }
+            FindingCategory::GlobalRemoved => {
+                "Removing global variables may alter internal state or host bindings. Ensure dependent functions are updated."
+            }
+            FindingCategory::GlobalMutabilityChanged => {
+                "This is a breaking change. Changing a global from mutable to immutable (or vice versa) breaks initialization and mutation semantics. Restore the original mutability."
+            }
+            FindingCategory::GlobalTypeChanged => {
+                "This is a breaking change. Modifying global variable types breaks internal operations and any host bindings. Revert the type change."
+            }
+            FindingCategory::StartFunctionAdded => {
+                "Warning: Start functions execute automatically during module instantiation before any contract method is called. Verify that this initialization logic is safe and intentional."
+            }
+            FindingCategory::StartFunctionRemoved => {
+                "Verify that module initialization is not required or has been moved to an explicit contract initialization function."
+            }
+            FindingCategory::StartFunctionChanged => {
+                "Verify that the updated start function performs the intended module initialization without unintended side effects."
+            }
+            FindingCategory::ElementSegmentChanged => {
+                "Ensure indirect call dispatch tables have sufficient entries for all function pointers used by the contract."
+            }
+            FindingCategory::DataSegmentChanged => {
+                "No action typically required for internal data segment compiler optimizations unless active segment offsets exceed memory bounds."
+            }
+            FindingCategory::WasmProposalAdded => {
+                "Verify that the target network and Soroban host environment support this WebAssembly proposal (e.g. SIMD, multi-memory, memory64)."
+            }
+            FindingCategory::WasmProposalRemoved => {
+                "No action required. The contract has simplified its runtime feature requirements."
+            }
         }
     }
 
@@ -493,6 +709,30 @@ impl FindingCategory {
             FindingCategory::ErrorEnumCaseAdded,
             FindingCategory::TypeKindChanged,
             FindingCategory::CascadingLayoutBreak,
+            FindingCategory::HostImportAdded,
+            FindingCategory::HostImportRemoved,
+            FindingCategory::HostImportSignatureChanged,
+            FindingCategory::UnknownHostImport,
+            FindingCategory::ProtocolRequirementRaised,
+            FindingCategory::ProtocolEnvironmentMismatch,
+            FindingCategory::MemoryAdded,
+            FindingCategory::MemoryRemoved,
+            FindingCategory::MemoryLimitsChanged,
+            FindingCategory::TableAdded,
+            FindingCategory::TableRemoved,
+            FindingCategory::TableLimitsChanged,
+            FindingCategory::TableElementTypeChanged,
+            FindingCategory::GlobalAdded,
+            FindingCategory::GlobalRemoved,
+            FindingCategory::GlobalMutabilityChanged,
+            FindingCategory::GlobalTypeChanged,
+            FindingCategory::StartFunctionAdded,
+            FindingCategory::StartFunctionRemoved,
+            FindingCategory::StartFunctionChanged,
+            FindingCategory::ElementSegmentChanged,
+            FindingCategory::DataSegmentChanged,
+            FindingCategory::WasmProposalAdded,
+            FindingCategory::WasmProposalRemoved,
         ]
     }
 

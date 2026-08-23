@@ -77,11 +77,12 @@ The source lives under `src/` and is split into focused modules. Understanding t
 - `suppression.rs` parses `.safeguard.toml` and matches acknowledged findings.
 - `limits.rs` defines the resource limits that protect decoding and type walks from untrusted input.
 - `loader.rs` reads a WASM file from disk and validates that it is a well formed WASM binary.
-- `parser.rs` extracts the Soroban custom sections and decodes the XDR spec entries.
+- `parser.rs` extracts the Soroban custom sections, decodes the XDR spec entries, and records every WASM function import (module, name, resolved signature).
 - `spec.rs` defines `ContractSpec`, the in-memory model that groups functions and user-defined types by name.
 - `storage_schema.rs` loads optional manifests for checking internal storage layouts.
+- `capability.rs` is the versioned registry mapping recognized Soroban host imports to protocol capability metadata; see [Updating the Capability Registry](capability-registry.md).
 - `mapper.rs` turns type definitions into readable signatures and builds the reverse dependency graph used for cascade detection.
-- `diff.rs` holds the comparison logic and the `Finding` and `Severity` types. This is where most detection rules live.
+- `diff.rs` holds the comparison logic and the `Finding` and `Severity` types. This is where most detection rules live, including `compare_host_imports`, which classifies host-import changes against `capability.rs`.
 - `dependency.rs` propagates breaking changes across declared contract dependencies in batch comparisons.
 - `report.rs` aggregates findings into a `SafetyReport` and renders the colored summary.
 
@@ -192,6 +193,36 @@ cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<crash-file>
 `stellar-xdr`'s `arbitrary` feature is declared in `fuzz/Cargo.toml` rather than
 in the crate's release dependencies, so structure-aware targets can use it
 without pulling it into the shipped binary (see issue #79).
+
+## Real-World Contract Upgrade Validation Corpus
+
+To complement synthetic unit tests and fixtures, a validation corpus of real-world Soroban contract upgrade pairs is maintained in `tests/real_world_corpus/`. Drawn from deployed protocols (Blend Lending, Soroswap AMM Router, Reflector Price Oracle, SAC Token Router, Governance Escrow), this corpus exercises the analyzer against realistic contract shapes and upgrades.
+
+### Running the Corpus (Opt-In)
+
+The corpus is marked with `#[ignore]` so standard `cargo test` runs remain hermetic, fast, and offline. To run the corpus validation:
+
+```bash
+cargo test --test real_world_corpus -- --ignored
+```
+
+or with environment variable opt-in:
+
+```bash
+REAL_WORLD_CORPUS=1 cargo test --test real_world_corpus -- --ignored
+```
+
+### Refreshing and Maintaining the Corpus
+
+Binaries are compiled reproducibly and documented with provenance and open-source licenses (Apache-2.0 / MIT) in `tests/real_world_corpus/manifest.json`.
+
+To refresh or rebuild the corpus WASMs:
+
+```bash
+bash tests/real_world_corpus/refresh_corpus.sh
+```
+
+Any false positives or missed breaks revealed by the corpus should be documented in [`docs/real_world_corpus_issues.md`](real_world_corpus_issues.md) and tracked as dedicated issues rather than silently accepted.
 
 ## Benchmarking
 

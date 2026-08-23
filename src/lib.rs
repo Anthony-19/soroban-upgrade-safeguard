@@ -9,6 +9,11 @@ pub mod call_abi;
 mod call_abi;
 
 #[cfg(feature = "unstable")]
+pub mod capability;
+#[cfg(not(feature = "unstable"))]
+mod capability;
+
+#[cfg(feature = "unstable")]
 pub mod category;
 #[cfg(not(feature = "unstable"))]
 mod category;
@@ -49,6 +54,11 @@ pub mod interface_hash;
 mod interface_hash;
 
 #[cfg(feature = "unstable")]
+pub mod jsonl;
+#[cfg(not(feature = "unstable"))]
+mod jsonl;
+
+#[cfg(feature = "unstable")]
 pub mod loader;
 #[cfg(not(feature = "unstable"))]
 mod loader;
@@ -69,9 +79,19 @@ pub mod mapper;
 mod mapper;
 
 #[cfg(feature = "unstable")]
+pub mod oci;
+#[cfg(not(feature = "unstable"))]
+mod oci;
+
+#[cfg(feature = "unstable")]
 pub mod parser;
 #[cfg(not(feature = "unstable"))]
 mod parser;
+
+#[cfg(feature = "unstable")]
+pub mod remote;
+#[cfg(not(feature = "unstable"))]
+mod remote;
 
 #[cfg(feature = "unstable")]
 pub mod render;
@@ -87,6 +107,21 @@ mod report;
 pub mod rpc;
 #[cfg(not(feature = "unstable"))]
 mod rpc;
+
+#[cfg(feature = "unstable")]
+pub mod rpc_bundle;
+#[cfg(not(feature = "unstable"))]
+mod rpc_bundle;
+
+#[cfg(feature = "unstable")]
+pub mod rpc_record;
+#[cfg(not(feature = "unstable"))]
+mod rpc_record;
+
+#[cfg(feature = "unstable")]
+pub mod runtime_surface;
+#[cfg(not(feature = "unstable"))]
+mod runtime_surface;
 
 #[cfg(feature = "unstable")]
 pub mod spec;
@@ -123,7 +158,18 @@ pub use crate::call_abi::{
     CallAbiBreak, CallAbiCompatibility, CallDirection, DirectionalCallVerdict,
 };
 pub use crate::diff::{Finding, Severity};
+pub use crate::oci::{
+    OciArtifact, OciArtifactKind, OciFetchConfig, OciReference, OciSelector,
+    MEDIA_TYPE_EXTRACTED_SPEC, MEDIA_TYPE_WASM,
+};
+pub use crate::remote::{
+    default_cache_dir, fetch_verified, CacheStatus, FetchedArtifact, RemoteFetchConfig, RemoteRef,
+};
 pub use crate::report::{ReportedFinding, SafetyReport};
+pub use crate::runtime_surface::{
+    DataSegmentSummary, ElementSegmentSummary, GlobalDeclaration, MemoryDeclaration,
+    RuntimeSurface, TableDeclaration,
+};
 pub use crate::storage_schema::{StorageReconciliation, StorageSchema, StorageSchemaComparison};
 
 use std::path::Path;
@@ -172,7 +218,13 @@ pub fn compare_wasm_bytes(old_wasm: &[u8], new_wasm: &[u8]) -> Result<SafetyRepo
     let old_spec = ContractSpec::from_entries(&old_meta.spec);
     let new_spec = ContractSpec::from_entries(&new_meta.spec);
 
-    let diff_report = diff::compare(&old_spec, &new_spec);
+    let mut diff_report = diff::compare(&old_spec, &new_spec);
+    diff::compare_runtime_surfaces(
+        &old_meta.runtime_surface,
+        &new_meta.runtime_surface,
+        &mut diff_report,
+    );
+
     Ok(
         SafetyReport::new_with_specs(&diff_report, &old_spec, &new_spec)
             .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash()),
@@ -216,6 +268,20 @@ pub fn compare_wasm_bytes_with_options(
     diff::compare_env_metadata(
         old_meta.env_meta.as_ref(),
         new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+
+    diff::compare_host_imports(
+        &old_meta.host_imports,
+        &new_meta.host_imports,
+        old_meta.env_meta.as_ref(),
+        new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+
+    diff::compare_runtime_surfaces(
+        &old_meta.runtime_surface,
+        &new_meta.runtime_surface,
         &mut diff_report,
     );
 

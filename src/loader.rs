@@ -10,6 +10,8 @@ use stellar_xdr::curr::{
 use wasmparser::Parser;
 
 use crate::error::Error;
+use crate::oci::{self, OciArtifact, OciArtifactKind, OciFetchConfig, OciReference};
+use crate::remote::{self, FetchedArtifact, RemoteFetchConfig, RemoteRef};
 use crate::rpc::RpcClientConfig;
 
 /// Holds raw WASM bytes alongside the validated file path.
@@ -71,6 +73,48 @@ pub fn load_wasm_from_stdin(stdin: &mut impl Read) -> Result<WasmModule, Error> 
         })?;
 
     wasm_module_from_bytes(bytes, PathBuf::from("-"), "-".to_string())
+}
+
+/// Downloads a WASM binary from an `https://…#sha256=<hex>` reference,
+/// verifies it against the pinned digest, and validates it like a local file.
+///
+/// Returns both the resulting [`WasmModule`] (whose `path` is the sanitized
+/// final URL, mirroring how [`fetch_wasm_from_rpc`] labels RPC-sourced
+/// modules) and the [`FetchedArtifact`] provenance record — original URL,
+/// cache status, and media type — for callers that want to surface it.
+pub fn load_wasm_from_url(
+    remote: &RemoteRef,
+    config: &RemoteFetchConfig,
+) -> Result<(WasmModule, FetchedArtifact), Error> {
+    let artifact = remote::fetch_verified(remote, config)?;
+    let module = wasm_module_from_bytes(
+        artifact.bytes.clone(),
+        PathBuf::from(&artifact.final_url),
+        artifact.final_url.clone(),
+    )?;
+    Ok((module, artifact))
+}
+
+/// Resolves a WASM binary from an `oci://<registry>/<repository>@sha256:<hex>`
+/// reference, verifies it against the resolved layer digest, and validates
+/// it like a local file.
+///
+/// Returns both the resulting [`WasmModule`] (whose `path` is a
+/// `oci://registry/repository@sha256:...` label built from the resolved
+/// digest, mirroring how [`fetch_wasm_from_rpc`] labels RPC-sourced modules)
+/// and the [`OciArtifact`] provenance record for callers that want to
+/// surface registry/repository/manifest/layer details.
+pub fn load_wasm_from_oci(
+    reference: &OciReference,
+    config: &OciFetchConfig,
+) -> Result<(WasmModule, OciArtifact), Error> {
+    let artifact = oci::resolve_oci_artifact(reference, OciArtifactKind::Wasm, config)?;
+    let label = format!(
+        "oci://{}/{}@{}",
+        artifact.registry, artifact.repository, artifact.layer_digest
+    );
+    let module = wasm_module_from_bytes(artifact.bytes.clone(), PathBuf::from(&label), label)?;
+    Ok((module, artifact))
 }
 
 fn wasm_module_from_bytes(
