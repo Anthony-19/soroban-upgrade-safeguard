@@ -229,6 +229,11 @@ soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>
 soroban-upgrade-safeguard --manifest <MANIFEST_PATH>
 ```
 
+  A manifest can also compose other manifests (`include`), share settings across
+  pairs (`[defaults]`), and override them per pair. See
+  [Batch Manifests](batch_manifests.md) for the schema, the precedence rules,
+  path resolution, and `--explain-manifest`.
+
 - Directory scan (pair by file stem):
 
 ```bash

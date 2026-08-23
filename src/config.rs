@@ -431,7 +431,11 @@ pub enum RunMode {
     DirScan,
 }
 
-fn resolve_path(base_dir: &Path, path: PathBuf) -> PathBuf {
+/// Anchor `path` on `base_dir` unless it is already absolute.
+///
+/// Shared with [`crate::manifest`], which anchors every relative manifest path
+/// on the directory of the file that wrote it.
+pub(crate) fn resolve_path(base_dir: &Path, path: PathBuf) -> PathBuf {
     let windows_absolute = path
         .to_str()
         .map(|value| {

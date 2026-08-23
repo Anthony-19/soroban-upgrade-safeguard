@@ -69,6 +69,11 @@ pub mod limits;
 mod limits;
 
 #[cfg(feature = "unstable")]
+pub mod manifest;
+#[cfg(not(feature = "unstable"))]
+mod manifest;
+
+#[cfg(feature = "unstable")]
 pub mod mapper;
 #[cfg(not(feature = "unstable"))]
 mod mapper;
