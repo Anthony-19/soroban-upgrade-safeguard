@@ -114,6 +114,11 @@ pub mod rpc_record;
 mod rpc_record;
 
 #[cfg(feature = "unstable")]
+pub mod runtime_surface;
+#[cfg(not(feature = "unstable"))]
+mod runtime_surface;
+
+#[cfg(feature = "unstable")]
 pub mod spec;
 #[cfg(not(feature = "unstable"))]
 mod spec;
@@ -156,6 +161,10 @@ pub use crate::remote::{
     default_cache_dir, fetch_verified, CacheStatus, FetchedArtifact, RemoteFetchConfig, RemoteRef,
 };
 pub use crate::report::{ReportedFinding, SafetyReport};
+pub use crate::runtime_surface::{
+    DataSegmentSummary, ElementSegmentSummary, GlobalDeclaration, MemoryDeclaration,
+    RuntimeSurface, TableDeclaration,
+};
 pub use crate::storage_schema::{StorageReconciliation, StorageSchema, StorageSchemaComparison};
 
 use std::path::Path;
@@ -204,7 +213,13 @@ pub fn compare_wasm_bytes(old_wasm: &[u8], new_wasm: &[u8]) -> Result<SafetyRepo
     let old_spec = ContractSpec::from_entries(&old_meta.spec);
     let new_spec = ContractSpec::from_entries(&new_meta.spec);
 
-    let diff_report = diff::compare(&old_spec, &new_spec);
+    let mut diff_report = diff::compare(&old_spec, &new_spec);
+    diff::compare_runtime_surfaces(
+        &old_meta.runtime_surface,
+        &new_meta.runtime_surface,
+        &mut diff_report,
+    );
+
     Ok(
         SafetyReport::new_with_specs(&diff_report, &old_spec, &new_spec)
             .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash()),
@@ -256,6 +271,12 @@ pub fn compare_wasm_bytes_with_options(
         &new_meta.host_imports,
         old_meta.env_meta.as_ref(),
         new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+
+    diff::compare_runtime_surfaces(
+        &old_meta.runtime_surface,
+        &new_meta.runtime_surface,
         &mut diff_report,
     );
 
