@@ -2,6 +2,7 @@ use crate::capability;
 use crate::category::FindingCategory;
 use crate::mapper::LayoutMapper;
 use crate::parser::{ContractEnvMeta, ImportedFunction};
+pub use crate::runtime_surface::compare_runtime_surfaces;
 use crate::spec::ContractSpec;
 use serde::{Deserialize, Serialize};
 use stellar_xdr::curr::{
@@ -30,6 +31,7 @@ pub enum CompatibilityAxis {
     CallAbi,
     EventIndexer,
     SourceLevel,
+    RuntimeSurface,
 }
 
 impl CompatibilityAxis {
@@ -39,6 +41,7 @@ impl CompatibilityAxis {
             CompatibilityAxis::CallAbi => Severity::Critical,
             CompatibilityAxis::EventIndexer => Severity::Warning,
             CompatibilityAxis::SourceLevel => Severity::Info,
+            CompatibilityAxis::RuntimeSurface => Severity::Critical,
         }
     }
 }
@@ -408,6 +411,27 @@ pub fn classify_finding_axes(
         | "Error Enum Case Value Changed"
         | "Error Enum Case Added" => {
             axes.push(CompatibilityAxis::CallAbi);
+        }
+
+        "Memory Added"
+        | "Memory Removed"
+        | "Memory Limits Changed"
+        | "Table Added"
+        | "Table Removed"
+        | "Table Limits Changed"
+        | "Table Element Type Changed"
+        | "Global Added"
+        | "Global Removed"
+        | "Global Mutability Changed"
+        | "Global Type Changed"
+        | "Start Function Added"
+        | "Start Function Removed"
+        | "Start Function Changed"
+        | "Element Segment Changed"
+        | "Data Segment Changed"
+        | "WASM Proposal Added"
+        | "WASM Proposal Removed" => {
+            axes.push(CompatibilityAxis::RuntimeSurface);
         }
 
         _ => {

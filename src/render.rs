@@ -276,6 +276,7 @@ impl RenderableReport {
             crate::diff::CompatibilityAxis::CallAbi,
             crate::diff::CompatibilityAxis::EventIndexer,
             crate::diff::CompatibilityAxis::SourceLevel,
+            crate::diff::CompatibilityAxis::RuntimeSurface,
         ];
         for axis in axes_in_order {
             let axis_status = self
@@ -293,6 +294,7 @@ impl RenderableReport {
                 crate::diff::CompatibilityAxis::CallAbi => "Call ABI",
                 crate::diff::CompatibilityAxis::EventIndexer => "Event & Indexer",
                 crate::diff::CompatibilityAxis::SourceLevel => "Source Level",
+                crate::diff::CompatibilityAxis::RuntimeSurface => "Runtime Surface",
             };
             output.push_str(&format!("  - {:<18} {}\n", label, status_str));
         }
@@ -348,6 +350,7 @@ impl RenderableReport {
             crate::diff::CompatibilityAxis::CallAbi,
             crate::diff::CompatibilityAxis::EventIndexer,
             crate::diff::CompatibilityAxis::SourceLevel,
+            crate::diff::CompatibilityAxis::RuntimeSurface,
         ] {
             let group = match self.findings_by_axis.get(axis) {
                 Some(g) if !g.is_empty() => g,
@@ -359,6 +362,7 @@ impl RenderableReport {
                 crate::diff::CompatibilityAxis::CallAbi => "CALL ABI COMPATIBILITY",
                 crate::diff::CompatibilityAxis::EventIndexer => "EVENT & INDEXER COMPATIBILITY",
                 crate::diff::CompatibilityAxis::SourceLevel => "SOURCE LEVEL COMPATIBILITY",
+                crate::diff::CompatibilityAxis::RuntimeSurface => "RUNTIME SURFACE COMPATIBILITY",
             };
 
             output.push_str(
@@ -511,6 +515,7 @@ impl RenderableReport {
             crate::diff::CompatibilityAxis::CallAbi,
             crate::diff::CompatibilityAxis::EventIndexer,
             crate::diff::CompatibilityAxis::SourceLevel,
+            crate::diff::CompatibilityAxis::RuntimeSurface,
         ];
 
         for axis in axes_in_order {
@@ -529,6 +534,7 @@ impl RenderableReport {
                 crate::diff::CompatibilityAxis::CallAbi => "Call ABI",
                 crate::diff::CompatibilityAxis::EventIndexer => "Event & Indexer",
                 crate::diff::CompatibilityAxis::SourceLevel => "Source Level",
+                crate::diff::CompatibilityAxis::RuntimeSurface => "Runtime Surface",
             };
             let gated = if self.gated_axes.contains(&axis) {
                 "Yes"
@@ -571,6 +577,7 @@ impl RenderableReport {
             crate::diff::CompatibilityAxis::CallAbi,
             crate::diff::CompatibilityAxis::EventIndexer,
             crate::diff::CompatibilityAxis::SourceLevel,
+            crate::diff::CompatibilityAxis::RuntimeSurface,
         ] {
             let group = match self.findings_by_axis.get(axis) {
                 Some(g) if !g.is_empty() => g,
@@ -582,6 +589,7 @@ impl RenderableReport {
                 crate::diff::CompatibilityAxis::CallAbi => "Call ABI Compatibility",
                 crate::diff::CompatibilityAxis::EventIndexer => "Event & Indexer Compatibility",
                 crate::diff::CompatibilityAxis::SourceLevel => "Source Level Compatibility",
+                crate::diff::CompatibilityAxis::RuntimeSurface => "Runtime Surface Compatibility",
             };
 
             output.push_str(&format!("### {}\n\n", label));

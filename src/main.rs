@@ -945,7 +945,24 @@ fn run_init(args: &InitArgs) -> Result<()> {
     let new_spec = spec::ContractSpec::from_entries(&new_meta.spec);
 
     // Generate diff
-    let diff_report = diff::compare(&old_spec, &new_spec);
+    let mut diff_report = diff::compare(&old_spec, &new_spec);
+    diff::compare_env_metadata(
+        old_meta.env_meta.as_ref(),
+        new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+    diff::compare_host_imports(
+        &old_meta.host_imports,
+        &new_meta.host_imports,
+        old_meta.env_meta.as_ref(),
+        new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+    diff::compare_runtime_surfaces(
+        &old_meta.runtime_surface,
+        &new_meta.runtime_surface,
+        &mut diff_report,
+    );
 
     // Collect unsuppressed findings (with empty suppression config)
     let empty_suppressions = SuppressionConfig::default();
@@ -1246,12 +1263,17 @@ fn run_batch(
                     diff::CompatibilityAxis::SourceLevel,
                     report::AxisStatus::Passed,
                 );
+                verdicts.insert(
+                    diff::CompatibilityAxis::RuntimeSurface,
+                    report::AxisStatus::Passed,
+                );
                 verdicts
             },
             gated_axes: {
                 let mut gated = std::collections::HashSet::new();
                 gated.insert(diff::CompatibilityAxis::CallAbi);
                 gated.insert(diff::CompatibilityAxis::StorageLayout);
+                gated.insert(diff::CompatibilityAxis::RuntimeSurface);
                 gated
             },
             findings_by_category: {
@@ -1499,12 +1521,17 @@ fn synthesize_error_report(
                 diff::CompatibilityAxis::SourceLevel,
                 report::AxisStatus::Passed,
             );
+            verdicts.insert(
+                diff::CompatibilityAxis::RuntimeSurface,
+                report::AxisStatus::Passed,
+            );
             verdicts
         },
         gated_axes: {
             let mut gated = std::collections::HashSet::new();
             gated.insert(diff::CompatibilityAxis::CallAbi);
             gated.insert(diff::CompatibilityAxis::StorageLayout);
+            gated.insert(diff::CompatibilityAxis::RuntimeSurface);
             gated
         },
         findings_by_category: {
@@ -2213,6 +2240,11 @@ fn compare_contracts(
         &new_meta.host_imports,
         old_meta.env_meta.as_ref(),
         new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+    diff::compare_runtime_surfaces(
+        &old_meta.runtime_surface,
+        &new_meta.runtime_surface,
         &mut diff_report,
     );
 

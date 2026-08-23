@@ -521,10 +521,15 @@ impl SafetyReport {
             crate::diff::CompatibilityAxis::SourceLevel,
             AxisStatus::Passed,
         );
+        axis_verdicts.insert(
+            crate::diff::CompatibilityAxis::RuntimeSurface,
+            AxisStatus::Passed,
+        );
 
         let mut gated_axes = HashSet::new();
         gated_axes.insert(crate::diff::CompatibilityAxis::StorageLayout);
         gated_axes.insert(crate::diff::CompatibilityAxis::CallAbi);
+        gated_axes.insert(crate::diff::CompatibilityAxis::RuntimeSurface);
 
         Self {
             call_abi: crate::call_abi::CallAbiCompatibility::default(),
@@ -628,13 +633,18 @@ impl SafetyReport {
             crate::diff::CompatibilityAxis::SourceLevel,
             AxisStatus::Passed,
         );
+        axis_verdicts.insert(
+            crate::diff::CompatibilityAxis::RuntimeSurface,
+            AxisStatus::Passed,
+        );
 
         let mut gated_axes = HashSet::new();
-        let axes_list = vec![
+        let axes_list = [
             crate::diff::CompatibilityAxis::StorageLayout,
             crate::diff::CompatibilityAxis::CallAbi,
             crate::diff::CompatibilityAxis::EventIndexer,
             crate::diff::CompatibilityAxis::SourceLevel,
+            crate::diff::CompatibilityAxis::RuntimeSurface,
         ];
         for axis in axes_list {
             let is_gated = strict
@@ -648,6 +658,9 @@ impl SafetyReport {
                     }
                     crate::diff::CompatibilityAxis::SourceLevel => {
                         suppressions.policy.gate_source_level
+                    }
+                    crate::diff::CompatibilityAxis::RuntimeSurface => {
+                        suppressions.policy.gate_runtime_surface
                     }
                 };
             if is_gated {
@@ -759,6 +772,9 @@ impl SafetyReport {
                             }
                             crate::diff::CompatibilityAxis::SourceLevel => {
                                 suppressions.policy.gate_source_level
+                            }
+                            crate::diff::CompatibilityAxis::RuntimeSurface => {
+                                suppressions.policy.gate_runtime_surface
                             }
                         };
 
@@ -908,6 +924,7 @@ impl SafetyReport {
         findings_by_axis.insert(crate::diff::CompatibilityAxis::CallAbi, Vec::new());
         findings_by_axis.insert(crate::diff::CompatibilityAxis::EventIndexer, Vec::new());
         findings_by_axis.insert(crate::diff::CompatibilityAxis::SourceLevel, Vec::new());
+        findings_by_axis.insert(crate::diff::CompatibilityAxis::RuntimeSurface, Vec::new());
 
         for category_findings in self.findings_by_category.values() {
             for reported in category_findings {
