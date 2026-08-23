@@ -180,8 +180,13 @@ pub struct RawPair {
 ///
 /// [`PolicyConfig`] itself uses plain `bool` fields with defaulting getters, so
 /// it cannot express "unset". This mirror uses `Option<bool>` so a layer can
-/// override one gate without restating the other three — the same shape
+/// override one gate without restating the rest — the same shape
 /// [`LimitsConfig`] already uses for resource limits.
+///
+/// This must stay field-for-field in sync with [`PolicyConfig`]: a gate missing
+/// here cannot be set in a manifest at all, and `deny_unknown_fields` turns the
+/// attempt into a hard error. `every_policy_gate_is_overridable_from_a_manifest`
+/// guards the pairing in both directions.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyOverrides {
@@ -193,6 +198,8 @@ pub struct PolicyOverrides {
     pub gate_event_indexer: Option<bool>,
     #[serde(default)]
     pub gate_source_level: Option<bool>,
+    #[serde(default)]
+    pub gate_runtime_surface: Option<bool>,
 }
 
 impl PolicyOverrides {
@@ -212,6 +219,9 @@ impl PolicyOverrides {
         }
         if let Some(v) = self.gate_source_level {
             base.gate_source_level = v;
+        }
+        if let Some(v) = self.gate_runtime_surface {
+            base.gate_runtime_surface = v;
         }
         base
     }
@@ -271,6 +281,7 @@ pub struct ResolvedPolicy {
     pub gate_call_abi: Sourced<bool>,
     pub gate_event_indexer: Sourced<bool>,
     pub gate_source_level: Sourced<bool>,
+    pub gate_runtime_surface: Sourced<bool>,
 }
 
 impl ResolvedPolicy {
@@ -284,6 +295,7 @@ impl ResolvedPolicy {
             gate_call_abi: set(&self.gate_call_abi),
             gate_event_indexer: set(&self.gate_event_indexer),
             gate_source_level: set(&self.gate_source_level),
+            gate_runtime_surface: set(&self.gate_runtime_surface),
         }
     }
 }
@@ -684,6 +696,7 @@ fn fold_settings(layers: &[Layer], pair: &Layer, cli: &CliSettings) -> ResolvedS
             gate_call_abi: gate(|p| p.gate_call_abi, defaults.gate_call_abi),
             gate_event_indexer: gate(|p| p.gate_event_indexer, defaults.gate_event_indexer),
             gate_source_level: gate(|p| p.gate_source_level, defaults.gate_source_level),
+            gate_runtime_surface: gate(|p| p.gate_runtime_surface, defaults.gate_runtime_surface),
         },
         limits: ResolvedLimits {
             max_xdr_depth: limit!(max_xdr_depth),
@@ -833,10 +846,10 @@ impl ResolvedManifest {
             out.push_str(&format!("      old:        {}\n", pair.old.display()));
             out.push_str(&format!("      new:        {}\n", pair.new.display()));
             for (key, value, origin) in pair.settings.rows() {
-                // Width covers the longest key (`policy.gate_storage_layout`) so
-                // the `=` column stays aligned across every row.
+                // Width covers the longest key (`policy.gate_runtime_surface`)
+                // so the `=` column stays aligned across every row.
                 out.push_str(&format!(
-                    "      {key:<26} = {value:<12} ({origin})\n",
+                    "      {key:<27} = {value:<12} ({origin})\n",
                     key = key,
                     value = value,
                     origin = origin
@@ -933,6 +946,11 @@ impl ResolvedSettings {
                 "policy.gate_source_level",
                 self.policy.gate_source_level.value.to_string(),
                 self.policy.gate_source_level.origin.to_string(),
+            ),
+            (
+                "policy.gate_runtime_surface",
+                self.policy.gate_runtime_surface.value.to_string(),
+                self.policy.gate_runtime_surface.origin.to_string(),
             ),
             (
                 "limits.max_xdr_depth",
@@ -1608,6 +1626,73 @@ mod tests {
             ResourcePolicy::default().max_walk_depth
         );
         assert_eq!(limits.max_walk_depth.origin, Origin::BuiltIn);
+    }
+
+    #[test]
+    fn every_policy_gate_is_overridable_from_a_manifest() {
+        // `PolicyOverrides` mirrors `suppression::PolicyConfig` field for field.
+        // When a new axis is added there and not here, a manifest silently loses
+        // the ability to configure it — and `deny_unknown_fields` turns the
+        // attempt into a confusing hard error. This test pins the two together:
+        // serializing a fully-populated override set must name every gate the
+        // resolved policy reports, so adding an axis fails here first.
+        let all_set = PolicyOverrides {
+            gate_storage_layout: Some(false),
+            gate_call_abi: Some(false),
+            gate_event_indexer: Some(true),
+            gate_source_level: Some(true),
+            gate_runtime_surface: Some(false),
+        };
+        let folded = all_set.apply_to(PolicyConfig::default());
+        assert!(!folded.gate_storage_layout);
+        assert!(!folded.gate_call_abi);
+        assert!(folded.gate_event_indexer);
+        assert!(folded.gate_source_level);
+        assert!(!folded.gate_runtime_surface);
+
+        // Every gate the resolver reports must be settable through the schema.
+        let reported: Vec<String> = cli_only_settings(&CliSettings::default())
+            .rows()
+            .into_iter()
+            .filter(|(key, _, _)| key.starts_with("policy."))
+            .map(|(key, _, _)| key.trim_start_matches("policy.").to_string())
+            .collect();
+        let settable = serde_json::to_value(all_set).expect("overrides must serialize");
+        let settable = settable.as_object().expect("overrides is a map");
+        for gate in &reported {
+            assert!(
+                settable.contains_key(gate),
+                "gate '{gate}' is reported in provenance but cannot be set in a manifest; \
+                 add it to PolicyOverrides"
+            );
+        }
+        assert_eq!(reported.len(), settable.len(), "gates: {reported:?}");
+    }
+
+    #[test]
+    fn a_manifest_can_override_the_runtime_surface_gate() {
+        let dir = temp_dir("runtime-surface");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+
+            [pairs.policy]
+            gate_runtime_surface = false
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        let policy = &resolved.pairs[0].settings.policy;
+        assert!(!policy.gate_runtime_surface.value);
+        assert_eq!(policy.gate_runtime_surface.origin, Origin::File(root));
+
+        let config = resolved.pairs[0]
+            .settings
+            .apply_policy(SuppressionConfig::default());
+        assert!(!config.policy().gate_runtime_surface);
     }
 
     #[test]

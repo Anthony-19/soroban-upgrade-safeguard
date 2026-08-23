@@ -46,10 +46,11 @@ ascii    = false
 no_timestamp = false
 
 [defaults.policy]             # which axes gate the verdict
-gate_storage_layout = true
-gate_call_abi       = true
-gate_event_indexer  = false
-gate_source_level   = false
+gate_storage_layout  = true
+gate_call_abi        = true
+gate_event_indexer   = false
+gate_source_level    = false
+gate_runtime_surface = true
 
 [defaults.limits]             # resolved and reported; see "What is not wired up"
 max_xdr_depth = 64
@@ -85,7 +86,7 @@ Every field a pair accepts, `[defaults]` accepts too, and vice versa — except
 | `explain` | `[defaults]`, pair | Include remediation text in the report. |
 | `ascii` | `[defaults]`, pair | ASCII markers instead of emoji. |
 | `no_timestamp` | `[defaults]`, pair | Omit timestamps, for snapshot testing. |
-| `[policy]` | `[defaults]`, pair | Which compatibility axes gate the verdict. |
+| `[policy]` | `[defaults]`, pair | Which compatibility axes gate the verdict. One key per axis: `gate_storage_layout`, `gate_call_abi`, `gate_event_indexer`, `gate_source_level`, `gate_runtime_surface`. |
 | `[limits]` | `[defaults]`, pair | Resource limits. Resolved and reported only. |
 | `old`, `new`, `name` | pair | The two builds and the report identity. |
 
