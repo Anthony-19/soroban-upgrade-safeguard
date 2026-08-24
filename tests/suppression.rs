@@ -99,6 +99,35 @@ fn findings(json: &Value) -> Vec<(String, Option<String>, bool)> {
 }
 
 #[test]
+fn rule_id_based_suppression_matches_stable_identifier() {
+    let config = write_config(
+        "rule-id",
+        r#"
+        [[suppress]]
+        rule_id = "struct_field_removed"
+        target  = "ConfigData.threshold"
+        reason  = "Reviewed storage migration"
+        "#,
+    );
+
+    let (json, code) = run(Some(&config));
+
+    assert_eq!(
+        code, 1,
+        "unrelated critical findings must still fail the run"
+    );
+    assert_eq!(json["suppressed_count"].as_u64().unwrap(), 1);
+    assert!(
+        findings(&json)
+            .iter()
+            .any(|(c, t, s)| c == "Struct Field Removed"
+                && t.as_deref() == Some("ConfigData.threshold")
+                && *s),
+        "the removed field must appear as suppressed when matched by rule_id"
+    );
+}
+
+#[test]
 fn suppressing_all_criticals_passes_but_still_lists_them() {
     let config = write_config("all", all_critical_suppressions());
 
