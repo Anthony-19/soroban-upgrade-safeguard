@@ -2444,16 +2444,17 @@ fn load_pair_storage_schemas(pair: &BatchPair) -> Result<Option<PairStorageSchem
 fn load_storage_schema(path: &Path) -> Result<soroban_upgrade_safeguard::StorageSchema> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read storage schema '{}'", path.display()))?;
-    let result = if path
+    let format = if path
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
     {
-        soroban_upgrade_safeguard::StorageSchema::from_json(&content)
+        soroban_upgrade_safeguard::SchemaFormat::Json
     } else {
-        soroban_upgrade_safeguard::StorageSchema::from_toml(&content)
+        soroban_upgrade_safeguard::SchemaFormat::Toml
     };
-    result.map_err(|error| anyhow::anyhow!("{}: {}", path.display(), error))
+    soroban_upgrade_safeguard::StorageSchema::from_str(&content, format)
+        .map_err(|error| anyhow::anyhow!("{}: {}", path.display(), error))
 }
 
 fn compare_contracts(

@@ -175,7 +175,9 @@ pub use crate::runtime_surface::{
     DataSegmentSummary, ElementSegmentSummary, GlobalDeclaration, MemoryDeclaration,
     RuntimeSurface, TableDeclaration,
 };
-pub use crate::storage_schema::{StorageReconciliation, StorageSchema, StorageSchemaComparison};
+pub use crate::storage_schema::{
+    SchemaFormat, StorageReconciliation, StorageSchema, StorageSchemaComparison,
+};
 
 use std::path::Path;
 
@@ -311,7 +313,12 @@ pub fn compare_wasm_bytes_with_options(
             new_schema,
             &new_meta.storage,
         );
-        safety_report.apply_storage_schema_comparison(&storage_comparison);
+        safety_report.apply_storage_schema_comparison(
+            &storage_comparison,
+            suppressions,
+            options.explain,
+            options.strict,
+        );
     }
 
     Ok(safety_report)

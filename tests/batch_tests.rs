@@ -294,6 +294,27 @@ fn batch_manifest_partial_schema_is_pair_error_without_aborting_next_pair() {
 }
 
 #[test]
+fn committed_mixed_manifest_fixture_resolves_relative_paths() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("batch")
+        .join("mixed.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args(["--manifest", manifest.to_str().unwrap(), "--format", "json"])
+        .output()
+        .expect("failed to run committed fixture");
+    let json: Value = serde_json::from_slice(&output.stdout).expect("output must be JSON");
+    let results = json["results"].as_array().expect("results must be ordered");
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[0]["coverage"], "schema-backed");
+    assert_eq!(results[1]["coverage"], "interface-only");
+    assert_eq!(results[2]["coverage"], "error");
+    assert_eq!(results[3]["coverage"], "error");
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
 fn batch_markdown_output_shows_scope_and_coverage_columns() {
     let manifest = format!(
         r#"
