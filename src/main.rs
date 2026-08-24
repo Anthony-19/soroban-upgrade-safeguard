@@ -6,16 +6,7 @@ use std::path::{Path, PathBuf};
 
 use soroban_upgrade_safeguard::{
     color::{should_disable_color, ColorMode},
-    dependency::{
-        cycle_findings, missing_contract_findings, ContractDependency, CrossContractFinding,
-        DependencyGraph,
-    },
-    diff,
-    limits::{find_limit_error, LimitsConfig, ResourcePolicy},
-    loader, parser,
-    report::{self, validate_categories, CategoryFilter},
-    spec,
-    storage_schema::StorageSchema,
+    diff, loader, parser, report, spec,
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
 
@@ -170,9 +161,8 @@ fn main() -> Result<()> {
     } else {
         match &args.config {
             Some(path) => SuppressionConfig::load_from_path(path)?,
-            None => {
-                SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?.unwrap_or_default()
-            }
+            None => SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?
+                .unwrap_or_default(),
         }
     };
 

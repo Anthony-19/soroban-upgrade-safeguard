@@ -48,11 +48,8 @@ fn all_critical_suppressions() -> &'static str {
 }
 
 fn temp_dir(name: &str) -> PathBuf {
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "{}-{}",
-        name,
-        std::process::id()
-    ));
+    let path =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{}-{}", name, std::process::id()));
     std::fs::create_dir_all(&path).expect("failed to create temp dir");
     path
 }

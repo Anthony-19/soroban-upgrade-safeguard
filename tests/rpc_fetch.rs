@@ -73,6 +73,47 @@ fn build_code_entry_xdr(wasm_hash: &[u8; 32], code: &[u8]) -> String {
         .expect("failed to encode code entry")
 }
 
+fn read_http_request(stream: &mut std::net::TcpStream) {
+    let mut request = Vec::new();
+    let mut buf = [0u8; 1024];
+
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        let n = stream.read(&mut buf).expect("failed to read request");
+        if n == 0 {
+            return;
+        }
+        request.extend_from_slice(&buf[..n]);
+    }
+
+    let Some(header_end) = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+    else {
+        return;
+    };
+
+    let headers = String::from_utf8_lossy(&request[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+
+    let target_len = header_end + content_length;
+    while request.len() < target_len {
+        let n = stream.read(&mut buf).expect("failed to read request body");
+        if n == 0 {
+            break;
+        }
+        request.extend_from_slice(&buf[..n]);
+    }
+}
+
 /// A tiny HTTP server that handles exactly two sequential `getLedgerEntries`
 /// requests and returns pre-canned JSON-RPC responses.
 ///
@@ -88,10 +129,7 @@ fn start_mock_rpc(instance_xdr: String, code_xdr: String) -> (String, Arc<TcpLis
         for xdr in [instance_xdr, code_xdr].iter() {
             let (mut stream, _) = listener_clone.accept().expect("failed to accept");
 
-            // Read the full HTTP request (we don't need to parse it carefully)
-            let mut buf = [0u8; 8192];
-            let n = stream.read(&mut buf).expect("failed to read request");
-            let _request = String::from_utf8_lossy(&buf[..n]);
+            read_http_request(&mut stream);
 
             let body = serde_json::json!({
                 "jsonrpc": "2.0",
@@ -131,8 +169,7 @@ fn start_mock_rpc_not_found() -> (String, Arc<TcpListener>) {
 
     thread::spawn(move || {
         let (mut stream, _) = listener_clone.accept().expect("failed to accept");
-        let mut buf = [0u8; 8192];
-        let _ = stream.read(&mut buf).expect("failed to read request");
+        read_http_request(&mut stream);
 
         let body = serde_json::json!({
             "jsonrpc": "2.0",
