@@ -154,6 +154,12 @@ pub struct RawPair {
     pub old: PathBuf,
     /// The candidate build.
     pub new: PathBuf,
+    /// Optional declared storage schema for the baseline build.
+    #[serde(default, alias = "old-storage-schema")]
+    pub old_storage_schema: Option<PathBuf>,
+    /// Optional declared storage schema for the candidate build.
+    #[serde(default, alias = "new-storage-schema")]
+    pub new_storage_schema: Option<PathBuf>,
     /// Report name. Defaults to the file name of `new`.
     #[serde(default)]
     pub name: Option<String>,
@@ -345,6 +351,9 @@ pub struct ResolvedPair {
     pub name: String,
     pub old: PathBuf,
     pub new: PathBuf,
+    /// Optional schema paths, resolved against the manifest that declared the pair.
+    pub old_storage_schema: Option<PathBuf>,
+    pub new_storage_schema: Option<PathBuf>,
     /// The manifest file this pair was written in.
     pub defined_in: PathBuf,
     pub settings: ResolvedSettings,
@@ -596,6 +605,16 @@ fn fold_pairs(walk: &Walk, cli: &CliSettings) -> Result<Vec<ResolvedPair>> {
             name,
             old,
             new,
+            old_storage_schema: walked
+                .raw
+                .old_storage_schema
+                .clone()
+                .map(|path| resolve_path(&parent_dir(&walked.defined_in), path)),
+            new_storage_schema: walked
+                .raw
+                .new_storage_schema
+                .clone()
+                .map(|path| resolve_path(&parent_dir(&walked.defined_in), path)),
             defined_in: walked.defined_in.clone(),
             settings,
         });
@@ -845,6 +864,12 @@ impl ResolvedManifest {
             ));
             out.push_str(&format!("      old:        {}\n", pair.old.display()));
             out.push_str(&format!("      new:        {}\n", pair.new.display()));
+            if let Some(path) = &pair.old_storage_schema {
+                out.push_str(&format!("      old schema:  {}\n", path.display()));
+            }
+            if let Some(path) = &pair.new_storage_schema {
+                out.push_str(&format!("      new schema:  {}\n", path.display()));
+            }
             for (key, value, origin) in pair.settings.rows() {
                 // Width covers the longest key (`policy.gate_runtime_surface`)
                 // so the `=` column stays aligned across every row.
@@ -889,6 +914,14 @@ impl ResolvedPair {
             "defined_in": self.defined_in.display().to_string(),
             "old": self.old.display().to_string(),
             "new": self.new.display().to_string(),
+            "old_storage_schema": self
+                .old_storage_schema
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            "new_storage_schema": self
+                .new_storage_schema
+                .as_ref()
+                .map(|path| path.display().to_string()),
             "settings": self.settings.to_json(),
         })
     }
@@ -1053,6 +1086,29 @@ mod tests {
         // Relative paths anchor on the manifest's own directory.
         assert_eq!(resolved.pairs[0].old, dir.join("a_v1.wasm"));
         assert_eq!(resolved.sources, vec![root]);
+    }
+
+    #[test]
+    fn schema_paths_resolve_from_manifest_and_accept_hyphenated_aliases() {
+        let dir = temp_dir("schema-paths");
+        let root = write(
+            &dir,
+            "manifests/root.toml",
+            r#"
+            [[pairs]]
+            old = "../wasm/a_v1.wasm"
+            new = "../wasm/a_v2.wasm"
+            old-storage-schema = "../schemas/a_v1.toml"
+            new_storage_schema = "../schemas/a_v2.json"
+            "#,
+        );
+
+        let resolved = resolve(&root, &CliSettings::default()).expect("resolve failed");
+        let pair = &resolved.pairs[0];
+        assert_eq!(pair.old, dir.join("wasm/a_v1.wasm"));
+        assert_eq!(pair.new, dir.join("wasm/a_v2.wasm"));
+        assert_eq!(pair.old_storage_schema, Some(dir.join("schemas/a_v1.toml")));
+        assert_eq!(pair.new_storage_schema, Some(dir.join("schemas/a_v2.json")));
     }
 
     #[test]

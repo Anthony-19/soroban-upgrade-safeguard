@@ -5,17 +5,6 @@ use crate::suppression::SuppressionConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-const CHECK: &str = "\u{2705}";
-const CROSS: &str = "\u{274c}";
-const BELL: &str = "\u{1f515}";
-const RED_DOT: &str = "\u{1f534}";
-const YELLOW_DOT: &str = "\u{1f7e1}";
-const BLUE_DOT: &str = "\u{1f535}";
-const WARNING: &str = "\u{26a0}\u{fe0f}";
-const ARROW: &str = "\u{21b3}";
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ReportedFinding {
 pub use crate::render::SeverityCounts;
 
 /// The status of a compatibility axis.
@@ -34,11 +23,6 @@ pub struct ReportedFinding {
     #[serde(flatten)]
     #[cfg(feature = "unstable")]
     pub finding: Finding,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub suppressed: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub suppression_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(flatten)]
     #[cfg(not(feature = "unstable"))]
     pub(crate) finding: Finding,
@@ -152,24 +136,6 @@ pub struct SafetyReport {
 
     #[cfg(feature = "unstable")]
     pub strict: bool,
-}
-
-#[derive(Serialize)]
-pub struct SeverityCounts {
-    pub critical: usize,
-    pub warning: usize,
-    pub info: usize,
-}
-
-#[derive(Serialize)]
-pub struct SafetyReportJson<'a> {
-    pub is_safe: bool,
-    pub strict: bool,
-    pub counts: SeverityCounts,
-    pub suppressed_count: usize,
-    pub total_findings: usize,
-    pub recommended_bump: &'static str,
-    pub findings_by_category: BTreeMap<&'a str, &'a Vec<ReportedFinding>>,
     #[cfg(not(feature = "unstable"))]
     pub(crate) strict: bool,
 
@@ -736,9 +702,6 @@ impl SafetyReport {
             if suppressed {
                 suppressed_count += 1;
                 match finding.severity {
-                    Severity::Critical => failing_critical_count += 1,
-                    Severity::Warning => failing_warning_count += 1,
-                    Severity::Info => {}
                     Severity::Critical => suppressed_critical_count += 1,
                     Severity::Warning => suppressed_warning_count += 1,
                     Severity::Info => suppressed_info_count += 1,
@@ -880,9 +843,6 @@ impl SafetyReport {
             is_safe,
             findings_by_category,
             strict,
-        }
-    }
-
             critical_root_count,
             cascade_critical_count,
             old_interface_hash: None,
@@ -933,8 +893,6 @@ impl SafetyReport {
         }
     }
 
-    pub fn to_json(&self) -> SafetyReportJson<'_> {
-        SafetyReportJson {
     fn has_non_documentation_info_findings(&self) -> bool {
         const DOC_CATEGORIES: &[&str] = &[
             "Function Documentation Changed",
@@ -1015,222 +973,6 @@ impl SafetyReport {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-        }
-    }
-
-    pub fn generate_summary_text(&self, explain: bool) -> String {
-        let mut output = String::new();
-
-        let status = if self.is_safe {
-            format!("{CHECK} PASSED (No breaking changes detected)")
-                .green()
-                .bold()
-        } else if self.strict && self.critical_count == 0 {
-            format!("{CROSS} FAILED (Warnings detected in strict mode)")
-                .red()
-                .bold()
-        } else {
-            format!("{CROSS} FAILED (Critical breaking changes detected)")
-                .red()
-                .bold()
-        };
-        output.push_str(&format!("Status: {}\n", status));
-
-        let crit_str = if self.critical_count > 0 {
-            self.critical_count.to_string().red().bold()
-        } else {
-            self.critical_count.to_string().green()
-        };
-        let warn_str = if self.warning_count > 0 {
-            self.warning_count.to_string().yellow().bold()
-        } else {
-            self.warning_count.to_string().normal()
-        };
-
-        output.push_str(&format!("Critical: {}\n", crit_str));
-        output.push_str(&format!("Warnings: {}\n", warn_str));
-        output.push_str(&format!(
-            "Info:     {}\n",
-            self.info_count.to_string().blue()
-        ));
-        if self.suppressed_count > 0 {
-            output.push_str(&format!(
-                "Suppressed: {}\n",
-                self.suppressed_count.to_string().magenta().bold()
-            ));
-        }
-
-        let bump = self.recommended_bump();
-        let bump_str = match bump {
-            "major" => "major".red().bold(),
-            "minor" => "minor".yellow().bold(),
-            "patch" => "patch".green().bold(),
-            _ => bump.normal(),
-        };
-        output.push_str(&format!("Recommended Bump: {}\n", bump_str));
-        output.push_str(
-            &"----------------------------------------\n\n"
-                .dimmed()
-                .to_string(),
-        );
-
-        if self.total_findings == 0 {
-            output.push_str(
-                &"No relevant changes detected. The upgrade is identical in its exports and types.\n"
-                    .green()
-                    .to_string(),
-            );
-            return output;
-        }
-
-        let mut categories: Vec<&String> = self.findings_by_category.keys().collect();
-        categories.sort();
-
-        for category in categories {
-            output.push_str(
-                &format!("--- [{}] ---\n", category.to_ascii_uppercase())
-                    .magenta()
-                    .bold()
-                    .to_string(),
-            );
-            let group = self.findings_by_category.get(category).unwrap();
-            for reported in group {
-                let finding = &reported.finding;
-                if reported.suppressed {
-                    output.push_str(
-                        &format!("{BELL} [SUPPRESSED] {}\n", finding.message)
-                            .dimmed()
-                            .to_string(),
-                    );
-                    if let Some(reason) = &reported.suppression_reason {
-                        output.push_str(
-                            &format!("    {ARROW} reason: {}\n", reason)
-                                .dimmed()
-                                .to_string(),
-                        );
-                    }
-                    if explain {
-                        if let Some(remediation) = &reported.remediation {
-                            output.push_str(
-                                &format!("    {ARROW} guidance: {}\n", remediation)
-                                    .dimmed()
-                                    .to_string(),
-                            );
-                        }
-                    }
-                    continue;
-                }
-
-                let formatted = match finding.severity {
-                    Severity::Critical => format!("{RED_DOT} {}", finding.message).red(),
-                    Severity::Warning => format!("{YELLOW_DOT} {}", finding.message).yellow(),
-                    Severity::Info => format!("{BLUE_DOT} {}", finding.message).cyan(),
-                };
-                output.push_str(&format!("{}\n", formatted));
-                if explain {
-                    if let Some(remediation) = &reported.remediation {
-                        output.push_str(
-                            &format!("    {ARROW} guidance: {}\n", remediation)
-                                .green()
-                                .to_string(),
-                        );
-                    }
-                }
-            }
-            output.push('\n');
-        }
-
-        if !self.is_safe {
-            if self.strict && self.critical_count == 0 {
-                output.push_str(
-                    &format!("{WARNING}  ACTION REQUIRED: Strict mode is active and warnings were detected.\n")
-                        .yellow()
-                        .bold()
-                        .to_string(),
-                );
-                output.push_str(
-                    &"These warnings must be resolved or strict mode disabled to proceed.\n"
-                        .yellow()
-                        .to_string(),
-                );
-            } else {
-                output.push_str(&format!("{WARNING}  ACTION REQUIRED: The new contract version modifies existing storage layouts or function interfaces.\n").red().bold().to_string());
-                output.push_str(&"Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n".red().to_string());
-            }
-        }
-
-        output
-    }
-
-    pub fn generate_summary_markdown(&self) -> String {
-        let mut output = String::new();
-        output.push_str("# Soroban Upgrade Safety Report\n\n");
-
-        let status = if self.is_safe {
-            format!("{CHECK} PASSED (No breaking changes detected)")
-        } else if self.strict && self.critical_count == 0 {
-            format!("{CROSS} FAILED (Warnings detected in strict mode)")
-        } else {
-            format!("{CROSS} FAILED (Critical breaking changes detected)")
-        };
-        output.push_str(&format!("## Status: {}\n\n", status));
-
-        output.push_str("### Summary Table\n\n");
-        output.push_str("| Finding Severity | Count |\n");
-        output.push_str("| :--- | :--- |\n");
-        output.push_str(&format!("| **Critical** | {} |\n", self.critical_count));
-        output.push_str(&format!("| **Warning** | {} |\n", self.warning_count));
-        output.push_str(&format!("| **Info** | {} |\n", self.info_count));
-        if self.suppressed_count > 0 {
-            output.push_str(&format!("| **Suppressed** | {} |\n", self.suppressed_count));
-        }
-        output.push_str(&format!(
-            "\n**Recommended SemVer Bump**: `{}`\n\n",
-            self.recommended_bump()
-        ));
-        output.push_str("---\n\n");
-
-        if self.total_findings == 0 {
-            output.push_str("No relevant changes detected. The exported interface is identical in its exports and types.\n");
-            return output;
-        }
-
-        let mut categories: Vec<&String> = self.findings_by_category.keys().collect();
-        categories.sort();
-
-        for category in categories {
-            output.push_str(&format!("### {}\n\n", category));
-            let group = self.findings_by_category.get(category).unwrap();
-            for reported in group {
-                let finding = &reported.finding;
-                if reported.suppressed {
-                    output.push_str(&format!("- {BELL} **[SUPPRESSED]** {}\n", finding.message));
-                    if let Some(reason) = &reported.suppression_reason {
-                        output.push_str(&format!("  - {ARROW} reason: {}\n", reason));
-                    }
-                    continue;
-                }
-
-                let emoji = match finding.severity {
-                    Severity::Critical => RED_DOT,
-                    Severity::Warning => YELLOW_DOT,
-                    Severity::Info => BLUE_DOT,
-                };
-                output.push_str(&format!("- {} {}\n", emoji, finding.message));
-            }
-            output.push('\n');
-        }
-
-        if !self.is_safe {
-            output.push_str(&format!("### {WARNING} Action Required\n\n"));
-            output.push_str("- The new contract version modifies existing storage layouts or function interfaces.\n");
-            output.push_str("- Deploying this upgrade will result in orphaned data, serialization panics, or broken integrations.\n");
-        }
-
-        output
-    }
-}
-
             axis_verdicts: self.axis_verdicts.iter().map(|(k, v)| (*k, *v)).collect(),
             gated_axes: self.gated_axes.iter().copied().collect(),
             findings_by_axis,
@@ -1337,85 +1079,6 @@ mod tests {
     /// test lives in `category.rs` (`generated_markdown_matches_committed_file`);
     /// this just guards the delegation wrapper.
     #[test]
-    fn test_every_emitted_category_has_guidance() {
-        let diff_rs_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("diff.rs");
-        let content = std::fs::read_to_string(diff_rs_path).expect("Failed to read src/diff.rs");
-
-        let mut checked_categories = std::collections::HashSet::new();
-
-        for line in content.lines() {
-            if line.contains("category:") {
-                if line.contains("ENVIRONMENT_CATEGORY") {
-                    checked_categories.insert("Environment".to_string());
-                    continue;
-                }
-
-                let mut chars = line.chars().peekable();
-                while let Some(c) = chars.next() {
-                    if c == '"' {
-                        let mut literal = String::new();
-                        while let Some(&nc) = chars.peek() {
-                            if nc == '"' {
-                                chars.next();
-                                break;
-                            }
-                            literal.push(chars.next().unwrap());
-                        }
-                        if !literal.is_empty() {
-                            if literal.contains("{}") {
-                                let suffixes = [
-                                    "Removed",
-                                    "Reordered",
-                                    "Type Changed",
-                                    "Value Changed",
-                                    "Added",
-                                ];
-                                for suffix in suffixes {
-                                    if literal == format!("{{}} {}", suffix) {
-                                        let prefixes = match suffix {
-                                            "Reordered" | "Type Changed" => {
-                                                vec!["Struct Field", "Event Field"]
-                                            }
-                                            "Value Changed" | "Added" => {
-                                                vec!["Enum Case", "Event Enum Case"]
-                                            }
-                                            "Removed" => vec![
-                                                "Struct Field",
-                                                "Event Field",
-                                                "Enum Case",
-                                                "Event Enum Case",
-                                            ],
-                                            _ => unreachable!(),
-                                        };
-                                        for prefix in prefixes {
-                                            checked_categories
-                                                .insert(format!("{} {}", prefix, suffix));
-                                        }
-                                    }
-                                }
-                            } else {
-                                checked_categories.insert(literal);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        checked_categories.remove("TOTALLY CUSTOM CATEGORY");
-
-        assert!(
-            !checked_categories.is_empty(),
-            "Sanity check: should have found categories"
-        );
-
-        for cat in &checked_categories {
-            assert!(
-                get_remediation_guidance(cat).is_some(),
-                "Category '{}' does not have remediation guidance!",
-                cat
     fn test_remediation_guidance_resolves_known_categories() {
         for cat in crate::category::FindingCategory::all() {
             let guidance = get_remediation_guidance(cat.as_str());
