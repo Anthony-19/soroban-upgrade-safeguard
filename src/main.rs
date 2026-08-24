@@ -1239,7 +1239,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
         gaps.len()
     ));
 
-    let mut results = std::collections::BTreeMap::new();
+    let mut results = Vec::new();
     let mut overall_safe = true;
     let mut seen_names = std::collections::BTreeSet::new();
     let gap_count = gaps.len();
@@ -1375,7 +1375,15 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             )?;
         }
 
-        results.insert(gap.name, gap_report);
+        results.push(BatchResult::Error {
+            name: gap.name,
+            old_path: gap.old_path,
+            new_path: None,
+            old_storage_schema: None,
+            new_storage_schema: None,
+            error: "contract is missing from the new deployment".to_string(),
+            report: gap_report,
+        });
         overall_safe = false;
     }
 
@@ -1401,31 +1409,54 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             contract_name.bold()
         ));
 
+        let mut pair_error = None;
         let report = match (
             load_wasm_input(&pair.old, &remote_config, &oci_config, progress),
             load_wasm_input(&pair.new, &remote_config, &oci_config, progress),
         ) {
             (Ok(old_wasm), Ok(new_wasm)) => {
-                match compare_contracts(
-                    &ContractComparison {
-                        old_bytes: &old_wasm.bytes,
-                        old_path: &old_wasm.path,
-                        new_bytes: &new_wasm.bytes,
-                        new_path: &new_wasm.path,
-                        suppressions: &pair_suppressions,
-                        explain,
-                        strict: settings.strict.value,
-                        no_timestamp: settings.no_timestamp.value,
-                        empirical: args.empirical || args.empirical_file.is_some(),
-                        empirical_file: args.empirical_file.as_deref(),
-                        contract_id: None,
-                        rpc_url: None,
-                        rpc_headers: &args.rpc_headers,
-                    },
-                    progress,
-                ) {
+                match load_pair_storage_schemas(pair).and_then(|storage_schemas| {
+                    if let Some(storage_schemas) = storage_schemas.as_ref() {
+                        let mut report =
+                            soroban_upgrade_safeguard::compare_wasm_bytes_with_options(
+                                &old_wasm.bytes,
+                                &new_wasm.bytes,
+                                &soroban_upgrade_safeguard::CompareOptions {
+                                    suppressions: Some(&pair_suppressions),
+                                    explain,
+                                    strict: settings.strict.value,
+                                    storage_schemas: Some((
+                                        &storage_schemas.old,
+                                        &storage_schemas.new,
+                                    )),
+                                },
+                            )?;
+                        report.set_no_timestamp(settings.no_timestamp.value);
+                        Ok(report)
+                    } else {
+                        compare_contracts(
+                            &ContractComparison {
+                                old_bytes: &old_wasm.bytes,
+                                old_path: &old_wasm.path,
+                                new_bytes: &new_wasm.bytes,
+                                new_path: &new_wasm.path,
+                                suppressions: &pair_suppressions,
+                                explain,
+                                strict: settings.strict.value,
+                                no_timestamp: settings.no_timestamp.value,
+                                empirical: args.empirical || args.empirical_file.is_some(),
+                                empirical_file: args.empirical_file.as_deref(),
+                                contract_id: None,
+                                rpc_url: None,
+                                rpc_headers: &args.rpc_headers,
+                            },
+                            progress,
+                        )
+                    }
+                }) {
                     Ok(report) => report,
                     Err(e) => {
+                        pair_error = Some(e.to_string());
                         progress(format!(
                             "  ⚠️  Comparison failed for '{}': {}",
                             contract_name,
@@ -1441,6 +1472,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                 }
             }
             (Err(e), _) | (_, Err(e)) => {
+                pair_error = Some(e.to_string());
                 progress(format!(
                     "  ⚠️  Failed to load contract files for '{}': {}",
                     contract_name,
@@ -1488,7 +1520,26 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             )?;
         }
 
-        results.insert(contract_name, report);
+        if let Some(error) = pair_error {
+            results.push(BatchResult::Error {
+                name: contract_name,
+                old_path: pair.old.clone(),
+                new_path: Some(pair.new.clone()),
+                old_storage_schema: pair.old_storage_schema.clone(),
+                new_storage_schema: pair.new_storage_schema.clone(),
+                error,
+                report,
+            });
+        } else {
+            results.push(BatchResult::Success {
+                name: contract_name,
+                old_path: pair.old.clone(),
+                new_path: pair.new.clone(),
+                old_storage_schema: pair.old_storage_schema.clone(),
+                new_storage_schema: pair.new_storage_schema.clone(),
+                report,
+            });
+        }
         progress("\n----------------------------------------\n".to_string());
     }
 
@@ -1606,8 +1657,55 @@ fn synthesize_error_report(
 /// [`ContractComparison`] — the batch verdict, the per-contract reports, and the
 /// manifest provenance are three different things and reading them by name at
 /// the call site is worth more than the brevity.
+enum BatchResult {
+    Success {
+        name: String,
+        old_path: PathBuf,
+        new_path: PathBuf,
+        old_storage_schema: Option<PathBuf>,
+        new_storage_schema: Option<PathBuf>,
+        report: report::SafetyReport,
+    },
+    Error {
+        name: String,
+        old_path: PathBuf,
+        new_path: Option<PathBuf>,
+        old_storage_schema: Option<PathBuf>,
+        new_storage_schema: Option<PathBuf>,
+        error: String,
+        report: report::SafetyReport,
+    },
+}
+
+impl BatchResult {
+    fn name(&self) -> &str {
+        match self {
+            Self::Success { name, .. } | Self::Error { name, .. } => name,
+        }
+    }
+
+    fn report(&self) -> &report::SafetyReport {
+        match self {
+            Self::Success { report, .. } | Self::Error { report, .. } => report,
+        }
+    }
+
+    fn coverage(&self) -> &str {
+        match self {
+            Self::Error { .. } => "error",
+            Self::Success { .. } => {
+                if self.report().scope().storage_analyzed() {
+                    "schema-backed"
+                } else {
+                    "interface-only"
+                }
+            }
+        }
+    }
+}
+
 struct BatchSummary<'a> {
-    results: &'a std::collections::BTreeMap<String, report::SafetyReport>,
+    results: &'a [BatchResult],
     overall_safe: bool,
     total_pairs: usize,
     /// The run-level `--strict` flag. Per-pair strictness lives in the manifest
@@ -1635,9 +1733,57 @@ fn render_batch_summary(
     for output in outputs {
         let content = match output.format {
             OutputFormat::Json => {
-                let mut results_json = serde_json::Map::new();
-                for (name, report) in results {
-                    results_json.insert(name.clone(), serde_json::to_value(report.to_json())?);
+                let mut results_json = Vec::new();
+                for result in results {
+                    let mut entry = serde_json::json!({
+                        "name": result.name(),
+                        "coverage": result.coverage(),
+                        "report": result.report().to_json(),
+                    });
+                    let object = entry
+                        .as_object_mut()
+                        .expect("batch result entry is an object");
+                    match result {
+                        BatchResult::Success {
+                            old_path,
+                            new_path,
+                            old_storage_schema,
+                            new_storage_schema,
+                            ..
+                        } => {
+                            object.insert("old".to_string(), serde_json::json!(old_path));
+                            object.insert("new".to_string(), serde_json::json!(new_path));
+                            object.insert(
+                                "old_storage_schema".to_string(),
+                                serde_json::json!(old_storage_schema),
+                            );
+                            object.insert(
+                                "new_storage_schema".to_string(),
+                                serde_json::json!(new_storage_schema),
+                            );
+                        }
+                        BatchResult::Error {
+                            old_path,
+                            new_path,
+                            old_storage_schema,
+                            new_storage_schema,
+                            error,
+                            ..
+                        } => {
+                            object.insert("error".to_string(), serde_json::json!(error));
+                            object.insert("old".to_string(), serde_json::json!(old_path));
+                            object.insert("new".to_string(), serde_json::json!(new_path));
+                            object.insert(
+                                "old_storage_schema".to_string(),
+                                serde_json::json!(old_storage_schema),
+                            );
+                            object.insert(
+                                "new_storage_schema".to_string(),
+                                serde_json::json!(new_storage_schema),
+                            );
+                        }
+                    }
+                    results_json.push(entry);
                 }
                 let mut batch_json = serde_json::json!({
                     "is_safe": overall_safe,
@@ -1666,20 +1812,24 @@ fn render_batch_summary(
                 };
                 markdown.push_str(&format!("## Status: {}\n\n", status));
                 markdown.push_str("### Summary\n\n");
-                markdown
-                    .push_str("| Contract | Status | Critical | Warning | Info | Suppressed |\n");
-                markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
+                markdown.push_str(
+                    "| Contract | Status | Scope | Coverage | Critical | Warning | Info | Suppressed |\n",
+                );
+                markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n");
 
-                for (name, report) in results {
+                for result in results {
+                    let report = result.report();
                     let status_str = if report.is_safe() {
                         "✅ PASSED"
                     } else {
                         "❌ FAILED"
                     };
                     markdown.push_str(&format!(
-                        "| {} | {} | {} | {} | {} | {} |\n",
-                        name,
+                        "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                        result.name(),
                         status_str,
+                        report.scope().summary_line(),
+                        result.coverage(),
                         report.critical_count(),
                         report.warning_count(),
                         report.info_count(),
@@ -1689,8 +1839,12 @@ fn render_batch_summary(
 
                 markdown.push_str("\n---\n\n");
 
-                for (name, report) in results {
-                    markdown.push_str(&format!("## Details: {}\n\n", name));
+                for result in results {
+                    markdown.push_str(&format!("## Details: {}\n\n", result.name()));
+                    let report = result.report();
+                    if let BatchResult::Error { error, .. } = result {
+                        markdown.push_str(&format!("**Pair error**: `{}`\n\n", error));
+                    }
                     let report_md = report.generate_summary_markdown();
                     let stripped_md = report_md.replace("# Soroban Upgrade Safety Report\n\n", "");
                     markdown.push_str(&stripped_md);
@@ -1719,16 +1873,19 @@ fn render_batch_summary(
                 };
                 text.push_str(&format!("Overall Status: {}\n\n", status));
                 text.push_str("Summary of Contracts:\n");
-                for (name, report) in results {
+                for result in results {
+                    let report = result.report();
                     let status_str = if report.is_safe() {
                         "✅ PASSED".green().to_string()
                     } else {
                         "❌ FAILED".red().bold().to_string()
                     };
                     text.push_str(&format!(
-                        "  - {}: {} ({} critical, {} warnings, {} info, {} suppressed)\n",
-                        name.bold(),
+                        "  - {}: {} [{}; {}] ({} critical, {} warnings, {} info, {} suppressed)\n",
+                        result.name().bold(),
                         status_str,
+                        report.scope().summary_line(),
+                        result.coverage(),
                         report.critical_count(),
                         report.warning_count(),
                         report.info_count(),
@@ -1738,8 +1895,15 @@ fn render_batch_summary(
 
                 text.push_str("\n========================================\n\n");
 
-                for (name, report) in results {
-                    text.push_str(&format!("=== Contract: {} ===\n", name.bold().magenta()));
+                for result in results {
+                    let report = result.report();
+                    text.push_str(&format!(
+                        "=== Contract: {} ===\n",
+                        result.name().bold().magenta()
+                    ));
+                    if let BatchResult::Error { error, .. } = result {
+                        text.push_str(&format!("Pair error: {}\n", error));
+                    }
                     let detail = report.generate_summary_text(false);
                     if ascii {
                         text.push_str(&report::asciify_markers(&detail));
@@ -1756,8 +1920,9 @@ fn render_batch_summary(
             }
             OutputFormat::GithubActions => {
                 let mut output = String::new();
-                for (name, report) in results {
-                    output.push_str(&format!("::group::{name}\n"));
+                for result in results {
+                    output.push_str(&format!("::group::{}\n", result.name()));
+                    let report = result.report();
                     output.push_str(&render_github_actions(report));
                     output.push_str("::endgroup::\n");
                 }
@@ -2223,6 +2388,8 @@ struct BatchPair {
     name: String,
     old: PathBuf,
     new: PathBuf,
+    old_storage_schema: Option<PathBuf>,
+    new_storage_schema: Option<PathBuf>,
     settings: manifest::ResolvedSettings,
 }
 
@@ -2232,6 +2399,8 @@ impl From<manifest::ResolvedPair> for BatchPair {
             name: pair.name,
             old: pair.old,
             new: pair.new,
+            old_storage_schema: pair.old_storage_schema,
+            new_storage_schema: pair.new_storage_schema,
             settings: pair.settings,
         }
     }
@@ -2251,6 +2420,41 @@ struct ContractComparison<'a> {
     contract_id: Option<&'a str>,
     rpc_url: Option<&'a str>,
     rpc_headers: &'a [String],
+}
+
+struct PairStorageSchemas {
+    old: soroban_upgrade_safeguard::StorageSchema,
+    new: soroban_upgrade_safeguard::StorageSchema,
+}
+
+fn load_pair_storage_schemas(pair: &BatchPair) -> Result<Option<PairStorageSchemas>> {
+    match (&pair.old_storage_schema, &pair.new_storage_schema) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => anyhow::bail!(
+            "partial storage schema declaration for '{}': both old_storage_schema and new_storage_schema are required",
+            pair.name
+        ),
+        (Some(old_path), Some(new_path)) => Ok(Some(PairStorageSchemas {
+            old: load_storage_schema(old_path)?,
+            new: load_storage_schema(new_path)?,
+        })),
+    }
+}
+
+fn load_storage_schema(path: &Path) -> Result<soroban_upgrade_safeguard::StorageSchema> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read storage schema '{}'", path.display()))?;
+    let format = if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        soroban_upgrade_safeguard::SchemaFormat::Json
+    } else {
+        soroban_upgrade_safeguard::SchemaFormat::Toml
+    };
+    soroban_upgrade_safeguard::StorageSchema::from_str(&content, format)
+        .map_err(|error| anyhow::anyhow!("{}: {}", path.display(), error))
 }
 
 fn compare_contracts(
@@ -2537,6 +2741,8 @@ fn scan_directories(
                     name: derived,
                     old: path,
                     new: new_path,
+                    old_storage_schema: None,
+                    new_storage_schema: None,
                     settings: settings.clone(),
                 });
             } else {

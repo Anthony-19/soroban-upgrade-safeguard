@@ -230,6 +230,89 @@ pub struct ReportSettings {
 }
 
 impl SafetyReport {
+    pub fn apply_storage_schema_comparison(
+        &mut self,
+        comparison: &crate::storage_schema::StorageSchemaComparison,
+        suppressions: &SuppressionConfig,
+        explain: bool,
+        strict: bool,
+    ) {
+        let key_types = comparison
+            .old
+            .observations
+            .iter()
+            .chain(comparison.new.observations.iter())
+            .filter(|observation| observation.key_type.is_some())
+            .count();
+        let value_types = comparison
+            .old
+            .observations
+            .iter()
+            .chain(comparison.new.observations.iter())
+            .filter(|observation| observation.value_type.is_some())
+            .count();
+        self.scope.storage_schema = StorageScopeState::Analyzed {
+            key_types,
+            value_types,
+        };
+
+        for (side, findings) in [
+            ("old", &comparison.old.findings),
+            ("new", &comparison.new.findings),
+        ] {
+            for mismatch in findings {
+                let category = "Storage Schema Mismatch".to_string();
+                let message = format!(
+                    "{} storage schema mismatch: {}",
+                    side,
+                    serde_json::to_string(mismatch)
+                        .unwrap_or_else(|_| "unserializable mismatch".to_string())
+                );
+                let finding = crate::diff::Finding {
+                    severity: crate::diff::Severity::Critical,
+                    axes: vec![crate::diff::CompatibilityAxis::StorageLayout],
+                    category: category.clone(),
+                    message,
+                    type_name: None,
+                    target: None,
+                    root_target: None,
+                };
+                let rule = suppressions.matching_rule(&finding);
+                let suppressed = rule.is_some();
+                self.critical_count += 1;
+                self.total_findings += 1;
+                if suppressed {
+                    self.suppressed_count += 1;
+                    self.suppressed_critical_count += 1;
+                }
+                if !suppressed {
+                    let storage_gated = suppressions.policy.gate_storage_layout || strict;
+                    if storage_gated {
+                        self.is_safe = false;
+                        self.axis_verdicts.insert(
+                            crate::diff::CompatibilityAxis::StorageLayout,
+                            AxisStatus::Failed,
+                        );
+                    }
+                }
+                self.findings_by_category
+                    .entry(category)
+                    .or_default()
+                    .push(ReportedFinding {
+                        rule_id: "storage_schema_mismatch".to_string(),
+                        axes: finding.axes.clone(),
+                        finding,
+                        suppressed,
+                        suppression_reason: rule.and_then(|rule| rule.reason.clone()),
+                        remediation: explain.then(|| {
+                            "Reconcile the declared schema with the compiled storage behavior."
+                                .to_string()
+                        }),
+                    });
+            }
+        }
+    }
+
     pub fn critical_count(&self) -> usize {
         self.critical_count
     }
@@ -336,7 +419,7 @@ impl SafetyReport {
 }
 
 /// Track what was analyzed in the report.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnalysisScope {
     pub exported_interface: bool,
     pub env_metadata: bool,
@@ -389,7 +472,7 @@ impl AnalysisScope {
 }
 
 /// Whether storage schema analysis was performed.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum StorageScopeState {
     #[default]
     NotAnalyzed,
@@ -968,6 +1051,12 @@ impl SafetyReport {
             recommended_bump: self.recommended_bump().to_string(),
             old_interface_hash: self.old_interface_hash.map(|h| h.to_hex()),
             new_interface_hash: self.new_interface_hash.map(|h| h.to_hex()),
+            scope: self.scope.clone(),
+            storage_coverage: if self.scope.storage_analyzed() {
+                "schema-backed".to_string()
+            } else {
+                "interface-only".to_string()
+            },
             findings_by_category: self
                 .findings_by_category
                 .iter()

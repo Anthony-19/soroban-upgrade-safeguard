@@ -120,6 +120,16 @@ fn origin_of(json: &Value, pair_name: &str, path: &[&str]) -> String {
         .to_string()
 }
 
+fn result<'a>(json: &'a Value, pair_name: &str) -> &'a Value {
+    json["results"]
+        .as_array()
+        .expect("results must be an ordered array")
+        .iter()
+        .find(|entry| entry["name"] == pair_name)
+        .and_then(|entry| entry.get("report"))
+        .unwrap_or_else(|| panic!("no result named '{pair_name}'"))
+}
+
 // ── Composition ──────────────────────────────────────────────────────────────
 
 #[test]
@@ -207,10 +217,11 @@ fn nested_includes_compose_depth_first() {
         .collect();
     assert_eq!(sources, vec!["b.toml", "a.toml", "root.toml"]);
 
-    // Reports are still keyed by name and sorted, as before.
-    let results = json["results"].as_object().unwrap();
+    let results = json["results"].as_array().unwrap();
     assert_eq!(results.len(), 3);
-    assert!(results.contains_key("a") && results.contains_key("b") && results.contains_key("root"));
+    assert_eq!(results[0]["name"], "b");
+    assert_eq!(results[1]["name"], "a");
+    assert_eq!(results[2]["name"], "root");
 }
 
 #[test]
@@ -398,7 +409,7 @@ fn a_gate_can_be_turned_off_because_gates_are_valued_not_escalation() {
         false
     );
     // The findings are still reported — ungating changes the verdict, not visibility.
-    assert_eq!(json["results"]["token"]["counts"]["critical"], 3);
+    assert_eq!(result(&json, "token")["counts"]["critical"], 3);
 }
 
 #[test]
@@ -451,14 +462,14 @@ fn per_pair_config_applies_only_to_its_own_pair() {
 
     // The config applies to the pair that named it. Suppressed findings stay
     // counted and visible — suppression flips the verdict, not the tally.
-    assert_eq!(json["results"]["suppressed"]["counts"]["critical"], 3);
-    assert_eq!(json["results"]["suppressed"]["suppressed_count"], 3);
-    assert_eq!(json["results"]["suppressed"]["is_safe"], true);
+    assert_eq!(result(&json, "suppressed")["counts"]["critical"], 3);
+    assert_eq!(result(&json, "suppressed")["suppressed_count"], 3);
+    assert_eq!(result(&json, "suppressed")["is_safe"], true);
 
     // ...and not to its sibling, which sees the same three findings unsuppressed.
-    assert_eq!(json["results"]["unsuppressed"]["counts"]["critical"], 3);
-    assert_eq!(json["results"]["unsuppressed"]["suppressed_count"], 0);
-    assert_eq!(json["results"]["unsuppressed"]["is_safe"], false);
+    assert_eq!(result(&json, "unsuppressed")["counts"]["critical"], 3);
+    assert_eq!(result(&json, "unsuppressed")["suppressed_count"], 0);
+    assert_eq!(result(&json, "unsuppressed")["is_safe"], false);
 
     // One pair still failing keeps the batch verdict failing.
     assert_eq!(run.code, 1);
@@ -915,11 +926,8 @@ fn a_flat_toml_manifest_behaves_exactly_as_before() {
     let json = run.json();
     assert_eq!(json["total_pairs"], 2);
     assert_eq!(json["is_safe"], false);
-    assert_eq!(json["results"]["clean_contract"]["is_safe"], true);
-    assert_eq!(
-        json["results"]["breaking_contract"]["counts"]["critical"],
-        3
-    );
+    assert_eq!(result(&json, "clean_contract")["is_safe"], true);
+    assert_eq!(result(&json, "breaking_contract")["counts"]["critical"], 3);
 }
 
 #[test]
@@ -943,8 +951,8 @@ fn a_flat_json_manifest_behaves_exactly_as_before() {
 
     let json = run.json();
     assert_eq!(json["total_pairs"], 2);
-    assert_eq!(json["results"]["clean"]["is_safe"], true);
-    assert_eq!(json["results"]["breaking"]["counts"]["critical"], 3);
+    assert_eq!(result(&json, "clean")["is_safe"], true);
+    assert_eq!(result(&json, "breaking")["counts"]["critical"], 3);
 }
 
 #[test]
@@ -1019,7 +1027,7 @@ fn directory_scan_mode_is_unaffected_and_emits_no_manifest_block() {
     assert_eq!(run.code, 1);
 
     let json = run.json();
-    assert_eq!(json["results"]["token"]["counts"]["critical"], 3);
+    assert_eq!(result(&json, "token")["counts"]["critical"], 3);
     // There is no composition to describe, so the key is absent rather than empty.
     assert!(
         json.get("manifest").is_none(),
@@ -1154,15 +1162,15 @@ fn the_same_manifest_yields_byte_identical_json() {
     assert_eq!(first.json()["is_safe"], second.json()["is_safe"]);
     assert_eq!(first.json()["total_pairs"], second.json()["total_pairs"]);
 
-    // Report order stays name-sorted regardless of composition order.
+    // Report order follows manifest composition order.
     let json = first.json();
     let names: Vec<&str> = json["results"]
-        .as_object()
+        .as_array()
         .unwrap()
-        .keys()
-        .map(|k| k.as_str())
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["a", "b"]);
+    assert_eq!(names, vec!["b", "a"]);
 
     // Provenance keeps composition order, which is the useful order there.
     let pair_names: Vec<&str> = json["manifest"]["pairs"]

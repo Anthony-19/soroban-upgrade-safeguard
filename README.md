@@ -159,6 +159,8 @@ strict   = false
 old    = "token_v1.wasm"
 new    = "token_v2.wasm"
 name   = "token"
+old_storage_schema = "schemas/token_v1.json"
+new_storage_schema = "schemas/token_v2.json"
 strict = true                      # this one contract is held to a stricter bar
 
 [pairs.policy]
@@ -174,7 +176,7 @@ soroban-upgrade-safeguard --manifest release.toml --explain-manifest
 ```
 
 See [Batch Manifests](docs/batch_manifests.md) for the full schema, includes,
-path rules, and the provenance emitted in JSON reports.
+schema coverage rules, path rules, and JSON provenance.
 
 ### Deterministic output for snapshot testing
 

@@ -1,3 +1,8 @@
+//! # Soroban Upgrade Safeguard
+//!
+//! Library for analyzing and validating Soroban smart-contract upgrades on the
+//! Stellar network. It detects breaking changes in storage layout, function
+//! signatures, and event schemas before an upgrade is deployed.
 #[cfg(feature = "unstable")]
 pub mod attestation;
 #[cfg(not(feature = "unstable"))]
@@ -170,7 +175,9 @@ pub use crate::runtime_surface::{
     DataSegmentSummary, ElementSegmentSummary, GlobalDeclaration, MemoryDeclaration,
     RuntimeSurface, TableDeclaration,
 };
-pub use crate::storage_schema::{StorageReconciliation, StorageSchema, StorageSchemaComparison};
+pub use crate::storage_schema::{
+    SchemaFormat, StorageReconciliation, StorageSchema, StorageSchemaComparison,
+};
 
 use std::path::Path;
 
@@ -244,6 +251,7 @@ pub struct CompareOptions<'a> {
     pub suppressions: Option<&'a SuppressionConfig>,
     pub explain: bool,
     pub strict: bool,
+    pub storage_schemas: Option<(&'a StorageSchema, &'a StorageSchema)>,
 }
 
 /// Compare two Soroban contract builds supplied as raw WASM byte slices with options.
@@ -293,8 +301,25 @@ pub fn compare_wasm_bytes_with_options(
         &old_spec,
         &new_spec,
     );
+    safety_report.scope.exported_interface = true;
+    safety_report.scope.env_metadata = old_meta.env_meta.is_some() || new_meta.env_meta.is_some();
     safety_report.old_spec_summary = Some(old_spec.summary());
     safety_report.new_spec_summary = Some(new_spec.summary());
+
+    if let Some((old_schema, new_schema)) = options.storage_schemas {
+        let storage_comparison = storage_schema::compare_storage_schemas(
+            old_schema,
+            &old_meta.storage,
+            new_schema,
+            &new_meta.storage,
+        );
+        safety_report.apply_storage_schema_comparison(
+            &storage_comparison,
+            suppressions,
+            options.explain,
+            options.strict,
+        );
+    }
 
     Ok(safety_report)
 }

@@ -481,6 +481,48 @@ soroban-upgrade-safeguard ./on-chain.wasm ./candidate.wasm \
 
 Both flags are required together. Supplying only one is an error, because a single snapshot cannot show a change. Keep the manifest versioned next to your contract and update it in the same commit that changes a storage type.
 
+#### Schemas in batch manifests
+
+Each `[[pairs]]` entry may provide its own `old_storage_schema` and
+`new_storage_schema` fields. Schema-backed and interface-only comparisons can
+therefore coexist in one batch:
+
+```toml
+[[pairs]]
+old = "artifacts/token_v1.wasm"
+new = "artifacts/token_v2.wasm"
+name = "token"
+old_storage_schema = "schemas/token_v1.json"
+new_storage_schema = "schemas/token_v2.json"
+
+[[pairs]]
+old = "artifacts/oracle_v1.wasm"
+new = "artifacts/oracle_v2.wasm"
+name = "oracle"
+```
+
+The equivalent JSON fields may use ergonomic hyphenated names:
+
+```json
+{
+  "pairs": [
+    {
+      "old": "artifacts/token_v1.wasm",
+      "new": "artifacts/token_v2.wasm",
+      "name": "token",
+      "old-storage-schema": "schemas/token_v1.json",
+      "new-storage-schema": "schemas/token_v2.json"
+    }
+  ]
+}
+```
+
+Schema paths resolve relative to the manifest file that declares the pair,
+just like `old` and `new`. Both schema fields are required together. A partial,
+missing, or invalid schema is a pair-level error: it fails the batch verdict,
+but unrelated pairs continue to run. Directory scan mode remains
+interface-only because it has no schema discovery step.
+
 ### Manifest format
 
 TOML and JSON are both accepted with the same shape. A ready-to-copy template lives at [`.storage-schema.example.toml`](../.storage-schema.example.toml).
@@ -589,7 +631,9 @@ Storage findings count toward `is_safe` and therefore toward the exit code, so a
 
 Coverage is bounded by what you declare. A storage type you forget to declare is not analyzed, and the report does not pretend otherwise. If a declaration references a type that is neither declared in the manifest nor exported by the contract, that dangling reference is reported as an informational finding rather than quietly skipped.
 
-Storage schemas apply to a single contract pair and are refused in batch mode, since one manifest cannot describe several different contracts.
+In batch output, each pair reports `schema-backed`, `interface-only`, or
+`error` coverage. A passing interface-only pair certifies only its exported
+interface and environment metadata; it must not be read as storage verified.
 
 ## Detection Categories
 
