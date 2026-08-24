@@ -79,14 +79,14 @@ fn build_code_entry_xdr(wasm_hash: &[u8; 32], code: &[u8]) -> String {
         .expect("failed to encode code entry")
 }
 
-fn read_http_request(stream: &mut std::net::TcpStream) {
+fn read_http_request(stream: &mut std::net::TcpStream) -> String {
     let mut request = Vec::new();
     let mut buf = [0u8; 1024];
 
     while !request.windows(4).any(|window| window == b"\r\n\r\n") {
         let n = stream.read(&mut buf).expect("failed to read request");
         if n == 0 {
-            return;
+            return String::new();
         }
         request.extend_from_slice(&buf[..n]);
     }
@@ -96,7 +96,7 @@ fn read_http_request(stream: &mut std::net::TcpStream) {
         .position(|window| window == b"\r\n\r\n")
         .map(|index| index + 4)
     else {
-        return;
+        return String::new();
     };
 
     let headers = String::from_utf8_lossy(&request[..header_end]);
@@ -118,6 +118,15 @@ fn read_http_request(stream: &mut std::net::TcpStream) {
         }
         request.extend_from_slice(&buf[..n]);
     }
+
+    String::from_utf8_lossy(&request).into_owned()
+}
+
+fn finish_http_response(stream: &mut std::net::TcpStream, response: &[u8]) {
+    stream
+        .write_all(response)
+        .expect("failed to write HTTP response");
+    stream.flush().expect("failed to flush HTTP response");
 }
 
 /// A tiny HTTP server that handles exactly two sequential `getLedgerEntries`

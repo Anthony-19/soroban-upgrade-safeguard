@@ -604,6 +604,7 @@ fn process_job(
             suppressions: Some(&suppressions),
             explain: job.overrides.explain,
             strict,
+            storage_schemas: None,
         },
     ) {
         Ok(report) => {

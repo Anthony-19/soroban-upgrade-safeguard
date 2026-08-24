@@ -1105,10 +1105,17 @@ mod tests {
 
         let resolved = resolve(&root, &CliSettings::default()).expect("resolve failed");
         let pair = &resolved.pairs[0];
-        assert_eq!(pair.old, dir.join("wasm/a_v1.wasm"));
-        assert_eq!(pair.new, dir.join("wasm/a_v2.wasm"));
-        assert_eq!(pair.old_storage_schema, Some(dir.join("schemas/a_v1.toml")));
-        assert_eq!(pair.new_storage_schema, Some(dir.join("schemas/a_v2.json")));
+        let manifest_dir = dir.join("manifests");
+        assert_eq!(pair.old, manifest_dir.join("../wasm/a_v1.wasm"));
+        assert_eq!(pair.new, manifest_dir.join("../wasm/a_v2.wasm"));
+        assert_eq!(
+            pair.old_storage_schema,
+            Some(manifest_dir.join("../schemas/a_v1.toml"))
+        );
+        assert_eq!(
+            pair.new_storage_schema,
+            Some(manifest_dir.join("../schemas/a_v2.json"))
+        );
     }
 
     #[test]

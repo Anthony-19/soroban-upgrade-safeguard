@@ -123,6 +123,11 @@ pub struct RenderableReport {
     /// Interface hash of the new build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_interface_hash: Option<String>,
+    /// Analysis scope and storage coverage for this report.
+    #[serde(default)]
+    pub scope: crate::report::AnalysisScope,
+    #[serde(default)]
+    pub storage_coverage: String,
     /// Categories in a [`BTreeMap`] so the JSON key order is stable and
     /// diffable across runs.
     pub findings_by_category: BTreeMap<String, Vec<ReportedFinding>>,
@@ -269,6 +274,8 @@ impl RenderableReport {
                 .bold()
         };
         output.push_str(&format!("Status: {}\n", status));
+        output.push_str(&format!("Analysis scope: {}\n", self.scope.summary_line()));
+        output.push_str(&format!("Storage coverage: {}\n", self.storage_coverage));
 
         output.push_str("\nCompatibility Verdicts:\n");
         let axes_in_order = vec![
@@ -505,6 +512,14 @@ impl RenderableReport {
             "❌ FAILED (Critical breaking changes detected)"
         };
         output.push_str(&format!("## Status: {}\n\n", status));
+        output.push_str(&format!(
+            "**Analysis scope**: `{}`  \n",
+            self.scope.summary_line()
+        ));
+        output.push_str(&format!(
+            "**Storage coverage**: `{}`\n\n",
+            self.storage_coverage
+        ));
 
         output.push_str("### Compatibility Verdicts\n\n");
         output.push_str("| Compatibility Axis | Status | Gated |\n");

@@ -230,6 +230,43 @@ pub struct ReportSettings {
 }
 
 impl SafetyReport {
+    pub fn apply_storage_schema_comparison(
+        &mut self,
+        comparison: &crate::storage_schema::StorageSchemaComparison,
+    ) {
+        let key_types = comparison
+            .old
+            .observations
+            .iter()
+            .chain(comparison.new.observations.iter())
+            .filter(|observation| observation.key_type.is_some())
+            .count();
+        let value_types = comparison
+            .old
+            .observations
+            .iter()
+            .chain(comparison.new.observations.iter())
+            .filter(|observation| observation.value_type.is_some())
+            .count();
+        self.scope.storage_schema = StorageScopeState::Analyzed {
+            key_types,
+            value_types,
+        };
+
+        let mismatch_count = comparison.old.findings.len() + comparison.new.findings.len();
+        if mismatch_count > 0 {
+            self.critical_count += mismatch_count;
+            self.total_findings += mismatch_count;
+            self.is_safe = false;
+            self.axis_verdicts.insert(
+                crate::diff::CompatibilityAxis::StorageLayout,
+                AxisStatus::Failed,
+            );
+            self.gated_axes
+                .insert(crate::diff::CompatibilityAxis::StorageLayout);
+        }
+    }
+
     pub fn critical_count(&self) -> usize {
         self.critical_count
     }
@@ -336,7 +373,7 @@ impl SafetyReport {
 }
 
 /// Track what was analyzed in the report.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnalysisScope {
     pub exported_interface: bool,
     pub env_metadata: bool,
@@ -389,7 +426,7 @@ impl AnalysisScope {
 }
 
 /// Whether storage schema analysis was performed.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum StorageScopeState {
     #[default]
     NotAnalyzed,
@@ -968,6 +1005,12 @@ impl SafetyReport {
             recommended_bump: self.recommended_bump().to_string(),
             old_interface_hash: self.old_interface_hash.map(|h| h.to_hex()),
             new_interface_hash: self.new_interface_hash.map(|h| h.to_hex()),
+            scope: self.scope.clone(),
+            storage_coverage: if self.scope.storage_analyzed() {
+                "schema-backed".to_string()
+            } else {
+                "interface-only".to_string()
+            },
             findings_by_category: self
                 .findings_by_category
                 .iter()

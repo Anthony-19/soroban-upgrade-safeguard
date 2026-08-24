@@ -62,6 +62,8 @@ max_walk_depth = 128
 old  = "token_v1.wasm"
 new  = "token_v2.wasm"
 name = "token"
+old_storage_schema = "schemas/token_v1.json"
+new-storage-schema = "schemas/token_v2.json"
 strict = true                 # per-pair override
 config = "token.safeguard.toml"
 
@@ -89,6 +91,7 @@ Every field a pair accepts, `[defaults]` accepts too, and vice versa — except
 | `[policy]` | `[defaults]`, pair | Which compatibility axes gate the verdict. One key per axis: `gate_storage_layout`, `gate_call_abi`, `gate_event_indexer`, `gate_source_level`, `gate_runtime_surface`. |
 | `[limits]` | `[defaults]`, pair | Resource limits. Resolved and reported only. |
 | `old`, `new`, `name` | pair | The two builds and the report identity. |
+| `old_storage_schema`, `new_storage_schema` | pair | Optional old/new storage schemas. Both must be supplied together. |
 
 Unknown keys are a **hard error**, everywhere — top level, `[defaults]`, and on a
 pair. Composition multiplies files, and a `strictt = true` silently dropped in a
@@ -153,17 +156,17 @@ that same order — so `root.toml` wins over `a.toml`, which wins over `b.toml`.
 An included file uses the same schema as a root manifest, so any manifest can be
 used as a fragment and any fragment can be run on its own.
 
-Report output order is unaffected: results stay sorted by contract name, as
-before. Composition order shows up only in the `manifest` provenance block, where
-it is the useful order.
+Report output follows manifest order. JSON batch output uses an ordered
+`results` array; each entry includes its name, paths, coverage, and report (or
+the pair-level error).
 
 Include chains are bounded at **8** levels deep and may not cycle; both are hard
 errors that print the full chain.
 
 ## Path resolution
 
-Every relative path — `include` targets, `base_dir`, `config`, and a pair's
-`old`/`new` — resolves against **the directory of the file that wrote it**, never
+Every relative path — `include` targets, `base_dir`, `config`, a pair's
+`old`/`new`, and its storage schemas — resolves against **the directory of the file that wrote it**, never
 the process working directory. A fragment can therefore be moved, vendored, or
 included from anywhere and still find its own artifacts:
 
@@ -210,6 +213,55 @@ never leaves partial reports on disk.
 A pair's identity is its explicit `name`, or the file name of `new` when `name`
 is omitted — unchanged from before. Duplicate detection now runs ahead of
 execution rather than mid-loop, so a collision fails with nothing written.
+
+### Storage schema coverage
+
+Storage schemas are pair-local, so schema-backed and interface-only pairs can
+coexist in one manifest:
+
+```toml
+[[pairs]]
+old = "artifacts/token_v1.wasm"
+new = "artifacts/token_v2.wasm"
+name = "token"
+old_storage_schema = "schemas/token_v1.json"
+new_storage_schema = "schemas/token_v2.json"
+```
+
+Schema files use the same declaration shape as single-pair analysis:
+
+```json
+{
+  "declarations": [
+    {
+      "name": "balance",
+      "function": "balance",
+      "operation": "get",
+      "durability": "persistent",
+      "key_type": "Address",
+      "value_type": "i128"
+    }
+  ]
+}
+```
+
+The equivalent TOML is:
+
+```toml
+[[declarations]]
+name = "balance"
+function = "balance"
+operation = "get"
+durability = "persistent"
+key_type = "Address"
+value_type = "i128"
+```
+
+`schema-backed` means both schemas loaded and were reconciled. `interface-only`
+means no schemas were declared, so storage was not verified. A partial,
+missing, or invalid schema is a pair-level error and fails the aggregate
+verdict without stopping unrelated pairs. Directory scans remain
+interface-only because they do not discover schemas.
 
 ## Provenance
 
@@ -271,7 +323,15 @@ key, alongside `is_safe` / `strict` / `total_pairs` / `results`:
     ],
     "dependencies": []
   },
-  "results": { "token": { "...": "..." } }
+  "results": [
+    {
+      "name": "token",
+      "coverage": "schema-backed",
+      "old": "/repo/artifacts/token_v1.wasm",
+      "new": "/repo/artifacts/token_v2.wasm",
+      "report": { "...": "..." }
+    }
+  ]
 }
 ```
 

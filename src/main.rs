@@ -1416,25 +1416,43 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
         ) {
             (Ok(old_wasm), Ok(new_wasm)) => {
                 match load_pair_storage_schemas(pair).and_then(|storage_schemas| {
-                    compare_contracts(
-                        &ContractComparison {
-                            old_bytes: &old_wasm.bytes,
-                            old_path: &old_wasm.path,
-                            new_bytes: &new_wasm.bytes,
-                            new_path: &new_wasm.path,
-                            suppressions: &pair_suppressions,
-                            explain,
-                            strict: settings.strict.value,
-                            no_timestamp: settings.no_timestamp.value,
-                            empirical: args.empirical || args.empirical_file.is_some(),
-                            empirical_file: args.empirical_file.as_deref(),
-                            contract_id: None,
-                            rpc_url: None,
-                            rpc_headers: &args.rpc_headers,
-                            storage_schemas: storage_schemas.as_ref(),
-                        },
-                        progress,
-                    )
+                    if let Some(storage_schemas) = storage_schemas.as_ref() {
+                        let mut report =
+                            soroban_upgrade_safeguard::compare_wasm_bytes_with_options(
+                                &old_wasm.bytes,
+                                &new_wasm.bytes,
+                                &soroban_upgrade_safeguard::CompareOptions {
+                                    suppressions: Some(&pair_suppressions),
+                                    explain,
+                                    strict: settings.strict.value,
+                                    storage_schemas: Some((
+                                        &storage_schemas.old,
+                                        &storage_schemas.new,
+                                    )),
+                                },
+                            )?;
+                        report.set_no_timestamp(settings.no_timestamp.value);
+                        Ok(report)
+                    } else {
+                        compare_contracts(
+                            &ContractComparison {
+                                old_bytes: &old_wasm.bytes,
+                                old_path: &old_wasm.path,
+                                new_bytes: &new_wasm.bytes,
+                                new_path: &new_wasm.path,
+                                suppressions: &pair_suppressions,
+                                explain,
+                                strict: settings.strict.value,
+                                no_timestamp: settings.no_timestamp.value,
+                                empirical: args.empirical || args.empirical_file.is_some(),
+                                empirical_file: args.empirical_file.as_deref(),
+                                contract_id: None,
+                                rpc_url: None,
+                                rpc_headers: &args.rpc_headers,
+                            },
+                            progress,
+                        )
+                    }
                 }) {
                     Ok(report) => report,
                     Err(e) => {
@@ -1671,6 +1689,19 @@ impl BatchResult {
             Self::Success { report, .. } | Self::Error { report, .. } => report,
         }
     }
+
+    fn coverage(&self) -> &str {
+        match self {
+            Self::Error { .. } => "error",
+            Self::Success { .. } => {
+                if self.report().scope().storage_analyzed() {
+                    "schema-backed"
+                } else {
+                    "interface-only"
+                }
+            }
+        }
+    }
 }
 
 struct BatchSummary<'a> {
@@ -1702,12 +1733,57 @@ fn render_batch_summary(
     for output in outputs {
         let content = match output.format {
             OutputFormat::Json => {
-                let mut results_json = serde_json::Map::new();
+                let mut results_json = Vec::new();
                 for result in results {
-                    results_json.insert(
-                        result.name().to_string(),
-                        serde_json::to_value(result.report().to_json())?,
-                    );
+                    let mut entry = serde_json::json!({
+                        "name": result.name(),
+                        "coverage": result.coverage(),
+                        "report": result.report().to_json(),
+                    });
+                    let object = entry
+                        .as_object_mut()
+                        .expect("batch result entry is an object");
+                    match result {
+                        BatchResult::Success {
+                            old_path,
+                            new_path,
+                            old_storage_schema,
+                            new_storage_schema,
+                            ..
+                        } => {
+                            object.insert("old".to_string(), serde_json::json!(old_path));
+                            object.insert("new".to_string(), serde_json::json!(new_path));
+                            object.insert(
+                                "old_storage_schema".to_string(),
+                                serde_json::json!(old_storage_schema),
+                            );
+                            object.insert(
+                                "new_storage_schema".to_string(),
+                                serde_json::json!(new_storage_schema),
+                            );
+                        }
+                        BatchResult::Error {
+                            old_path,
+                            new_path,
+                            old_storage_schema,
+                            new_storage_schema,
+                            error,
+                            ..
+                        } => {
+                            object.insert("error".to_string(), serde_json::json!(error));
+                            object.insert("old".to_string(), serde_json::json!(old_path));
+                            object.insert("new".to_string(), serde_json::json!(new_path));
+                            object.insert(
+                                "old_storage_schema".to_string(),
+                                serde_json::json!(old_storage_schema),
+                            );
+                            object.insert(
+                                "new_storage_schema".to_string(),
+                                serde_json::json!(new_storage_schema),
+                            );
+                        }
+                    }
+                    results_json.push(entry);
                 }
                 let mut batch_json = serde_json::json!({
                     "is_safe": overall_safe,
@@ -1736,9 +1812,10 @@ fn render_batch_summary(
                 };
                 markdown.push_str(&format!("## Status: {}\n\n", status));
                 markdown.push_str("### Summary\n\n");
-                markdown
-                    .push_str("| Contract | Status | Critical | Warning | Info | Suppressed |\n");
-                markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
+                markdown.push_str(
+                    "| Contract | Status | Scope | Coverage | Critical | Warning | Info | Suppressed |\n",
+                );
+                markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n");
 
                 for result in results {
                     let report = result.report();
@@ -1748,9 +1825,11 @@ fn render_batch_summary(
                         "❌ FAILED"
                     };
                     markdown.push_str(&format!(
-                        "| {} | {} | {} | {} | {} | {} |\n",
+                        "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
                         result.name(),
                         status_str,
+                        report.scope().summary_line(),
+                        result.coverage(),
                         report.critical_count(),
                         report.warning_count(),
                         report.info_count(),
@@ -1763,6 +1842,9 @@ fn render_batch_summary(
                 for result in results {
                     markdown.push_str(&format!("## Details: {}\n\n", result.name()));
                     let report = result.report();
+                    if let BatchResult::Error { error, .. } = result {
+                        markdown.push_str(&format!("**Pair error**: `{}`\n\n", error));
+                    }
                     let report_md = report.generate_summary_markdown();
                     let stripped_md = report_md.replace("# Soroban Upgrade Safety Report\n\n", "");
                     markdown.push_str(&stripped_md);
@@ -1799,9 +1881,11 @@ fn render_batch_summary(
                         "❌ FAILED".red().bold().to_string()
                     };
                     text.push_str(&format!(
-                        "  - {}: {} ({} critical, {} warnings, {} info, {} suppressed)\n",
+                        "  - {}: {} [{}; {}] ({} critical, {} warnings, {} info, {} suppressed)\n",
                         result.name().bold(),
                         status_str,
+                        report.scope().summary_line(),
+                        result.coverage(),
                         report.critical_count(),
                         report.warning_count(),
                         report.info_count(),
@@ -1817,6 +1901,9 @@ fn render_batch_summary(
                         "=== Contract: {} ===\n",
                         result.name().bold().magenta()
                     ));
+                    if let BatchResult::Error { error, .. } = result {
+                        text.push_str(&format!("Pair error: {}\n", error));
+                    }
                     let detail = report.generate_summary_text(false);
                     if ascii {
                         text.push_str(&report::asciify_markers(&detail));
@@ -1974,7 +2061,6 @@ fn run_single(
                 contract_id: old_source,
                 rpc_url: args.rpc_url.as_deref(),
                 rpc_headers: &args.rpc_headers,
-                storage_schemas: None,
             },
             progress,
         )?;
@@ -2334,7 +2420,6 @@ struct ContractComparison<'a> {
     contract_id: Option<&'a str>,
     rpc_url: Option<&'a str>,
     rpc_headers: &'a [String],
-    storage_schemas: Option<&'a PairStorageSchemas>,
 }
 
 struct PairStorageSchemas {
@@ -2389,7 +2474,6 @@ fn compare_contracts(
         contract_id,
         rpc_url,
         rpc_headers,
-        storage_schemas: _,
     } = comparison;
     let old_meta = parser::extract_metadata(old_bytes)?;
     let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
