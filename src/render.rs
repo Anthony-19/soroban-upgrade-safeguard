@@ -620,7 +620,10 @@ impl RenderableReport {
                 let finding = &reported.finding;
                 if current_category != Some(finding.category.as_str()) {
                     current_category = Some(&finding.category);
-                    output.push_str(&format!("### {}\n\n", markdown_escape_text(&finding.category)));
+                    output.push_str(&format!(
+                        "### {}\n\n",
+                        markdown_escape_text(&finding.category)
+                    ));
                 }
 
                 if reported.suppressed {
@@ -629,10 +632,8 @@ impl RenderableReport {
                         markdown_escape_text(&finding.message)
                     ));
                     if let Some(reason) = &reported.suppression_reason {
-                        output.push_str(&format!(
-                            "  - ↳ reason: {}\n",
-                            markdown_escape_text(reason)
-                        ));
+                        output
+                            .push_str(&format!("  - ↳ reason: {}\n", markdown_escape_text(reason)));
                     }
                     continue;
                 }
@@ -642,7 +643,11 @@ impl RenderableReport {
                     Severity::Warning => "🟡",
                     Severity::Info => "🔵",
                 };
-                output.push_str(&format!("- {} {}\n", emoji, markdown_escape_text(&finding.message)));
+                output.push_str(&format!(
+                    "- {} {}\n",
+                    emoji,
+                    markdown_escape_text(&finding.message)
+                ));
                 if self.empirical {
                     if let Some(ref udt_name) = finding.type_name {
                         let matching_emp: Vec<&crate::empirical::EmpiricalFinding> = self
@@ -748,7 +753,11 @@ impl RenderableReport {
                     "New client → old contract"
                 }
             };
-            let compatibility = if verdict.compatible { "passed" } else { "failed" };
+            let compatibility = if verdict.compatible {
+                "passed"
+            } else {
+                "failed"
+            };
             out.push_str(&format!(
                 "- **{}**: {}\n",
                 label,
@@ -1046,9 +1055,9 @@ mod tests {
         let markdown = report.generate_summary_markdown();
 
         assert!(markdown.contains("### Function \\[Removed\\]\\|Changed"));
-        assert!(markdown.contains(
-            "target \\`name\\` has \\[brackets\\] \\| and a newline\\nnext line"
-        ));
+        assert!(
+            markdown.contains("target \\`name\\` has \\[brackets\\] \\| and a newline\\nnext line")
+        );
         assert!(!markdown.contains("target `name` has [brackets] | and a newline\nnext line"));
     }
 
